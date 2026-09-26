@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/auth"
+	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-agent/internal/service"
 	"github.com/viovy/iazio-agent/internal/supervisor"
 )
@@ -45,6 +46,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		return runUpdate(args[1:], stdout)
 	case "run":
 		fmt.Fprintln(stdout, supervisor.HostKind(getenv("IAZIO_AGENT_HOST_KIND")))
+		if err := dialControlPlane(ctx, getenv); err != nil {
+			return err
+		}
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -55,6 +59,20 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 	default:
 		return fmt.Errorf("unknown command %s", args[0])
 	}
+}
+
+func dialControlPlane(ctx context.Context, getenv func(string) string) error {
+	api := getenv("IAZIO_HARNESS_API_URL")
+	host := getenv("IAZIO_AGENT_HOST_ID")
+	if api == "" || host == "" {
+		return nil
+	}
+	client := controlplane.Client{BaseURL: api}
+	kind := supervisor.HostKind(getenv("IAZIO_AGENT_HOST_KIND"))
+	if err := client.Register(ctx, host, kind); err != nil {
+		return err
+	}
+	return client.Heartbeat(ctx, host, nil, false)
 }
 
 func runAuth(ctx context.Context, args []string, stdout io.Writer, getenv func(string) string) error {
