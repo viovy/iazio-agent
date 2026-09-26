@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -88,13 +91,151 @@ func runService(args []string, stdout io.Writer, getenv func(string) string) err
 	if v := getenv("GOOS_OVERRIDE"); v != "" {
 		goos = v
 	}
-	text := service.ActionText(goos, action, "iazio-agent", force)
-	fmt.Fprintln(stdout, text)
+	bin := "iazio-agent"
+	if !dry && action == "install" {
+		installed, err := installCanonicalBinary()
+		if err != nil {
+			return err
+		}
+		bin = installed
+	}
+	text := service.ActionText(goos, action, bin, force)
+	if dry || action != "status" {
+		fmt.Fprintln(stdout, text)
+	}
 	if dry {
 		return nil
 	}
-	_, err = service.Apply(goos, action, "iazio-agent", false, force, nil)
-	return err
+	switch goos {
+	case "darwin":
+		return applyDarwin(action, bin)
+	case "windows":
+		if action == "install" {
+			return service.InstallWindows(bin)
+		}
+		_, err = service.Apply(goos, action, bin, false, force, execCommand)
+		return err
+	default:
+		if action == "install" {
+			return service.InstallLinux(bin)
+		}
+		_, err = service.Apply(goos, action, bin, false, force, execCommand)
+		return err
+	}
+}
+
+func applyDarwin(action, bin string) error {
+	switch action {
+	case "install", "restart":
+		if err := service.InstallDarwin(bin); err != nil {
+			return err
+		}
+		if action == "restart" {
+			return kickstartDarwin()
+		}
+		return nil
+	case "start":
+		return kickstartDarwin()
+	case "stop", "uninstall":
+		return bootoutDarwin(action == "uninstall")
+	case "status":
+		out, err := exec.Command("launchctl", "print", darwinTarget()).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("service not loaded: %s", strings.TrimSpace(string(out)))
+		}
+		if strings.Contains(string(out), "pid =") && !strings.Contains(string(out), "job state = exited") {
+			fmt.Println("running")
+			return nil
+		}
+		return fmt.Errorf("installed but not running")
+	default:
+		return fmt.Errorf("unknown service action %s", action)
+	}
+}
+
+func darwinTarget() string {
+	return "gui/" + strconv.Itoa(os.Getuid()) + "/io.iazio.iazio-agent"
+}
+
+func kickstartDarwin() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	plist := filepath.Join(home, "Library", "LaunchAgents", "io.iazio.iazio-agent.plist")
+	if _, err := os.Stat(plist); err != nil {
+		return fmt.Errorf("LaunchAgent is not installed")
+	}
+	_ = execCommand("launchctl", "bootstrap", "gui/"+strconv.Itoa(os.Getuid()), plist)
+	return execCommand("launchctl", "kickstart", "-k", darwinTarget())
+}
+
+func bootoutDarwin(remove bool) error {
+	_ = execCommand("launchctl", "bootout", darwinTarget())
+	if !remove {
+		return nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	return os.Remove(filepath.Join(home, "Library", "LaunchAgents", "io.iazio.iazio-agent.plist"))
+}
+
+func installCanonicalBinary() (string, error) {
+	src, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolve executable: %w", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(src); err == nil {
+		src = resolved
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home: %w", err)
+	}
+	dest := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+	if err := copyBinary(src, dest); err != nil {
+		return "", err
+	}
+	_ = copyBinary(src, filepath.Join(home, ".local", "bin", "iazio-agent"))
+	return dest, nil
+}
+
+func copyBinary(src, dest string) error {
+	if src == dest {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp := dest + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dest)
+}
+
+func execCommand(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: %s", name, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func runUpdate(args []string, stdout io.Writer) error {
