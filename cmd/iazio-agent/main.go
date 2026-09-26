@@ -2,77 +2,150 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
+	"os/signal"
+	"runtime"
+	"strings"
+	"syscall"
+	"time"
 
 	"github.com/viovy/iazio-agent/internal/auth"
 	"github.com/viovy/iazio-agent/internal/service"
 	"github.com/viovy/iazio-agent/internal/supervisor"
 )
 
-var (
-	version = "0.1.0-dev"
-	commit  = "unknown"
-	branch  = "unknown"
-)
-
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := execute(ctx, os.Args[1:], os.Stdout, os.Stderr, os.Getenv); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
 }
 
-func run(args []string) error {
+func execute(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
 	if len(args) == 0 {
 		return fmt.Errorf("usage: iazio-agent version|auth|service|update|run")
 	}
 	switch args[0] {
 	case "version":
-		fmt.Println(formatVersion())
+		fmt.Fprintln(stdout, formatVersion())
 		return nil
 	case "auth":
-		return runAuth(args[1:])
+		return runAuth(ctx, args[1:], stdout, getenv)
 	case "service":
-		fmt.Println(service.UnitText(os.Getenv("GOOS_OVERRIDE"), "iazio-agent"))
-		return nil
+		return runService(args[1:], stdout, getenv)
 	case "update":
-		return nil
+		return runUpdate(args[1:], stdout)
 	case "run":
-		fmt.Println(supervisor.HostKind(os.Getenv("IAZIO_AGENT_HOST_KIND")))
+		fmt.Fprintln(stdout, supervisor.HostKind(getenv("IAZIO_AGENT_HOST_KIND")))
+		if ctx.Err() != nil {
+			return nil
+		}
+		sup := supervisor.New(time.Now)
+		_ = sup.Lock("run")
+		<-ctx.Done()
 		return nil
 	default:
 		return fmt.Errorf("unknown command %s", args[0])
 	}
 }
 
-func formatVersion() string {
-	if commit == "" || commit == "unknown" {
-		return "iazio-agent " + version
-	}
-	sha := commit
-	if len(sha) > 12 {
-		sha = sha[:12]
-	}
-	return "iazio-agent " + version + "+" + sha
-}
-
-func runAuth(args []string) error {
+func runAuth(ctx context.Context, args []string, stdout io.Writer, getenv func(string) string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("auth status|login")
 	}
-	st, err := auth.ReadStatus(auth.ConfigPath())
-	if err != nil {
-		return err
-	}
 	switch args[0] {
 	case "status":
-		fmt.Println(auth.FormatStatus(st))
+		st, err := auth.ReadStatus(auth.ConfigPathFrom("", getenv))
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, auth.FormatStatus(st))
 		return nil
 	case "login":
-		noninteractive := os.Getenv("IAZIO_AGENT_NONINTERACTIVE") == "1" || os.Getenv("INVOCATION_ID") != ""
-		return auth.LoginAllowed(noninteractive, st.HasRefreshToken)
+		if auth.Noninteractive(getenv) {
+			return fmt.Errorf("auth login refused: noninteractive session")
+		}
+		return auth.Login(ctx, auth.LoginOptions{Getenv: getenv, Stdout: stdout})
 	default:
 		return fmt.Errorf("unknown auth command")
 	}
+}
+
+func runService(args []string, stdout io.Writer, getenv func(string) string) error {
+	action, dry, force, err := parseService(args)
+	if err != nil {
+		return err
+	}
+	goos := runtime.GOOS
+	if v := getenv("GOOS_OVERRIDE"); v != "" {
+		goos = v
+	}
+	text := service.ActionText(goos, action, "iazio-agent", force)
+	fmt.Fprintln(stdout, text)
+	if dry {
+		return nil
+	}
+	_, err = service.Apply(goos, action, "iazio-agent", false, force, nil)
+	return err
+}
+
+func runUpdate(args []string, stdout io.Writer) error {
+	suite := false
+	onTimeout := "reject"
+	expired := false
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--suite":
+			suite = true
+		case args[i] == "--on-timeout" && i+1 < len(args):
+			i++
+			onTimeout = args[i]
+		case strings.HasPrefix(args[i], "--on-timeout="):
+			onTimeout = strings.TrimPrefix(args[i], "--on-timeout=")
+		case args[i] == "--drain-expired":
+			expired = true
+		default:
+			return fmt.Errorf("unknown update flag %s", args[i])
+		}
+	}
+	if suite {
+		if !service.SuiteAllowed(false, onTimeout, expired) {
+			return service.ErrSuiteBusy
+		}
+		fmt.Fprintln(stdout, "update suite")
+		return nil
+	}
+	fmt.Fprintln(stdout, "update")
+	return nil
+}
+
+func parseService(args []string) (action string, dry, force bool, err error) {
+	if len(args) == 0 {
+		return "", false, false, fmt.Errorf("service install|uninstall|start|stop|restart|status")
+	}
+	action = args[0]
+	switch action {
+	case "install", "uninstall", "start", "stop", "restart", "status":
+	default:
+		return "", false, false, fmt.Errorf("unknown service action %s", action)
+	}
+	for _, arg := range args[1:] {
+		switch arg {
+		case "--dry-run":
+			dry = true
+		case "--force":
+			force = true
+		default:
+			return "", false, false, fmt.Errorf("unknown service flag %s", arg)
+		}
+	}
+	return action, dry, force, nil
 }
