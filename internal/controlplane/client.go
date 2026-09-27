@@ -6,8 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // Client posts heartbeats and finish checks. It does not send IDE credentials.
@@ -36,6 +38,76 @@ func (c Client) Register(ctx context.Context, hostID, kind string) error {
 	return c.post(ctx, "/v1/hosts/register", map[string]string{"id": hostID, "kind": kind})
 }
 
+// Assignment is one leased job returned by the control plane.
+type Assignment struct {
+	ID           string `json:"id"`
+	Kind         string `json:"kind"`
+	WorktreePath string `json:"worktree_path"`
+	DocsHubPath  string `json:"docs_hub_path"`
+}
+
+// NextLease asks for the next job for this host. ok is false when the queue is empty.
+func (c Client) NextLease(ctx context.Context, hostID string) (Assignment, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/v1/hosts/"+hostID+"/poll", strings.NewReader("{}"))
+	if err != nil {
+		return Assignment{}, false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	resp, err := c.http().Do(req)
+	if err != nil {
+		return Assignment{}, false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return Assignment{}, false, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return Assignment{}, false, fmt.Errorf("control plane poll: %s", resp.Status)
+	}
+	var job Assignment
+	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil && err != io.EOF {
+		return Assignment{}, false, err
+	}
+	if job.ID == "" {
+		return Assignment{}, false, nil
+	}
+	return job, true, nil
+}
+
+// Loop registers the host, then heartbeats and polls for a lease until ctx is cancelled.
+func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Duration, onJob func(Assignment) error) error {
+	if every <= 0 {
+		every = 30 * time.Second
+	}
+	if err := c.Register(ctx, hostID, kind); err != nil {
+		return err
+	}
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	for {
+		if err := c.Heartbeat(ctx, hostID, nil, false); err != nil && ctx.Err() != nil {
+			return nil
+		}
+		job, ok, err := c.NextLease(ctx, hostID)
+		if err != nil && ctx.Err() != nil {
+			return nil
+		}
+		if ok && onJob != nil {
+			if err := onJob(job); err != nil {
+				return err
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-tick.C:
+		}
+	}
+}
+
 // PostChunk stores one stripped output chunk for a job.
 func (c Client) PostChunk(ctx context.Context, jobID, stream, text string) error {
 	return c.post(ctx, "/v1/jobs/"+jobID+"/chunks", map[string]string{
@@ -56,11 +128,7 @@ func (c Client) post(ctx context.Context, path string, body any) error {
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
-	httpClient := c.HTTP
-	if httpClient == nil {
-		httpClient = http.DefaultClient
-	}
-	resp, err := httpClient.Do(req)
+	resp, err := c.http().Do(req)
 	if err != nil {
 		return err
 	}
@@ -69,4 +137,11 @@ func (c Client) post(ctx context.Context, path string, body any) error {
 		return fmt.Errorf("control plane %s: %s", path, resp.Status)
 	}
 	return nil
+}
+
+func (c Client) http() *http.Client {
+	if c.HTTP != nil {
+		return c.HTTP
+	}
+	return http.DefaultClient
 }

@@ -7,7 +7,33 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestLoopPollsUntilCancel(t *testing.T) {
+	var n int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		if strings.HasSuffix(r.URL.Path, "/poll") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+	err := Client{BaseURL: srv.URL}.Loop(ctx, "runner-1", "permanent", 15*time.Millisecond, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < 2 {
+		t.Fatalf("expected register and heartbeat, got %d", n)
+	}
+}
 
 func TestHeartbeatAndChunk(t *testing.T) {
 	var seen []string

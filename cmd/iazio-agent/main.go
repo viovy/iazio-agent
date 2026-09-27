@@ -45,9 +45,15 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 	case "update":
 		return runUpdate(args[1:], stdout)
 	case "run":
-		fmt.Fprintln(stdout, supervisor.HostKind(getenv("IAZIO_AGENT_HOST_KIND")))
-		if err := dialControlPlane(ctx, getenv); err != nil {
-			return err
+		kind := supervisor.HostKind(getenv("IAZIO_AGENT_HOST_KIND"))
+		fmt.Fprintln(stdout, kind)
+		api := getenv("IAZIO_HARNESS_API_URL")
+		host := getenv("IAZIO_AGENT_HOST_ID")
+		if api != "" && host != "" && ctx.Err() == nil {
+			sup := supervisor.New(time.Now)
+			return controlplane.Client{BaseURL: api}.Loop(ctx, host, kind, 30*time.Second, func(job controlplane.Assignment) error {
+				return sup.Spawn(nil, job.ID, api, job.WorktreePath, job.DocsHubPath, "")
+			})
 		}
 		if ctx.Err() != nil {
 			return nil
@@ -59,20 +65,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 	default:
 		return fmt.Errorf("unknown command %s", args[0])
 	}
-}
-
-func dialControlPlane(ctx context.Context, getenv func(string) string) error {
-	api := getenv("IAZIO_HARNESS_API_URL")
-	host := getenv("IAZIO_AGENT_HOST_ID")
-	if api == "" || host == "" {
-		return nil
-	}
-	client := controlplane.Client{BaseURL: api}
-	kind := supervisor.HostKind(getenv("IAZIO_AGENT_HOST_KIND"))
-	if err := client.Register(ctx, host, kind); err != nil {
-		return err
-	}
-	return client.Heartbeat(ctx, host, nil, false)
 }
 
 func runAuth(ctx context.Context, args []string, stdout io.Writer, getenv func(string) string) error {
