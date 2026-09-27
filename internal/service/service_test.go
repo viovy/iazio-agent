@@ -1,14 +1,48 @@
 package service
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"unicode/utf16"
+)
 
 func TestUnitContainsNoninteractive(t *testing.T) {
 	text := UnitText("linux", "/usr/bin/iazio-agent")
 	if !contains(text, "IAZIO_AGENT_NONINTERACTIVE=1") {
 		t.Fatal(text)
 	}
-	if !contains(UnitText("darwin", "bin"), "RunAtLoad") {
-		t.Fatal("plist")
+	plist := UnitText("darwin", "bin")
+	if !contains(plist, "RunAtLoad") || !contains(plist, "KeepAlive") || !contains(plist, "io.iazio.iazio-agent") {
+		t.Fatal(plist)
+	}
+}
+
+func TestInstallDarwinBootstrapsUserAgent(t *testing.T) {
+	home := t.TempDir()
+	var got []string
+	err := InstallDarwinAt(home, "/Users/romeo/.iazio/bin/iazio-agent", func(name string, args ...string) error {
+		got = append(got, name+" "+strings.Join(args, " "))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plist := filepath.Join(home, "Library", "LaunchAgents", "io.iazio.iazio-agent.plist")
+	body, err := os.ReadFile(plist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, needle := range []string{"RunAtLoad", "KeepAlive", "<string>run</string>", "IAZIO_AGENT_NONINTERACTIVE", "ThrottleInterval"} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("missing %s in %s", needle, text)
+		}
+	}
+	joined := strings.Join(got, "\n")
+	if !strings.Contains(joined, "launchctl bootstrap") || !strings.Contains(joined, plist) {
+		t.Fatal(joined)
 	}
 }
 
@@ -51,6 +85,91 @@ func TestDryRunText(t *testing.T) {
 	}
 }
 
+func TestInstallLinuxAndWindowsUnits(t *testing.T) {
+	home := t.TempDir()
+	var cmds []string
+	run := func(name string, args ...string) error {
+		cmds = append(cmds, name+" "+strings.Join(args, " "))
+		return nil
+	}
+	if err := InstallLinuxAt(home, "/usr/local/bin/iazio-agent", run); err != nil {
+		t.Fatal(err)
+	}
+	unit, err := os.ReadFile(filepath.Join(home, ".config", "systemd", "user", "iazio-agent.service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(unit), "WantedBy=default.target") || !strings.Contains(string(unit), "RestartSec=60s") {
+		t.Fatal(string(unit))
+	}
+	joined := strings.Join(cmds, "\n")
+	if !strings.Contains(joined, "enable --now iazio-agent.service") || !strings.Contains(joined, "loginctl enable-linger") {
+		t.Fatal(joined)
+	}
+	cmds = nil
+	if err := InstallWindowsAt(home, `C:\bin\iazio-agent.exe`, "romeo", run); err != nil {
+		t.Fatal(err)
+	}
+	xml, err := os.ReadFile(filepath.Join(home, ".iazio", "tasks", "iazio-agent.xml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(xml) < 2 || xml[0] != 0xFF || xml[1] != 0xFE {
+		t.Fatalf("task XML must be UTF-16LE with BOM, got %d bytes", len(xml))
+	}
+	decoded := decodeUTF16LE(xml[2:])
+	if !strings.Contains(decoded, "<UserId>romeo</UserId>") || !strings.Contains(decoded, "RestartOnFailure") {
+		t.Fatal(decoded)
+	}
+	if !strings.Contains(decoded, `id="Author"`) || !strings.Contains(decoded, "LeastPrivilege") {
+		t.Fatal(decoded)
+	}
+	if !strings.Contains(strings.Join(cmds, "\n"), "schtasks /Create") {
+		t.Fatal(cmds)
+	}
+	if msg := WSLSystemdBlock(); strings.Contains(msg, "WSL") && !strings.Contains(msg, "wsl.conf") {
+		t.Fatal(msg)
+	}
+}
+
+func TestWSLSystemdBlockSentence(t *testing.T) {
+	got := wslSystemdBlock("6.6.87.2-microsoft-standard-WSL2", true, false)
+	if !strings.Contains(got, "wsl.conf") || !strings.Contains(got, "systemd=true") {
+		t.Fatal(got)
+	}
+	if wslSystemdBlock("6.8.0-generic", true, false) != "" {
+		t.Fatal("non-WSL release must not block")
+	}
+	if wslSystemdBlock("microsoft", true, true) != "" {
+		t.Fatal("WSL with systemd must not block")
+	}
+	if wslSystemdBlock("", false, false) != "" {
+		t.Fatal("missing osrelease must not block")
+	}
+}
+
+func TestWindowsLifecycleCommands(t *testing.T) {
+	var got []string
+	run := func(name string, args ...string) error {
+		got = append(got, name+" "+strings.Join(args, " "))
+		return nil
+	}
+	cases := map[string]string{
+		"start":     "schtasks /Run /TN iazio-agent",
+		"stop":      "schtasks /End /TN iazio-agent",
+		"uninstall": "schtasks /Delete /TN iazio-agent /F",
+	}
+	for action, want := range cases {
+		got = nil
+		if _, err := Apply("windows", action, "bin", false, false, run); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0] != want {
+			t.Fatalf("%s: got %v", action, got)
+		}
+	}
+}
+
 func TestSuiteAllowed(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -82,4 +201,15 @@ func contains(s, sub string) bool {
 		}
 		return false
 	})()
+}
+
+func decodeUTF16LE(b []byte) string {
+	if len(b)%2 != 0 {
+		b = b[:len(b)-1]
+	}
+	units := make([]uint16, len(b)/2)
+	for i := range units {
+		units[i] = uint16(b[i*2]) | uint16(b[i*2+1])<<8
+	}
+	return string(utf16.Decode(units))
 }
