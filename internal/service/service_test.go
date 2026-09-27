@@ -121,6 +121,9 @@ func TestInstallLinuxAndWindowsUnits(t *testing.T) {
 	if !strings.Contains(decoded, "<UserId>romeo</UserId>") || !strings.Contains(decoded, "RestartOnFailure") {
 		t.Fatal(decoded)
 	}
+	if !strings.Contains(decoded, `id="Author"`) || !strings.Contains(decoded, "LeastPrivilege") {
+		t.Fatal(decoded)
+	}
 	if !strings.Contains(strings.Join(cmds, "\n"), "schtasks /Create") {
 		t.Fatal(cmds)
 	}
@@ -142,6 +145,28 @@ func TestWSLSystemdBlockSentence(t *testing.T) {
 	}
 	if wslSystemdBlock("", false, false) != "" {
 		t.Fatal("missing osrelease must not block")
+	}
+}
+
+func TestWindowsLifecycleCommands(t *testing.T) {
+	var got []string
+	run := func(name string, args ...string) error {
+		got = append(got, name+" "+strings.Join(args, " "))
+		return nil
+	}
+	cases := map[string]string{
+		"start":     "schtasks /Run /TN iazio-agent",
+		"stop":      "schtasks /End /TN iazio-agent",
+		"uninstall": "schtasks /Delete /TN iazio-agent /F",
+	}
+	for action, want := range cases {
+		got = nil
+		if _, err := Apply("windows", action, "bin", false, false, run); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0] != want {
+			t.Fatalf("%s: got %v", action, got)
+		}
 	}
 }
 

@@ -47,7 +47,16 @@ func ActionText(goos, action, bin string, force bool) string {
 	case "darwin":
 		return fmt.Sprintf("launchctl %s gui/%d/%s", action, os.Getuid(), agentLabel)
 	case "windows":
-		return "schtasks /TN iazio-agent /Query"
+		switch action {
+		case "start", "restart":
+			return "schtasks /Run /TN iazio-agent"
+		case "stop":
+			return "schtasks /End /TN iazio-agent"
+		case "uninstall":
+			return "schtasks /Delete /TN iazio-agent /F"
+		default:
+			return "schtasks /Query /TN iazio-agent"
+		}
 	default:
 		return fmt.Sprintf("systemctl --user %s iazio-agent.service", action)
 	}
@@ -90,14 +99,22 @@ func controlArgv(goos, action string, force bool) []string {
 			return []string{"launchctl", action, "gui/iazio-agent"}
 		}
 	case "windows":
-		if action == "install" {
+		switch action {
+		case "install":
 			args := []string{"schtasks", "/Create", "/TN", "iazio-agent"}
 			if force {
 				args = append(args, "/F")
 			}
 			return args
+		case "start", "restart":
+			return []string{"schtasks", "/Run", "/TN", "iazio-agent"}
+		case "stop":
+			return []string{"schtasks", "/End", "/TN", "iazio-agent"}
+		case "uninstall":
+			return []string{"schtasks", "/Delete", "/TN", "iazio-agent", "/F"}
+		default:
+			return []string{"schtasks", "/Query", "/TN", "iazio-agent"}
 		}
-		return []string{"schtasks", "/Query", "/TN", "iazio-agent"}
 	default:
 		if action == "install" {
 			args := []string{"systemctl", "--user", "enable", "--now"}
@@ -186,7 +203,9 @@ func InstallDarwinAt(home, bin string, run func(name string, args ...string) err
 	if err := run("launchctl", "bootstrap", domain, plistPath); err != nil {
 		return fmt.Errorf("launchctl bootstrap: %w", err)
 	}
-	_ = run("launchctl", "enable", target)
+	if err := run("launchctl", "enable", target); err != nil {
+		return fmt.Errorf("launchctl enable: %w", err)
+	}
 	return nil
 }
 
@@ -281,6 +300,12 @@ func InstallWindowsAt(home, bin, user string, run func(name string, args ...stri
 	xmlDoc := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>%s</UserId></LogonTrigger></Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
   <Settings>
     <StartWhenAvailable>true</StartWhenAvailable>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
