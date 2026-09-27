@@ -129,6 +129,22 @@ func TestInstallLinuxAndWindowsUnits(t *testing.T) {
 	}
 }
 
+func TestWSLSystemdBlockSentence(t *testing.T) {
+	got := wslSystemdBlock("6.6.87.2-microsoft-standard-WSL2", true, false)
+	if !strings.Contains(got, "wsl.conf") || !strings.Contains(got, "systemd=true") {
+		t.Fatal(got)
+	}
+	if wslSystemdBlock("6.8.0-generic", true, false) != "" {
+		t.Fatal("non-WSL release must not block")
+	}
+	if wslSystemdBlock("microsoft", true, true) != "" {
+		t.Fatal("WSL with systemd must not block")
+	}
+	if wslSystemdBlock("", false, false) != "" {
+		t.Fatal("missing osrelease must not block")
+	}
+}
+
 func TestSuiteAllowed(t *testing.T) {
 	tests := []struct {
 		name    string

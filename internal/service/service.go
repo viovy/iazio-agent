@@ -210,10 +210,15 @@ WantedBy=default.target
 // WSLSystemdBlock reports when this process is WSL without systemd.
 func WSLSystemdBlock() string {
 	data, err := os.ReadFile("/proc/sys/kernel/osrelease")
-	if err != nil || !strings.Contains(strings.ToLower(string(data)), "microsoft") {
+	_, statErr := os.Stat("/run/systemd/system")
+	return wslSystemdBlock(string(data), err == nil, statErr == nil)
+}
+
+func wslSystemdBlock(release string, haveRelease, systemd bool) string {
+	if !haveRelease || !strings.Contains(strings.ToLower(release), "microsoft") {
 		return ""
 	}
-	if _, err := os.Stat("/run/systemd/system"); err == nil {
+	if systemd {
 		return ""
 	}
 	return "WSL is not running systemd. Set systemd=true under [boot] in /etc/wsl.conf, run `wsl --shutdown` from Windows, then retry service install"
