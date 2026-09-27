@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf16"
 )
 
 func TestUnitContainsNoninteractive(t *testing.T) {
@@ -113,8 +114,12 @@ func TestInstallLinuxAndWindowsUnits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(xml), "<UserId>romeo</UserId>") || !strings.Contains(string(xml), "RestartOnFailure") {
-		t.Fatal(string(xml))
+	if len(xml) < 2 || xml[0] != 0xFF || xml[1] != 0xFE {
+		t.Fatalf("task XML must be UTF-16LE with BOM, got %d bytes", len(xml))
+	}
+	decoded := decodeUTF16LE(xml[2:])
+	if !strings.Contains(decoded, "<UserId>romeo</UserId>") || !strings.Contains(decoded, "RestartOnFailure") {
+		t.Fatal(decoded)
 	}
 	if !strings.Contains(strings.Join(cmds, "\n"), "schtasks /Create") {
 		t.Fatal(cmds)
@@ -155,4 +160,15 @@ func contains(s, sub string) bool {
 		}
 		return false
 	})()
+}
+
+func decodeUTF16LE(b []byte) string {
+	if len(b)%2 != 0 {
+		b = b[:len(b)-1]
+	}
+	units := make([]uint16, len(b)/2)
+	for i := range units {
+		units[i] = uint16(b[i*2]) | uint16(b[i*2+1])<<8
+	}
+	return string(utf16.Decode(units))
 }

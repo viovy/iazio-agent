@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf16"
 )
 
 const agentLabel = "io.iazio.iazio-agent"
@@ -286,10 +288,21 @@ func InstallWindowsAt(home, bin, user string, run func(name string, args ...stri
 	if err := os.WriteFile(batPath, []byte(bat), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(xmlPath, []byte(xmlDoc), 0o644); err != nil {
+	if err := os.WriteFile(xmlPath, encodeUTF16LEWithBOM(xmlDoc), 0o644); err != nil {
 		return err
 	}
 	return run("schtasks", "/Create", "/TN", "iazio-agent", "/XML", xmlPath, "/F")
+}
+
+func encodeUTF16LEWithBOM(s string) []byte {
+	u16 := utf16.Encode([]rune(s))
+	out := make([]byte, 2+len(u16)*2)
+	out[0], out[1] = 0xFF, 0xFE
+	for i, v := range u16 {
+		out[2+i*2] = byte(v)
+		out[2+i*2+1] = byte(v >> 8)
+	}
+	return out
 }
 
 func windowsLogonUser() string {
@@ -299,7 +312,11 @@ func windowsLogonUser() string {
 	if v := strings.TrimSpace(os.Getenv("USER")); v != "" {
 		return v
 	}
-	return ""
+	current, err := user.Current()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(current.Username)
 }
 
 func execCommand(name string, args ...string) error {
