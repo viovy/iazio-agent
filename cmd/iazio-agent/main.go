@@ -54,7 +54,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		fmt.Fprintln(stdout, kind)
 		api := getenv("IAZIO_HARNESS_API_URL")
 		if api == "" {
-			api = "https://tian.go.ro/iazio-harness-api"
+			api = "http://localhost:8090"
 		}
 		host := getenv("IAZIO_AGENT_HOST_ID")
 		if host == "" {
