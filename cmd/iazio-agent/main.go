@@ -177,6 +177,15 @@ func runService(args []string, stdout io.Writer, getenv func(string) string) err
 		goos = v
 	}
 	bin := "iazio-agent"
+	if home, err := os.UserHomeDir(); err == nil {
+		canonical := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+		if runtime.GOOS == "windows" {
+			canonical += ".exe"
+		}
+		if _, err := os.Stat(canonical); err == nil {
+			bin = canonical
+		}
+	}
 	if !dry && action == "install" {
 		installed, err := installCanonicalBinary()
 		if err != nil {
@@ -212,13 +221,8 @@ func runService(args []string, stdout io.Writer, getenv func(string) string) err
 func applyDarwin(action, bin string) error {
 	switch action {
 	case "install", "restart":
-		if err := service.InstallDarwin(bin); err != nil {
-			return err
-		}
-		if action == "restart" {
-			return kickstartDarwin()
-		}
-		return nil
+		_ = bootoutDarwin(false)
+		return service.InstallDarwin(bin)
 	case "start":
 		return kickstartDarwin()
 	case "stop", "uninstall":
@@ -252,7 +256,7 @@ func kickstartDarwin() error {
 		return fmt.Errorf("LaunchAgent is not installed")
 	}
 	_ = execCommand("launchctl", "bootstrap", "gui/"+strconv.Itoa(os.Getuid()), plist)
-	return execCommand("launchctl", "kickstart", "-k", darwinTarget())
+	return execCommand("launchctl", "kickstart", "-k", "-p", darwinTarget())
 }
 
 func bootoutDarwin(remove bool) error {
