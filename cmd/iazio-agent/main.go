@@ -53,8 +53,18 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		kind := supervisor.HostKind(getenv("IAZIO_AGENT_HOST_KIND"))
 		fmt.Fprintln(stdout, kind)
 		api := getenv("IAZIO_HARNESS_API_URL")
+		if api == "" {
+			api = "https://tian.go.ro/iazio-harness-api"
+		}
 		host := getenv("IAZIO_AGENT_HOST_ID")
-		if api != "" && host != "" && ctx.Err() == nil {
+		if host == "" {
+			if h, err := os.Hostname(); err == nil && h != "" {
+				host = strings.ToLower(strings.Split(h, ".")[0])
+			} else {
+				host = "runner"
+			}
+		}
+		if ctx.Err() == nil {
 			sup := supervisor.New(time.Now)
 			runner := supervisor.NewOSRunner()
 			client := controlplane.Client{

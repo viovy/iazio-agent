@@ -35,7 +35,7 @@ func TestInstallDarwinBootstrapsUserAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(body)
-	for _, needle := range []string{"RunAtLoad", "KeepAlive", "<string>run</string>", "IAZIO_AGENT_NONINTERACTIVE", "ThrottleInterval"} {
+	for _, needle := range []string{"RunAtLoad", "KeepAlive", "<string>run</string>", "IAZIO_AGENT_NONINTERACTIVE", "IAZIO_HARNESS_API_URL", "ThrottleInterval"} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("missing %s in %s", needle, text)
 		}
@@ -51,9 +51,9 @@ func TestDryRunText(t *testing.T) {
 		goos string
 		need string
 	}{
-		{goos: "darwin", need: "IAZIO_AGENT_NONINTERACTIVE"},
-		{goos: "linux", need: "Environment=IAZIO_AGENT_NONINTERACTIVE=1"},
-		{goos: "windows", need: "IAZIO_AGENT_NONINTERACTIVE=1"},
+		{goos: "darwin", need: "IAZIO_HARNESS_API_URL"},
+		{goos: "linux", need: "Environment=IAZIO_HARNESS_API_URL=https://tian.go.ro/iazio-harness-api"},
+		{goos: "windows", need: "IAZIO_HARNESS_API_URL=https://tian.go.ro/iazio-harness-api"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.goos, func(t *testing.T) {
