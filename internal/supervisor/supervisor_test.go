@@ -68,6 +68,7 @@ func (r *recordingRunner) Start(argv []string) (int, error) {
 }
 
 func (r *recordingRunner) Signal(int, string) error { return nil }
+func (r *recordingRunner) Wait(int) (int, error)     { return 0, nil }
 
 func TestSpawnArgvOmitsToken(t *testing.T) {
 	start := time.Unix(1_700_000_000, 0)
@@ -206,3 +207,33 @@ func TestProcessHostIDOnce(t *testing.T) {
 		t.Fatalf("first %s second %s", first, second)
 	}
 }
+
+func TestOSRunnerSmoke(t *testing.T) {
+	r := NewOSRunner()
+	pid, err := r.Start([]string{"echo", "hello"})
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	if pid <= 0 {
+		t.Fatalf("invalid pid: %d", pid)
+	}
+	code, err := r.Wait(pid)
+	if err != nil {
+		t.Fatalf("Wait failed: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("unexpected exit code: %d", code)
+	}
+}
+
+func TestSupPID(t *testing.T) {
+	s := New(nil)
+	runner := &recordingRunner{}
+	if err := s.Spawn(runner, "job-1", "https://api.test", "/repos/work", "/repos/hub", ""); err != nil {
+		t.Fatalf("Spawn failed: %v", err)
+	}
+	if pid := s.PID("/repos/work"); pid != 4 {
+		t.Fatalf("expected PID 4, got %d", pid)
+	}
+}
+

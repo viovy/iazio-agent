@@ -3,10 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
 
 func TestFormatVersion(t *testing.T) {
 	origV, origC, origB := version, commit, branch
@@ -71,3 +75,46 @@ func TestExecuteCommands(t *testing.T) {
 		t.Fatal(err, stdout.String())
 	}
 }
+
+func TestExecuteRunConnected(t *testing.T) {
+	var heartbeatReceived bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/register"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			heartbeatReceived = true
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/poll"):
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	var stdout, stderr bytes.Buffer
+	err := execute(ctx, []string{"run"}, &stdout, &stderr, func(k string) string {
+		switch k {
+		case "IAZIO_HARNESS_API_URL":
+			return srv.URL
+		case "IAZIO_AGENT_HOST_ID":
+			return "test-host"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if !heartbeatReceived {
+		t.Fatalf("expected heartbeat to be received")
+	}
+}
+

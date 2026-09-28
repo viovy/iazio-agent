@@ -17,7 +17,9 @@ type Client struct {
 	BaseURL string
 	Token   string
 	HTTP    *http.Client
+	Tools   func() []Tool
 }
+
 
 // Tool is one binary on a heartbeat.
 type Tool struct {
@@ -88,7 +90,11 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 	tick := time.NewTicker(every)
 	defer tick.Stop()
 	for {
-		if err := c.Heartbeat(ctx, hostID, nil, false); err != nil && ctx.Err() != nil {
+		var tools []Tool
+		if c.Tools != nil {
+			tools = c.Tools()
+		}
+		if err := c.Heartbeat(ctx, hostID, tools, false); err != nil && ctx.Err() != nil {
 			return nil
 		}
 		job, ok, err := c.NextLease(ctx, hostID)
@@ -108,12 +114,108 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 	}
 }
 
+// PreflightHalt is the response from the API preflight check.
+type PreflightHalt struct {
+	Reason     string `json:"Reason"`
+	PauseQueue bool   `json:"PauseQueue"`
+	Heal       bool   `json:"Heal"`
+}
+
+// FinishReport carries the post-cooling finish assessment.
+type FinishReport struct {
+	Kind            string `json:"Kind"`
+	ASEComplete     bool   `json:"ASEComplete"`
+	WorkPorcelain   string `json:"WorkPorcelain"`
+	HubPorcelain    string `json:"HubPorcelain"`
+	HubAhead        int    `json:"HubAhead"`
+	HealingAttempts int    `json:"HealingAttempts"`
+	StoryDraftOK    bool   `json:"StoryDraftOK"`
+	HubPushOK       bool   `json:"HubPushOK"`
+}
+
+// FinishDecision is what the API applies to the repo queue.
+type FinishDecision struct {
+	Queue           string `json:"Queue"`
+	Reason          string `json:"Reason"`
+	HealingAttempts int    `json:"HealingAttempts"`
+	LeaseResume     bool   `json:"LeaseResume"`
+	Decrement       bool   `json:"Decrement"`
+}
+
+// PostPreflight posts the preflight check before spawning a harness.
+func (c Client) PostPreflight(ctx context.Context, hostID, worktree string, pre any) (PreflightHalt, error) {
+	body := map[string]any{
+		"worktree_path": worktree,
+		"preflight":     pre,
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return PreflightHalt{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/v1/repos/"+hostID+"/preflight", bytes.NewReader(raw))
+	if err != nil {
+		return PreflightHalt{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	resp, err := c.http().Do(req)
+	if err != nil {
+		return PreflightHalt{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return PreflightHalt{}, fmt.Errorf("preflight post: %s", resp.Status)
+	}
+	var halt PreflightHalt
+	if err := json.NewDecoder(resp.Body).Decode(&halt); err != nil {
+		return PreflightHalt{}, err
+	}
+	return halt, nil
+}
+
+// PostFinish posts the post-cooling finish check.
+func (c Client) PostFinish(ctx context.Context, hostID, worktree, jobID string, finish any) (FinishDecision, error) {
+	body := map[string]any{
+		"worktree_path": worktree,
+		"job_id":        jobID,
+		"finish":        finish,
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return FinishDecision{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/v1/repos/"+hostID+"/finish", bytes.NewReader(raw))
+	if err != nil {
+		return FinishDecision{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	resp, err := c.http().Do(req)
+	if err != nil {
+		return FinishDecision{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return FinishDecision{}, fmt.Errorf("finish post: %s", resp.Status)
+	}
+	var decision FinishDecision
+	if err := json.NewDecoder(resp.Body).Decode(&decision); err != nil {
+		return FinishDecision{}, err
+	}
+	return decision, nil
+}
+
 // PostChunk stores one stripped output chunk for a job.
 func (c Client) PostChunk(ctx context.Context, jobID, stream, text string) error {
 	return c.post(ctx, "/v1/jobs/"+jobID+"/chunks", map[string]string{
 		"type": "OUTPUT_CHUNK", "stream": stream, "text": text,
 	})
 }
+
 
 func (c Client) post(ctx context.Context, path string, body any) error {
 	raw, err := json.Marshal(body)

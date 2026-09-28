@@ -44,6 +44,7 @@ const (
 type Runner interface {
 	Start(argv []string) (pid int, err error)
 	Signal(pid int, sig string) error
+	Wait(pid int) (exitCode int, err error)
 }
 
 // Sup is the in-process repo lock table.
@@ -77,6 +78,7 @@ func New(now func() time.Time) *Sup {
 		reasons:  map[string]string{},
 		now:      now,
 		sleep:    time.Sleep,
+		alive:    isProcessAlive,
 	}
 }
 
@@ -111,9 +113,20 @@ func (s *Sup) Spawn(r Runner, jobID, apiURL, worktree, docsHub, token string) er
 	s.mu.Lock()
 	s.pids[worktree] = pid
 	s.deadline[worktree] = s.now().Add(DefaultJobDuration)
+	if s.signal == nil && r != nil {
+		s.signal = r.Signal
+	}
 	s.mu.Unlock()
 	return nil
 }
+
+// PID returns the running process ID for the worktree.
+func (s *Sup) PID(path string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pids[path]
+}
+
 
 // TrySpawn records RUNNING_HARNESS. A second call for the same path is refused.
 func (s *Sup) TrySpawn(path string) error {

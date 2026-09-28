@@ -65,3 +65,82 @@ func TestHeartbeatAndChunk(t *testing.T) {
 		t.Fatal("secret leaked")
 	}
 }
+
+func TestPostPreflightAndFinish(t *testing.T) {
+	var seenPaths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPaths = append(seenPaths, r.URL.Path)
+		if r.Header.Get("Authorization") != "Bearer test-tok" {
+			t.Fatalf("auth %s", r.Header.Get("Authorization"))
+		}
+		switch r.URL.Path {
+		case "/v1/repos/runner-1/preflight":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Reason":"","PauseQueue":false,"Heal":false}`))
+		case "/v1/repos/runner-1/finish":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Queue":"OPEN","Reason":"","HealingAttempts":0,"LeaseResume":false,"Decrement":false}`))
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := Client{BaseURL: srv.URL, Token: "test-tok"}
+	ctx := context.Background()
+
+	halt, err := c.PostPreflight(ctx, "runner-1", "/repos/work", map[string]any{"Kind": "ordinary"})
+	if err != nil {
+		t.Fatalf("PostPreflight failed: %v", err)
+	}
+	if halt.Reason != "" || halt.PauseQueue {
+		t.Fatalf("unexpected halt: %+v", halt)
+	}
+
+	decision, err := c.PostFinish(ctx, "runner-1", "/repos/work", "job-1", FinishReport{Kind: "ordinary", ASEComplete: true})
+	if err != nil {
+		t.Fatalf("PostFinish failed: %v", err)
+	}
+	if decision.Queue != "OPEN" {
+		t.Fatalf("unexpected decision: %+v", decision)
+	}
+
+	if len(seenPaths) != 2 || seenPaths[0] != "/v1/repos/runner-1/preflight" || seenPaths[1] != "/v1/repos/runner-1/finish" {
+		t.Fatalf("unexpected seen paths: %v", seenPaths)
+	}
+}
+
+func TestLoopWithTools(t *testing.T) {
+	var heartbeatBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/heartbeat") {
+			b, _ := io.ReadAll(r.Body)
+			heartbeatBody = string(b)
+		}
+		if strings.HasSuffix(r.URL.Path, "/poll") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	c := Client{
+		BaseURL: srv.URL,
+		Tools: func() []Tool {
+			return []Tool{{Name: "autopilot", Path: "/bin/autopilot", Version: "1.0.0", Status: "OK"}}
+		},
+	}
+	_ = c.Loop(ctx, "runner-1", "permanent", 15*time.Millisecond, nil)
+
+	if !strings.Contains(heartbeatBody, "autopilot") {
+		t.Fatalf("heartbeat missing scanned tools: %s", heartbeatBody)
+	}
+}
+

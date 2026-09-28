@@ -17,6 +17,8 @@ import (
 
 	"github.com/viovy/iazio-agent/internal/auth"
 	"github.com/viovy/iazio-agent/internal/controlplane"
+	"github.com/viovy/iazio-agent/internal/inventory"
+	"github.com/viovy/iazio-agent/internal/preflight"
 	"github.com/viovy/iazio-agent/internal/service"
 	"github.com/viovy/iazio-agent/internal/supervisor"
 )
@@ -54,10 +56,73 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		host := getenv("IAZIO_AGENT_HOST_ID")
 		if api != "" && host != "" && ctx.Err() == nil {
 			sup := supervisor.New(time.Now)
-			return controlplane.Client{BaseURL: api}.Loop(ctx, host, kind, 30*time.Second, func(job controlplane.Assignment) error {
-				return sup.Spawn(nil, job.ID, api, job.WorktreePath, job.DocsHubPath, "")
+			runner := supervisor.NewOSRunner()
+			client := controlplane.Client{
+				BaseURL: api,
+				Tools: func() []controlplane.Tool {
+					home, _ := os.UserHomeDir()
+					dirs := inventory.DefaultDirs(getenv("PATH"), home, runtime.GOOS)
+					found := inventory.Scan(dirs)
+					classified, _ := inventory.Classify(found, nil)
+					var tools []controlplane.Tool
+					for _, t := range classified {
+						tools = append(tools, controlplane.Tool{
+							Name:    t.Name,
+							Path:    t.Path,
+							Version: t.Version,
+							Status:  t.Status,
+						})
+					}
+					return tools
+				},
+			}
+			return client.Loop(ctx, host, kind, 30*time.Second, func(job controlplane.Assignment) error {
+				if sup.Lock(job.WorktreePath) == supervisor.LockRunning {
+					return fmt.Errorf("worktree %s busy", job.WorktreePath)
+				}
+				rep, err := preflight.Collect(ctx, job.WorktreePath, job.DocsHubPath, job.Kind)
+				if err != nil {
+					return err
+				}
+				dec := preflight.Decide(rep)
+				if dec.Reason != "" {
+					_, postErr := client.PostPreflight(ctx, host, job.WorktreePath, rep)
+					return postErr
+				}
+				if err := sup.Spawn(runner, job.ID, api, job.WorktreePath, job.DocsHubPath, ""); err != nil {
+					return err
+				}
+				go func(worktree, docsHub, jobID, kind string) {
+					pid := sup.PID(worktree)
+					exitCode, _ := runner.Wait(pid)
+					sup.BeginCooling(worktree)
+					time.Sleep(supervisor.CoolingOff)
+					sup.Promote()
+
+					workPorc := ""
+					hubPorc := ""
+					if out, err := exec.Command("git", "-C", worktree, "status", "--porcelain").CombinedOutput(); err == nil {
+						workPorc = strings.TrimSpace(string(out))
+					}
+					if docsHub != "" {
+						if out, err := exec.Command("git", "-C", docsHub, "status", "--porcelain").CombinedOutput(); err == nil {
+							hubPorc = strings.TrimSpace(string(out))
+						}
+					}
+					finish := controlplane.FinishReport{
+						Kind:          kind,
+						ASEComplete:   (exitCode == 0),
+						WorkPorcelain: workPorc,
+						HubPorcelain:  hubPorc,
+						StoryDraftOK:  (exitCode == 0),
+						HubPushOK:     (exitCode == 0),
+					}
+					_, _ = client.PostFinish(context.Background(), host, worktree, jobID, finish)
+				}(job.WorktreePath, job.DocsHubPath, job.ID, job.Kind)
+				return nil
 			})
 		}
+
 		if ctx.Err() != nil {
 			return nil
 		}
