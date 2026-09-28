@@ -118,3 +118,44 @@ func TestExecuteRunConnected(t *testing.T) {
 	}
 }
 
+func TestExecuteRunDefaultHostID(t *testing.T) {
+	var registeredHost string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/register"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			parts := strings.Split(r.URL.Path, "/")
+			if len(parts) >= 4 {
+				registeredHost = parts[len(parts)-2]
+			}
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/poll"):
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	var stdout, stderr bytes.Buffer
+	err := execute(ctx, []string{"run"}, &stdout, &stderr, func(k string) string {
+		if k == "IAZIO_HARNESS_API_URL" {
+			return srv.URL
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if registeredHost == "" {
+		t.Fatalf("expected registered host from hostname default, got empty")
+	}
+}
+

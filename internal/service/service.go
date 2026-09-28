@@ -38,7 +38,7 @@ func ActionText(goos, action, bin string, force bool) string {
 			if force {
 				flag = " /F"
 			}
-			return fmt.Sprintf(`schtasks /Create /TN iazio-agent /SC ONLOGON%s /TR "cmd /C set IAZIO_AGENT_NONINTERACTIVE=1&& \"%s\" run"`, flag, bin)
+			return fmt.Sprintf(`schtasks /Create /TN iazio-agent /SC ONLOGON%s /TR "cmd /C set IAZIO_AGENT_NONINTERACTIVE=1&& set IAZIO_HARNESS_API_URL=https://tian.go.ro/iazio-harness-api&& \"%s\" run"`, flag, bin)
 		default:
 			return linuxUnit(bin)
 		}
@@ -151,6 +151,8 @@ func darwinPlist(bin, logPath string) string {
 	<dict>
 		<key>IAZIO_AGENT_NONINTERACTIVE</key>
 		<string>1</string>
+		<key>IAZIO_HARNESS_API_URL</key>
+		<string>https://tian.go.ro/iazio-harness-api</string>
 	</dict>
 	<key>StandardOutPath</key>
 	<string>%s</string>
@@ -220,6 +222,7 @@ ExecStart=%s run
 Restart=on-failure
 RestartSec=60s
 Environment=IAZIO_AGENT_NONINTERACTIVE=1
+Environment=IAZIO_HARNESS_API_URL=https://tian.go.ro/iazio-harness-api
 
 [Install]
 WantedBy=default.target
