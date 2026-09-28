@@ -20,6 +20,7 @@ func TestUnitContainsNoninteractive(t *testing.T) {
 }
 
 func TestInstallDarwinBootstrapsUserAgent(t *testing.T) {
+	t.Setenv("IAZIO_HARNESS_API_URL", "http://127.0.0.1:8090")
 	home := t.TempDir()
 	var got []string
 	err := InstallDarwinAt(home, "/Users/romeo/.iazio/bin/iazio-agent", func(name string, args ...string) error {
@@ -47,13 +48,14 @@ func TestInstallDarwinBootstrapsUserAgent(t *testing.T) {
 }
 
 func TestDryRunText(t *testing.T) {
+	t.Setenv("IAZIO_HARNESS_API_URL", "http://127.0.0.1:8090")
 	tests := []struct {
 		goos string
 		need string
 	}{
 		{goos: "darwin", need: "IAZIO_HARNESS_API_URL"},
-		{goos: "linux", need: "Environment=IAZIO_HARNESS_API_URL=https://tian.go.ro/iazio-harness-api"},
-		{goos: "windows", need: "IAZIO_HARNESS_API_URL=https://tian.go.ro/iazio-harness-api"},
+		{goos: "linux", need: "Environment=IAZIO_HARNESS_API_URL=http://127.0.0.1:8090"},
+		{goos: "windows", need: "IAZIO_HARNESS_API_URL=http://127.0.0.1:8090"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.goos, func(t *testing.T) {

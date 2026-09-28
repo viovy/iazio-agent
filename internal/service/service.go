@@ -38,7 +38,11 @@ func ActionText(goos, action, bin string, force bool) string {
 			if force {
 				flag = " /F"
 			}
-			return fmt.Sprintf(`schtasks /Create /TN iazio-agent /SC ONLOGON%s /TR "cmd /C set IAZIO_AGENT_NONINTERACTIVE=1&& set IAZIO_HARNESS_API_URL=https://tian.go.ro/iazio-harness-api&& \"%s\" run"`, flag, bin)
+			setApi := ""
+			if apiEnv := os.Getenv("IAZIO_HARNESS_API_URL"); apiEnv != "" {
+				setApi = fmt.Sprintf("set IAZIO_HARNESS_API_URL=%s&& ", apiEnv)
+			}
+			return fmt.Sprintf(`schtasks /Create /TN iazio-agent /SC ONLOGON%s /TR "cmd /C set IAZIO_AGENT_NONINTERACTIVE=1&& %s\"%s\" run"`, flag, setApi, bin)
 		default:
 			return linuxUnit(bin)
 		}
@@ -128,6 +132,10 @@ func controlArgv(goos, action string, force bool) []string {
 }
 
 func darwinPlist(bin, logPath string) string {
+	apiXml := ""
+	if apiEnv := os.Getenv("IAZIO_HARNESS_API_URL"); apiEnv != "" {
+		apiXml = fmt.Sprintf("\n\t\t<key>IAZIO_HARNESS_API_URL</key>\n\t\t<string>%s</string>", apiEnv)
+	}
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -150,9 +158,7 @@ func darwinPlist(bin, logPath string) string {
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>IAZIO_AGENT_NONINTERACTIVE</key>
-		<string>1</string>
-		<key>IAZIO_HARNESS_API_URL</key>
-		<string>https://tian.go.ro/iazio-harness-api</string>
+		<string>1</string>%s
 	</dict>
 	<key>StandardOutPath</key>
 	<string>%s</string>
@@ -160,7 +166,7 @@ func darwinPlist(bin, logPath string) string {
 	<string>%s</string>
 </dict>
 </plist>
-`, agentLabel, bin, logPath, logPath)
+`, agentLabel, bin, apiXml, logPath, logPath)
 }
 
 func agentLogPath() string {
@@ -212,6 +218,10 @@ func InstallDarwinAt(home, bin string, run func(name string, args ...string) err
 }
 
 func linuxUnit(bin string) string {
+	apiLine := ""
+	if apiEnv := os.Getenv("IAZIO_HARNESS_API_URL"); apiEnv != "" {
+		apiLine = fmt.Sprintf("Environment=IAZIO_HARNESS_API_URL=%s\n", apiEnv)
+	}
 	return fmt.Sprintf(`[Unit]
 Description=iazio-agent user supervisor
 After=network.target
@@ -222,11 +232,10 @@ ExecStart=%s run
 Restart=on-failure
 RestartSec=60s
 Environment=IAZIO_AGENT_NONINTERACTIVE=1
-Environment=IAZIO_HARNESS_API_URL=https://tian.go.ro/iazio-harness-api
-
+%s
 [Install]
 WantedBy=default.target
-`, bin)
+`, bin, apiLine)
 }
 
 // WSLSystemdBlock reports when this process is WSL without systemd.
