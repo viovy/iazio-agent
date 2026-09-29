@@ -105,3 +105,56 @@ func TestCollectorWithTempWorktree(t *testing.T) {
 	}
 	_ = os.Chdir(dir)
 }
+
+func TestCollectorEmptyDocsHub(t *testing.T) {
+	col := &Collector{
+		FreeSpace: func(string) (uint64, error) {
+			return 15 << 30, nil
+		},
+		Git: func(_ context.Context, dir string, args ...string) (string, error) {
+			cmd := strings.Join(args, " ")
+			switch {
+			case strings.Contains(cmd, "rev-parse --is-inside-work-tree"):
+				return "true", nil
+			case strings.Contains(cmd, "status --porcelain"):
+				return "", nil
+			case strings.Contains(cmd, "symbolic-ref -q HEAD"):
+				return "refs/heads/main", nil
+			case strings.Contains(cmd, "branch --show-current"):
+				return "main", nil
+			case strings.Contains(cmd, "rev-parse --verify --quiet @{upstream}"):
+				return "commit-sha", nil
+			case strings.Contains(cmd, "ls-remote"):
+				return "head-sha", nil
+			default:
+				return "", nil
+			}
+		},
+	}
+
+	// Ordinary job without docs hub: DocsHubOK is true, Decides cleanly
+	repOrd, err := col.Collect(context.Background(), "/work", "", KindOrdinary)
+	if err != nil {
+		t.Fatalf("Collect ordinary failed: %v", err)
+	}
+	if !repOrd.DocsHubOK {
+		t.Fatalf("expected DocsHubOK true for ordinary job with empty docsHub, got %+v", repOrd)
+	}
+	decOrd := Decide(repOrd)
+	if decOrd.Reason != "" {
+		t.Fatalf("expected clean decision for ordinary job, got %+v", decOrd)
+	}
+
+	// Refinement job without docs hub: DocsHubOK is false, Decides ReasonNoDocsHub
+	repRef, err := col.Collect(context.Background(), "/work", "", KindRefinement)
+	if err != nil {
+		t.Fatalf("Collect refinement failed: %v", err)
+	}
+	if repRef.DocsHubOK {
+		t.Fatalf("expected DocsHubOK false for refinement job with empty docsHub, got %+v", repRef)
+	}
+	decRef := Decide(repRef)
+	if decRef.Reason != ReasonNoDocsHub {
+		t.Fatalf("expected ReasonNoDocsHub for refinement job without docs hub, got %+v", decRef)
+	}
+}

@@ -56,6 +56,8 @@ func (c *Collector) Collect(ctx context.Context, worktree, docsHub, kind string)
 		if err == nil && out == "true" {
 			r.DocsHubOK = true
 		}
+	} else if docsHub == "" && kind != KindRefinement {
+		r.DocsHubOK = true
 	}
 
 	if r.GitWorkTree && c.Git != nil {
@@ -87,7 +89,7 @@ func (c *Collector) Collect(ctx context.Context, worktree, docsHub, kind string)
 		r.GitAuthOK = (errAuth == nil)
 	}
 
-	if r.DocsHubOK && c.Git != nil {
+	if r.DocsHubOK && docsHub != "" && c.Git != nil {
 		if out, err := c.Git(ctx, docsHub, "status", "--porcelain"); err == nil {
 			r.HubPorcelain = out
 		}
