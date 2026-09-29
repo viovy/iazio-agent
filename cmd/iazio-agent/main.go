@@ -54,6 +54,13 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		fmt.Fprintln(stdout, kind)
 		api := getenv("IAZIO_HARNESS_API_URL")
 		if api == "" {
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				if b, err := os.ReadFile(filepath.Join(home, ".iazio", "api_url")); err == nil {
+					api = strings.TrimSpace(string(b))
+				}
+			}
+		}
+		if api == "" {
 			api = "http://localhost:8090"
 		}
 		host := getenv("IAZIO_AGENT_HOST_ID")

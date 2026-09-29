@@ -94,8 +94,11 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 		if c.Tools != nil {
 			tools = c.Tools()
 		}
-		if err := c.Heartbeat(ctx, hostID, tools, false); err != nil && ctx.Err() != nil {
-			return nil
+		if err := c.Heartbeat(ctx, hostID, tools, false); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			_ = c.Register(ctx, hostID, kind)
 		}
 		job, ok, err := c.NextLease(ctx, hostID)
 		if err != nil && ctx.Err() != nil {
@@ -241,9 +244,11 @@ func (c Client) post(ctx context.Context, path string, body any) error {
 	return nil
 }
 
+var defaultHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
 func (c Client) http() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
 	}
-	return http.DefaultClient
+	return defaultHTTPClient
 }
