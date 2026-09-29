@@ -23,6 +23,20 @@ func UnitText(goos, bin string) string {
 	return ActionText(goos, "install", bin, false)
 }
 
+func resolveHarnessAPIURL() string {
+	if apiEnv := os.Getenv("IAZIO_HARNESS_API_URL"); apiEnv != "" {
+		return apiEnv
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if b, err := os.ReadFile(filepath.Join(home, ".iazio", "api_url")); err == nil {
+			if s := strings.TrimSpace(string(b)); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 // ActionText returns the dry-run text for a service action.
 // Install yields a launchd plist, a systemd user unit, or a Task Scheduler command.
 func ActionText(goos, action, bin string, force bool) string {
@@ -39,7 +53,7 @@ func ActionText(goos, action, bin string, force bool) string {
 				flag = " /F"
 			}
 			setApi := ""
-			if apiEnv := os.Getenv("IAZIO_HARNESS_API_URL"); apiEnv != "" {
+			if apiEnv := resolveHarnessAPIURL(); apiEnv != "" {
 				setApi = fmt.Sprintf("set IAZIO_HARNESS_API_URL=%s&& ", apiEnv)
 			}
 			return fmt.Sprintf(`schtasks /Create /TN iazio-agent /SC ONLOGON%s /TR "cmd /C set IAZIO_AGENT_NONINTERACTIVE=1&& %s\"%s\" run"`, flag, setApi, bin)
@@ -133,8 +147,22 @@ func controlArgv(goos, action string, force bool) []string {
 
 func darwinPlist(bin, logPath string) string {
 	apiXml := ""
-	if apiEnv := os.Getenv("IAZIO_HARNESS_API_URL"); apiEnv != "" {
+	if apiEnv := resolveHarnessAPIURL(); apiEnv != "" {
 		apiXml = fmt.Sprintf("\n\t\t<key>IAZIO_HARNESS_API_URL</key>\n\t\t<string>%s</string>", apiEnv)
+	}
+	homeXml := ""
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		homeXml = fmt.Sprintf("\n\t\t<key>HOME</key>\n\t\t<string>%s</string>", home)
+	}
+	userXml := ""
+	if u := os.Getenv("USER"); u != "" {
+		userXml = fmt.Sprintf("\n\t\t<key>USER</key>\n\t\t<string>%s</string>", u)
+	} else if curr, err := user.Current(); err == nil && curr.Username != "" {
+		userXml = fmt.Sprintf("\n\t\t<key>USER</key>\n\t\t<string>%s</string>", curr.Username)
+	}
+	pathXml := ""
+	if p := os.Getenv("PATH"); p != "" {
+		pathXml = fmt.Sprintf("\n\t\t<key>PATH</key>\n\t\t<string>%s</string>", p)
 	}
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -158,7 +186,7 @@ func darwinPlist(bin, logPath string) string {
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>IAZIO_AGENT_NONINTERACTIVE</key>
-		<string>1</string>%s
+		<string>1</string>%s%s%s%s
 	</dict>
 	<key>StandardOutPath</key>
 	<string>%s</string>
@@ -166,7 +194,7 @@ func darwinPlist(bin, logPath string) string {
 	<string>%s</string>
 </dict>
 </plist>
-`, agentLabel, bin, apiXml, logPath, logPath)
+`, agentLabel, bin, apiXml, homeXml, userXml, pathXml, logPath, logPath)
 }
 
 func agentLogPath() string {
@@ -219,7 +247,7 @@ func InstallDarwinAt(home, bin string, run func(name string, args ...string) err
 
 func linuxUnit(bin string) string {
 	apiLine := ""
-	if apiEnv := os.Getenv("IAZIO_HARNESS_API_URL"); apiEnv != "" {
+	if apiEnv := resolveHarnessAPIURL(); apiEnv != "" {
 		apiLine = fmt.Sprintf("Environment=IAZIO_HARNESS_API_URL=%s\n", apiEnv)
 	}
 	return fmt.Sprintf(`[Unit]

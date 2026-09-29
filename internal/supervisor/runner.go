@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -53,6 +54,7 @@ func ResolveBinary(name string) string {
 }
 
 // AugmentedEnv returns env with PATH updated to include standard user directories.
+// It also ensures HOME and USER are populated if missing.
 func AugmentedEnv(base []string) []string {
 	home, _ := os.UserHomeDir()
 	var userDirs []string
@@ -77,18 +79,36 @@ func AugmentedEnv(base []string) []string {
 	}
 	fullPath := strings.Join(dedupeDirs(newPathParts), string(filepath.ListSeparator))
 
-	env := make([]string, 0, len(base)+1)
+	env := make([]string, 0, len(base)+3)
 	pathSet := false
+	homeSet := false
+	userSet := false
 	for _, kv := range base {
 		if strings.HasPrefix(kv, "PATH=") || strings.HasPrefix(kv, "Path=") {
 			env = append(env, "PATH="+fullPath)
 			pathSet = true
 		} else {
+			if strings.HasPrefix(kv, "HOME=") {
+				homeSet = true
+			}
+			if strings.HasPrefix(kv, "USER=") {
+				userSet = true
+			}
 			env = append(env, kv)
 		}
 	}
 	if !pathSet {
 		env = append(env, "PATH="+fullPath)
+	}
+	if !homeSet && home != "" {
+		env = append(env, "HOME="+home)
+	}
+	if !userSet {
+		if u := os.Getenv("USER"); u != "" {
+			env = append(env, "USER="+u)
+		} else if curr, err := user.Current(); err == nil && curr.Username != "" {
+			env = append(env, "USER="+curr.Username)
+		}
 	}
 	return env
 }

@@ -85,7 +85,7 @@ func (c *Collector) Collect(ctx context.Context, worktree, docsHub, kind string)
 
 		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		_, errAuth := c.Git(probeCtx, worktree, "ls-remote", "--exit-code", "-h", "origin", "HEAD")
+		_, errAuth := c.Git(probeCtx, worktree, "ls-remote", "--exit-code", "origin", "HEAD")
 		r.GitAuthOK = (errAuth == nil)
 	}
 
