@@ -150,6 +150,42 @@ func TestWSLSystemdBlockSentence(t *testing.T) {
 	}
 }
 
+func TestIsWSLWith(t *testing.T) {
+	// From WSL_DISTRO_NAME
+	if !IsWSLWith(func(k string) string {
+		if k == "WSL_DISTRO_NAME" {
+			return "Debian"
+		}
+		return ""
+	}, nil) {
+		t.Fatal("expected WSL detected from WSL_DISTRO_NAME")
+	}
+
+	// From WSL_INTEROP
+	if !IsWSLWith(func(k string) string {
+		if k == "WSL_INTEROP" {
+			return "/run/WSL/10_interop"
+		}
+		return ""
+	}, nil) {
+		t.Fatal("expected WSL detected from WSL_INTEROP")
+	}
+
+	// From osrelease
+	if !IsWSLWith(nil, func() ([]byte, error) {
+		return []byte("6.6.87.2-microsoft-standard-WSL2"), nil
+	}) {
+		t.Fatal("expected WSL detected from osrelease containing microsoft")
+	}
+
+	// Non-WSL
+	if IsWSLWith(func(string) string { return "" }, func() ([]byte, error) {
+		return []byte("6.8.0-generic"), nil
+	}) {
+		t.Fatal("expected non-WSL not detected as WSL")
+	}
+}
+
 func TestWindowsLifecycleCommands(t *testing.T) {
 	var got []string
 	run := func(name string, args ...string) error {

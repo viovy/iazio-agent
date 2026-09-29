@@ -266,6 +266,30 @@ WantedBy=default.target
 `, bin, apiLine)
 }
 
+// IsWSL reports whether the current environment is Windows Subsystem for Linux (WSL).
+func IsWSL() bool {
+	return IsWSLWith(os.Getenv, func() ([]byte, error) {
+		return os.ReadFile("/proc/sys/kernel/osrelease")
+	})
+}
+
+// IsWSLWith allows injecting getenv and readOSRelease for testing.
+func IsWSLWith(getenv func(string) string, readOSRelease func() ([]byte, error)) bool {
+	if getenv != nil {
+		if getenv("WSL_DISTRO_NAME") != "" || getenv("WSL_INTEROP") != "" {
+			return true
+		}
+	}
+	if readOSRelease != nil {
+		if data, err := readOSRelease(); err == nil {
+			if strings.Contains(strings.ToLower(string(data)), "microsoft") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // WSLSystemdBlock reports when this process is WSL without systemd.
 func WSLSystemdBlock() string {
 	data, err := os.ReadFile("/proc/sys/kernel/osrelease")

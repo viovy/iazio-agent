@@ -63,14 +63,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		if api == "" {
 			api = "http://localhost:8090"
 		}
-		host := getenv("IAZIO_AGENT_HOST_ID")
-		if host == "" {
-			if h, err := os.Hostname(); err == nil && h != "" {
-				host = strings.ToLower(strings.Split(h, ".")[0])
-			} else {
-				host = "runner"
-			}
-		}
+		host := resolveHostID(getenv, os.Hostname, nil)
 		if ctx.Err() == nil {
 			sup := supervisor.New(time.Now)
 			runner := supervisor.NewOSRunner()
@@ -386,4 +379,32 @@ func parseService(args []string) (action string, dry, force bool, err error) {
 		}
 	}
 	return action, dry, force, nil
+}
+
+func resolveHostID(getenv func(string) string, hostnameFn func() (string, error), isWSLFn func() bool) string {
+	if getenv != nil {
+		if host := strings.TrimSpace(getenv("IAZIO_AGENT_HOST_ID")); host != "" {
+			return host
+		}
+	}
+	if hostnameFn == nil {
+		hostnameFn = os.Hostname
+	}
+	if isWSLFn == nil {
+		isWSLFn = func() bool {
+			return service.IsWSLWith(getenv, func() ([]byte, error) {
+				return os.ReadFile("/proc/sys/kernel/osrelease")
+			})
+		}
+	}
+	var host string
+	if h, err := hostnameFn(); err == nil && strings.TrimSpace(h) != "" {
+		host = strings.ToLower(strings.Split(strings.TrimSpace(h), ".")[0])
+	} else {
+		host = "runner"
+	}
+	if isWSLFn() && !strings.HasSuffix(host, "-wsl") {
+		host += "-wsl"
+	}
+	return host
 }
