@@ -104,7 +104,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}
 				go func(worktree, docsHub, jobID, kind string) {
 					pid := sup.PID(worktree)
-					exitCode, _ := runner.Wait(pid)
+					exitCode, waitErr := runner.Wait(pid)
 					sup.BeginCooling(worktree)
 					time.Sleep(supervisor.CoolingOff)
 					sup.Promote()
@@ -119,13 +119,14 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							hubPorc = strings.TrimSpace(string(out))
 						}
 					}
+					ok := (waitErr == nil && exitCode == 0)
 					finish := controlplane.FinishReport{
 						Kind:          kind,
-						ASEComplete:   (exitCode == 0),
+						ASEComplete:   ok,
 						WorkPorcelain: workPorc,
 						HubPorcelain:  hubPorc,
-						StoryDraftOK:  (exitCode == 0),
-						HubPushOK:     (exitCode == 0),
+						StoryDraftOK:  ok,
+						HubPushOK:     ok,
 					}
 					_, _ = client.PostFinish(context.Background(), host, worktree, jobID, finish)
 				}(job.WorktreePath, job.DocsHubPath, job.ID, job.Kind)

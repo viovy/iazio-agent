@@ -224,6 +224,33 @@ func TestOSRunnerSmoke(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("unexpected exit code: %d", code)
 	}
+
+	// Untracked PID returns -1 and error
+	missingCode, missingErr := r.Wait(999999)
+	if missingCode != -1 || missingErr == nil {
+		t.Fatalf("expected -1 and error for missing pid, got %d, %v", missingCode, missingErr)
+	}
+}
+
+func TestResolveBinaryAndAugmentedEnv(t *testing.T) {
+	// Abs path is preserved
+	abs := "/usr/bin/echo"
+	if got := ResolveBinary(abs); got != abs {
+		t.Fatalf("ResolveBinary(%q) = %q, want %q", abs, got, abs)
+	}
+
+	// AugmentedEnv sets PATH with user dirs
+	env := AugmentedEnv([]string{"FOO=BAR"})
+	hasPath := false
+	for _, kv := range env {
+		if len(kv) >= 5 && kv[:5] == "PATH=" {
+			hasPath = true
+			break
+		}
+	}
+	if !hasPath {
+		t.Fatalf("AugmentedEnv missing PATH: %v", env)
+	}
 }
 
 func TestSupPID(t *testing.T) {
