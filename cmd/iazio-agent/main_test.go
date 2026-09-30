@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -156,6 +157,107 @@ func TestExecuteRunDefaultHostID(t *testing.T) {
 	}
 	if registeredHost == "" {
 		t.Fatalf("expected registered host from hostname default, got empty")
+	}
+}
+
+func TestResolveHostID(t *testing.T) {
+	// 1. Explicit env var wins unconditionally
+	got := resolveHostID(func(k string) string {
+		if k == "IAZIO_AGENT_HOST_ID" {
+			return "explicit-host"
+		}
+		return ""
+	}, func() (string, error) {
+		return "ignored-pc", nil
+	}, func() bool {
+		return true
+	})
+	if got != "explicit-host" {
+		t.Fatalf("expected explicit-host, got %s", got)
+	}
+
+	// 2. Non-WSL host derives clean lowercase hostname without suffix
+	got = resolveHostID(func(string) string { return "" }, func() (string, error) {
+		return "My-PC.localdomain", nil
+	}, func() bool {
+		return false
+	})
+	if got != "my-pc" {
+		t.Fatalf("expected my-pc, got %s", got)
+	}
+
+	// 3. WSL host appends -wsl
+	got = resolveHostID(func(string) string { return "" }, func() (string, error) {
+		return "PC1", nil
+	}, func() bool {
+		return true
+	})
+	if got != "pc1-wsl" {
+		t.Fatalf("expected pc1-wsl, got %s", got)
+	}
+
+	// 4. WSL host already suffixed with -wsl does not duplicate
+	got = resolveHostID(func(string) string { return "" }, func() (string, error) {
+		return "PC1-WSL", nil
+	}, func() bool {
+		return true
+	})
+	if got != "pc1-wsl" {
+		t.Fatalf("expected pc1-wsl, got %s", got)
+	}
+
+	// 5. Hostname lookup failure defaults to runner or runner-wsl
+	got = resolveHostID(func(string) string { return "" }, func() (string, error) {
+		return "", errors.New("lookup failed")
+	}, func() bool {
+		return false
+	})
+	if got != "runner" {
+		t.Fatalf("expected runner, got %s", got)
+	}
+
+	got = resolveHostID(func(string) string { return "" }, func() (string, error) {
+		return "", errors.New("lookup failed")
+	}, func() bool {
+		return true
+	})
+	if got != "runner-wsl" {
+		t.Fatalf("expected runner-wsl, got %s", got)
+	}
+
+	// 6. Special characters in hostname are sanitized to lowercase alphanumeric and dashes
+	got = resolveHostID(func(string) string { return "" }, func() (string, error) {
+		return "My_PC!Test-01.lan", nil
+	}, func() bool {
+		return false
+	})
+	if got != "mypctest-01" {
+		t.Fatalf("expected mypctest-01, got %s", got)
+	}
+
+	// 7. Whitespace-only hostname defaults to runner / runner-wsl
+	got = resolveHostID(func(string) string { return "" }, func() (string, error) {
+		return "   ", nil
+	}, func() bool {
+		return true
+	})
+	if got != "runner-wsl" {
+		t.Fatalf("expected runner-wsl, got %s", got)
+	}
+
+	// 8. Explicit IAZIO_AGENT_HOST_ID with whitespace and special chars is sanitized
+	got = resolveHostID(func(k string) string {
+		if k == "IAZIO_AGENT_HOST_ID" {
+			return "  My_Agent!01  "
+		}
+		return ""
+	}, func() (string, error) {
+		return "ignored", nil
+	}, func() bool {
+		return true
+	})
+	if got != "myagent01" {
+		t.Fatalf("expected myagent01, got %s", got)
 	}
 }
 
