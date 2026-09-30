@@ -224,5 +224,40 @@ func TestResolveHostID(t *testing.T) {
 	if got != "runner-wsl" {
 		t.Fatalf("expected runner-wsl, got %s", got)
 	}
+
+	// 6. Special characters in hostname are sanitized to lowercase alphanumeric and dashes
+	got = resolveHostID(func(string) string { return "" }, func() (string, error) {
+		return "My_PC!Test-01.lan", nil
+	}, func() bool {
+		return false
+	})
+	if got != "mypctest-01" {
+		t.Fatalf("expected mypctest-01, got %s", got)
+	}
+
+	// 7. Whitespace-only hostname defaults to runner / runner-wsl
+	got = resolveHostID(func(string) string { return "" }, func() (string, error) {
+		return "   ", nil
+	}, func() bool {
+		return true
+	})
+	if got != "runner-wsl" {
+		t.Fatalf("expected runner-wsl, got %s", got)
+	}
+
+	// 8. Explicit IAZIO_AGENT_HOST_ID with whitespace and special chars is sanitized
+	got = resolveHostID(func(k string) string {
+		if k == "IAZIO_AGENT_HOST_ID" {
+			return "  My_Agent!01  "
+		}
+		return ""
+	}, func() (string, error) {
+		return "ignored", nil
+	}, func() bool {
+		return true
+	})
+	if got != "myagent01" {
+		t.Fatalf("expected myagent01, got %s", got)
+	}
 }
 

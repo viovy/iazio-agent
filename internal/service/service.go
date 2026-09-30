@@ -298,7 +298,13 @@ func WSLSystemdBlock() string {
 }
 
 func wslSystemdBlock(release string, haveRelease, systemd bool) string {
-	if !haveRelease || !strings.Contains(strings.ToLower(release), "microsoft") {
+	isWSL := IsWSLWith(nil, func() ([]byte, error) {
+		if !haveRelease {
+			return nil, os.ErrNotExist
+		}
+		return []byte(release), nil
+	})
+	if !isWSL {
 		return ""
 	}
 	if systemd {

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -381,10 +382,17 @@ func parseService(args []string) (action string, dry, force bool, err error) {
 	return action, dry, force, nil
 }
 
+var hostIDSanitizeRegex = regexp.MustCompile(`[^a-z0-9-]`)
+
+func sanitizeHostID(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	return hostIDSanitizeRegex.ReplaceAllString(s, "")
+}
+
 func resolveHostID(getenv func(string) string, hostnameFn func() (string, error), isWSLFn func() bool) string {
 	if getenv != nil {
 		if host := strings.TrimSpace(getenv("IAZIO_AGENT_HOST_ID")); host != "" {
-			return host
+			return sanitizeHostID(host)
 		}
 	}
 	if hostnameFn == nil {
@@ -399,8 +407,9 @@ func resolveHostID(getenv func(string) string, hostnameFn func() (string, error)
 	}
 	var host string
 	if h, err := hostnameFn(); err == nil && strings.TrimSpace(h) != "" {
-		host = strings.ToLower(strings.Split(strings.TrimSpace(h), ".")[0])
-	} else {
+		host = sanitizeHostID(strings.Split(strings.TrimSpace(h), ".")[0])
+	}
+	if host == "" {
 		host = "runner"
 	}
 	if isWSLFn() && !strings.HasSuffix(host, "-wsl") {
