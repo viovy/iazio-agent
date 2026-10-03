@@ -220,7 +220,7 @@ func (s *Sup) Reason(path string) string {
 	return s.reasons[path]
 }
 
-// Tick cancels harnesses that have reached their execution timeout and finishes cooling-off.
+// Tick cancels harnesses that have reached their execution timeout or died, and finishes cooling-off.
 func (s *Sup) Tick() {
 	now := s.now()
 	s.mu.Lock()
@@ -229,6 +229,11 @@ func (s *Sup) Tick() {
 		if state == LockRunning {
 			if deadline, ok := s.deadline[path]; ok && !deadline.After(now) {
 				due = append(due, path)
+			} else {
+				pid := s.pids[path]
+				if pid > 0 && s.alive != nil && !s.alive(pid) {
+					due = append(due, path)
+				}
 			}
 		}
 	}
