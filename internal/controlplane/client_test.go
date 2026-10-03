@@ -2,6 +2,8 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -143,4 +145,83 @@ func TestLoopWithTools(t *testing.T) {
 		t.Fatalf("heartbeat missing scanned tools: %s", heartbeatBody)
 	}
 }
+
+func TestLoopContinuesWhenOnJobFails(t *testing.T) {
+	var pollCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/poll") {
+			pollCount++
+			if pollCount == 1 {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"id":"job-err","kind":"ordinary","worktree_path":"/repos/work"}`))
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var jobsSeen int
+	errOnJob := func(job Assignment) error {
+		jobsSeen++
+		return fmt.Errorf("simulated job execution error")
+	}
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	c := Client{BaseURL: srv.URL}
+	err := c.Loop(ctx, "runner-1", "permanent", 10*time.Millisecond, errOnJob)
+	if err != nil {
+		t.Fatalf("expected Loop to ignore onJob error and not exit fatally, got: %v", err)
+	}
+	if jobsSeen != 1 {
+		t.Fatalf("expected 1 job handled, got %d", jobsSeen)
+	}
+	if pollCount < 2 {
+		t.Fatalf("expected Loop to continue polling after onJob error, pollCount: %d", pollCount)
+	}
+}
+
+func TestDeclineJob(t *testing.T) {
+	var declinedID string
+	var declinedReason string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/decline") {
+			parts := strings.Split(r.URL.Path, "/")
+			if len(parts) >= 4 {
+				declinedID = parts[len(parts)-2]
+			}
+			var body struct {
+				Reason string `json:"reason"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			declinedReason = body.Reason
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := Client{BaseURL: srv.URL}
+	if err := c.DeclineJob(context.Background(), "job-42", "worktree_busy"); err != nil {
+		t.Fatalf("DeclineJob failed: %v", err)
+	}
+	if declinedID != "job-42" {
+		t.Fatalf("expected declined job job-42, got: %s", declinedID)
+	}
+	if declinedReason != "worktree_busy" {
+		t.Fatalf("expected reason worktree_busy, got: %s", declinedReason)
+	}
+}
+
 

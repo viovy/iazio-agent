@@ -89,19 +89,28 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			}
 			return client.Loop(ctx, host, kind, 30*time.Second, func(job controlplane.Assignment) error {
 				if sup.Lock(job.WorktreePath) == supervisor.LockRunning {
-					return fmt.Errorf("worktree %s busy", job.WorktreePath)
+					fmt.Fprintf(os.Stderr, "worktree %s busy with another job; declining assignment %s\n", job.WorktreePath, job.ID)
+					_ = client.DeclineJob(ctx, job.ID, "worktree_busy")
+					return nil
 				}
 				rep, err := preflight.Collect(ctx, job.WorktreePath, job.DocsHubPath, job.Kind)
 				if err != nil {
-					return err
+					fmt.Fprintf(os.Stderr, "preflight collect error for %s: %v\n", job.WorktreePath, err)
+					_ = client.DeclineJob(ctx, job.ID, fmt.Sprintf("preflight_collect_error: %v", err))
+					return nil
 				}
 				dec := preflight.Decide(rep)
 				if dec.Reason != "" {
-					_, postErr := client.PostPreflight(ctx, host, job.WorktreePath, rep)
-					return postErr
+					if _, postErr := client.PostPreflight(ctx, host, job.WorktreePath, rep); postErr != nil {
+						fmt.Fprintf(os.Stderr, "post preflight error for %s: %v\n", job.WorktreePath, postErr)
+					}
+					_ = client.DeclineJob(ctx, job.ID, fmt.Sprintf("preflight_rejected: %s", dec.Reason))
+					return nil
 				}
 				if err := sup.Spawn(runner, job.ID, api, job.WorktreePath, job.DocsHubPath, ""); err != nil {
-					return err
+					fmt.Fprintf(os.Stderr, "spawn error for job %s: %v\n", job.ID, err)
+					_ = client.DeclineJob(ctx, job.ID, fmt.Sprintf("spawn_error: %v", err))
+					return nil
 				}
 				go func(worktree, docsHub, jobID, kind string) {
 					pid := sup.PID(worktree)

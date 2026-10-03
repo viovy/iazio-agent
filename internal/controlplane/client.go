@@ -106,7 +106,9 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 		}
 		if ok && onJob != nil {
 			if err := onJob(job); err != nil {
-				return err
+				if ctx.Err() != nil {
+					return nil
+				}
 			}
 		}
 		select {
@@ -216,6 +218,13 @@ func (c Client) PostFinish(ctx context.Context, hostID, worktree, jobID string, 
 func (c Client) PostChunk(ctx context.Context, jobID, stream, text string) error {
 	return c.post(ctx, "/v1/jobs/"+jobID+"/chunks", map[string]string{
 		"type": "OUTPUT_CHUNK", "stream": stream, "text": text,
+	})
+}
+
+// DeclineJob rejects an assignment when the worktree is busy or cannot be executed.
+func (c Client) DeclineJob(ctx context.Context, jobID, reason string) error {
+	return c.post(ctx, "/v1/jobs/"+jobID+"/decline", map[string]string{
+		"reason": reason,
 	})
 }
 
