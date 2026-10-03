@@ -1,9 +1,11 @@
 package supervisor
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -287,6 +289,73 @@ func TestTickReapsDeadProcess(t *testing.T) {
 
 	if lock := s.Lock("/repos/dead"); lock != LockIdle {
 		t.Fatalf("expected lock to move to LockIdle after cooling off, got %s", lock)
+	}
+}
+
+func TestReconcileHostCheckouts(t *testing.T) {
+	var discarded []string
+	var resumed []string
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+
+	repos := []RepoState{
+		{
+			WorktreePath:   "/work/discard-me",
+			Queue:          "PAUSED",
+			Reason:         "HALTED_DIRTY",
+			DiscardPending: true,
+		},
+		{
+			WorktreePath:   "/work/clean-auto-resume",
+			Queue:          "PAUSED",
+			Reason:         "HALTED_DIRTY",
+			DiscardPending: false,
+		},
+		{
+			WorktreePath:   "/work/still-dirty",
+			Queue:          "PAUSED",
+			Reason:         "HALTED_DIRTY",
+			DiscardPending: false,
+		},
+		{
+			WorktreePath:   "/work/busy-running",
+			Queue:          "PAUSED",
+			Reason:         "HALTED_DIRTY",
+			DiscardPending: true,
+		},
+	}
+
+	isLockIdle := func(w string) bool {
+		return w != "/work/busy-running"
+	}
+	discard := func(w string) error {
+		discarded = append(discarded, w)
+		return nil
+	}
+	isClean := func(w string) (bool, error) {
+		if w == "/work/clean-auto-resume" {
+			return true, nil
+		}
+		return false, nil
+	}
+	resume := func(w string) error {
+		resumed = append(resumed, w)
+		return nil
+	}
+
+	ReconcileHostCheckouts(repos, isLockIdle, discard, isClean, resume, stdout, stderr)
+
+	if len(discarded) != 1 || discarded[0] != "/work/discard-me" {
+		t.Fatalf("expected discard on /work/discard-me, got: %v", discarded)
+	}
+	if len(resumed) != 2 || resumed[0] != "/work/discard-me" || resumed[1] != "/work/clean-auto-resume" {
+		t.Fatalf("expected resume on discard-me and clean-auto-resume, got: %v", resumed)
+	}
+	if !strings.Contains(stdout.String(), "discarding checkout for /work/discard-me") {
+		t.Fatalf("missing discard message in stdout: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "worktree /work/clean-auto-resume is clean; resuming paused queue") {
+		t.Fatalf("missing clean resume message in stdout: %s", stdout.String())
 	}
 }
 

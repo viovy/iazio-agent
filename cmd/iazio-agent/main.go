@@ -90,40 +90,47 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				OnTick: func(ctx context.Context, hostID string) error {
 					detail, err := client.GetHost(ctx, hostID)
 					if err != nil {
+						if stderr != nil {
+							fmt.Fprintf(stderr, "reconcile get host error for %s: %v\n", hostID, err)
+						}
 						return nil
 					}
-					for _, repo := range detail.Repos {
-						worktree := repo.WorktreePath
-						if worktree == "" {
-							worktree = repo.Path
+					repoStates := make([]supervisor.RepoState, 0, len(detail.Repos))
+					for _, r := range detail.Repos {
+						path := r.WorktreePath
+						if path == "" {
+							path = r.Path
 						}
-						if worktree == "" {
-							continue
-						}
-						if repo.DiscardPending {
-							if sup.Lock(worktree) == supervisor.LockIdle {
-								fmt.Fprintf(stdout, "discarding checkout for %s as requested by control plane\n", worktree)
-								gitCmd := func(args ...string) error {
-									cmd := exec.CommandContext(ctx, "git", append([]string{"-C", worktree}, args...)...)
-									return cmd.Run()
-								}
-								if err := supervisor.DiscardCheckout(true, false, nil, gitCmd); err != nil {
-									fmt.Fprintf(os.Stderr, "discard checkout error for %s: %v\n", worktree, err)
-								} else {
-									_ = client.ResumeRepo(ctx, hostID, worktree)
-								}
-							}
-						}
-						if repo.Queue == "PAUSED" && repo.Reason == "HALTED_DIRTY" {
-							if sup.Lock(worktree) == supervisor.LockIdle {
-								out, err := exec.CommandContext(ctx, "git", "-C", worktree, "status", "--porcelain").CombinedOutput()
-								if err == nil && strings.TrimSpace(string(out)) == "" {
-									fmt.Fprintf(stdout, "worktree %s is clean; resuming paused queue on host %s\n", worktree, hostID)
-									_ = client.ResumeRepo(ctx, hostID, worktree)
-								}
-							}
-						}
+						repoStates = append(repoStates, supervisor.RepoState{
+							WorktreePath:   path,
+							Queue:          r.Queue,
+							Reason:         r.Reason,
+							DiscardPending: r.DiscardPending,
+						})
 					}
+					supervisor.ReconcileHostCheckouts(
+						repoStates,
+						func(w string) bool { return sup.Lock(w) == supervisor.LockIdle },
+						func(w string) error {
+							gitCmd := func(args ...string) error {
+								cmd := exec.CommandContext(ctx, "git", append([]string{"-C", w}, args...)...)
+								return cmd.Run()
+							}
+							return supervisor.DiscardCheckout(true, false, nil, gitCmd)
+						},
+						func(w string) (bool, error) {
+							out, err := exec.CommandContext(ctx, "git", "-C", w, "status", "--porcelain").CombinedOutput()
+							if err != nil {
+								return false, err
+							}
+							return strings.TrimSpace(string(out)) == "", nil
+						},
+						func(w string) error {
+							return client.ResumeRepo(ctx, hostID, w)
+						},
+						stdout,
+						stderr,
+					)
 					return nil
 				},
 			}
