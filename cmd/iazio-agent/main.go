@@ -68,7 +68,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		if ctx.Err() == nil {
 			sup := supervisor.New(time.Now)
 			runner := supervisor.NewOSRunner()
-			client := controlplane.Client{
+			var client controlplane.Client
+			client = controlplane.Client{
 				BaseURL: api,
 				Tools: func() []controlplane.Tool {
 					home, _ := os.UserHomeDir()
@@ -85,6 +86,45 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						})
 					}
 					return tools
+				},
+				OnTick: func(ctx context.Context, hostID string) error {
+					detail, err := client.GetHost(ctx, hostID)
+					if err != nil {
+						return nil
+					}
+					for _, repo := range detail.Repos {
+						worktree := repo.WorktreePath
+						if worktree == "" {
+							worktree = repo.Path
+						}
+						if worktree == "" {
+							continue
+						}
+						if repo.DiscardPending {
+							if sup.Lock(worktree) == supervisor.LockIdle {
+								fmt.Fprintf(stdout, "discarding checkout for %s as requested by control plane\n", worktree)
+								gitCmd := func(args ...string) error {
+									cmd := exec.CommandContext(ctx, "git", append([]string{"-C", worktree}, args...)...)
+									return cmd.Run()
+								}
+								if err := supervisor.DiscardCheckout(true, false, nil, gitCmd); err != nil {
+									fmt.Fprintf(os.Stderr, "discard checkout error for %s: %v\n", worktree, err)
+								} else {
+									_ = client.ResumeRepo(ctx, hostID, worktree)
+								}
+							}
+						}
+						if repo.Queue == "PAUSED" && repo.Reason == "HALTED_DIRTY" {
+							if sup.Lock(worktree) == supervisor.LockIdle {
+								out, err := exec.CommandContext(ctx, "git", "-C", worktree, "status", "--porcelain").CombinedOutput()
+								if err == nil && strings.TrimSpace(string(out)) == "" {
+									fmt.Fprintf(stdout, "worktree %s is clean; resuming paused queue on host %s\n", worktree, hostID)
+									_ = client.ResumeRepo(ctx, hostID, worktree)
+								}
+							}
+						}
+					}
+					return nil
 				},
 			}
 			return client.Loop(ctx, host, kind, 30*time.Second, func(job controlplane.Assignment) error {

@@ -224,4 +224,86 @@ func TestDeclineJob(t *testing.T) {
 	}
 }
 
+func TestGetHostAndResumeRepo(t *testing.T) {
+	var resumedHost, resumedPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/hosts/runner-1" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"host": {"id":"runner-1","kind":"permanent","presence":"ONLINE","repos_paused":1},
+				"repos": [{"path":"/repos/foo","worktree_path":"/repos/foo","queue":"PAUSED","lock":"IDLE","reason":"HALTED_DIRTY","discard_pending":true}]
+			}`))
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/repos/runner-1/resume" {
+			resumedHost = "runner-1"
+			var body struct {
+				Path string `json:"worktree_path"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			resumedPath = body.Path
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"queue":"OPEN"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := Client{BaseURL: srv.URL}
+	ctx := context.Background()
+
+	detail, err := c.GetHost(ctx, "runner-1")
+	if err != nil {
+		t.Fatalf("GetHost failed: %v", err)
+	}
+	if detail.Host.ID != "runner-1" || len(detail.Repos) != 1 {
+		t.Fatalf("unexpected host detail: %+v", detail)
+	}
+	if !detail.Repos[0].DiscardPending || detail.Repos[0].Reason != "HALTED_DIRTY" {
+		t.Fatalf("unexpected repo details: %+v", detail.Repos[0])
+	}
+
+	if err := c.ResumeRepo(ctx, "runner-1", "/repos/foo"); err != nil {
+		t.Fatalf("ResumeRepo failed: %v", err)
+	}
+	if resumedHost != "runner-1" || resumedPath != "/repos/foo" {
+		t.Fatalf("unexpected resumed host/path: %s %s", resumedHost, resumedPath)
+	}
+}
+
+func TestLoopOnTick(t *testing.T) {
+	var tickCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/poll") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := Client{
+		BaseURL: srv.URL,
+		OnTick: func(ctx context.Context, hostID string) error {
+			tickCount++
+			if tickCount >= 2 {
+				cancel()
+			}
+			return nil
+		},
+	}
+
+	err := c.Loop(ctx, "runner-1", "permanent", 5*time.Millisecond, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tickCount < 2 {
+		t.Fatalf("expected at least 2 ticks, got %d", tickCount)
+	}
+}
+
 
