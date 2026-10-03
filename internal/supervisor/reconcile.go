@@ -2,6 +2,8 @@ package supervisor
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -187,4 +189,80 @@ func ProcessHostID(hostname, uuid string) string {
 		processID = FormatHostID(hostname, uuid)
 	})
 	return processID
+}
+
+// RepoState represents one repository status to reconcile.
+type RepoState struct {
+	WorktreePath   string
+	Queue          string
+	Reason         string
+	DiscardPending bool
+}
+
+// ReconcileHostCheckouts checks registered repos on each tick:
+// 1. If DiscardPending is set and the lock is idle, it discards changes and calls resume.
+// 2. If the queue is PAUSED with HALTED_DIRTY and the worktree is idle and clean, it calls resume.
+// Errors are reported to stderr, informative events to stdout.
+func ReconcileHostCheckouts(
+	repos []RepoState,
+	isLockIdle func(worktree string) bool,
+	discard func(worktree string) error,
+	isClean func(worktree string) (bool, error),
+	resume func(worktree string) error,
+	stdout io.Writer,
+	stderr io.Writer,
+) {
+	if isLockIdle == nil || resume == nil {
+		return
+	}
+	for _, repo := range repos {
+		worktree := repo.WorktreePath
+		if worktree == "" {
+			continue
+		}
+		if repo.DiscardPending {
+			if isLockIdle(worktree) {
+				if stdout != nil {
+					fmt.Fprintf(stdout, "discarding checkout for %s as requested by control plane\n", worktree)
+				}
+				if discard != nil {
+					if err := discard(worktree); err != nil {
+						if stderr != nil {
+							fmt.Fprintf(stderr, "discard checkout error for %s: %v\n", worktree, err)
+						}
+						continue
+					}
+				}
+				if err := resume(worktree); err != nil {
+					if stderr != nil {
+						fmt.Fprintf(stderr, "resume repo after discard error for %s: %v\n", worktree, err)
+					}
+				}
+			}
+			continue
+		}
+		if repo.Queue == "PAUSED" && repo.Reason == "HALTED_DIRTY" {
+			if isLockIdle(worktree) {
+				if isClean != nil {
+					clean, err := isClean(worktree)
+					if err != nil {
+						if stderr != nil {
+							fmt.Fprintf(stderr, "check clean status error for %s: %v\n", worktree, err)
+						}
+						continue
+					}
+					if clean {
+						if stdout != nil {
+							fmt.Fprintf(stdout, "worktree %s is clean; resuming paused queue\n", worktree)
+						}
+						if err := resume(worktree); err != nil {
+							if stderr != nil {
+								fmt.Fprintf(stderr, "resume repo error for %s: %v\n", worktree, err)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 }

@@ -18,6 +18,7 @@ type Client struct {
 	Token   string
 	HTTP    *http.Client
 	Tools   func() []Tool
+	OnTick  func(ctx context.Context, hostID string) error
 }
 
 
@@ -99,6 +100,13 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 				return nil
 			}
 			_ = c.Register(ctx, hostID, kind)
+		}
+		if c.OnTick != nil {
+			if err := c.OnTick(ctx, hostID); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+			}
 		}
 		job, ok, err := c.NextLease(ctx, hostID)
 		if err != nil && ctx.Err() != nil {
@@ -225,6 +233,67 @@ func (c Client) PostChunk(ctx context.Context, jobID, stream, text string) error
 func (c Client) DeclineJob(ctx context.Context, jobID, reason string) error {
 	return c.post(ctx, "/v1/jobs/"+jobID+"/decline", map[string]string{
 		"reason": reason,
+	})
+}
+
+// HostDetail contains full details of a registered host and its checkouts.
+type HostDetail struct {
+	Host  HostSummary   `json:"host"`
+	Repos []RepoSummary `json:"repos"`
+	Tools []Tool        `json:"tools"`
+}
+
+// HostSummary is high-level host metadata.
+type HostSummary struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Kind          string `json:"kind"`
+	Presence      string `json:"presence"`
+	LastHeartbeat string `json:"last_heartbeat"`
+	ReposPaused   int    `json:"repos_paused"`
+	FetchFailed   bool   `json:"fetch_failed"`
+}
+
+// RepoSummary is repository status on a host.
+type RepoSummary struct {
+	Path           string `json:"path"`
+	WorktreePath   string `json:"worktree_path"`
+	Queue          string `json:"queue"`
+	Lock           string `json:"lock"`
+	Reason         string `json:"reason"`
+	DiscardPending bool   `json:"discard_pending"`
+	DocsHubPath    string `json:"docs_hub_path"`
+	CloneURL       string `json:"clone_url"`
+}
+
+// GetHost returns host details and registered repos from the control plane.
+func (c Client) GetHost(ctx context.Context, hostID string) (HostDetail, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.BaseURL, "/")+"/v1/hosts/"+hostID, nil)
+	if err != nil {
+		return HostDetail{}, err
+	}
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	resp, err := c.http().Do(req)
+	if err != nil {
+		return HostDetail{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return HostDetail{}, fmt.Errorf("control plane get host: %s", resp.Status)
+	}
+	var detail HostDetail
+	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+		return HostDetail{}, err
+	}
+	return detail, nil
+}
+
+// ResumeRepo requests the control plane to unpause/resume a paused repo queue.
+func (c Client) ResumeRepo(ctx context.Context, hostID, worktree string) error {
+	return c.post(ctx, "/v1/repos/"+hostID+"/resume", map[string]string{
+		"worktree_path": worktree,
 	})
 }
 
