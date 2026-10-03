@@ -264,3 +264,30 @@ func TestSupPID(t *testing.T) {
 	}
 }
 
+func TestTickReapsDeadProcess(t *testing.T) {
+	curr := time.Unix(1_700_000_000, 0)
+	s := New(func() time.Time { return curr })
+	s.alive = func(pid int) bool {
+		return pid != 999
+	}
+	s.mu.Lock()
+	s.locks["/repos/dead"] = LockRunning
+	s.pids["/repos/dead"] = 999
+	s.deadline["/repos/dead"] = curr.Add(1 * time.Hour)
+	s.mu.Unlock()
+
+	s.Tick()
+
+	if lock := s.Lock("/repos/dead"); lock != LockCooling {
+		t.Fatalf("expected lock to move to LockCooling after dead process reaped, got %s", lock)
+	}
+
+	curr = curr.Add(CoolingOff + time.Second)
+	s.Promote()
+
+	if lock := s.Lock("/repos/dead"); lock != LockIdle {
+		t.Fatalf("expected lock to move to LockIdle after cooling off, got %s", lock)
+	}
+}
+
+
