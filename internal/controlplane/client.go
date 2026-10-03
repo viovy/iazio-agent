@@ -106,7 +106,9 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 		}
 		if ok && onJob != nil {
 			if err := onJob(job); err != nil {
-				return err
+				if ctx.Err() != nil {
+					return nil
+				}
 			}
 		}
 		select {
