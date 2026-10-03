@@ -221,6 +221,13 @@ func (c Client) PostChunk(ctx context.Context, jobID, stream, text string) error
 	})
 }
 
+// DeclineJob rejects an assignment when the worktree is busy or cannot be executed.
+func (c Client) DeclineJob(ctx context.Context, jobID, reason string) error {
+	return c.post(ctx, "/v1/jobs/"+jobID+"/decline", map[string]string{
+		"reason": reason,
+	})
+}
+
 
 func (c Client) post(ctx context.Context, path string, body any) error {
 	raw, err := json.Marshal(body)

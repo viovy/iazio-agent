@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -186,6 +187,40 @@ func TestLoopContinuesWhenOnJobFails(t *testing.T) {
 	}
 	if pollCount < 2 {
 		t.Fatalf("expected Loop to continue polling after onJob error, pollCount: %d", pollCount)
+	}
+}
+
+func TestDeclineJob(t *testing.T) {
+	var declinedID string
+	var declinedReason string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/decline") {
+			parts := strings.Split(r.URL.Path, "/")
+			if len(parts) >= 4 {
+				declinedID = parts[len(parts)-2]
+			}
+			var body struct {
+				Reason string `json:"reason"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			declinedReason = body.Reason
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := Client{BaseURL: srv.URL}
+	if err := c.DeclineJob(context.Background(), "job-42", "worktree_busy"); err != nil {
+		t.Fatalf("DeclineJob failed: %v", err)
+	}
+	if declinedID != "job-42" {
+		t.Fatalf("expected declined job job-42, got: %s", declinedID)
+	}
+	if declinedReason != "worktree_busy" {
+		t.Fatalf("expected reason worktree_busy, got: %s", declinedReason)
 	}
 }
 
