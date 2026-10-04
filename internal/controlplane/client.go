@@ -118,6 +118,14 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 					return nil
 				}
 			}
+			// When a job just executed, immediately poll again to drain active queues without 30s delay
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				tick.Reset(every)
+				continue
+			}
 		}
 		select {
 		case <-ctx.Done():
