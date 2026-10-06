@@ -36,9 +36,13 @@ func (c Client) Heartbeat(ctx context.Context, hostID string, tools []Tool, fetc
 	return c.post(ctx, "/v1/hosts/"+hostID+"/heartbeat", body)
 }
 
-// Register records the host kind.
-func (c Client) Register(ctx context.Context, hostID, kind string) error {
-	return c.post(ctx, "/v1/hosts/register", map[string]string{"id": hostID, "kind": kind})
+// Register records the host kind and optional distribution profile.
+func (c Client) Register(ctx context.Context, hostID, kind string, profile ...string) error {
+	body := map[string]string{"id": hostID, "kind": kind}
+	if len(profile) > 0 && strings.TrimSpace(profile[0]) != "" {
+		body["profile"] = strings.TrimSpace(profile[0])
+	}
+	return c.post(ctx, "/v1/hosts/register", body)
 }
 
 // Assignment is one leased job returned by the control plane.
@@ -81,11 +85,15 @@ func (c Client) NextLease(ctx context.Context, hostID string) (Assignment, bool,
 }
 
 // Loop registers the host, then heartbeats and polls for a lease until ctx is cancelled.
-func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Duration, onJob func(Assignment) error) error {
+func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Duration, onJob func(Assignment) error, profile ...string) error {
 	if every <= 0 {
 		every = 30 * time.Second
 	}
-	if err := c.Register(ctx, hostID, kind); err != nil {
+	prof := ""
+	if len(profile) > 0 {
+		prof = profile[0]
+	}
+	if err := c.Register(ctx, hostID, kind, prof); err != nil {
 		return err
 	}
 	tick := time.NewTicker(every)
@@ -99,7 +107,7 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 			if ctx.Err() != nil {
 				return nil
 			}
-			_ = c.Register(ctx, hostID, kind)
+			_ = c.Register(ctx, hostID, kind, prof)
 		}
 		if c.OnTick != nil {
 			if err := c.OnTick(ctx, hostID); err != nil {
@@ -257,6 +265,7 @@ type HostSummary struct {
 	Name          string `json:"name"`
 	Kind          string `json:"kind"`
 	Presence      string `json:"presence"`
+	Profile       string `json:"profile,omitempty"`
 	LastHeartbeat string `json:"last_heartbeat"`
 	ReposPaused   int    `json:"repos_paused"`
 	FetchFailed   bool   `json:"fetch_failed"`

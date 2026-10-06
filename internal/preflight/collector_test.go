@@ -2,7 +2,6 @@ package preflight
 
 import (
 	"context"
-	"os"
 	"strings"
 	"testing"
 )
@@ -105,7 +104,6 @@ func TestCollectorWithTempWorktree(t *testing.T) {
 	if dec.Reason != ReasonNoDocsHub {
 		t.Fatalf("expected ReasonNoDocsHub, got %s", dec.Reason)
 	}
-	_ = os.Chdir(dir)
 }
 
 func TestCollectorEmptyDocsHub(t *testing.T) {

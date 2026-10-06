@@ -87,11 +87,15 @@ func Reconcile(procs []Proc, leases []Lease, porcelain map[string]string, signal
 			unlocked = append(unlocked, path)
 		}
 	}
+	cleanedPorcelain := make(map[string]string, len(porcelain))
+	for k, v := range porcelain {
+		cleanedPorcelain[filepath.Clean(k)] = v
+	}
 	locks := make(map[string]string, len(order))
 	dirty := false
 	for _, path := range order {
 		locks[path] = LockIdle
-		if strings.TrimSpace(porcelain[path]) != "" {
+		if strings.TrimSpace(cleanedPorcelain[path]) != "" {
 			dirty = true
 		}
 	}
