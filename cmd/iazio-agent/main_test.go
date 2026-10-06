@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -258,6 +260,121 @@ func TestResolveHostID(t *testing.T) {
 	})
 	if got != "myagent01" {
 		t.Fatalf("expected myagent01, got %s", got)
+	}
+}
+
+func TestRunUpdate_ManifestIntegration(t *testing.T) {
+	manifestHit := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/fleet/manifest") {
+			manifestHit = true
+			if r.URL.Query().Get("profile") != "developer-workstation" {
+				t.Errorf("expected profile developer-workstation, got %s", r.URL.Query().Get("profile"))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(ManifestResponse{
+				Profile: "developer-workstation",
+				InstallRoots: ManifestInstallRoots{
+					Unix:    ManifestInstallRootPaths{Primary: "~/.local/bin"},
+					Windows: ManifestInstallRootPaths{Primary: `C:\bin`},
+				},
+				Tools: []ManifestToolItem{
+					{
+						Name:        "iazio-agent",
+						Repository:  "viovy/iazio-agent",
+						BinaryName:  "iazio-agent",
+						Tier:        "baseline",
+					},
+				},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	var stdout, stderr bytes.Buffer
+	err := execute(ctx, []string{
+		"update",
+		"--suite",
+		"--profile", "developer-workstation",
+		"--api", srv.URL,
+	}, &stdout, &stderr, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("unexpected update error: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "update suite") {
+		t.Errorf("expected stdout to contain 'update suite', got %q", stdout.String())
+	}
+	if !manifestHit {
+		t.Error("expected manifest endpoint to be fetched")
+	}
+}
+
+func TestExecuteRunProfileBinding(t *testing.T) {
+	var registeredProfile string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/register"):
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			registeredProfile = body["profile"]
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/poll"):
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	var stdout, stderr bytes.Buffer
+	_ = execute(ctx, []string{"run", "--profile", "workstation-pro"}, &stdout, &stderr, func(k string) string {
+		if k == "IAZIO_HARNESS_API_URL" {
+			return srv.URL
+		}
+		return ""
+	})
+
+	if registeredProfile != "workstation-pro" {
+		t.Errorf("expected registered profile 'workstation-pro', got %q", registeredProfile)
+	}
+}
+
+func TestSyncLocalEndpointsAndResolveLocalAPI(t *testing.T) {
+	tempHome := t.TempDir()
+	origHome := os.Getenv("USERPROFILE")
+	if origHome == "" {
+		origHome = os.Getenv("HOME")
+	}
+	// On Windows UserHomeDir checks USERPROFILE, on Unix HOME
+	os.Setenv("USERPROFILE", tempHome)
+	os.Setenv("HOME", tempHome)
+	t.Cleanup(func() {
+		os.Setenv("USERPROFILE", origHome)
+		os.Setenv("HOME", origHome)
+	})
+
+	eps := map[string]string{
+		"harness_api": "https://harness.example.com",
+		"iazio_api":   "https://api.example.com",
+	}
+	if err := syncLocalEndpoints(eps, "custom-prof"); err != nil {
+		t.Fatalf("syncLocalEndpoints failed: %v", err)
+	}
+
+	gotAPI := resolveLocalAPI(func(string) string { return "" })
+	if gotAPI != "https://harness.example.com" {
+		t.Errorf("expected resolved API from config https://harness.example.com, got %q", gotAPI)
 	}
 }
 

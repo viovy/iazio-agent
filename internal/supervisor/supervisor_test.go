@@ -159,13 +159,13 @@ func TestReconcileOrphans(t *testing.T) {
 		},
 		func(string) error { return nil },
 	)
-	if len(res.Terminated) != 4 || len(pruned) != 1 || pruned[0] != "/repos/leaf-01" {
+	if len(res.Terminated) != 4 || len(pruned) != 1 || filepath.Clean(pruned[0]) != filepath.Clean("/repos/leaf-01") {
 		t.Fatalf("%+v prune %v", res, pruned)
 	}
 	if !res.PauseQueue || res.HaltCode != "HALTED_DIRTY" || res.Healing != 0 {
 		t.Fatal(res)
 	}
-	if res.Locks["/repos/leaf-01"] != LockIdle || len(res.Leases) != 2 || res.Leases[0].Reason != ReasonHostRestart || res.Leases[0].Healing != 0 {
+	if res.Locks[filepath.Clean("/repos/leaf-01")] != LockIdle || len(res.Leases) != 2 || res.Leases[0].Reason != ReasonHostRestart || res.Leases[0].Healing != 0 {
 		t.Fatal(res)
 	}
 }

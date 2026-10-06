@@ -3,6 +3,7 @@ package inventory
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -29,10 +30,14 @@ func TestClassifyBehindAndMissing(t *testing.T) {
 func TestScanFirstHit(t *testing.T) {
 	a := t.TempDir()
 	b := t.TempDir()
-	writeExe(t, filepath.Join(a, "autopilot"))
-	writeExe(t, filepath.Join(b, "autopilot"))
+	binName := "autopilot"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	writeExe(t, filepath.Join(a, binName))
+	writeExe(t, filepath.Join(b, binName))
 	got := Scan([]string{a, b})
-	if len(got) != 1 || got[0].Path != filepath.Join(a, "autopilot") {
+	if len(got) != 1 || got[0].Path != filepath.Join(a, binName) {
 		t.Fatalf("%+v", got)
 	}
 }

@@ -49,23 +49,109 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 	case "service":
 		return runService(args[1:], stdout, getenv)
 	case "update":
-		return runUpdate(args[1:], stdout)
+		return runUpdate(ctx, args[1:], stdout, stderr, getenv)
 	case "run":
 		kind := supervisor.HostKind(getenv("IAZIO_AGENT_HOST_KIND"))
 		fmt.Fprintln(stdout, kind)
-		api := getenv("IAZIO_HARNESS_API_URL")
-		if api == "" {
-			if home, err := os.UserHomeDir(); err == nil && home != "" {
-				if b, err := os.ReadFile(filepath.Join(home, ".iazio", "api_url")); err == nil {
-					api = strings.TrimSpace(string(b))
-				}
+		api := resolveLocalAPI(getenv)
+		profile := getenv("IAZIO_AGENT_PROFILE")
+		updateInterval := 6 * time.Hour
+		if raw := getenv("IAZIO_AGENT_UPDATE_INTERVAL"); raw != "" {
+			if d, err := time.ParseDuration(raw); err == nil {
+				updateInterval = d
+			} else if raw == "0" || strings.ToLower(raw) == "disabled" {
+				updateInterval = 0
 			}
 		}
-		if api == "" {
-			api = "http://localhost:8090"
+		updateSuite := getenv("IAZIO_AGENT_UPDATE_SUITE") == "1" || strings.ToLower(getenv("IAZIO_AGENT_UPDATE_SUITE")) == "true"
+
+		for i := 1; i < len(args); i++ {
+			switch {
+			case args[i] == "--profile" && i+1 < len(args):
+				i++
+				profile = args[i]
+			case strings.HasPrefix(args[i], "--profile="):
+				profile = strings.TrimPrefix(args[i], "--profile=")
+			case args[i] == "--api" && i+1 < len(args):
+				i++
+				api = args[i]
+			case strings.HasPrefix(args[i], "--api="):
+				api = strings.TrimPrefix(args[i], "--api=")
+			case args[i] == "--update-interval" && i+1 < len(args):
+				i++
+				if d, err := time.ParseDuration(args[i]); err == nil {
+					updateInterval = d
+				} else if args[i] == "0" || strings.ToLower(args[i]) == "disabled" {
+					updateInterval = 0
+				}
+			case strings.HasPrefix(args[i], "--update-interval="):
+				val := strings.TrimPrefix(args[i], "--update-interval=")
+				if d, err := time.ParseDuration(val); err == nil {
+					updateInterval = d
+				} else if val == "0" || strings.ToLower(val) == "disabled" {
+					updateInterval = 0
+				}
+			case args[i] == "--update-suite":
+				updateSuite = true
+			}
+		}
+		if profile == "" {
+			profile = "generic"
 		}
 		host := resolveHostID(getenv, os.Hostname, nil)
 		if ctx.Err() == nil {
+			runCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			if updateInterval > 0 {
+				go func() {
+					select {
+					case <-runCtx.Done():
+						return
+					case <-time.After(5 * time.Second):
+					}
+
+					checkOnce := func() bool {
+						updated, err := performUpdate(runCtx, UpdateOptions{
+							Suite:   updateSuite,
+							Profile: profile,
+							API:     api,
+						}, stdout, stderr, getenv)
+						if err != nil {
+							if stderr != nil {
+								fmt.Fprintf(stderr, "[supervisor] update check error: %v\n", err)
+							}
+							return false
+						}
+						return updated
+					}
+
+					if checkOnce() {
+						if stdout != nil {
+							fmt.Fprintln(stdout, "[supervisor] iazio-agent self-updated; restarting service...")
+						}
+						cancel()
+						return
+					}
+
+					ticker := time.NewTicker(updateInterval)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-runCtx.Done():
+							return
+						case <-ticker.C:
+							if checkOnce() {
+								if stdout != nil {
+									fmt.Fprintln(stdout, "[supervisor] iazio-agent self-updated; restarting service...")
+								}
+								cancel()
+								return
+							}
+						}
+					}
+				}()
+			}
 			sup := supervisor.New(time.Now)
 			runner := supervisor.NewOSRunner()
 			var client controlplane.Client
@@ -134,7 +220,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return nil
 				},
 			}
-			return client.Loop(ctx, host, kind, 30*time.Second, func(job controlplane.Assignment) error {
+			return client.Loop(runCtx, host, kind, 30*time.Second, func(job controlplane.Assignment) error {
 				if sup.Lock(job.WorktreePath) == supervisor.LockRunning {
 					fmt.Fprintf(os.Stderr, "worktree %s busy with another job; declining assignment %s\n", job.WorktreePath, job.ID)
 					_ = client.DeclineJob(ctx, job.ID, "worktree_busy")
@@ -188,7 +274,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					_, _ = client.PostFinish(context.Background(), host, worktree, jobID, finish)
 				}(job.WorktreePath, job.DocsHubPath, job.ID, job.Kind)
 				return nil
-			})
+			}, profile)
 		}
 
 		if ctx.Err() != nil {
@@ -382,36 +468,6 @@ func execCommand(name string, args ...string) error {
 	if err != nil {
 		return fmt.Errorf("%s: %s", name, strings.TrimSpace(string(out)))
 	}
-	return nil
-}
-
-func runUpdate(args []string, stdout io.Writer) error {
-	suite := false
-	onTimeout := "reject"
-	expired := false
-	for i := 0; i < len(args); i++ {
-		switch {
-		case args[i] == "--suite":
-			suite = true
-		case args[i] == "--on-timeout" && i+1 < len(args):
-			i++
-			onTimeout = args[i]
-		case strings.HasPrefix(args[i], "--on-timeout="):
-			onTimeout = strings.TrimPrefix(args[i], "--on-timeout=")
-		case args[i] == "--drain-expired":
-			expired = true
-		default:
-			return fmt.Errorf("unknown update flag %s", args[i])
-		}
-	}
-	if suite {
-		if !service.SuiteAllowed(false, onTimeout, expired) {
-			return service.ErrSuiteBusy
-		}
-		fmt.Fprintln(stdout, "update suite")
-		return nil
-	}
-	fmt.Fprintln(stdout, "update")
 	return nil
 }
 
