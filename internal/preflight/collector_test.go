@@ -98,6 +98,8 @@ func TestCollectorWithTempWorktree(t *testing.T) {
 	if rep.FreeBytes == 0 {
 		t.Fatalf("expected positive FreeBytes")
 	}
+	// Explicitly isolate disk headroom check from host disk variance
+	rep.FreeBytes = 20 << 30
 	dec := Decide(rep)
 	// Missing docs hub or not a work tree halts with ReasonNoDocsHub
 	if dec.Reason != ReasonNoDocsHub {
