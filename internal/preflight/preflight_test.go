@@ -14,7 +14,7 @@ func TestDecideMatrix(t *testing.T) {
 		pause bool
 	}{
 		{name: "exact free space", code: ""},
-		{name: "one byte under disk", edit: func(r *Report) { r.FreeBytes = MinFreeBytes - 1 }, code: ReasonDisk},
+		{name: "one byte under disk", edit: func(r *Report) { r.FreeBytes = RequiredMinFreeBytes() - 1 }, code: ReasonDisk},
 		{name: "disk wins over dirty", edit: func(r *Report) { r.FreeBytes = 1; r.WorkPorcelain = " M a" }, code: ReasonDisk},
 		{name: "missing docs hub", edit: func(r *Report) { r.DocsHubOK = false }, code: ReasonNoDocsHub},
 		{name: "docs hub not a work tree", edit: func(r *Report) { r.GitWorkTree = false }, code: ReasonNoDocsHub},
@@ -90,5 +90,19 @@ func TestDecide(t *testing.T) {
 	iv.HeadAttached = false
 	if d := Decide(iv); d.Reason != "" {
 		t.Fatal(d)
+	}
+}
+
+func TestRequiredMinFreeBytes(t *testing.T) {
+	// Default is 5 GiB
+	t.Setenv("IAZIO_PREFLIGHT_MIN_FREE_BYTES", "")
+	if got := RequiredMinFreeBytes(); got != DefaultMinFreeBytes {
+		t.Fatalf("expected DefaultMinFreeBytes %d, got %d", DefaultMinFreeBytes, got)
+	}
+
+	// Custom override
+	t.Setenv("IAZIO_PREFLIGHT_MIN_FREE_BYTES", "2147483648") // 2 GiB
+	if got := RequiredMinFreeBytes(); got != 2147483648 {
+		t.Fatalf("expected 2147483648, got %d", got)
 	}
 }

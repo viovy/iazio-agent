@@ -215,9 +215,14 @@ func ReconcileHostCheckouts(
 	resume func(worktree string) error,
 	stdout io.Writer,
 	stderr io.Writer,
+	diskChecker ...func(worktree string) (bool, error),
 ) {
 	if isLockIdle == nil || resume == nil {
 		return
+	}
+	var checkDisk func(string) (bool, error)
+	if len(diskChecker) > 0 {
+		checkDisk = diskChecker[0]
 	}
 	for _, repo := range repos {
 		worktree := repo.WorktreePath
@@ -263,6 +268,28 @@ func ReconcileHostCheckouts(
 							if stderr != nil {
 								fmt.Fprintf(stderr, "resume repo error for %s: %v\n", worktree, err)
 							}
+						}
+					}
+				}
+			}
+			continue
+		}
+		if repo.Reason == "HALTED_DISK" {
+			if isLockIdle(worktree) && checkDisk != nil {
+				sufficient, err := checkDisk(worktree)
+				if err != nil {
+					if stderr != nil {
+						fmt.Fprintf(stderr, "check disk status error for %s: %v\n", worktree, err)
+					}
+					continue
+				}
+				if sufficient {
+					if stdout != nil {
+						fmt.Fprintf(stdout, "worktree %s has sufficient disk space; resuming halted queue\n", worktree)
+					}
+					if err := resume(worktree); err != nil {
+						if stderr != nil {
+							fmt.Fprintf(stderr, "resume repo error for %s: %v\n", worktree, err)
 						}
 					}
 				}

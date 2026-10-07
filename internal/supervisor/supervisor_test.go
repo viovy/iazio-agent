@@ -323,6 +323,18 @@ func TestReconcileHostCheckouts(t *testing.T) {
 			Reason:         "HALTED_DIRTY",
 			DiscardPending: true,
 		},
+		{
+			WorktreePath:   "/work/disk-recovered",
+			Queue:          "OPEN",
+			Reason:         "HALTED_DISK",
+			DiscardPending: false,
+		},
+		{
+			WorktreePath:   "/work/disk-still-low",
+			Queue:          "OPEN",
+			Reason:         "HALTED_DISK",
+			DiscardPending: false,
+		},
 	}
 
 	isLockIdle := func(w string) bool {
@@ -342,20 +354,26 @@ func TestReconcileHostCheckouts(t *testing.T) {
 		resumed = append(resumed, w)
 		return nil
 	}
+	checkDisk := func(w string) (bool, error) {
+		return w == "/work/disk-recovered", nil
+	}
 
-	ReconcileHostCheckouts(repos, isLockIdle, discard, isClean, resume, stdout, stderr)
+	ReconcileHostCheckouts(repos, isLockIdle, discard, isClean, resume, stdout, stderr, checkDisk)
 
 	if len(discarded) != 1 || discarded[0] != "/work/discard-me" {
 		t.Fatalf("expected discard on /work/discard-me, got: %v", discarded)
 	}
-	if len(resumed) != 2 || resumed[0] != "/work/discard-me" || resumed[1] != "/work/clean-auto-resume" {
-		t.Fatalf("expected resume on discard-me and clean-auto-resume, got: %v", resumed)
+	if len(resumed) != 3 || resumed[0] != "/work/discard-me" || resumed[1] != "/work/clean-auto-resume" || resumed[2] != "/work/disk-recovered" {
+		t.Fatalf("expected resume on discard-me, clean-auto-resume, and disk-recovered, got: %v", resumed)
 	}
 	if !strings.Contains(stdout.String(), "discarding checkout for /work/discard-me") {
 		t.Fatalf("missing discard message in stdout: %s", stdout.String())
 	}
 	if !strings.Contains(stdout.String(), "worktree /work/clean-auto-resume is clean; resuming paused queue") {
 		t.Fatalf("missing clean resume message in stdout: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "worktree /work/disk-recovered has sufficient disk space; resuming halted queue") {
+		t.Fatalf("missing disk recovery message in stdout: %s", stdout.String())
 	}
 }
 

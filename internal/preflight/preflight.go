@@ -1,10 +1,27 @@
 // Package preflight decides whether a harness child may start.
 package preflight
 
-import "strings"
+import (
+	"os"
+	"strconv"
+	"strings"
+)
 
-// MinFreeBytes is the free-space floor on the worktree mount.
-const MinFreeBytes = 10 << 30
+// DefaultMinFreeBytes is the default free-space floor on the worktree mount (5 GiB).
+const DefaultMinFreeBytes uint64 = 5 << 30
+
+// MinFreeBytes is the fallback constant kept for backward compatibility (10 GiB).
+const MinFreeBytes uint64 = 10 << 30
+
+// RequiredMinFreeBytes returns the active threshold in bytes, configurable via IAZIO_PREFLIGHT_MIN_FREE_BYTES.
+func RequiredMinFreeBytes() uint64 {
+	if v := os.Getenv("IAZIO_PREFLIGHT_MIN_FREE_BYTES"); v != "" {
+		if n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return DefaultMinFreeBytes
+}
 
 const (
 	// KindOrdinary is a normal scheduled slice.
@@ -24,7 +41,7 @@ const (
 	ReasonDetached = "HALTED_DETACHED"
 	// ReasonUntracked means the branch is not the default and has no upstream. The queue is paused.
 	ReasonUntracked = "HALTED_UNTRACKED"
-	// ReasonDisk means free space is under 10 GiB. The queue is not paused.
+	// ReasonDisk means free space is under the required floor (default 5 GiB). The queue is not paused.
 	ReasonDisk = "HALTED_DISK"
 	// ReasonNoDocsHub means the docs hub is not a git work tree. The queue is not paused.
 	ReasonNoDocsHub = "HALTED_NO_DOCS_HUB"
@@ -60,7 +77,7 @@ type Decision struct {
 // story_refinement checks porcelain only on the docs hub.
 // intervention may start when porcelain is dirty, HEAD is detached, or the branch has no upstream.
 func Decide(r Report) Decision {
-	if r.FreeBytes < MinFreeBytes {
+	if r.FreeBytes < RequiredMinFreeBytes() {
 		return Decision{Reason: ReasonDisk}
 	}
 	if !r.DocsHubOK || !r.GitWorkTree {
