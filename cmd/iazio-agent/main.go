@@ -216,6 +216,13 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						},
 						stdout,
 						stderr,
+						func(w string) (bool, error) {
+							bytes, err := preflight.FreeSpace(w)
+							if err != nil {
+								return false, err
+							}
+							return bytes >= preflight.RequiredMinFreeBytes(), nil
+						},
 					)
 					return nil
 				},

@@ -1,0 +1,17 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+bin/
+.local/
+*.version
+
+# OS
+.DS_Store
+
+# Temporary
+tmp/
+*.tmp

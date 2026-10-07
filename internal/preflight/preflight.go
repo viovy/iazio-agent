@@ -41,7 +41,7 @@ const (
 	ReasonDetached = "HALTED_DETACHED"
 	// ReasonUntracked means the branch is not the default and has no upstream. The queue is paused.
 	ReasonUntracked = "HALTED_UNTRACKED"
-	// ReasonDisk means free space is under 10 GiB. The queue is not paused.
+	// ReasonDisk means free space is under the required floor (default 5 GiB). The queue is not paused.
 	ReasonDisk = "HALTED_DISK"
 	// ReasonNoDocsHub means the docs hub is not a git work tree. The queue is not paused.
 	ReasonNoDocsHub = "HALTED_NO_DOCS_HUB"
