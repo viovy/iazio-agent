@@ -14,13 +14,20 @@ import (
 
 // Client posts heartbeats and finish checks. It does not send IDE credentials.
 type Client struct {
-	BaseURL string
-	Token   string
-	HTTP    *http.Client
-	Tools   func() []Tool
-	OnTick  func(ctx context.Context, hostID string) error
+	BaseURL    string
+	Token      string
+	HTTP       *http.Client
+	Tools      func() []Tool
+	ActiveJobs func() []ActiveJob
+	OnTick     func(ctx context.Context, hostID string) error
 }
 
+// ActiveJob describes one job currently running on this agent.
+type ActiveJob struct {
+	JobID        string `json:"job_id"`
+	WorktreePath string `json:"worktree_path"`
+	PID          int    `json:"pid"`
+}
 
 // Tool is one binary on a heartbeat.
 type Tool struct {
@@ -30,9 +37,13 @@ type Tool struct {
 	Status  string `json:"status"`
 }
 
-// Heartbeat marks the host online and stores the tool inventory.
-func (c Client) Heartbeat(ctx context.Context, hostID string, tools []Tool, fetchFailed bool) error {
-	body := map[string]any{"fetch_failed": fetchFailed, "tools": tools}
+// Heartbeat marks the host online, stores the tool inventory, and reports active jobs.
+func (c Client) Heartbeat(ctx context.Context, hostID string, tools []Tool, fetchFailed bool, activeJobs ...ActiveJob) error {
+	body := map[string]any{
+		"fetch_failed": fetchFailed,
+		"tools":        tools,
+		"active_jobs":  activeJobs,
+	}
 	return c.post(ctx, "/v1/hosts/"+hostID+"/heartbeat", body)
 }
 
@@ -103,7 +114,11 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 		if c.Tools != nil {
 			tools = c.Tools()
 		}
-		if err := c.Heartbeat(ctx, hostID, tools, false); err != nil {
+		var activeJobs []ActiveJob
+		if c.ActiveJobs != nil {
+			activeJobs = c.ActiveJobs()
+		}
+		if err := c.Heartbeat(ctx, hostID, tools, false, activeJobs...); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -281,6 +296,7 @@ type RepoSummary struct {
 	DiscardPending bool   `json:"discard_pending"`
 	DocsHubPath    string `json:"docs_hub_path"`
 	CloneURL       string `json:"clone_url"`
+	RunningJobID   string `json:"running_job_id,omitempty"`
 }
 
 // GetHost returns host details and registered repos from the control plane.
@@ -310,6 +326,25 @@ func (c Client) GetHost(ctx context.Context, hostID string) (HostDetail, error) 
 // ResumeRepo requests the control plane to unpause/resume a paused repo queue.
 func (c Client) ResumeRepo(ctx context.Context, hostID, worktree string) error {
 	return c.post(ctx, "/v1/repos/"+hostID+"/resume", map[string]string{
+		"worktree_path": worktree,
+	})
+}
+
+// AbandonJob marks a stalled or orphaned job as abandoned.
+func (c Client) AbandonJob(ctx context.Context, jobID, reason string) error {
+	return c.post(ctx, "/v1/jobs/"+jobID+"/abandon", map[string]string{
+		"reason": reason,
+	})
+}
+
+// ResumeJob requests the control plane to resume a stalled or abandoned job using its conversation ID.
+func (c Client) ResumeJob(ctx context.Context, jobID string) error {
+	return c.post(ctx, "/v1/jobs/"+jobID+"/resume", map[string]string{})
+}
+
+// RemediateRepo requests the control plane to remediate a stuck repository worktree.
+func (c Client) RemediateRepo(ctx context.Context, hostID, worktree string) error {
+	return c.post(ctx, "/v1/repos/"+hostID+"/remediate", map[string]string{
 		"worktree_path": worktree,
 	})
 }
