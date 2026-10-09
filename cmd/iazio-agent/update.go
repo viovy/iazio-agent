@@ -15,11 +15,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"time"
 
+	"github.com/viovy/iazio-agent/internal/inventory"
 	"github.com/viovy/iazio-agent/internal/service"
 )
 
@@ -312,7 +312,14 @@ func updateSingleTool(
 	}
 
 	destPath := filepath.Join(binDir, binName)
-	curVer := inspectInstalledVersion(destPath)
+	curVer := inventory.InspectInstalledVersion(destPath)
+
+	if !force && (strings.Contains(curVer, "-dev") || curVer == "dev" || curVer == "0.1.0-dev") {
+		if stdout != nil {
+			fmt.Fprintf(stdout, "  [*] %s: %s (dev version preserved, skip update)\n", tool.Name, curVer)
+		}
+		return false, nil
+	}
 
 	repo := tool.Repository
 	if !strings.Contains(repo, "/") {
@@ -617,31 +624,5 @@ func installExecutableSafe(destPath string, data []byte) error {
 }
 
 func inspectInstalledVersion(binaryPath string) string {
-	if _, err := os.Stat(binaryPath); err != nil {
-		return ""
-	}
-	if data, err := os.ReadFile(binaryPath + ".version"); err == nil {
-		v := strings.TrimSpace(string(data))
-		if v != "" {
-			return strings.TrimPrefix(v, "v")
-		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, binaryPath, "--version")
-	out, err := cmd.Output()
-	if err != nil {
-		cmd = exec.CommandContext(ctx, binaryPath, "version")
-		out, err = cmd.Output()
-	}
-	if err != nil {
-		return "installed"
-	}
-	re := regexp.MustCompile(`v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?)|([0-9]+\.[0-9]+\.[0-9]+)`)
-	if match := re.FindString(string(out)); match != "" {
-		return strings.TrimPrefix(match, "v")
-	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	return strings.TrimSpace(lines[0])
+	return inventory.InspectInstalledVersion(binaryPath)
 }

@@ -34,8 +34,8 @@ func ResolveBinary(name string) string {
 	}
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		candidates := []string{
-			filepath.Join(home, ".local", "bin", name),
 			filepath.Join(home, ".iazio", "bin", name),
+			filepath.Join(home, ".local", "bin", name),
 		}
 		if runtime.GOOS == "windows" {
 			candidates = append(candidates, filepath.Join(home, "bin", name))
@@ -59,7 +59,7 @@ func AugmentedEnv(base []string) []string {
 	home, _ := os.UserHomeDir()
 	var userDirs []string
 	if home != "" {
-		userDirs = append(userDirs, filepath.Join(home, ".local", "bin"), filepath.Join(home, ".iazio", "bin"))
+		userDirs = append(userDirs, filepath.Join(home, ".iazio", "bin"), filepath.Join(home, ".local", "bin"))
 		if runtime.GOOS == "windows" {
 			userDirs = append(userDirs, filepath.Join(home, "bin"))
 		}

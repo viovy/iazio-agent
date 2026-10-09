@@ -86,8 +86,8 @@ func TestDefaultDirsOrder(t *testing.T) {
 	wantPrefix := []string{
 		first,
 		second,
-		filepath.Join(home, ".local", "bin"),
 		filepath.Join(home, ".iazio", "bin"),
+		filepath.Join(home, ".local", "bin"),
 	}
 	if len(got) != len(wantPrefix) {
 		t.Fatalf("%v", got)
@@ -100,6 +100,28 @@ func TestDefaultDirsOrder(t *testing.T) {
 	win := DefaultDirs("", home, "windows")
 	if win[len(win)-1] != filepath.Join(home, "bin") {
 		t.Fatalf("%v", win)
+	}
+}
+
+func TestInspectInstalledVersion(t *testing.T) {
+	dir := t.TempDir()
+	binPath := filepath.Join(dir, "mytool")
+	if err := os.WriteFile(binPath, []byte("#!/bin/sh\necho 'mytool version v1.4.2'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Without .version file, should execute and parse
+	ver := InspectInstalledVersion(binPath)
+	if ver != "1.4.2" {
+		t.Fatalf("expected parsed version 1.4.2, got: %s", ver)
+	}
+
+	// With .version file, should read immediately
+	if err := os.WriteFile(binPath+".version", []byte("2.0.0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ver2 := InspectInstalledVersion(binPath)
+	if ver2 != "2.0.0" {
+		t.Fatalf("expected version file 2.0.0, got: %s", ver2)
 	}
 }
 

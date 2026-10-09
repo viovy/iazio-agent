@@ -2,12 +2,87 @@
 package inventory
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
+
+var (
+	verCacheMu sync.RWMutex
+	verCache   = make(map[string]cachedVersion)
+)
+
+type cachedVersion struct {
+	modTime time.Time
+	size    int64
+	version string
+}
+
+// InspectInstalledVersion returns the semantic or release version of a binary.
+// It checks <path>.version first, then falls back to running --version or version,
+// caching results based on file modtime and size.
+func InspectInstalledVersion(binaryPath string) string {
+	fi, err := os.Stat(binaryPath)
+	if err != nil {
+		return ""
+	}
+	if data, err := os.ReadFile(binaryPath + ".version"); err == nil {
+		v := strings.TrimSpace(string(data))
+		if v != "" {
+			return strings.TrimPrefix(v, "v")
+		}
+	}
+
+	verCacheMu.RLock()
+	cached, ok := verCache[binaryPath]
+	verCacheMu.RUnlock()
+	if ok && cached.modTime.Equal(fi.ModTime()) && cached.size == fi.Size() {
+		return cached.version
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, binaryPath, "--version")
+	out, err := cmd.Output()
+	if err != nil {
+		cmd = exec.CommandContext(ctx, binaryPath, "version")
+		out, err = cmd.Output()
+	}
+	ver := "installed"
+	if err == nil {
+		re := regexp.MustCompile(`v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?)|([0-9]+\.[0-9]+\.[0-9]+)`)
+		if match := re.FindString(string(out)); match != "" {
+			ver = strings.TrimPrefix(match, "v")
+		} else {
+			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			if len(lines) > 0 && strings.TrimSpace(lines[0]) != "" {
+				ver = strings.TrimSpace(lines[0])
+			}
+		}
+	}
+
+	if ver != "installed" && ver != "" {
+		_ = os.WriteFile(binaryPath+".version", []byte(ver), 0644)
+	}
+
+	verCacheMu.Lock()
+	verCache[binaryPath] = cachedVersion{
+		modTime: fi.ModTime(),
+		size:    fi.Size(),
+		version: ver,
+	}
+	verCacheMu.Unlock()
+
+	return ver
+}
 
 // BaselineNames are the tools that must be present before a host is schedulable.
 func BaselineNames() []string {
@@ -40,7 +115,7 @@ type Tool struct {
 	Executable bool
 }
 
-// DefaultDirs is the scan order: PATH, ~/.local/bin, ~/.iazio/bin, and on windows the user bin.
+// DefaultDirs is the scan order: PATH, ~/.iazio/bin, ~/.local/bin, and on windows the user bin.
 func DefaultDirs(pathEnv, home, goos string) []string {
 	var dirs []string
 	if pathEnv != "" {
@@ -48,8 +123,8 @@ func DefaultDirs(pathEnv, home, goos string) []string {
 	}
 	if home != "" {
 		dirs = append(dirs,
-			filepath.Join(home, ".local", "bin"),
 			filepath.Join(home, ".iazio", "bin"),
+			filepath.Join(home, ".local", "bin"),
 		)
 		if goos == "windows" {
 			dirs = append(dirs, filepath.Join(home, "bin"))
@@ -89,14 +164,26 @@ func scan(dirs []string, goos string) []Tool {
 				continue
 			}
 			seen[name] = true
+			binPath := filepath.Join(dir, ent.Name())
 			out = append(out, Tool{
 				Name:       name,
-				Path:       filepath.Join(dir, ent.Name()),
+				Path:       binPath,
 				Status:     "OK",
 				Executable: true,
 			})
 		}
 	}
+
+	var wg sync.WaitGroup
+	for i := range out {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			out[idx].Version = InspectInstalledVersion(out[idx].Path)
+		}(i)
+	}
+	wg.Wait()
+
 	return out
 }
 
