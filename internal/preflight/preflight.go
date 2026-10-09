@@ -60,8 +60,12 @@ type Report struct {
 	DefaultBranch string
 	HasUpstream   bool
 	DocsHubOK     bool
-	GitAuthOK     bool
-	GitWorkTree   bool
+	GitAuthOK              bool
+	GitWorkTree            bool
+	DirtyStoryID           string `json:"DirtyStoryID,omitempty"`
+	DirtyReviewFile        string `json:"DirtyReviewFile,omitempty"`
+	DetectedConversationID string `json:"DetectedConversationID,omitempty"`
+	DetectedVerdict        string `json:"DetectedVerdict,omitempty"`
 }
 
 // Decision is the spawn gate result.
@@ -87,6 +91,15 @@ func Decide(r Report) Decision {
 		return Decision{Reason: ReasonGitAuth}
 	}
 	if r.Kind == KindIntervention {
+		return Decision{}
+	}
+	if r.Kind == KindResume {
+		// Resumption is explicitly intended to recover an in-flight prompt execution
+		// that left uncommitted work, modified submodules, or local review reports in the worktree.
+		// It permits dirty porcelain and untracked branches, skipping ReasonDirty and ReasonUntracked.
+		if !r.HeadAttached {
+			return Decision{Reason: ReasonDetached, PauseQueue: true}
+		}
 		return Decision{}
 	}
 	hubDirty := strings.TrimSpace(r.HubPorcelain) != ""
