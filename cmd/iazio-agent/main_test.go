@@ -98,7 +98,12 @@ func TestExecuteRunConnected(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		time.Sleep(50 * time.Millisecond)
+		for i := 0; i < 40; i++ {
+			if heartbeatReceived {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
 		cancel()
 	}()
 

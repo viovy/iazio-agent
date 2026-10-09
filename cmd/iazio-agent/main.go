@@ -103,6 +103,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			runCtx, cancel := context.WithCancel(ctx)
 			defer cancel()
 
+			sup := supervisor.New(time.Now)
+			runner := supervisor.NewOSRunner()
+			var client controlplane.Client
+
 			if updateInterval > 0 {
 				go func() {
 					select {
@@ -112,6 +116,34 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 
 					checkOnce := func() bool {
+						if api != "" {
+							detail, err := client.GetHost(runCtx, host)
+							if err == nil {
+								for _, r := range detail.Repos {
+									path := r.WorktreePath
+									if path == "" {
+										path = r.Path
+									}
+									if path == "" {
+										continue
+									}
+									if sup.Lock(path) == supervisor.LockRunning {
+										if stdout != nil {
+											fmt.Fprintf(stdout, "[supervisor] worktree %s is running a job; deferring background update\n", path)
+										}
+										return false
+									}
+									out, err := exec.CommandContext(runCtx, "git", "-C", path, "status", "--porcelain").CombinedOutput()
+									if err == nil && strings.TrimSpace(string(out)) != "" {
+										if stdout != nil {
+											fmt.Fprintf(stdout, "[supervisor] worktree %s is dirty; deferring background update\n", path)
+										}
+										return false
+									}
+								}
+							}
+						}
+
 						updated, err := performUpdate(runCtx, UpdateOptions{
 							Suite:   updateSuite,
 							Profile: profile,
@@ -152,9 +184,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 				}()
 			}
-			sup := supervisor.New(time.Now)
-			runner := supervisor.NewOSRunner()
-			var client controlplane.Client
 			client = controlplane.Client{
 				BaseURL: api,
 				Tools: func() []controlplane.Tool {
