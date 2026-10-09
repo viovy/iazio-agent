@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -201,6 +202,8 @@ type RepoState struct {
 	Queue          string
 	Reason         string
 	DiscardPending bool
+	Lock           string
+	RunningJobID   string
 }
 
 // ReconcileHostCheckouts checks registered repos on each tick:
@@ -293,6 +296,46 @@ func ReconcileHostCheckouts(
 						}
 					}
 				}
+			}
+		}
+	}
+}
+
+// ReconcileStrandedCheckouts checks whether the control plane believes a job or lock is active on this host,
+// but the local supervisor has no active process running for that checkout.
+// If stranded, it triggers automatic self-remediation (abandoning the stranded job and clearing the repo lock).
+func ReconcileStrandedCheckouts(
+	ctx context.Context,
+	hostID string,
+	repos []RepoState,
+	isLockActive func(worktree string) bool,
+	abandonJob func(ctx context.Context, jobID, reason string) error,
+	remediateRepo func(ctx context.Context, hostID, worktree string) error,
+	stdout io.Writer,
+	stderr io.Writer,
+) {
+	for _, repo := range repos {
+		worktree := repo.WorktreePath
+		if worktree == "" {
+			continue
+		}
+		isStranded := (repo.Lock == "RUNNING_HARNESS" || repo.RunningJobID != "") &&
+			(isLockActive != nil && !isLockActive(worktree))
+		if !isStranded {
+			continue
+		}
+		if stderr != nil {
+			fmt.Fprintf(stderr, "[reconcile] worktree %s has stranded job %q (lock: %s) on host %s; initiating self-remediation\n",
+				worktree, repo.RunningJobID, repo.Lock, hostID)
+		}
+		if repo.RunningJobID != "" && abandonJob != nil {
+			if err := abandonJob(ctx, repo.RunningJobID, "process_disappeared_on_host"); err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "[reconcile] failed to abandon stranded job %s: %v\n", repo.RunningJobID, err)
+			}
+		}
+		if remediateRepo != nil {
+			if err := remediateRepo(ctx, hostID, worktree); err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "[reconcile] failed to remediate repo %s on host %s: %v\n", worktree, hostID, err)
 			}
 		}
 	}

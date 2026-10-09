@@ -202,7 +202,28 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 					return tools
 				},
+				ActiveJobs: func() []controlplane.ActiveJob {
+					var jobs []controlplane.ActiveJob
+					for _, rj := range sup.RunningJobs() {
+						jobs = append(jobs, controlplane.ActiveJob{
+							JobID:        rj.JobID,
+							WorktreePath: rj.WorktreePath,
+							PID:          rj.PID,
+						})
+					}
+					return jobs
+				},
 				OnTick: func(ctx context.Context, hostID string) error {
+					reaped := sup.Tick()
+					for _, r := range reaped {
+						if stderr != nil {
+							fmt.Fprintf(stderr, "[supervisor] reaped stalled or terminated harness job %q on %s (reason: %s)\n",
+								r.JobID, r.WorktreePath, r.Reason)
+						}
+						if r.JobID != "" {
+							_ = client.AbandonJob(ctx, r.JobID, r.Reason)
+						}
+					}
 					detail, err := client.GetHost(ctx, hostID)
 					if err != nil {
 						if stderr != nil {
@@ -221,8 +242,24 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							Queue:          r.Queue,
 							Reason:         r.Reason,
 							DiscardPending: r.DiscardPending,
+							Lock:           r.Lock,
+							RunningJobID:   r.RunningJobID,
 						})
 					}
+					supervisor.ReconcileStrandedCheckouts(
+						ctx,
+						hostID,
+						repoStates,
+						func(w string) bool { return sup.Lock(w) == supervisor.LockRunning },
+						func(ctx context.Context, jobID, reason string) error {
+							return client.AbandonJob(ctx, jobID, reason)
+						},
+						func(ctx context.Context, hostID, worktree string) error {
+							return client.RemediateRepo(ctx, hostID, worktree)
+						},
+						stdout,
+						stderr,
+					)
 					supervisor.ReconcileHostCheckouts(
 						repoStates,
 						func(w string) bool { return sup.Lock(w) == supervisor.LockIdle },

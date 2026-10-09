@@ -38,6 +38,8 @@ const (
 	ReasonDrainTimeout = "DRAIN_TIMEOUT"
 	// ReasonHostRestart is stored when a lease is stranded after process start.
 	ReasonHostRestart = "host_restart"
+	// ReasonProcessDied is stored when a child harness process terminates unexpectedly.
+	ReasonProcessDied = "process_died"
 )
 
 // Runner executes a harness child. Tests substitute it.
@@ -55,6 +57,7 @@ type Sup struct {
 	until    map[string]time.Time
 	deadline map[string]time.Time
 	pids     map[string]int
+	jobIDs   map[string]string
 	reasons  map[string]string
 	now      func() time.Time
 	sleep    func(time.Duration)
@@ -75,6 +78,7 @@ func New(now func() time.Time) *Sup {
 		until:    map[string]time.Time{},
 		deadline: map[string]time.Time{},
 		pids:     map[string]int{},
+		jobIDs:   map[string]string{},
 		reasons:  map[string]string{},
 		now:      now,
 		sleep:    time.Sleep,
@@ -112,6 +116,7 @@ func (s *Sup) Spawn(r Runner, jobID, apiURL, worktree, docsHub, token string) er
 	}
 	s.mu.Lock()
 	s.pids[worktree] = pid
+	s.jobIDs[worktree] = jobID
 	s.deadline[worktree] = s.now().Add(DefaultJobDuration)
 	if s.signal == nil && r != nil {
 		s.signal = r.Signal
@@ -125,6 +130,13 @@ func (s *Sup) PID(path string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.pids[path]
+}
+
+// JobID returns the active job ID for the worktree.
+func (s *Sup) JobID(path string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.jobIDs[path]
 }
 
 
@@ -158,6 +170,9 @@ func (s *Sup) MarkIdle(path string) {
 	s.mu.Lock()
 	s.locks[path] = LockIdle
 	delete(s.until, path)
+	delete(s.pids, path)
+	delete(s.deadline, path)
+	delete(s.jobIDs, path)
 	s.mu.Unlock()
 }
 
@@ -177,6 +192,8 @@ func (s *Sup) BeginCooling(path string) {
 	defer s.mu.Unlock()
 	s.locks[path] = LockCooling
 	s.until[path] = s.now().Add(CoolingOff)
+	delete(s.pids, path)
+	delete(s.deadline, path)
 }
 
 // Promote moves cooled locks to IDLE.
@@ -192,6 +209,7 @@ func (s *Sup) Promote() {
 		if ok && !now.Before(until) {
 			s.locks[path] = LockIdle
 			delete(s.until, path)
+			delete(s.jobIDs, path)
 		}
 	}
 }
@@ -220,28 +238,90 @@ func (s *Sup) Reason(path string) string {
 	return s.reasons[path]
 }
 
+// ActiveJobs returns a list of actively running worktrees and their PIDs.
+func (s *Sup) ActiveJobs() map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res := make(map[string]int)
+	for path, state := range s.locks {
+		if state == LockRunning {
+			res[path] = s.pids[path]
+		}
+	}
+	return res
+}
+
+// RunningJob describes an active harness job.
+type RunningJob struct {
+	JobID        string
+	WorktreePath string
+	PID          int
+}
+
+// RunningJobs returns a list of actively running worktrees, their job IDs, and PIDs.
+func (s *Sup) RunningJobs() []RunningJob {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var res []RunningJob
+	for path, state := range s.locks {
+		if state == LockRunning {
+			res = append(res, RunningJob{
+				JobID:        s.jobIDs[path],
+				WorktreePath: path,
+				PID:          s.pids[path],
+			})
+		}
+	}
+	return res
+}
+
+// ReapedJob holds details about a reaped job.
+type ReapedJob struct {
+	JobID        string
+	WorktreePath string
+	Reason       string
+}
+
 // Tick cancels harnesses that have reached their execution timeout or died, and finishes cooling-off.
-func (s *Sup) Tick() {
+func (s *Sup) Tick() []ReapedJob {
 	now := s.now()
 	s.mu.Lock()
-	var due []string
+	var dueTimeout []string
+	var dueDied []string
 	for path, state := range s.locks {
 		if state == LockRunning {
 			if deadline, ok := s.deadline[path]; ok && !deadline.After(now) {
-				due = append(due, path)
+				dueTimeout = append(dueTimeout, path)
 			} else {
 				pid := s.pids[path]
 				if pid > 0 && s.alive != nil && !s.alive(pid) {
-					due = append(due, path)
+					dueDied = append(dueDied, path)
 				}
 			}
 		}
 	}
 	s.mu.Unlock()
-	for _, path := range due {
+	var reaped []ReapedJob
+	for _, path := range dueTimeout {
+		jobID := s.JobID(path)
 		s.Cancel(path, ReasonExecutionTimeout)
+		reaped = append(reaped, ReapedJob{
+			JobID:        jobID,
+			WorktreePath: path,
+			Reason:       ReasonExecutionTimeout,
+		})
+	}
+	for _, path := range dueDied {
+		jobID := s.JobID(path)
+		s.Cancel(path, ReasonProcessDied)
+		reaped = append(reaped, ReapedJob{
+			JobID:        jobID,
+			WorktreePath: path,
+			Reason:       ReasonProcessDied,
+		})
 	}
 	s.Promote()
+	return reaped
 }
 
 // Deadline returns the execution deadline armed by Spawn.

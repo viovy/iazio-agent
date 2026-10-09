@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -374,6 +375,67 @@ func TestReconcileHostCheckouts(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "worktree /work/disk-recovered has sufficient disk space; resuming halted queue") {
 		t.Fatalf("missing disk recovery message in stdout: %s", stdout.String())
+	}
+}
+
+func TestReconcileStrandedCheckouts(t *testing.T) {
+	repos := []RepoState{
+		{
+			WorktreePath: "/repos/running-ok",
+			Lock:         "RUNNING_HARNESS",
+			RunningJobID: "job-active",
+		},
+		{
+			WorktreePath: "/repos/stranded-job",
+			Lock:         "RUNNING_HARNESS",
+			RunningJobID: "job-dead",
+		},
+		{
+			WorktreePath: "/repos/idle-normal",
+			Lock:         "IDLE",
+		},
+	}
+	var abandoned []string
+	var remediated []string
+	isLockActive := func(w string) bool {
+		return w == "/repos/running-ok"
+	}
+	abandonJob := func(ctx context.Context, jobID, reason string) error {
+		abandoned = append(abandoned, jobID+":"+reason)
+		return nil
+	}
+	remediateRepo := func(ctx context.Context, hostID, worktree string) error {
+		remediated = append(remediated, hostID+":"+worktree)
+		return nil
+	}
+
+	ReconcileStrandedCheckouts(context.Background(), "mac-mini", repos, isLockActive, abandonJob, remediateRepo, nil, nil)
+
+	if len(abandoned) != 1 || abandoned[0] != "job-dead:process_disappeared_on_host" {
+		t.Fatalf("expected job-dead abandoned, got %v", abandoned)
+	}
+	if len(remediated) != 1 || remediated[0] != "mac-mini:/repos/stranded-job" {
+		t.Fatalf("expected stranded-job remediated, got %v", remediated)
+	}
+}
+
+func TestRunningJobs(t *testing.T) {
+	s := New(nil)
+	_ = s.TrySpawn("/repos/app1")
+	s.mu.Lock()
+	s.pids["/repos/app1"] = 1234
+	s.jobIDs["/repos/app1"] = "job-42"
+	s.mu.Unlock()
+
+	running := s.RunningJobs()
+	if len(running) != 1 {
+		t.Fatalf("expected 1 running job, got %d", len(running))
+	}
+	if running[0].JobID != "job-42" || running[0].WorktreePath != "/repos/app1" || running[0].PID != 1234 {
+		t.Fatalf("unexpected running job: %+v", running[0])
+	}
+	if s.JobID("/repos/app1") != "job-42" {
+		t.Fatalf("expected job-42, got %s", s.JobID("/repos/app1"))
 	}
 }
 
