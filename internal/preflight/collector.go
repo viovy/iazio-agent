@@ -5,6 +5,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/sessionstore"
 )
 
 // GitRunner runs a git command in a working directory and returns trimmed output and error.
@@ -63,6 +65,13 @@ func (c *Collector) Collect(ctx context.Context, worktree, docsHub, kind string)
 	if r.GitWorkTree && c.Git != nil {
 		if out, err := c.Git(ctx, worktree, "status", "--porcelain"); err == nil {
 			r.WorkPorcelain = out
+			if strings.TrimSpace(out) != "" {
+				dCtx := sessionstore.DefaultResolver().DetectDirtyWorktreeContext(worktree)
+				r.DirtyStoryID = dCtx.StoryID
+				r.DirtyReviewFile = dCtx.ReviewFile
+				r.DetectedConversationID = dCtx.ConversationID
+				r.DetectedVerdict = dCtx.Verdict
+			}
 		}
 
 		_, errRef := c.Git(ctx, worktree, "symbolic-ref", "-q", "HEAD")

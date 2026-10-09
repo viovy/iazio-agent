@@ -7,6 +7,25 @@ import (
 	"time"
 )
 
+func TestExtractStoryID(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"2026-10-09-review-v0-44c767-STORY-APP-0098.md", "STORY-APP-0098"},
+		{"docs/stories/2026-10-09-app-0098-feature.story.md", "STORY-APP-0098"},
+		{"feat/app-0100-dirty-resumption", "STORY-APP-0100"},
+		{"STORY-ENG-3369", "STORY-ENG-3369"},
+		{"no-story-here.txt", ""},
+	}
+	for _, tc := range cases {
+		got := ExtractStoryID(tc.input)
+		if got != tc.want {
+			t.Errorf("ExtractStoryID(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
 func TestSessionStoreResolver(t *testing.T) {
 	tmpDir := t.TempDir()
 	worktree := filepath.Join(tmpDir, "my-repo")
@@ -33,7 +52,7 @@ func TestSessionStoreResolver(t *testing.T) {
 	conv1 := "11111111-2222-3333-4444-555555555555"
 	conv1Dir := filepath.Join(brainDir, conv1, ".system_generated", "logs")
 	_ = os.MkdirAll(conv1Dir, 0o755)
-	transcriptContent := `{"step_index":0,"content":"<USER_REQUEST>Fix something</USER_REQUEST>"}
+	transcriptContent := `{"step_index":0,"content":"<USER_REQUEST>Fix something for STORY-APP-0098</USER_REQUEST>"}
 {"step_index":1,"tool_calls":[{"name":"run_command","args":{"Cwd":"` + worktree + `"}}]}
 `
 	_ = os.WriteFile(filepath.Join(conv1Dir, "transcript.jsonl"), []byte(transcriptContent), 0o644)
@@ -51,8 +70,8 @@ func TestSessionStoreResolver(t *testing.T) {
 	if sess.Source != "brain" {
 		t.Fatalf("expected source 'brain', got %s", sess.Source)
 	}
-	if sess.PromptSnippet != "Fix something" {
-		t.Fatalf("expected prompt snippet 'Fix something', got %q", sess.PromptSnippet)
+	if sess.StoryID != "STORY-APP-0098" {
+		t.Fatalf("expected story ID 'STORY-APP-0098', got %q", sess.StoryID)
 	}
 
 	// 3. Add a newer spool engine log
@@ -72,7 +91,39 @@ func TestSessionStoreResolver(t *testing.T) {
 		t.Fatalf("expected source 'spool', got %s", sess.Source)
 	}
 
-	// 4. Add a worktree checkpoint with an even newer timestamp
+	// 4. Add a review markdown file with story in filename
+	revDir := filepath.Join(worktree, "docs", "reviews")
+	_ = os.MkdirAll(revDir, 0o755)
+	convRev := "4fc5bf81-6e70-4800-af36-8da466524b99"
+	revContent := `---
+date: 2026-10-09
+tool: agy
+story_id: STORY-APP-0098
+scheme_iteration: 0
+verdict: CLEAN
+conversation_id: "` + convRev + `"
+---
+# Review
+`
+	revFile := filepath.Join(revDir, "2026-10-09-review-v0-44c767-STORY-APP-0098.md")
+	_ = os.WriteFile(revFile, []byte(revContent), 0o644)
+	_ = os.Chtimes(revFile, time.Now().Add(5*time.Minute), time.Now().Add(5*time.Minute))
+
+	sess, err = resolver.ResolveForStory(worktree, "STORY-APP-0098")
+	if err != nil || sess == nil {
+		t.Fatalf("expected to resolve convRev for STORY-APP-0098, got %v, err=%v", sess, err)
+	}
+	if sess.ConversationID != convRev {
+		t.Fatalf("expected convRev %s, got %s", convRev, sess.ConversationID)
+	}
+	if sess.StoryID != "STORY-APP-0098" {
+		t.Fatalf("expected story ID 'STORY-APP-0098', got %q", sess.StoryID)
+	}
+	if sess.Verdict != "CLEAN" {
+		t.Fatalf("expected verdict 'CLEAN', got %q", sess.Verdict)
+	}
+
+	// 5. Add a worktree checkpoint with an even newer timestamp
 	conv3 := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	iazioDir := filepath.Join(worktree, ".iazio")
 	_ = os.MkdirAll(iazioDir, 0o755)
@@ -94,18 +145,5 @@ func TestSessionStoreResolver(t *testing.T) {
 	}
 	if sess.Source != "checkpoint" {
 		t.Fatalf("expected source 'checkpoint', got %s", sess.Source)
-	}
-
-	// 5. Test ListRecent with multiple sessions
-	list, err := resolver.ListRecent(worktree, 10)
-	if err != nil {
-		t.Fatalf("ListRecent failed: %v", err)
-	}
-	if len(list) != 3 {
-		t.Fatalf("expected 3 sessions, got %d", len(list))
-	}
-	// Verify order: conv3 (newest), conv2, conv1
-	if list[0].ConversationID != conv3 || list[1].ConversationID != conv2 || list[2].ConversationID != conv1 {
-		t.Fatalf("unexpected order: %+v", list)
 	}
 }

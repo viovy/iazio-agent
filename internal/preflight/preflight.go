@@ -60,8 +60,12 @@ type Report struct {
 	DefaultBranch string
 	HasUpstream   bool
 	DocsHubOK     bool
-	GitAuthOK     bool
-	GitWorkTree   bool
+	GitAuthOK              bool
+	GitWorkTree            bool
+	DirtyStoryID           string `json:"DirtyStoryID,omitempty"`
+	DirtyReviewFile        string `json:"DirtyReviewFile,omitempty"`
+	DetectedConversationID string `json:"DetectedConversationID,omitempty"`
+	DetectedVerdict        string `json:"DetectedVerdict,omitempty"`
 }
 
 // Decision is the spawn gate result.
