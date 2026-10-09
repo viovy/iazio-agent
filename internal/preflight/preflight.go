@@ -89,6 +89,15 @@ func Decide(r Report) Decision {
 	if r.Kind == KindIntervention {
 		return Decision{}
 	}
+	if r.Kind == KindResume {
+		// Resumption is explicitly intended to recover an in-flight prompt execution
+		// that left uncommitted work, modified submodules, or local review reports in the worktree.
+		// It permits dirty porcelain and untracked branches, skipping ReasonDirty and ReasonUntracked.
+		if !r.HeadAttached {
+			return Decision{Reason: ReasonDetached, PauseQueue: true}
+		}
+		return Decision{}
+	}
 	hubDirty := strings.TrimSpace(r.HubPorcelain) != ""
 	workDirty := strings.TrimSpace(r.WorkPorcelain) != ""
 	if r.Kind == KindRefinement {
