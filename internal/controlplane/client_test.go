@@ -306,4 +306,41 @@ func TestLoopOnTick(t *testing.T) {
 	}
 }
 
+func TestLoopRegisterRetry(t *testing.T) {
+	var regAttempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/register") {
+			regAttempts++
+			if regAttempts == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/poll") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		time.Sleep(1200 * time.Millisecond)
+		cancel()
+	}()
+
+	err := Client{BaseURL: srv.URL}.Loop(ctx, "runner-1", "permanent", 10*time.Millisecond, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if regAttempts < 2 {
+		t.Fatalf("expected at least 2 register attempts, got %d", regAttempts)
+	}
+}
+
 

@@ -41,8 +41,11 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		return fmt.Errorf("usage: iazio-agent version|auth|service|update|run")
 	}
 	switch args[0] {
-	case "version":
+	case "version", "--version", "-v":
 		fmt.Fprintln(stdout, formatVersion())
+		return nil
+	case "help", "--help", "-h":
+		fmt.Fprintln(stdout, "usage: iazio-agent version|auth|service|update|run")
 		return nil
 	case "auth":
 		return runAuth(ctx, args[1:], stdout, getenv)
@@ -424,8 +427,7 @@ func runService(args []string, stdout io.Writer, getenv func(string) string) err
 		if action == "install" {
 			return service.InstallWindows(bin)
 		}
-		_, err = service.Apply(goos, action, bin, false, force, execCommand)
-		return err
+		return applyWindows(action, bin, stdout)
 	default:
 		if action == "install" {
 			return service.InstallLinux(bin)
@@ -488,6 +490,51 @@ func bootoutDarwin(remove bool) error {
 	return os.Remove(filepath.Join(home, "Library", "LaunchAgents", "io.iazio.iazio-agent.plist"))
 }
 
+// parseSchtasksStatus extracts the Status field from `schtasks /Query /FO LIST` output.
+// ok is false when the Status: line is absent so callers fail closed instead of
+// treating unparseable output as a successful status probe.
+func parseSchtasksStatus(out string) (running bool, status string, ok bool) {
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if strings.HasPrefix(trimmed, "Status:") {
+			statusVal := strings.TrimSpace(strings.TrimPrefix(trimmed, "Status:"))
+			return strings.EqualFold(statusVal, "Running"), statusVal, true
+		}
+	}
+	return false, "", false
+}
+
+func applyWindows(action, _ string, stdout io.Writer) error {
+	switch action {
+	case "status":
+		cmd := exec.Command("schtasks", "/Query", "/TN", "iazio-agent", "/FO", "LIST")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("service not installed: %s", strings.TrimSpace(string(out)))
+		}
+		running, statusVal, ok := parseSchtasksStatus(string(out))
+		if !ok {
+			return fmt.Errorf("service status unavailable: Status field missing from schtasks output")
+		}
+		if running {
+			fmt.Fprintln(stdout, "running")
+			return nil
+		}
+		return fmt.Errorf("installed but not running (%s)", statusVal)
+	case "start":
+		return execCommand("schtasks", "/Run", "/TN", "iazio-agent")
+	case "stop":
+		return execCommand("schtasks", "/End", "/TN", "iazio-agent")
+	case "restart":
+		_ = execCommand("schtasks", "/End", "/TN", "iazio-agent")
+		return execCommand("schtasks", "/Run", "/TN", "iazio-agent")
+	case "uninstall":
+		return execCommand("schtasks", "/Delete", "/TN", "iazio-agent", "/F")
+	default:
+		return fmt.Errorf("unknown service action %s", action)
+	}
+}
+
 func installCanonicalBinary() (string, error) {
 	src, err := os.Executable()
 	if err != nil {
@@ -500,11 +547,15 @@ func installCanonicalBinary() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve home: %w", err)
 	}
-	dest := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+	binName := "iazio-agent"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	dest := filepath.Join(home, ".iazio", "bin", binName)
 	if err := copyBinary(src, dest); err != nil {
 		return "", err
 	}
-	_ = copyBinary(src, filepath.Join(home, ".local", "bin", "iazio-agent"))
+	_ = copyBinary(src, filepath.Join(home, ".local", "bin", binName))
 	return dest, nil
 }
 

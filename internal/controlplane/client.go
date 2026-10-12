@@ -104,8 +104,25 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 	if len(profile) > 0 {
 		prof = profile[0]
 	}
-	if err := c.Register(ctx, hostID, kind, prof); err != nil {
-		return err
+	backoff := 500 * time.Millisecond
+	for {
+		if err := c.Register(ctx, hostID, kind, prof); err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(backoff):
+		}
+		if backoff < every {
+			backoff *= 2
+			if backoff > every {
+				backoff = every
+			}
+		}
 	}
 	tick := time.NewTicker(every)
 	defer tick.Stop()

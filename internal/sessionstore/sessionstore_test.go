@@ -53,7 +53,7 @@ func TestSessionStoreResolver(t *testing.T) {
 	conv1Dir := filepath.Join(brainDir, conv1, ".system_generated", "logs")
 	_ = os.MkdirAll(conv1Dir, 0o755)
 	transcriptContent := `{"step_index":0,"content":"<USER_REQUEST>Fix something for STORY-APP-0098</USER_REQUEST>"}
-{"step_index":1,"tool_calls":[{"name":"run_command","args":{"Cwd":"` + worktree + `"}}]}
+{"step_index":1,"tool_calls":[{"name":"run_command","args":{"Cwd":"` + filepath.ToSlash(worktree) + `"}}]}
 `
 	_ = os.WriteFile(filepath.Join(conv1Dir, "transcript.jsonl"), []byte(transcriptContent), 0o644)
 
@@ -130,7 +130,7 @@ conversation_id: "` + convRev + `"
 	cpJSON := `{
   "job_id": "job-99",
   "engine": "agy",
-  "worktree_path": "` + worktree + `",
+  "worktree_path": "` + filepath.ToSlash(worktree) + `",
   "conversation_id": "` + conv3 + `",
   "started_at": "` + time.Now().Add(10*time.Minute).UTC().Format(time.RFC3339) + `"
 }`

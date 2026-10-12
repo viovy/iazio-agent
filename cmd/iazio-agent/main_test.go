@@ -33,11 +33,46 @@ func TestFormatVersion(t *testing.T) {
 	}
 }
 
+func TestParseSchtasksStatus(t *testing.T) {
+	running, status, ok := parseSchtasksStatus("HostName: DESKTOP\nTaskName: \\iazio-agent\nStatus: Running\n")
+	if !ok || !running || !strings.EqualFold(status, "Running") {
+		t.Fatalf("running case: ok=%v running=%v status=%q", ok, running, status)
+	}
+	running, status, ok = parseSchtasksStatus("Status: Ready\r\n")
+	if !ok || running || status != "Ready" {
+		t.Fatalf("ready case: ok=%v running=%v status=%q", ok, running, status)
+	}
+	_, _, ok = parseSchtasksStatus("TaskName: \\iazio-agent\nLast Result: 0\n")
+	if ok {
+		t.Fatal("expected missing Status field to yield ok=false")
+	}
+}
+
 func TestExecuteCommands(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var stdout, stderr bytes.Buffer
 	if err := execute(ctx, []string{"version"}, &stdout, &stderr, func(string) string { return "" }); err != nil || !strings.Contains(stdout.String(), "iazio-agent ") {
+		t.Fatal(err, stdout.String())
+	}
+	stdout.Reset()
+	if err := execute(ctx, []string{"--version"}, &stdout, &stderr, func(string) string { return "" }); err != nil || !strings.Contains(stdout.String(), "iazio-agent ") {
+		t.Fatal(err, stdout.String())
+	}
+	stdout.Reset()
+	if err := execute(ctx, []string{"-v"}, &stdout, &stderr, func(string) string { return "" }); err != nil || !strings.Contains(stdout.String(), "iazio-agent ") {
+		t.Fatal(err, stdout.String())
+	}
+	stdout.Reset()
+	if err := execute(ctx, []string{"--help"}, &stdout, &stderr, func(string) string { return "" }); err != nil || !strings.Contains(stdout.String(), "usage: iazio-agent") {
+		t.Fatal(err, stdout.String())
+	}
+	stdout.Reset()
+	if err := execute(ctx, []string{"-h"}, &stdout, &stderr, func(string) string { return "" }); err != nil || !strings.Contains(stdout.String(), "usage: iazio-agent") {
+		t.Fatal(err, stdout.String())
+	}
+	stdout.Reset()
+	if err := execute(ctx, []string{"help"}, &stdout, &stderr, func(string) string { return "" }); err != nil || !strings.Contains(stdout.String(), "usage: iazio-agent") {
 		t.Fatal(err, stdout.String())
 	}
 	stdout.Reset()
@@ -98,7 +133,7 @@ func TestExecuteRunConnected(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		for i := 0; i < 40; i++ {
+		for i := 0; i < 60; i++ {
 			if heartbeatReceived {
 				break
 			}
@@ -148,7 +183,8 @@ func TestExecuteRunDefaultHostID(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		time.Sleep(50 * time.Millisecond)
+		// Same PATH inventory cost as TestExecuteRunConnected on Windows.
+		time.Sleep(1500 * time.Millisecond)
 		cancel()
 	}()
 

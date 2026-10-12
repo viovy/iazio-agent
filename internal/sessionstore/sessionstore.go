@@ -420,9 +420,11 @@ func (r *Resolver) scanBrainSessions(worktree string) []Session {
 		promptSnippet := ""
 		storyID := ""
 
+		toSlash := filepath.ToSlash(worktree)
+		escaped := strings.ReplaceAll(worktree, "\\", "\\\\")
 		for i := 0; i < 15 && scanner.Scan(); i++ {
 			text := scanner.Text()
-			if strings.Contains(text, worktree) {
+			if strings.Contains(text, worktree) || strings.Contains(text, toSlash) || strings.Contains(text, escaped) {
 				matched = true
 			}
 			if storyID == "" {
