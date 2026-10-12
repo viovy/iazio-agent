@@ -3,9 +3,9 @@
 package supervisor
 
 import (
-	"os"
 	"os/exec"
 	"strconv"
+	"syscall"
 )
 
 func setProcGroup(cmd *exec.Cmd) {
@@ -23,9 +23,18 @@ func isProcessAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	p, err := os.FindProcess(pid)
+	const processQueryLimitedInformation = 0x1000
+	const stillActive = 259
+
+	h, err := syscall.OpenProcess(processQueryLimitedInformation, false, uint32(pid))
 	if err != nil {
 		return false
 	}
-	return p != nil
+	defer syscall.CloseHandle(h)
+
+	var exitCode uint32
+	if err := syscall.GetExitCodeProcess(h, &exitCode); err != nil {
+		return false
+	}
+	return exitCode == stillActive
 }

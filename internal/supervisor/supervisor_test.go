@@ -166,7 +166,7 @@ func TestReconcileOrphans(t *testing.T) {
 	if !res.PauseQueue || res.HaltCode != "HALTED_DIRTY" || res.Healing != 0 {
 		t.Fatal(res)
 	}
-	if res.Locks[filepath.Clean("/repos/leaf-01")] != LockIdle || len(res.Leases) != 2 || res.Leases[0].Reason != ReasonHostRestart || res.Leases[0].Healing != 0 {
+	if res.Locks[cleanPath("/repos/leaf-01")] != LockIdle || len(res.Leases) != 2 || res.Leases[0].Reason != ReasonHostRestart || res.Leases[0].Healing != 0 {
 		t.Fatal(res)
 	}
 }

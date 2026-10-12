@@ -44,6 +44,13 @@ type ReconcileResult struct {
 	Healing           int
 }
 
+func cleanPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	return filepath.ToSlash(filepath.Clean(p))
+}
+
 // Reconcile terminates orphan harnesses on registered checkouts, prunes only idle checkouts,
 // marks stranded leases failed with host_restart, and pauses when porcelain is dirty.
 // Healing is not incremented.
@@ -51,7 +58,7 @@ func Reconcile(procs []Proc, leases []Lease, porcelain map[string]string, signal
 	order := make([]string, 0, len(leases))
 	registered := map[string]struct{}{}
 	for _, lease := range leases {
-		path := filepath.Clean(lease.Worktree)
+		path := cleanPath(lease.Worktree)
 		if _, ok := registered[path]; ok {
 			continue
 		}
@@ -61,7 +68,7 @@ func Reconcile(procs []Proc, leases []Lease, porcelain map[string]string, signal
 	still := make([]Proc, 0, len(procs))
 	terminated := make([]int, 0)
 	for _, proc := range procs {
-		cwd := filepath.Clean(proc.Cwd)
+		cwd := cleanPath(proc.Cwd)
 		_, onRegistered := registered[cwd]
 		if orphanName(proc.Name) && onRegistered {
 			if signal == nil || signal(proc.PID, "TERM") == nil {
@@ -73,7 +80,7 @@ func Reconcile(procs []Proc, leases []Lease, porcelain map[string]string, signal
 	}
 	held := map[string]bool{}
 	for _, proc := range still {
-		held[filepath.Clean(proc.Cwd)] = true
+		held[cleanPath(proc.Cwd)] = true
 	}
 	pruned := make([]string, 0)
 	unlocked := make([]string, 0)
@@ -88,15 +95,15 @@ func Reconcile(procs []Proc, leases []Lease, porcelain map[string]string, signal
 			unlocked = append(unlocked, path)
 		}
 	}
-	cleanedPorcelain := make(map[string]string, len(porcelain))
+	cleanPorcelain := make(map[string]string, len(porcelain))
 	for k, v := range porcelain {
-		cleanedPorcelain[filepath.Clean(k)] = v
+		cleanPorcelain[cleanPath(k)] = v
 	}
 	locks := make(map[string]string, len(order))
 	dirty := false
 	for _, path := range order {
 		locks[path] = LockIdle
-		if strings.TrimSpace(cleanedPorcelain[path]) != "" {
+		if strings.TrimSpace(cleanPorcelain[path]) != "" {
 			dirty = true
 		}
 	}
@@ -151,9 +158,9 @@ func DiscardCheckout(idle bool, docsHub bool, lock func(time.Duration) error, gi
 }
 
 func harnessLive(procs []Proc, worktree string) bool {
-	want := filepath.Clean(worktree)
+	want := cleanPath(worktree)
 	for _, proc := range procs {
-		if filepath.Clean(proc.Cwd) == want && baseName(proc.Name) == "iazio-harness" {
+		if cleanPath(proc.Cwd) == want && baseName(proc.Name) == "iazio-harness" {
 			return true
 		}
 	}

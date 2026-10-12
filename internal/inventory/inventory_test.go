@@ -106,8 +106,15 @@ func TestDefaultDirsOrder(t *testing.T) {
 func TestInspectInstalledVersion(t *testing.T) {
 	dir := t.TempDir()
 	binPath := filepath.Join(dir, "mytool")
-	if err := os.WriteFile(binPath, []byte("#!/bin/sh\necho 'mytool version v1.4.2'\n"), 0o755); err != nil {
-		t.Fatal(err)
+	if runtime.GOOS == "windows" {
+		binPath = filepath.Join(dir, "mytool.cmd")
+		if err := os.WriteFile(binPath, []byte("@echo mytool version v1.4.2\r\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		if err := os.WriteFile(binPath, []byte("#!/bin/sh\necho 'mytool version v1.4.2'\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	// Without .version file, should execute and parse
 	ver := InspectInstalledVersion(binPath)

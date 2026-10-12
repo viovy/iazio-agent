@@ -361,12 +361,22 @@ func InstallWindowsAt(home, bin, user string, run func(name string, args ...stri
 		return errors.New("schtasks runner is required")
 	}
 	dir := filepath.Join(home, ".iazio", "tasks")
+	logDir := filepath.Join(home, ".iazio", "logs")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return err
 	}
 	batPath := filepath.Join(dir, "iazio-agent.bat")
 	xmlPath := filepath.Join(dir, "iazio-agent.xml")
-	bat := fmt.Sprintf("@echo off\r\nset \"IAZIO_AGENT_NONINTERACTIVE=1\"\r\n\"%s\" run\r\n", bin)
+	logPath := filepath.Join(logDir, "agent.log")
+
+	apiLine := ""
+	if apiEnv := resolveHarnessAPIURL(); apiEnv != "" {
+		apiLine = fmt.Sprintf("set \"IAZIO_HARNESS_API_URL=%s\"\r\n", apiEnv)
+	}
+	bat := fmt.Sprintf("@echo off\r\nset \"IAZIO_AGENT_NONINTERACTIVE=1\"\r\n%s\"%s\" run >> \"%s\" 2>&1\r\n", apiLine, bin, logPath)
 	xmlDoc := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>%s</UserId></LogonTrigger></Triggers>

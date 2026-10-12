@@ -41,6 +41,26 @@ func TestExecuteCommands(t *testing.T) {
 		t.Fatal(err, stdout.String())
 	}
 	stdout.Reset()
+	if err := execute(ctx, []string{"--version"}, &stdout, &stderr, func(string) string { return "" }); err != nil || !strings.Contains(stdout.String(), "iazio-agent ") {
+		t.Fatal(err, stdout.String())
+	}
+	stdout.Reset()
+	if err := execute(ctx, []string{"-v"}, &stdout, &stderr, func(string) string { return "" }); err != nil || !strings.Contains(stdout.String(), "iazio-agent ") {
+		t.Fatal(err, stdout.String())
+	}
+	stdout.Reset()
+	if err := execute(ctx, []string{"--help"}, &stdout, &stderr, func(string) string { return "" }); err != nil || !strings.Contains(stdout.String(), "usage: iazio-agent") {
+		t.Fatal(err, stdout.String())
+	}
+	stdout.Reset()
+	if err := execute(ctx, []string{"-h"}, &stdout, &stderr, func(string) string { return "" }); err != nil || !strings.Contains(stdout.String(), "usage: iazio-agent") {
+		t.Fatal(err, stdout.String())
+	}
+	stdout.Reset()
+	if err := execute(ctx, []string{"help"}, &stdout, &stderr, func(string) string { return "" }); err != nil || !strings.Contains(stdout.String(), "usage: iazio-agent") {
+		t.Fatal(err, stdout.String())
+	}
+	stdout.Reset()
 	err := execute(ctx, []string{"auth", "login"}, &stdout, &stderr, func(k string) string {
 		if k == "IAZIO_AGENT_NONINTERACTIVE" {
 			return "1"
