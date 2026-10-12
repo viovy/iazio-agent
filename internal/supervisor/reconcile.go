@@ -2,9 +2,12 @@ package supervisor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -279,6 +282,27 @@ func ReconcileHostCheckouts(
 								fmt.Fprintf(stderr, "resume repo error for %s: %v\n", worktree, err)
 							}
 						}
+						continue
+					}
+
+					// Worktree is dirty: check if this is an auto-healable superseded branch
+					healable, sirID, sirBranch, _ := DetectAutoHealableSIR(worktree)
+					if healable {
+						gitCmd := func(args ...string) error {
+							cmd := exec.Command("git", append([]string{"-C", worktree}, args...)...)
+							return cmd.Run()
+						}
+						if err := AutoHealSupersededWorktree(true, sirBranch, gitCmd); err == nil {
+							_ = ArchiveSIR(worktree, sirID)
+							if stdout != nil {
+								fmt.Fprintf(stdout, "[reconcile] auto-healed superseded worktree %s (SIR %s, branch %s); resuming paused queue\n", worktree, sirID, sirBranch)
+							}
+							if err := resume(worktree); err != nil && stderr != nil {
+								fmt.Fprintf(stderr, "resume repo after auto-heal error for %s: %v\n", worktree, err)
+							}
+						} else if stderr != nil {
+							fmt.Fprintf(stderr, "auto-heal error for %s: %v\n", worktree, err)
+						}
 					}
 				}
 			}
@@ -346,4 +370,114 @@ func ReconcileStrandedCheckouts(
 			}
 		}
 	}
+}
+
+// SIRPayload is the minimal representation of an intervention report in tmp/reports/.
+type SIRPayload struct {
+	ID           string `json:"id"`
+	StoryID      string `json:"story_id"`
+	Category     string `json:"category"`
+	AutoHealable bool   `json:"auto_healable"`
+	WorktreePath string `json:"worktree_path"`
+}
+
+// DetectAutoHealableSIR checks tmp/reports for any unhandled auto-healable intervention request.
+// Returns healable, sirID, currentBranch, and any error.
+func DetectAutoHealableSIR(worktree string, gitBranchReader ...func(string) (string, error)) (bool, string, string, error) {
+	reportsDir := filepath.Join(worktree, "tmp", "reports")
+	entries, err := os.ReadDir(reportsDir)
+	if err != nil {
+		return false, "", "", nil
+	}
+	var targetSIR *SIRPayload
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, "intervention-") && strings.HasSuffix(name, ".json") {
+			data, err := os.ReadFile(filepath.Join(reportsDir, name))
+			if err != nil {
+				continue
+			}
+			var sir SIRPayload
+			if err := json.Unmarshal(data, &sir); err == nil {
+				if sir.AutoHealable && sir.Category == "SUPERSEDED_BRANCH" {
+					targetSIR = &sir
+					break
+				}
+			}
+		}
+	}
+	if targetSIR == nil {
+		return false, "", "", nil
+	}
+
+	branch := ""
+	if len(gitBranchReader) > 0 && gitBranchReader[0] != nil {
+		branch, _ = gitBranchReader[0](worktree)
+	} else {
+		cmd := exec.Command("git", "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD")
+		if out, err := cmd.CombinedOutput(); err == nil {
+			branch = strings.TrimSpace(string(out))
+		}
+	}
+	if branch == "" || branch == "main" || branch == "master" {
+		return false, targetSIR.ID, branch, nil
+	}
+	return true, targetSIR.ID, branch, nil
+}
+
+// ArchiveSIR marks an intervention report as healed by renaming it.
+func ArchiveSIR(worktree, sirID string) error {
+	reportsDir := filepath.Join(worktree, "tmp", "reports")
+	entries, err := os.ReadDir(reportsDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, "intervention-") && strings.HasSuffix(name, ".json") {
+			fullPath := filepath.Join(reportsDir, name)
+			data, err := os.ReadFile(fullPath)
+			if err != nil {
+				continue
+			}
+			var sir SIRPayload
+			if err := json.Unmarshal(data, &sir); err == nil && sir.ID == sirID {
+				return os.Rename(fullPath, fullPath+".healed")
+			}
+		}
+	}
+	return nil
+}
+
+// AutoHealSupersededWorktree returns a stranded duplicate branch worktree back to clean origin/main.
+func AutoHealSupersededWorktree(idle bool, branch string, git func(args ...string) error) error {
+	if !idle {
+		return errors.New("auto-heal requires IDLE")
+	}
+	if git == nil {
+		return errors.New("git runner is not configured")
+	}
+	if branch == "" || branch == "main" || branch == "master" {
+		return nil
+	}
+	if err := git("reset", "--hard"); err != nil {
+		return fmt.Errorf("reset hard: %w", err)
+	}
+	if err := git("clean", "-fd"); err != nil {
+		return fmt.Errorf("clean fd: %w", err)
+	}
+	if err := git("checkout", "main"); err != nil {
+		if errMaster := git("checkout", "master"); errMaster != nil {
+			return fmt.Errorf("checkout main/master: %w", err)
+		}
+	}
+	_ = git("pull", "--ff-only")
+	_ = git("branch", "-D", branch)
+	return nil
 }

@@ -342,14 +342,36 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							hubPorc = strings.TrimSpace(string(out))
 						}
 					}
-					ok := (waitErr == nil && exitCode == 0)
+					isClean := (workPorc == "")
+					aseOk := (waitErr == nil && exitCode == 0 && isClean)
+
+					// Check for auto-healable SIR immediately post-run
+					if !isClean {
+						healable, sirID, sirBranch, _ := supervisor.DetectAutoHealableSIR(worktree)
+						if healable {
+							gitCmd := func(args ...string) error {
+								return exec.Command("git", append([]string{"-C", worktree}, args...)...).Run()
+							}
+							if err := supervisor.AutoHealSupersededWorktree(true, sirBranch, gitCmd); err == nil {
+								_ = supervisor.ArchiveSIR(worktree, sirID)
+								if out, err := exec.Command("git", "-C", worktree, "status", "--porcelain").CombinedOutput(); err == nil {
+									workPorc = strings.TrimSpace(string(out))
+									if workPorc == "" {
+										isClean = true
+										aseOk = (waitErr == nil && exitCode == 0)
+									}
+								}
+							}
+						}
+					}
+
 					finish := controlplane.FinishReport{
 						Kind:          kind,
-						ASEComplete:   ok,
+						ASEComplete:   aseOk,
 						WorkPorcelain: workPorc,
 						HubPorcelain:  hubPorc,
-						StoryDraftOK:  ok,
-						HubPushOK:     ok,
+						StoryDraftOK:  (waitErr == nil && exitCode == 0),
+						HubPushOK:     (waitErr == nil && exitCode == 0),
 					}
 					_, _ = client.PostFinish(context.Background(), host, worktree, jobID, finish)
 				}(job.WorktreePath, job.DocsHubPath, job.ID, job.Kind)
