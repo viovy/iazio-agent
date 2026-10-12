@@ -490,7 +490,21 @@ func bootoutDarwin(remove bool) error {
 	return os.Remove(filepath.Join(home, "Library", "LaunchAgents", "io.iazio.iazio-agent.plist"))
 }
 
-func applyWindows(action, bin string, stdout io.Writer) error {
+// parseSchtasksStatus extracts the Status field from `schtasks /Query /FO LIST` output.
+// ok is false when the Status: line is absent so callers fail closed instead of
+// treating unparseable output as a successful status probe.
+func parseSchtasksStatus(out string) (running bool, status string, ok bool) {
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if strings.HasPrefix(trimmed, "Status:") {
+			statusVal := strings.TrimSpace(strings.TrimPrefix(trimmed, "Status:"))
+			return strings.EqualFold(statusVal, "Running"), statusVal, true
+		}
+	}
+	return false, "", false
+}
+
+func applyWindows(action, _ string, stdout io.Writer) error {
 	switch action {
 	case "status":
 		cmd := exec.Command("schtasks", "/Query", "/TN", "iazio-agent", "/FO", "LIST")
@@ -498,20 +512,15 @@ func applyWindows(action, bin string, stdout io.Writer) error {
 		if err != nil {
 			return fmt.Errorf("service not installed: %s", strings.TrimSpace(string(out)))
 		}
-		outStr := string(out)
-		for _, line := range strings.Split(outStr, "\n") {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "Status:") {
-				statusVal := strings.TrimSpace(strings.TrimPrefix(trimmed, "Status:"))
-				if strings.EqualFold(statusVal, "Running") {
-					fmt.Fprintln(stdout, "running")
-					return nil
-				}
-				return fmt.Errorf("installed but not running (%s)", statusVal)
-			}
+		running, statusVal, ok := parseSchtasksStatus(string(out))
+		if !ok {
+			return fmt.Errorf("service status unavailable: Status field missing from schtasks output")
 		}
-		fmt.Fprintln(stdout, strings.TrimSpace(outStr))
-		return nil
+		if running {
+			fmt.Fprintln(stdout, "running")
+			return nil
+		}
+		return fmt.Errorf("installed but not running (%s)", statusVal)
 	case "start":
 		return execCommand("schtasks", "/Run", "/TN", "iazio-agent")
 	case "stop":
