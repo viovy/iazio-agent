@@ -497,11 +497,11 @@ func TestDetectAutoHealableSIR_And_Archive(t *testing.T) {
   "schema_version": 1,
   "id": "SIR-1051-12345",
   "job_id": "job-1051",
-  "story_id": "STORY-IAZIO-0098",
+  "story_id": "STORY-APP-0098",
   "category": "SUPERSEDED_BRANCH",
   "auto_healable": true
 }`
-	sirPath := filepath.Join(reportsDir, "intervention-story-iazio-0098-job-1051.json")
+	sirPath := filepath.Join(reportsDir, "intervention-story-app-0098-job-1051.json")
 	if err := os.WriteFile(sirPath, []byte(sirJSON), 0644); err != nil {
 		t.Fatalf("failed to write test SIR: %v", err)
 	}
