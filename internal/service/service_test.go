@@ -126,7 +126,13 @@ func TestInstallLinuxAndWindowsUnits(t *testing.T) {
 	if !strings.Contains(decoded, `id="Author"`) || !strings.Contains(decoded, "LeastPrivilege") {
 		t.Fatal(decoded)
 	}
+	if !strings.Contains(decoded, "MultipleInstancesPolicy") || !strings.Contains(decoded, "TimeTrigger") {
+		t.Fatal(decoded)
+	}
 	if !strings.Contains(strings.Join(cmds, "\n"), "schtasks /Create") {
+		t.Fatal(cmds)
+	}
+	if !strings.Contains(strings.Join(cmds, "\n"), "schtasks /Run") {
 		t.Fatal(cmds)
 	}
 	if msg := WSLSystemdBlock(); strings.Contains(msg, "WSL") && !strings.Contains(msg, "wsl.conf") {
@@ -227,6 +233,58 @@ func TestSuiteAllowed(t *testing.T) {
 				t.Fatalf("allow %v, want %v", got, tt.allow)
 			}
 		})
+	}
+}
+
+func TestUserDaemonLinuxFallback(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, "bin", "iazio-agent")
+	_ = os.MkdirAll(filepath.Dir(bin), 0o755)
+	_ = os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755)
+
+	var runs []string
+	run := func(name string, args ...string) error {
+		runs = append(runs, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	if err := InstallUserDaemonAt(home, bin, run); err != nil {
+		t.Fatal(err)
+	}
+	runner := filepath.Join(home, ".iazio", "daemon", "runner.sh")
+	if _, err := os.Stat(runner); err != nil {
+		t.Fatalf("runner script missing: %v", err)
+	}
+	body, _ := os.ReadFile(runner)
+	if !strings.Contains(string(body), "IAZIO_AGENT_NONINTERACTIVE=1") || !strings.Contains(string(body), "IAZIO_HARNESS_API_URL") {
+		t.Fatalf("unexpected runner content: %s", string(body))
+	}
+
+	if err := UninstallUserDaemonAt(home); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(runner); !os.IsNotExist(err) {
+		t.Fatalf("runner should be removed after uninstall: %v", err)
+	}
+}
+
+func TestResolveHarnessAPIURLDefaults(t *testing.T) {
+	t.Setenv("IAZIO_HARNESS_API_URL", "")
+	home := t.TempDir()
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("HOME", home)
+
+	url := resolveHarnessAPIURL()
+	if url != DefaultFleetAPI {
+		t.Fatalf("expected DefaultFleetAPI %q, got %q", DefaultFleetAPI, url)
+	}
+
+	// Now set in config.json
+	cfgDir := filepath.Join(home, ".iazio")
+	_ = os.MkdirAll(cfgDir, 0o755)
+	_ = os.WriteFile(filepath.Join(cfgDir, "config.json"), []byte(`{"endpoints":{"harness_api":"https://custom.fleet.local"}}`), 0o600)
+	if got := resolveHarnessAPIURL(); got != "https://custom.fleet.local" {
+		t.Fatalf("expected custom URL from config.json, got %q", got)
 	}
 }
 

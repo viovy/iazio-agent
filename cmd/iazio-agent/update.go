@@ -129,7 +129,37 @@ func resolveLocalAPI(getenv func(string) string) string {
 			}
 		}
 	}
-	return "http://localhost:8090"
+	return service.DefaultFleetAPI
+}
+
+func defaultBaselineManifest(profile string) ManifestResponse {
+	return ManifestResponse{
+		Profile: profile,
+		InstallRoots: ManifestInstallRoots{
+			Unix: ManifestInstallRootPaths{
+				Primary:  "~/.local/bin",
+				Fallback: "~/.iazio/bin",
+			},
+			Windows: ManifestInstallRootPaths{
+				Primary:  "%USERPROFILE%/bin",
+				Fallback: "%USERPROFILE%/.iazio/bin",
+			},
+		},
+		Endpoints: map[string]string{
+			"harness_api": "https://tian.go.ro/iazio-harness-api",
+			"iazio_api":   "https://tian.go.ro/iazio-api",
+		},
+		Tools: []ManifestToolItem{
+			{Name: "iazio-agent", Repository: "viovy/iazio-agent", BinaryName: "iazio-agent", Description: "Workstation runner daemon", Tier: "baseline"},
+			{Name: "iazio-harness", Repository: "viovy/iazio-harness", BinaryName: "iazio-harness", Description: "Prompt execution harness", Tier: "baseline"},
+			{Name: "iazio-harvester", Repository: "viovy/iazio-harvester", BinaryName: "iazio-harvester", Description: "Conversation harvester", Tier: "baseline"},
+			{Name: "autopilot", Repository: "viovy/autopilot", BinaryName: "autopilot", Description: "Autopilot CLI", Tier: "baseline"},
+			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", BinaryName: "autopilot-fleet", Description: "Fleet orchestration plugin", Tier: "baseline"},
+			{Name: "autopilot-story", Repository: "viovy/autopilot-plugins-internal", BinaryName: "autopilot-story", Description: "Story lifecycle plugin", Tier: "baseline"},
+			{Name: "autopilot-backlog", Repository: "viovy/autopilot-plugins-internal", BinaryName: "autopilot-backlog", Description: "Backlog management plugin", Tier: "baseline"},
+			{Name: "iazio-mcp", Repository: "viovy/iazio-mcp", BinaryName: "iazio-mcp", Description: "MCP protocol tool bridge", Tier: "baseline"},
+		},
+	}
 }
 
 type UpdateOptions struct {
@@ -177,13 +207,16 @@ func performUpdate(ctx context.Context, opts UpdateOptions, stdout, stderr io.Wr
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, fmt.Errorf("fetch manifest returned HTTP %d", resp.StatusCode)
-	}
-
 	var manifest ManifestResponse
-	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
-		return false, fmt.Errorf("decode manifest: %w", err)
+	if resp.StatusCode == http.StatusNotFound {
+		// Fallback to baseline default profile if control plane hasn't registered profile yet
+		manifest = defaultBaselineManifest(opts.Profile)
+	} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, fmt.Errorf("fetch manifest returned HTTP %d", resp.StatusCode)
+	} else {
+		if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
+			return false, fmt.Errorf("decode manifest: %w", err)
+		}
 	}
 
 	if len(manifest.Endpoints) > 0 {
