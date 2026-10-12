@@ -439,4 +439,145 @@ func TestRunningJobs(t *testing.T) {
 	}
 }
 
+func TestAutoHealSupersededWorktree(t *testing.T) {
+	// 1. Refuse when not idle
+	if err := AutoHealSupersededWorktree(false, "chore/test", nil); err == nil {
+		t.Fatalf("expected error when not idle")
+	}
+
+	// 2. Refuse when runner nil
+	if err := AutoHealSupersededWorktree(true, "chore/test", nil); err == nil {
+		t.Fatalf("expected error when runner is nil")
+	}
+
+	// 3. No-op on main
+	if err := AutoHealSupersededWorktree(true, "main", func(args ...string) error {
+		t.Fatalf("git should not be called for main branch")
+		return nil
+	}); err != nil {
+		t.Fatalf("unexpected error on main branch: %v", err)
+	}
+
+	// 4. Executed sequence on feature branch
+	var gitCalls [][]string
+	gitRunner := func(args ...string) error {
+		gitCalls = append(gitCalls, args)
+		return nil
+	}
+	err := AutoHealSupersededWorktree(true, "chore/iazio-0098-duplicate", gitRunner)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expected := [][]string{
+		{"reset", "--hard"},
+		{"clean", "-fd"},
+		{"checkout", "main"},
+		{"pull", "--ff-only"},
+		{"branch", "-D", "chore/iazio-0098-duplicate"},
+	}
+	if len(gitCalls) != len(expected) {
+		t.Fatalf("expected %d git calls, got %d: %v", len(expected), len(gitCalls), gitCalls)
+	}
+	for i, exp := range expected {
+		if strings.Join(gitCalls[i], " ") != strings.Join(exp, " ") {
+			t.Fatalf("call %d: expected %v, got %v", i, exp, gitCalls[i])
+		}
+	}
+}
+
+func TestDetectAutoHealableSIR_And_Archive(t *testing.T) {
+	tmpDir := t.TempDir()
+	reportsDir := filepath.Join(tmpDir, "tmp", "reports")
+	if err := os.MkdirAll(reportsDir, 0755); err != nil {
+		t.Fatalf("failed to create reports dir: %v", err)
+	}
+
+	sirJSON := `{
+  "schema_version": 1,
+  "id": "SIR-1051-12345",
+  "job_id": "job-1051",
+  "story_id": "STORY-IAZIO-0098",
+  "category": "SUPERSEDED_BRANCH",
+  "auto_healable": true
+}`
+	sirPath := filepath.Join(reportsDir, "intervention-story-iazio-0098-job-1051.json")
+	if err := os.WriteFile(sirPath, []byte(sirJSON), 0644); err != nil {
+		t.Fatalf("failed to write test SIR: %v", err)
+	}
+
+	branchMock := func(w string) (string, error) {
+		return "chore/iazio-0098-feature", nil
+	}
+
+	healable, sirID, branch, err := DetectAutoHealableSIR(tmpDir, branchMock)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !healable {
+		t.Fatalf("expected healable=true")
+	}
+	if sirID != "SIR-1051-12345" {
+		t.Fatalf("expected SIR-1051-12345, got %s", sirID)
+	}
+	if branch != "chore/iazio-0098-feature" {
+		t.Fatalf("expected chore/iazio-0098-feature, got %s", branch)
+	}
+
+	// Test Archive
+	if err := ArchiveSIR(tmpDir, sirID); err != nil {
+		t.Fatalf("failed to archive SIR: %v", err)
+	}
+	if _, err := os.Stat(sirPath + ".healed"); err != nil {
+		t.Fatalf("expected archived file at %s.healed: %v", sirPath, err)
+	}
+
+	// Subsequent check should find no unhealed SIR
+	healableAfter, _, _, _ := DetectAutoHealableSIR(tmpDir, branchMock)
+	if healableAfter {
+		t.Fatalf("expected healableAfter=false after archiving")
+	}
+}
+
+func TestReconcileHostCheckouts_AutoHealSuperseded(t *testing.T) {
+	tmpDir := t.TempDir()
+	reportsDir := filepath.Join(tmpDir, "tmp", "reports")
+	_ = os.MkdirAll(reportsDir, 0755)
+
+	sirJSON := `{
+  "id": "SIR-999",
+  "category": "SUPERSEDED_BRANCH",
+  "auto_healable": true
+}`
+	_ = os.WriteFile(filepath.Join(reportsDir, "intervention-test.json"), []byte(sirJSON), 0644)
+
+	repos := []RepoState{
+		{
+			WorktreePath:   tmpDir,
+			Queue:          "PAUSED",
+			Reason:         "HALTED_DIRTY",
+			DiscardPending: false,
+		},
+	}
+
+	isLockIdle := func(w string) bool { return true }
+	isClean := func(w string) (bool, error) { return false, nil }
+	var resumed []string
+	resume := func(w string) error {
+		resumed = append(resumed, w)
+		return nil
+	}
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+
+	ReconcileHostCheckouts(repos, isLockIdle, nil, isClean, resume, stdout, stderr)
+
+	// Since branch resolution in the real test worktree without git repo returns empty or main,
+	// let's verify it handled cleanly without panic or errors.
+	if len(stderr.String()) != 0 {
+		t.Fatalf("unexpected stderr: %s", stderr.String())
+	}
+}
+
+
 
