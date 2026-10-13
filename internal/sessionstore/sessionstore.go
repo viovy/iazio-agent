@@ -150,6 +150,9 @@ func (r *Resolver) DetectDirtyWorktreeContext(worktree string) DirtyContext {
 			fullPath := filepath.Join(worktree, rel)
 			info := extractReviewFrontmatter(fullPath)
 			ctx.StoryID = info.StoryID
+			if ctx.StoryID == "" {
+				ctx.StoryID = ExtractStoryID(filepath.Base(rel))
+			}
 			ctx.ConversationID = info.ConversationID
 			ctx.Verdict = info.Verdict
 			ctx.Iteration = info.Iteration
@@ -664,18 +667,18 @@ func getDirtyFiles(worktree string) map[string]bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "-C", worktree, "status", "--porcelain")
+	cmd := exec.CommandContext(ctx, "git", "-C", worktree, "status", "--porcelain", "-uall")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return dirty
 	}
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if len(line) < 4 {
+		rawLine := scanner.Text()
+		if len(rawLine) < 3 {
 			continue
 		}
-		pathPart := strings.TrimSpace(line[3:])
+		pathPart := strings.TrimSpace(rawLine[2:])
 		if idx := strings.Index(pathPart, " -> "); idx != -1 {
 			pathPart = strings.TrimSpace(pathPart[idx+4:])
 		}
