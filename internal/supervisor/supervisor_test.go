@@ -394,6 +394,11 @@ func TestReconcileStrandedCheckouts(t *testing.T) {
 			WorktreePath: "/repos/idle-normal",
 			Lock:         "IDLE",
 		},
+		{
+			WorktreePath: "/repos/idle-stale-job",
+			Lock:         "IDLE",
+			RunningJobID: "job-stale",
+		},
 	}
 	var abandoned []string
 	var remediated []string

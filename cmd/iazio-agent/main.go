@@ -253,7 +253,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						ctx,
 						hostID,
 						repoStates,
-						func(w string) bool { return sup.Lock(w) == supervisor.LockRunning },
+						func(w string) bool {
+							l := sup.Lock(w)
+							return l == supervisor.LockRunning || l == supervisor.LockCooling
+						},
 						func(ctx context.Context, jobID, reason string) error {
 							return client.AbandonJob(ctx, jobID, reason)
 						},
@@ -330,7 +333,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					exitCode, waitErr := runner.Wait(pid)
 					sup.BeginCooling(worktree)
 					time.Sleep(supervisor.CoolingOff)
-					sup.Promote()
 
 					workPorc := ""
 					hubPorc := ""
@@ -374,6 +376,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						HubPushOK:     (waitErr == nil && exitCode == 0),
 					}
 					_, _ = client.PostFinish(context.Background(), host, worktree, jobID, finish)
+					sup.Promote()
 				}(job.WorktreePath, job.DocsHubPath, job.ID, job.Kind)
 				return nil
 			}, profile)
