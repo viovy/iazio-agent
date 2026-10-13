@@ -19,7 +19,7 @@ import (
 const agentLabel = "io.iazio.iazio-agent"
 
 // DefaultFleetAPI is the default canonical fleet control plane API URL.
-const DefaultFleetAPI = "https://tian.go.ro/iazio-harness-api"
+const DefaultFleetAPI = ""
 
 // ErrSuiteBusy is returned when a suite update cannot start.
 var ErrSuiteBusy = errors.New("suite update refused while a harness is running")

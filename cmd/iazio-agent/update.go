@@ -146,8 +146,8 @@ func defaultBaselineManifest(profile string) ManifestResponse {
 			},
 		},
 		Endpoints: map[string]string{
-			"harness_api": "https://tian.go.ro/iazio-harness-api",
-			"iazio_api":   "https://tian.go.ro/iazio-api",
+			"harness_api": resolveLocalAPI(nil),
+			"iazio_api":   "",
 		},
 		Tools: []ManifestToolItem{
 			{Name: "iazio-agent", Repository: "viovy/iazio-agent", BinaryName: "iazio-agent", Description: "Workstation runner daemon", Tier: "baseline"},
