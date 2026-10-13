@@ -350,7 +350,7 @@ func ReconcileStrandedCheckouts(
 		if worktree == "" {
 			continue
 		}
-		isStranded := (repo.Lock == "RUNNING_HARNESS" || repo.RunningJobID != "") &&
+		isStranded := repo.Lock == "RUNNING_HARNESS" &&
 			(isLockActive != nil && !isLockActive(worktree))
 		if !isStranded {
 			continue
