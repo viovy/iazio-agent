@@ -2,6 +2,7 @@ package sessionstore
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -145,5 +146,44 @@ conversation_id: "` + convRev + `"
 	}
 	if sess.Source != "checkpoint" {
 		t.Fatalf("expected source 'checkpoint', got %s", sess.Source)
+	}
+}
+
+func TestGetDirtyFilesParsing(t *testing.T) {
+	dir := t.TempDir()
+	cmd := exec.Command("git", "init", dir)
+	if err := cmd.Run(); err != nil {
+		t.Skip("git not available")
+	}
+	_ = os.WriteFile(filepath.Join(dir, "committed.txt"), []byte("committed"), 0o644)
+	_ = exec.Command("git", "-C", dir, "add", ".").Run()
+	_ = exec.Command("git", "-C", dir, "-c", "user.name=tester", "-c", "user.email=tester@test.com", "commit", "-m", "init").Run()
+
+	// 1. Modify tracked file (starts with ' M ')
+	_ = os.WriteFile(filepath.Join(dir, "committed.txt"), []byte("changed"), 0o644)
+
+	// 2. Add untracked review file (starts with '?? ')
+	revDir := filepath.Join(dir, "docs", "reviews")
+	_ = os.MkdirAll(revDir, 0o755)
+	revPath := filepath.Join(revDir, "2026-10-09-review-v0-26991d-STORY-APP-0098.md")
+	_ = os.WriteFile(revPath, []byte("---\nverdict: CLEAN\n---\n"), 0o644)
+
+	files := getDirtyFiles(dir)
+	if !files["committed.txt"] {
+		t.Errorf("expected committed.txt in dirty files, got: %+v", files)
+	}
+	if !files["docs/reviews/2026-10-09-review-v0-26991d-STORY-APP-0098.md"] {
+		t.Errorf("expected review path in dirty files, got: %+v", files)
+	}
+
+	dCtx := DefaultResolver().DetectDirtyWorktreeContext(dir)
+	if !dCtx.IsDirty {
+		t.Errorf("expected IsDirty true")
+	}
+	if dCtx.StoryID != "STORY-APP-0098" {
+		t.Errorf("expected StoryID STORY-APP-0098, got %q", dCtx.StoryID)
+	}
+	if dCtx.ReviewFile != "docs/reviews/2026-10-09-review-v0-26991d-STORY-APP-0098.md" {
+		t.Errorf("expected ReviewFile docs/reviews/..., got %q", dCtx.ReviewFile)
 	}
 }

@@ -82,6 +82,9 @@ func (c *Collector) Collect(ctx context.Context, worktree, docsHub, kind string)
 			branch, _ = c.Git(ctx, worktree, "symbolic-ref", "--short", "-q", "HEAD")
 		}
 		r.Branch = branch
+		if r.DirtyStoryID == "" && r.Branch != "" {
+			r.DirtyStoryID = sessionstore.ExtractStoryID(r.Branch)
+		}
 
 		defBranch := "main"
 		if originHead, err := c.Git(ctx, worktree, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil && originHead != "" {
