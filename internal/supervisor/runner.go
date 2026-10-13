@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -13,14 +14,18 @@ import (
 
 // OSRunner executes child processes with their own process group.
 type OSRunner struct {
-	mu   sync.Mutex
-	cmds map[int]*exec.Cmd
+	mu     sync.Mutex
+	cmds   map[int]*exec.Cmd
+	Stdout io.Writer
+	Stderr io.Writer
 }
 
 // NewOSRunner returns a new OSRunner.
 func NewOSRunner() *OSRunner {
 	return &OSRunner{
-		cmds: make(map[int]*exec.Cmd),
+		cmds:   make(map[int]*exec.Cmd),
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
 	}
 }
 
@@ -138,6 +143,8 @@ func (r *OSRunner) Start(argv []string) (int, error) {
 	bin := ResolveBinary(argv[0])
 	cmd := exec.Command(bin, argv[1:]...)
 	cmd.Env = AugmentedEnv(os.Environ())
+	cmd.Stdout = r.Stdout
+	cmd.Stderr = r.Stderr
 	setProcGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		return 0, err

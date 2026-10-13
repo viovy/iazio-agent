@@ -328,9 +328,15 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					time.Sleep(2 * time.Second)
 					return nil
 				}
-				go func(worktree, docsHub, jobID, kind string) {
-					pid := sup.PID(worktree)
+				jobPID := sup.PID(job.WorktreePath)
+				if stdout != nil {
+					fmt.Fprintf(stdout, "[supervisor] spawned harness job %s (PID %d) on %s\n", job.ID, jobPID, job.WorktreePath)
+				}
+				go func(worktree, docsHub, jobID, kind string, pid int) {
 					exitCode, waitErr := runner.Wait(pid)
+					if stdout != nil {
+						fmt.Fprintf(stdout, "[supervisor] harness job %s (PID %d) on %s exited with code %d (waitErr: %v)\n", jobID, pid, worktree, exitCode, waitErr)
+					}
 					sup.BeginCooling(worktree)
 					time.Sleep(supervisor.CoolingOff)
 
@@ -377,7 +383,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 					_, _ = client.PostFinish(context.Background(), host, worktree, jobID, finish)
 					sup.Promote()
-				}(job.WorktreePath, job.DocsHubPath, job.ID, job.Kind)
+				}(job.WorktreePath, job.DocsHubPath, job.ID, job.Kind, jobPID)
 				return nil
 			}, profile)
 		}
