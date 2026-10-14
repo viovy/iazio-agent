@@ -62,6 +62,7 @@ type Assignment struct {
 	Kind         string `json:"kind"`
 	WorktreePath string `json:"worktree_path"`
 	DocsHubPath  string `json:"docs_hub_path"`
+	StoryID      string `json:"story_id,omitempty"`
 }
 
 // NextLease asks for the next job for this host. ok is false when the queue is empty.

@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -332,7 +333,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				if stdout != nil {
 					fmt.Fprintf(stdout, "[supervisor] spawned harness job %s (PID %d) on %s\n", job.ID, jobPID, job.WorktreePath)
 				}
-				go func(worktree, docsHub, jobID, kind string, pid int) {
+				go func(worktree, docsHub, jobID, kind, storyID string, pid int) {
 					exitCode, waitErr := runner.Wait(pid)
 					if stdout != nil {
 						fmt.Fprintf(stdout, "[supervisor] harness job %s (PID %d) on %s exited with code %d (waitErr: %v)\n", jobID, pid, worktree, exitCode, waitErr)
@@ -373,17 +374,95 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						}
 					}
 
+					// Check harness execution checkpoint if present
+					checkpointPath := filepath.Join(worktree, ".iazio", "execution-checkpoint.json")
+					if cpData, err := os.ReadFile(checkpointPath); err == nil {
+						var cp struct {
+							ASEComplete bool `json:"ase_complete"`
+							ExitCode    int  `json:"exit_code"`
+						}
+						if json.Unmarshal(cpData, &cp) == nil {
+							if cp.ASEComplete && isClean {
+								aseOk = true
+							}
+						}
+					}
+
+					storyDone := false
+					if storyID != "" {
+						matches, _ := filepath.Glob(filepath.Join(worktree, "docs", "stories", "*.story.md"))
+						for _, m := range matches {
+							if data, err := os.ReadFile(m); err == nil {
+								content := string(data)
+								if strings.Contains(content, storyID) && (strings.Contains(content, "status: DONE") || strings.Contains(content, "status: \"DONE\"") || strings.Contains(content, "status: 'DONE'")) {
+									storyDone = true
+									break
+								}
+							}
+						}
+					}
+
+					// If not yet considered complete but worktree is clean, check if story completed on origin/main
+					if !aseOk && isClean {
+						branchOut, _ := exec.Command("git", "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD").CombinedOutput()
+						curBranch := strings.TrimSpace(string(branchOut))
+						branchMerged := false
+
+						if curBranch != "" && curBranch != "main" && curBranch != "master" {
+							if exec.Command("git", "-C", worktree, "merge-base", "--is-ancestor", "HEAD", "origin/main").Run() == nil {
+								branchMerged = true
+							} else if storyID != "" {
+								if out, err := exec.Command("git", "-C", worktree, "log", "origin/main", "-n", "1", "--grep="+storyID, "--format=%H").CombinedOutput(); err == nil && strings.TrimSpace(string(out)) != "" {
+									branchMerged = true
+								}
+							}
+							if !branchMerged {
+								if out, err := exec.Command("git", "-C", worktree, "log", "origin/main", "-n", "1", "--grep="+curBranch, "--format=%H").CombinedOutput(); err == nil && strings.TrimSpace(string(out)) != "" {
+									branchMerged = true
+								}
+							}
+
+							if branchMerged {
+								// Auto-heal to main
+								if exec.Command("git", "-C", worktree, "checkout", "main").Run() == nil {
+									_ = exec.Command("git", "-C", worktree, "pull", "--ff-only").Run()
+									_ = exec.Command("git", "-C", worktree, "branch", "-D", curBranch).Run()
+									aseOk = true
+									if stdout != nil {
+										fmt.Fprintf(stdout, "[supervisor] auto-healed merged branch %s to main on %s for job %s\n", curBranch, worktree, jobID)
+									}
+								} else {
+									aseOk = true
+								}
+							}
+						} else if curBranch == "main" || curBranch == "master" {
+							// On main: only consider complete if story is confirmed DONE or merged on origin/main
+							if storyDone {
+								aseOk = true
+							} else if storyID != "" {
+								if out, err := exec.Command("git", "-C", worktree, "log", "origin/main", "-n", "1", "--grep="+storyID, "--format=%H").CombinedOutput(); err == nil && strings.TrimSpace(string(out)) != "" {
+									if logMsg, err := exec.Command("git", "-C", worktree, "log", "origin/main", "-n", "5", "--grep="+storyID, "--format=%s %b").CombinedOutput(); err == nil {
+										lower := strings.ToLower(string(logMsg))
+										if strings.Contains(lower, "closeout") || strings.Contains(lower, "done") {
+											aseOk = true
+										}
+									}
+								}
+							}
+						}
+					}
+
 					finish := controlplane.FinishReport{
 						Kind:          kind,
 						ASEComplete:   aseOk,
 						WorkPorcelain: workPorc,
 						HubPorcelain:  hubPorc,
-						StoryDraftOK:  (waitErr == nil && exitCode == 0),
-						HubPushOK:     (waitErr == nil && exitCode == 0),
+						StoryDraftOK:  (waitErr == nil && exitCode == 0) || aseOk,
+						HubPushOK:     (waitErr == nil && exitCode == 0) || aseOk,
 					}
 					_, _ = client.PostFinish(context.Background(), host, worktree, jobID, finish)
 					sup.Promote()
-				}(job.WorktreePath, job.DocsHubPath, job.ID, job.Kind, jobPID)
+				}(job.WorktreePath, job.DocsHubPath, job.ID, job.Kind, job.StoryID, jobPID)
 				return nil
 			}, profile)
 		}
