@@ -2,6 +2,7 @@
 package service
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,10 +11,15 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 	"unicode/utf16"
 )
 
 const agentLabel = "io.iazio.iazio-agent"
+
+// DefaultFleetAPI is the default canonical fleet control plane API URL.
+const DefaultFleetAPI = ""
 
 // ErrSuiteBusy is returned when a suite update cannot start.
 var ErrSuiteBusy = errors.New("suite update refused while a harness is running")
@@ -24,17 +30,31 @@ func UnitText(goos, bin string) string {
 }
 
 func resolveHarnessAPIURL() string {
-	if apiEnv := os.Getenv("IAZIO_HARNESS_API_URL"); apiEnv != "" {
+	if apiEnv := strings.TrimSpace(os.Getenv("IAZIO_HARNESS_API_URL")); apiEnv != "" {
 		return apiEnv
 	}
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		cfgPath := filepath.Join(home, ".iazio", "config.json")
+		if data, err := os.ReadFile(cfgPath); err == nil {
+			var cfg struct {
+				Endpoints map[string]string `json:"endpoints"`
+			}
+			if err := json.Unmarshal(data, &cfg); err == nil && cfg.Endpoints != nil {
+				if v, ok := cfg.Endpoints["harness_api"]; ok && strings.TrimSpace(v) != "" {
+					return strings.TrimSpace(v)
+				}
+				if v, ok := cfg.Endpoints["harness-api"]; ok && strings.TrimSpace(v) != "" {
+					return strings.TrimSpace(v)
+				}
+			}
+		}
 		if b, err := os.ReadFile(filepath.Join(home, ".iazio", "api_url")); err == nil {
 			if s := strings.TrimSpace(string(b)); s != "" {
 				return s
 			}
 		}
 	}
-	return ""
+	return DefaultFleetAPI
 }
 
 // ActionText returns the dry-run text for a service action.
@@ -313,16 +333,194 @@ func wslSystemdBlock(release string, haveRelease, systemd bool) string {
 	return "WSL is not running systemd. Set systemd=true under [boot] in /etc/wsl.conf, run `wsl --shutdown` from Windows, then retry service install"
 }
 
+// IsSystemdAvailable reports whether user-level systemd is available and running.
+func IsSystemdAvailable() bool {
+	if WSLSystemdBlock() != "" {
+		return false
+	}
+	if _, err := os.Stat("/run/systemd/system"); err != nil {
+		return false
+	}
+	return true
+}
+
 // InstallLinux writes the systemd user unit, enables it, and requests linger.
+// If systemd is not active (e.g. WSL without systemd or container), it installs a resilient user daemon.
 func InstallLinux(bin string) error {
-	if msg := WSLSystemdBlock(); msg != "" {
-		return errors.New(msg)
+	if !IsSystemdAvailable() {
+		return InstallUserDaemon(bin)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("resolve home: %w", err)
 	}
-	return InstallLinuxAt(home, bin, execCommand)
+	err = InstallLinuxAt(home, bin, execCommand)
+	if err != nil && (strings.Contains(err.Error(), "Failed to connect to bus") || strings.Contains(err.Error(), "No such file or directory")) {
+		return InstallUserDaemon(bin)
+	}
+	return err
+}
+
+// InstallUserDaemon installs a resilient non-root, non-systemd user daemon.
+func InstallUserDaemon(bin string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolve home: %w", err)
+	}
+	return InstallUserDaemonAt(home, bin, execCommand)
+}
+
+// InstallUserDaemonAt writes the daemon runner script and starts it immediately.
+func InstallUserDaemonAt(home, bin string, run func(name string, args ...string) error) error {
+	daemonDir := filepath.Join(home, ".iazio", "daemon")
+	logDir := filepath.Join(home, ".iazio", "logs")
+	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return err
+	}
+
+	runnerPath := filepath.Join(daemonDir, "runner.sh")
+	logPath := filepath.Join(logDir, "agent.log")
+	pidPath := filepath.Join(home, ".iazio", "agent.pid")
+	apiURL := resolveHarnessAPIURL()
+
+	runnerScript := fmt.Sprintf("#!/bin/sh\n"+
+		"# iazio-agent user-space supervisor runner\n"+
+		"export IAZIO_AGENT_NONINTERACTIVE=1\n"+
+		"export IAZIO_HARNESS_API_URL=\"%s\"\n"+
+		"echo $$ > \"%s\"\n"+
+		"exec \"%s\" run >> \"%s\" 2>&1\n", apiURL, pidPath, bin, logPath)
+
+	if err := os.WriteFile(runnerPath, []byte(runnerScript), 0o755); err != nil {
+		return err
+	}
+
+	setupUserCrontab(runnerPath)
+	return StartUserDaemonAt(home, bin, run)
+}
+
+func setupUserCrontab(runnerPath string) {
+	out, err := exec.Command("crontab", "-l").Output()
+	var lines []string
+	if err == nil {
+		for _, l := range strings.Split(string(out), "\n") {
+			l = strings.TrimSpace(l)
+			if l != "" && !strings.Contains(l, "iazio-agent") {
+				lines = append(lines, l)
+			}
+		}
+	}
+	cronEntry := fmt.Sprintf(`* * * * * pgrep -f "iazio-agent run" >/dev/null || nohup /bin/sh "%s" >/dev/null 2>&1 &`, runnerPath)
+	rebootEntry := fmt.Sprintf(`@reboot nohup /bin/sh "%s" >/dev/null 2>&1 &`, runnerPath)
+	lines = append(lines, cronEntry, rebootEntry)
+	newCron := strings.Join(lines, "\n") + "\n"
+
+	cmd := exec.Command("crontab", "-")
+	cmd.Stdin = strings.NewReader(newCron)
+	_ = cmd.Run()
+}
+
+// StartUserDaemonAt starts the runner in background if not already alive.
+func StartUserDaemonAt(home, bin string, run func(name string, args ...string) error) error {
+	pidPath := filepath.Join(home, ".iazio", "agent.pid")
+	if isDaemonPIDAlive(pidPath) {
+		return nil
+	}
+	runnerPath := filepath.Join(home, ".iazio", "daemon", "runner.sh")
+	if _, err := os.Stat(runnerPath); os.IsNotExist(err) {
+		return InstallUserDaemonAt(home, bin, run)
+	}
+	if run != nil {
+		return run("/bin/sh", runnerPath)
+	}
+	cmd := exec.Command("/bin/sh", runnerPath)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start user daemon: %w", err)
+	}
+	_ = cmd.Process.Release()
+	return nil
+}
+
+// StopUserDaemonAt terminates the user daemon process if running.
+func StopUserDaemonAt(home string) error {
+	pidPath := filepath.Join(home, ".iazio", "agent.pid")
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		return nil
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		_ = os.Remove(pidPath)
+		return nil
+	}
+	proc, err := os.FindProcess(pid)
+	if err == nil {
+		_ = proc.Signal(syscall.SIGTERM)
+		time.Sleep(200 * time.Millisecond)
+	}
+	_ = os.Remove(pidPath)
+	return nil
+}
+
+// StatusUserDaemonAt reports whether the daemon process is alive.
+func StatusUserDaemonAt(home string) (bool, int) {
+	pidPath := filepath.Join(home, ".iazio", "agent.pid")
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		return false, 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return false, 0
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false, 0
+	}
+	if err := proc.Signal(syscall.Signal(0)); err == nil {
+		return true, pid
+	}
+	return false, 0
+}
+
+// UninstallUserDaemonAt stops the daemon, cleans crontab, and removes runner files.
+func UninstallUserDaemonAt(home string) error {
+	_ = StopUserDaemonAt(home)
+	out, err := exec.Command("crontab", "-l").Output()
+	if err == nil {
+		var lines []string
+		for _, l := range strings.Split(string(out), "\n") {
+			l = strings.TrimSpace(l)
+			if l != "" && !strings.Contains(l, "iazio-agent") {
+				lines = append(lines, l)
+			}
+		}
+		newCron := strings.Join(lines, "\n") + "\n"
+		cmd := exec.Command("crontab", "-")
+		cmd.Stdin = strings.NewReader(newCron)
+		_ = cmd.Run()
+	}
+	_ = os.RemoveAll(filepath.Join(home, ".iazio", "daemon"))
+	_ = os.Remove(filepath.Join(home, ".iazio", "agent.pid"))
+	return nil
+}
+
+func isDaemonPIDAlive(pidPath string) bool {
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
 }
 
 // InstallLinuxAt writes the unit under home and runs the supplied commands.
@@ -379,7 +577,20 @@ func InstallWindowsAt(home, bin, user string, run func(name string, args ...stri
 	bat := fmt.Sprintf("@echo off\r\nset \"IAZIO_AGENT_NONINTERACTIVE=1\"\r\n%s\"%s\" run >> \"%s\" 2>&1\r\n", apiLine, bin, logPath)
 	xmlDoc := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>%s</UserId></LogonTrigger></Triggers>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>%s</UserId>
+    </LogonTrigger>
+    <TimeTrigger>
+      <Enabled>true</Enabled>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>
+  </Triggers>
   <Principals>
     <Principal id="Author">
       <LogonType>InteractiveToken</LogonType>
@@ -387,8 +598,10 @@ func InstallWindowsAt(home, bin, user string, run func(name string, args ...stri
     </Principal>
   </Principals>
   <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <StartWhenAvailable>true</StartWhenAvailable>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
   </Settings>
@@ -401,7 +614,11 @@ func InstallWindowsAt(home, bin, user string, run func(name string, args ...stri
 	if err := os.WriteFile(xmlPath, encodeUTF16LEWithBOM(xmlDoc), 0o644); err != nil {
 		return err
 	}
-	return run("schtasks", "/Create", "/TN", "iazio-agent", "/XML", xmlPath, "/F")
+	if err := run("schtasks", "/Create", "/TN", "iazio-agent", "/XML", xmlPath, "/F"); err != nil {
+		return err
+	}
+	_ = run("schtasks", "/Run", "/TN", "iazio-agent")
+	return nil
 }
 
 func encodeUTF16LEWithBOM(s string) []byte {

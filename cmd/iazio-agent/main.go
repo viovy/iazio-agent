@@ -543,12 +543,44 @@ func runService(args []string, stdout io.Writer, getenv func(string) string) err
 		}
 		return applyWindows(action, bin, stdout)
 	default:
-		if action == "install" {
-			return service.InstallLinux(bin)
-		}
-		_, err = service.Apply(goos, action, bin, false, force, execCommand)
-		return err
+		return applyLinux(action, bin, stdout, force)
 	}
+}
+
+func applyLinux(action, bin string, stdout io.Writer, force bool) error {
+	if !service.IsSystemdAvailable() {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		switch action {
+		case "install":
+			return service.InstallUserDaemon(bin)
+		case "start":
+			return service.StartUserDaemonAt(home, bin, execCommand)
+		case "stop":
+			return service.StopUserDaemonAt(home)
+		case "restart":
+			_ = service.StopUserDaemonAt(home)
+			return service.StartUserDaemonAt(home, bin, execCommand)
+		case "uninstall":
+			return service.UninstallUserDaemonAt(home)
+		case "status":
+			running, pid := service.StatusUserDaemonAt(home)
+			if running {
+				fmt.Fprintf(stdout, "running (pid: %d)\n", pid)
+				return nil
+			}
+			return fmt.Errorf("installed but not running")
+		default:
+			return fmt.Errorf("unknown service action %s", action)
+		}
+	}
+	if action == "install" {
+		return service.InstallLinux(bin)
+	}
+	_, err := service.Apply("linux", action, bin, false, force, execCommand)
+	return err
 }
 
 func applyDarwin(action, bin string) error {
