@@ -25,8 +25,10 @@ const (
 	TermGrace = 10 * time.Second
 	// CoolingOff is how long a lock stays reserved after a harness exits.
 	CoolingOff = 10 * time.Second
-	// DefaultJobDuration is the execution timeout.
-	DefaultJobDuration = 60 * time.Minute
+	// DefaultJobDuration is the execution timeout (65m), providing a 5m grace
+	// buffer beyond the default 60m engine timeout so the child harness can finish
+	// diagnostics, auto-healing, and terminal exit reporting before supervisor SIGKILL.
+	DefaultJobDuration = 65 * time.Minute
 	// HubLockTimeout is how long a docs-hub discard waits for the hub lock.
 	HubLockTimeout = 30 * time.Second
 
