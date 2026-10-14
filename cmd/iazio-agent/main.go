@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -373,6 +374,34 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						}
 					}
 
+					// Check harness execution checkpoint if present
+					checkpointPath := filepath.Join(worktree, ".iazio", "execution-checkpoint.json")
+					if cpData, err := os.ReadFile(checkpointPath); err == nil {
+						var cp struct {
+							ASEComplete bool `json:"ase_complete"`
+							ExitCode    int  `json:"exit_code"`
+						}
+						if json.Unmarshal(cpData, &cp) == nil {
+							if cp.ASEComplete && isClean {
+								aseOk = true
+							}
+						}
+					}
+
+					storyDone := false
+					if storyID != "" {
+						matches, _ := filepath.Glob(filepath.Join(worktree, "docs", "stories", "*.story.md"))
+						for _, m := range matches {
+							if data, err := os.ReadFile(m); err == nil {
+								content := string(data)
+								if strings.Contains(content, storyID) && (strings.Contains(content, "status: DONE") || strings.Contains(content, "status: \"DONE\"") || strings.Contains(content, "status: 'DONE'")) {
+									storyDone = true
+									break
+								}
+							}
+						}
+					}
+
 					// If not yet considered complete but worktree is clean, check if story completed on origin/main
 					if !aseOk && isClean {
 						branchOut, _ := exec.Command("git", "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD").CombinedOutput()
@@ -402,10 +431,24 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 									if stdout != nil {
 										fmt.Fprintf(stdout, "[supervisor] auto-healed merged branch %s to main on %s for job %s\n", curBranch, worktree, jobID)
 									}
+								} else {
+									aseOk = true
 								}
 							}
 						} else if curBranch == "main" || curBranch == "master" {
-							aseOk = true
+							// On main: only consider complete if story is confirmed DONE or merged on origin/main
+							if storyDone {
+								aseOk = true
+							} else if storyID != "" {
+								if out, err := exec.Command("git", "-C", worktree, "log", "origin/main", "-n", "1", "--grep="+storyID, "--format=%H").CombinedOutput(); err == nil && strings.TrimSpace(string(out)) != "" {
+									if logMsg, err := exec.Command("git", "-C", worktree, "log", "origin/main", "-n", "5", "--grep="+storyID, "--format=%s %b").CombinedOutput(); err == nil {
+										lower := strings.ToLower(string(logMsg))
+										if strings.Contains(lower, "closeout") || strings.Contains(lower, "done") {
+											aseOk = true
+										}
+									}
+								}
+							}
 						}
 					}
 
