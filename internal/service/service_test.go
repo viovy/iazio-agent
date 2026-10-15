@@ -291,6 +291,38 @@ func TestResolveHarnessAPIURLDefaults(t *testing.T) {
 	}
 }
 
+func TestBuildInstallAndUninstallCrontab(t *testing.T) {
+	runnerPath := "/tmp/runner.sh"
+	existing := "# existing comment\n0 * * * * backup.sh\n* * * * * pgrep -f \"iazio-agent run\" >/dev/null || nohup /bin/sh \"/old/runner.sh\" >/dev/null 2>&1 &\n"
+
+	installed := BuildInstallCrontab(existing, runnerPath)
+	if !strings.Contains(installed, "0 * * * * backup.sh") {
+		t.Errorf("expected backup.sh preserved, got %q", installed)
+	}
+	if strings.Contains(installed, "/old/runner.sh") {
+		t.Errorf("expected /old/runner.sh removed, got %q", installed)
+	}
+	if !strings.Contains(installed, runnerPath) {
+		t.Errorf("expected new runnerPath %q present, got %q", runnerPath, installed)
+	}
+	if !strings.Contains(installed, "@reboot nohup /bin/sh") {
+		t.Errorf("expected @reboot entry present, got %q", installed)
+	}
+
+	uninstalled := BuildUninstallCrontab(installed)
+	if strings.Contains(uninstalled, "iazio-agent") {
+		t.Errorf("expected iazio-agent stripped, got %q", uninstalled)
+	}
+	if !strings.Contains(uninstalled, "0 * * * * backup.sh") {
+		t.Errorf("expected backup.sh preserved after uninstall, got %q", uninstalled)
+	}
+
+	emptyUninstalled := BuildUninstallCrontab(BuildInstallCrontab("", runnerPath))
+	if emptyUninstalled != "" {
+		t.Errorf("expected empty string when only iazio-agent was present, got %q", emptyUninstalled)
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (func() bool {
 		for i := 0; i+len(sub) <= len(s); i++ {
