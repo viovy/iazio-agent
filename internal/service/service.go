@@ -397,11 +397,15 @@ func InstallUserDaemonAt(home, bin string, run func(name string, args ...string)
 		return err
 	}
 
-	setupUserCrontab(runnerPath)
+	setupUserCrontab(runnerPath, run)
 	return StartUserDaemonAt(home, bin, run)
 }
 
-func setupUserCrontab(runnerPath string) {
+func setupUserCrontab(runnerPath string, run func(name string, args ...string) error) {
+	if run != nil {
+		_ = run("crontab", "-")
+		return
+	}
 	out, err := exec.Command("crontab", "-l").Output()
 	var lines []string
 	if err == nil {
@@ -486,21 +490,25 @@ func StatusUserDaemonAt(home string) (bool, int) {
 }
 
 // UninstallUserDaemonAt stops the daemon, cleans crontab, and removes runner files.
-func UninstallUserDaemonAt(home string) error {
+func UninstallUserDaemonAt(home string, run ...func(name string, args ...string) error) error {
 	_ = StopUserDaemonAt(home)
-	out, err := exec.Command("crontab", "-l").Output()
-	if err == nil {
-		var lines []string
-		for _, l := range strings.Split(string(out), "\n") {
-			l = strings.TrimSpace(l)
-			if l != "" && !strings.Contains(l, "iazio-agent") {
-				lines = append(lines, l)
+	if len(run) > 0 && run[0] != nil {
+		_ = run[0]("crontab", "-")
+	} else {
+		out, err := exec.Command("crontab", "-l").Output()
+		if err == nil {
+			var lines []string
+			for _, l := range strings.Split(string(out), "\n") {
+				l = strings.TrimSpace(l)
+				if l != "" && !strings.Contains(l, "iazio-agent") {
+					lines = append(lines, l)
+				}
 			}
+			newCron := strings.Join(lines, "\n") + "\n"
+			cmd := exec.Command("crontab", "-")
+			cmd.Stdin = strings.NewReader(newCron)
+			_ = cmd.Run()
 		}
-		newCron := strings.Join(lines, "\n") + "\n"
-		cmd := exec.Command("crontab", "-")
-		cmd.Stdin = strings.NewReader(newCron)
-		_ = cmd.Run()
 	}
 	_ = os.RemoveAll(filepath.Join(home, ".iazio", "daemon"))
 	_ = os.Remove(filepath.Join(home, ".iazio", "agent.pid"))

@@ -260,11 +260,14 @@ func TestUserDaemonLinuxFallback(t *testing.T) {
 		t.Fatalf("unexpected runner content: %s", string(body))
 	}
 
-	if err := UninstallUserDaemonAt(home); err != nil {
+	if err := UninstallUserDaemonAt(home, run); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(runner); !os.IsNotExist(err) {
 		t.Fatalf("runner should be removed after uninstall: %v", err)
+	}
+	if !strings.Contains(strings.Join(runs, " "), "crontab") {
+		t.Fatalf("expected crontab command recorded in runs: %v", runs)
 	}
 }
 
