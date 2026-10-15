@@ -158,3 +158,36 @@ func TestCollectorEmptyDocsHub(t *testing.T) {
 		t.Fatalf("expected ReasonNoDocsHub for refinement job without docs hub, got %+v", decRef)
 	}
 }
+
+func TestCleanPorcelain(t *testing.T) {
+	input := ` M real_file.go
+?? .iazio/
+?? .iazio/execution-checkpoint.json
+?? .autopilot/state.json
+?? tmp/test.log
+?? new_feature.go
+`
+	cleaned := CleanPorcelain(input)
+	if strings.Contains(cleaned, ".iazio") {
+		t.Errorf("expected .iazio to be stripped, got %q", cleaned)
+	}
+	if strings.Contains(cleaned, ".autopilot") {
+		t.Errorf("expected .autopilot to be stripped, got %q", cleaned)
+	}
+	if strings.Contains(cleaned, "tmp/") {
+		t.Errorf("expected tmp/ to be stripped, got %q", cleaned)
+	}
+	if !strings.Contains(cleaned, "real_file.go") {
+		t.Errorf("expected real_file.go to be preserved, got %q", cleaned)
+	}
+	if !strings.Contains(cleaned, "new_feature.go") {
+		t.Errorf("expected new_feature.go to be preserved, got %q", cleaned)
+	}
+
+	// Only runtime scratch -> becomes completely clean
+	scratchOnly := "?? .iazio/\n?? .autopilot/sessions/\n?? tmp/foo\n"
+	if CleanPorcelain(scratchOnly) != "" {
+		t.Errorf("expected empty string for scratch only, got %q", CleanPorcelain(scratchOnly))
+	}
+}
+

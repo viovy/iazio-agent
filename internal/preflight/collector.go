@@ -64,8 +64,9 @@ func (c *Collector) Collect(ctx context.Context, worktree, docsHub, kind string)
 
 	if r.GitWorkTree && c.Git != nil {
 		if out, err := c.Git(ctx, worktree, "status", "--porcelain"); err == nil {
-			r.WorkPorcelain = out
-			if strings.TrimSpace(out) != "" {
+			cleanOut := CleanPorcelain(out)
+			r.WorkPorcelain = cleanOut
+			if strings.TrimSpace(cleanOut) != "" {
 				dCtx := sessionstore.DefaultResolver().DetectDirtyWorktreeContext(worktree)
 				r.DirtyStoryID = dCtx.StoryID
 				r.DirtyReviewFile = dCtx.ReviewFile
@@ -103,11 +104,33 @@ func (c *Collector) Collect(ctx context.Context, worktree, docsHub, kind string)
 
 	if r.DocsHubOK && docsHub != "" && c.Git != nil {
 		if out, err := c.Git(ctx, docsHub, "status", "--porcelain"); err == nil {
-			r.HubPorcelain = out
+			r.HubPorcelain = CleanPorcelain(out)
 		}
 	}
 
 	return r, nil
+}
+
+// CleanPorcelain strips internal runtime scratch files (such as .iazio/ or .autopilot/ or tmp/) from porcelain status.
+func CleanPorcelain(porc string) string {
+	if strings.TrimSpace(porc) == "" {
+		return ""
+	}
+	var lines []string
+	for _, line := range strings.Split(porc, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "?? ") {
+			target := strings.TrimSpace(trimmed[3:])
+			if strings.HasPrefix(target, ".iazio") || strings.HasPrefix(target, ".autopilot") || strings.HasPrefix(target, "tmp/") {
+				continue
+			}
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // Collect runs preflight collection using the DefaultCollector.

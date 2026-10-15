@@ -344,11 +344,11 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					workPorc := ""
 					hubPorc := ""
 					if out, err := exec.Command("git", "-C", worktree, "status", "--porcelain").CombinedOutput(); err == nil {
-						workPorc = strings.TrimSpace(string(out))
+						workPorc = strings.TrimSpace(preflight.CleanPorcelain(string(out)))
 					}
 					if docsHub != "" {
 						if out, err := exec.Command("git", "-C", docsHub, "status", "--porcelain").CombinedOutput(); err == nil {
-							hubPorc = strings.TrimSpace(string(out))
+							hubPorc = strings.TrimSpace(preflight.CleanPorcelain(string(out)))
 						}
 					}
 					isClean := (workPorc == "")
@@ -364,7 +364,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							if err := supervisor.AutoHealSupersededWorktree(true, sirBranch, gitCmd); err == nil {
 								_ = supervisor.ArchiveSIR(worktree, sirID)
 								if out, err := exec.Command("git", "-C", worktree, "status", "--porcelain").CombinedOutput(); err == nil {
-									workPorc = strings.TrimSpace(string(out))
+									workPorc = strings.TrimSpace(preflight.CleanPorcelain(string(out)))
 									if workPorc == "" {
 										isClean = true
 										aseOk = (waitErr == nil && exitCode == 0)
