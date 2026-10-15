@@ -397,29 +397,60 @@ func InstallUserDaemonAt(home, bin string, run func(name string, args ...string)
 		return err
 	}
 
-	setupUserCrontab(runnerPath)
+	if err := setupUserCrontab(runnerPath, run); err != nil {
+		return fmt.Errorf("setup crontab: %w", err)
+	}
 	return StartUserDaemonAt(home, bin, run)
 }
 
-func setupUserCrontab(runnerPath string) {
-	out, err := exec.Command("crontab", "-l").Output()
+// BuildInstallCrontab preserves unrelated crontab lines while configuring iazio-agent runner entries.
+func BuildInstallCrontab(existing, runnerPath string) string {
 	var lines []string
-	if err == nil {
-		for _, l := range strings.Split(string(out), "\n") {
-			l = strings.TrimSpace(l)
-			if l != "" && !strings.Contains(l, "iazio-agent") {
-				lines = append(lines, l)
-			}
+	for _, l := range strings.Split(existing, "\n") {
+		l = strings.TrimSpace(l)
+		if l != "" && !strings.Contains(l, "iazio-agent") {
+			lines = append(lines, l)
 		}
 	}
-	cronEntry := fmt.Sprintf(`* * * * * pgrep -f "iazio-agent run" >/dev/null || nohup /bin/sh "%s" >/dev/null 2>&1 &`, runnerPath)
-	rebootEntry := fmt.Sprintf(`@reboot nohup /bin/sh "%s" >/dev/null 2>&1 &`, runnerPath)
+	cronEntry := fmt.Sprintf(`* * * * * pgrep -f "iazio-agent run" >/dev/null || nohup /bin/sh "%s" >/dev/null 2>&1 & # iazio-agent`, runnerPath)
+	rebootEntry := fmt.Sprintf(`@reboot nohup /bin/sh "%s" >/dev/null 2>&1 & # iazio-agent`, runnerPath)
 	lines = append(lines, cronEntry, rebootEntry)
-	newCron := strings.Join(lines, "\n") + "\n"
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// BuildUninstallCrontab strips iazio-agent runner entries from existing crontab.
+func BuildUninstallCrontab(existing string) string {
+	var lines []string
+	for _, l := range strings.Split(existing, "\n") {
+		l = strings.TrimSpace(l)
+		if l != "" && !strings.Contains(l, "iazio-agent") {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func setupUserCrontab(runnerPath string, run func(name string, args ...string) error) error {
+	var existing string
+	if run != nil {
+		_ = BuildInstallCrontab(existing, runnerPath)
+		return run("crontab", "-")
+	}
+	out, err := exec.Command("crontab", "-l").Output()
+	if err == nil {
+		existing = string(out)
+	}
+	newCron := BuildInstallCrontab(existing, runnerPath)
 
 	cmd := exec.Command("crontab", "-")
 	cmd.Stdin = strings.NewReader(newCron)
-	_ = cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("update crontab: %w", err)
+	}
+	return nil
 }
 
 // StartUserDaemonAt starts the runner in background if not already alive.
@@ -486,24 +517,33 @@ func StatusUserDaemonAt(home string) (bool, int) {
 }
 
 // UninstallUserDaemonAt stops the daemon, cleans crontab, and removes runner files.
-func UninstallUserDaemonAt(home string) error {
+func UninstallUserDaemonAt(home string, run ...func(name string, args ...string) error) error {
 	_ = StopUserDaemonAt(home)
-	out, err := exec.Command("crontab", "-l").Output()
-	if err == nil {
-		var lines []string
-		for _, l := range strings.Split(string(out), "\n") {
-			l = strings.TrimSpace(l)
-			if l != "" && !strings.Contains(l, "iazio-agent") {
-				lines = append(lines, l)
+	if len(run) > 0 && run[0] != nil {
+		_ = run[0]("crontab", "-")
+	} else {
+		out, err := exec.Command("crontab", "-l").Output()
+		if err == nil {
+			newCron := BuildUninstallCrontab(string(out))
+			if newCron == "" {
+				_ = exec.Command("crontab", "-r").Run()
+			} else {
+				cmd := exec.Command("crontab", "-")
+				cmd.Stdin = strings.NewReader(newCron)
+				_ = cmd.Run()
 			}
 		}
-		newCron := strings.Join(lines, "\n") + "\n"
-		cmd := exec.Command("crontab", "-")
-		cmd.Stdin = strings.NewReader(newCron)
-		_ = cmd.Run()
 	}
-	_ = os.RemoveAll(filepath.Join(home, ".iazio", "daemon"))
-	_ = os.Remove(filepath.Join(home, ".iazio", "agent.pid"))
+	var errs []error
+	if err := os.RemoveAll(filepath.Join(home, ".iazio", "daemon")); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, err)
+	}
+	if err := os.Remove(filepath.Join(home, ".iazio", "agent.pid")); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("cleanup user daemon: %v", errs)
+	}
 	return nil
 }
 
