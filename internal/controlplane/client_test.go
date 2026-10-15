@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -340,6 +341,80 @@ func TestLoopRegisterRetry(t *testing.T) {
 	}
 	if regAttempts < 2 {
 		t.Fatalf("expected at least 2 register attempts, got %d", regAttempts)
+	}
+}
+
+func TestControlplaneTransientStatusAndError(t *testing.T) {
+	if !IsTransientStatus(502) || !IsTransientStatus(503) || !IsTransientStatus(504) || !IsTransientStatus(429) {
+		t.Fatal("expected transient statuses")
+	}
+	if IsTransientStatus(400) || IsTransientStatus(404) || IsTransientStatus(500) {
+		t.Fatal("non-transient status considered transient")
+	}
+	if !IsTransientError(errors.New("dial tcp: connection refused")) {
+		t.Fatal("connection refused should be transient error")
+	}
+}
+
+func TestPostPreflightTransientRetrySuccess(t *testing.T) {
+	var attempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`updating`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"Reason":"","PauseQueue":false,"Heal":false}`))
+	}))
+	defer srv.Close()
+
+	c := Client{
+		BaseURL:        srv.URL,
+		MaxRetries:     2,
+		InitialBackoff: 5 * time.Millisecond,
+	}
+	halt, err := c.PostPreflight(context.Background(), "host-1", "/work", map[string]string{})
+	if err != nil {
+		t.Fatalf("expected retry success, got %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempts)
+	}
+	if halt.PauseQueue {
+		t.Fatal("expected PauseQueue=false")
+	}
+}
+
+func TestPostFinishTransientRetrySuccess(t *testing.T) {
+	var attempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 2 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`restarting`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"Queue":"READY","Reason":"","HealingAttempts":0,"LeaseResume":false,"Decrement":false}`))
+	}))
+	defer srv.Close()
+
+	c := Client{
+		BaseURL:        srv.URL,
+		MaxRetries:     2,
+		InitialBackoff: 5 * time.Millisecond,
+	}
+	decision, err := c.PostFinish(context.Background(), "host-1", "/work", "job-1", map[string]string{})
+	if err != nil {
+		t.Fatalf("expected retry success, got %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempts)
+	}
+	if decision.Queue != "READY" {
+		t.Fatalf("expected Queue=READY, got %s", decision.Queue)
 	}
 }
 

@@ -5,21 +5,69 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
 )
 
+// Default transient retry parameters for rolling restart / update resilience.
+const (
+	DefaultMaxRetries     = 3
+	DefaultInitialBackoff = 100 * time.Millisecond
+)
+
+// IsTransientStatus reports whether a status code represents a temporary gateway or overload condition.
+func IsTransientStatus(status int) bool {
+	return status == http.StatusBadGateway ||
+		status == http.StatusServiceUnavailable ||
+		status == http.StatusGatewayTimeout ||
+		status == http.StatusTooManyRequests
+}
+
+// IsTransientError reports whether an error represents a temporary network error or connection refused/reset.
+func IsTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "eof")
+}
+
 // Client posts heartbeats and finish checks. It does not send IDE credentials.
 type Client struct {
-	BaseURL    string
-	Token      string
-	HTTP       *http.Client
-	Tools      func() []Tool
-	ActiveJobs func() []ActiveJob
-	OnTick     func(ctx context.Context, hostID string) error
+	BaseURL        string
+	Token          string
+	HTTP           *http.Client
+	Tools          func() []Tool
+	ActiveJobs     func() []ActiveJob
+	OnTick         func(ctx context.Context, hostID string) error
+	MaxRetries     int
+	InitialBackoff time.Duration
+}
+
+func (c Client) retryParams() (int, time.Duration) {
+	max := c.MaxRetries
+	if max < 0 {
+		max = 0
+	} else if max == 0 {
+		max = DefaultMaxRetries
+	}
+	backoff := c.InitialBackoff
+	if backoff <= 0 {
+		backoff = DefaultInitialBackoff
+	}
+	return max, backoff
 }
 
 // ActiveJob describes one job currently running on this agent.
@@ -67,33 +115,54 @@ type Assignment struct {
 
 // NextLease asks for the next job for this host. ok is false when the queue is empty.
 func (c Client) NextLease(ctx context.Context, hostID string) (Assignment, bool, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/v1/hosts/"+hostID+"/poll", strings.NewReader("{}"))
-	if err != nil {
-		return Assignment{}, false, err
+	maxRetries, backoff := c.retryParams()
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/v1/hosts/"+hostID+"/poll", strings.NewReader("{}"))
+		if err != nil {
+			return Assignment{}, false, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if c.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.Token)
+		}
+		resp, err := c.http().Do(req)
+		if err != nil {
+			lastErr = err
+			if !IsTransientError(err) || attempt == maxRetries {
+				return Assignment{}, false, lastErr
+			}
+		} else {
+			if resp.StatusCode == http.StatusNoContent {
+				_ = resp.Body.Close()
+				return Assignment{}, false, nil
+			}
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				var job Assignment
+				err := json.NewDecoder(resp.Body).Decode(&job)
+				_ = resp.Body.Close()
+				if err != nil && err != io.EOF {
+					return Assignment{}, false, err
+				}
+				if job.ID == "" {
+					return Assignment{}, false, nil
+				}
+				return job, true, nil
+			}
+			_ = resp.Body.Close()
+			lastErr = fmt.Errorf("control plane poll: %s", resp.Status)
+			if !IsTransientStatus(resp.StatusCode) || attempt == maxRetries {
+				return Assignment{}, false, lastErr
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return Assignment{}, false, ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
-	}
-	resp, err := c.http().Do(req)
-	if err != nil {
-		return Assignment{}, false, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNoContent {
-		return Assignment{}, false, nil
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Assignment{}, false, fmt.Errorf("control plane poll: %s", resp.Status)
-	}
-	var job Assignment
-	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil && err != io.EOF {
-		return Assignment{}, false, err
-	}
-	if job.ID == "" {
-		return Assignment{}, false, nil
-	}
-	return job, true, nil
+	return Assignment{}, false, lastErr
 }
 
 // Loop registers the host, then heartbeats and polls for a lease until ctx is cancelled.
@@ -214,27 +283,47 @@ func (c Client) PostPreflight(ctx context.Context, hostID, worktree string, pre 
 	if err != nil {
 		return PreflightHalt{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/v1/repos/"+hostID+"/preflight", bytes.NewReader(raw))
-	if err != nil {
-		return PreflightHalt{}, err
+	maxRetries, backoff := c.retryParams()
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/v1/repos/"+hostID+"/preflight", bytes.NewReader(raw))
+		if err != nil {
+			return PreflightHalt{}, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if c.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.Token)
+		}
+		resp, err := c.http().Do(req)
+		if err != nil {
+			lastErr = err
+			if !IsTransientError(err) || attempt == maxRetries {
+				return PreflightHalt{}, lastErr
+			}
+		} else {
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				var halt PreflightHalt
+				decErr := json.NewDecoder(resp.Body).Decode(&halt)
+				_ = resp.Body.Close()
+				if decErr != nil {
+					return PreflightHalt{}, decErr
+				}
+				return halt, nil
+			}
+			_ = resp.Body.Close()
+			lastErr = fmt.Errorf("preflight post: %s", resp.Status)
+			if !IsTransientStatus(resp.StatusCode) || attempt == maxRetries {
+				return PreflightHalt{}, lastErr
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return PreflightHalt{}, ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
-	}
-	resp, err := c.http().Do(req)
-	if err != nil {
-		return PreflightHalt{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return PreflightHalt{}, fmt.Errorf("preflight post: %s", resp.Status)
-	}
-	var halt PreflightHalt
-	if err := json.NewDecoder(resp.Body).Decode(&halt); err != nil {
-		return PreflightHalt{}, err
-	}
-	return halt, nil
+	return PreflightHalt{}, lastErr
 }
 
 // PostFinish posts the post-cooling finish check.
@@ -248,27 +337,47 @@ func (c Client) PostFinish(ctx context.Context, hostID, worktree, jobID string, 
 	if err != nil {
 		return FinishDecision{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/v1/repos/"+hostID+"/finish", bytes.NewReader(raw))
-	if err != nil {
-		return FinishDecision{}, err
+	maxRetries, backoff := c.retryParams()
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/v1/repos/"+hostID+"/finish", bytes.NewReader(raw))
+		if err != nil {
+			return FinishDecision{}, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if c.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.Token)
+		}
+		resp, err := c.http().Do(req)
+		if err != nil {
+			lastErr = err
+			if !IsTransientError(err) || attempt == maxRetries {
+				return FinishDecision{}, lastErr
+			}
+		} else {
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				var decision FinishDecision
+				decErr := json.NewDecoder(resp.Body).Decode(&decision)
+				_ = resp.Body.Close()
+				if decErr != nil {
+					return FinishDecision{}, decErr
+				}
+				return decision, nil
+			}
+			_ = resp.Body.Close()
+			lastErr = fmt.Errorf("finish post: %s", resp.Status)
+			if !IsTransientStatus(resp.StatusCode) || attempt == maxRetries {
+				return FinishDecision{}, lastErr
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return FinishDecision{}, ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
-	}
-	resp, err := c.http().Do(req)
-	if err != nil {
-		return FinishDecision{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return FinishDecision{}, fmt.Errorf("finish post: %s", resp.Status)
-	}
-	var decision FinishDecision
-	if err := json.NewDecoder(resp.Body).Decode(&decision); err != nil {
-		return FinishDecision{}, err
-	}
-	return decision, nil
+	return FinishDecision{}, lastErr
 }
 
 // PostChunk stores one stripped output chunk for a job.
@@ -373,23 +482,41 @@ func (c Client) post(ctx context.Context, path string, body any) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+path, bytes.NewReader(raw))
-	if err != nil {
-		return err
+	maxRetries, backoff := c.retryParams()
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+path, bytes.NewReader(raw))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if c.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.Token)
+		}
+		resp, err := c.http().Do(req)
+		if err != nil {
+			lastErr = err
+			if !IsTransientError(err) || attempt == maxRetries {
+				return lastErr
+			}
+		} else {
+			_ = resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return nil
+			}
+			lastErr = fmt.Errorf("control plane %s: %s", path, resp.Status)
+			if !IsTransientStatus(resp.StatusCode) || attempt == maxRetries {
+				return lastErr
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
-	}
-	resp, err := c.http().Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("control plane %s: %s", path, resp.Status)
-	}
-	return nil
+	return lastErr
 }
 
 var defaultHTTPClient = &http.Client{Timeout: 30 * time.Second}
