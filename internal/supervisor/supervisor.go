@@ -65,8 +65,9 @@ type Sup struct {
 	sleep    func(time.Duration)
 	signal   func(pid int, sig string) error
 	alive    func(pid int) bool
-	fetches  []string
-	halted   bool
+	fetches      []string
+	halted       bool
+	loopDetector *LoopDetector
 }
 
 // New returns a supervisor. now injects the clock.
@@ -442,4 +443,24 @@ func HostKind(env string) string {
 		return "permanent"
 	}
 	return env
+}
+
+// CheckLoop checks an action/output pair against the loop detector.
+func (s *Sup) CheckLoop(action, output string) LoopDetectionResult {
+	s.mu.Lock()
+	if s.loopDetector == nil {
+		s.loopDetector = NewLoopDetector(20, 3, 2)
+	}
+	ld := s.loopDetector
+	s.mu.Unlock()
+	return ld.Record(action, output)
+}
+
+// ResetLoopDetector clears supervisor loop history.
+func (s *Sup) ResetLoopDetector() {
+	s.mu.Lock()
+	if s.loopDetector != nil {
+		s.loopDetector.Reset()
+	}
+	s.mu.Unlock()
 }
