@@ -49,9 +49,11 @@ type Client struct {
 	BaseURL        string
 	Token          string
 	HTTP           *http.Client
+	Presence       func() string
 	Tools          func() []Tool
 	ActiveJobs     func() []ActiveJob
 	OnTick         func(ctx context.Context, hostID string) error
+	OnToolUpdate   func(ctx context.Context, tools []string, force bool) error
 	MaxRetries     int
 	InitialBackoff time.Duration
 }
@@ -85,14 +87,43 @@ type Tool struct {
 	Status  string `json:"status"`
 }
 
+// PendingToolUpdate describes a remote tool update command for the agent.
+type PendingToolUpdate struct {
+	Tools []string `json:"tools,omitempty"`
+	Force bool     `json:"force,omitempty"`
+}
+
+// HeartbeatResponse is the payload returned by the control plane upon heartbeat.
+type HeartbeatResponse struct {
+	Status            string             `json:"status"`
+	PendingToolUpdate *PendingToolUpdate `json:"pending_tool_update,omitempty"`
+}
+
 // Heartbeat marks the host online, stores the tool inventory, and reports active jobs.
 func (c Client) Heartbeat(ctx context.Context, hostID string, tools []Tool, fetchFailed bool, activeJobs ...ActiveJob) error {
+	_, err := c.HeartbeatDetailed(ctx, hostID, tools, fetchFailed, activeJobs...)
+	return err
+}
+
+// HeartbeatDetailed marks the host online and returns any pending instructions from the control plane.
+func (c Client) HeartbeatDetailed(ctx context.Context, hostID string, tools []Tool, fetchFailed bool, activeJobs ...ActiveJob) (*HeartbeatResponse, error) {
+	presence := "ONLINE"
+	if c.Presence != nil {
+		if p := c.Presence(); strings.TrimSpace(p) != "" {
+			presence = strings.TrimSpace(p)
+		}
+	}
 	body := map[string]any{
+		"presence":     presence,
 		"fetch_failed": fetchFailed,
 		"tools":        tools,
 		"active_jobs":  activeJobs,
 	}
-	return c.post(ctx, "/v1/hosts/"+hostID+"/heartbeat", body)
+	var res HeartbeatResponse
+	if err := c.postJSON(ctx, "/v1/hosts/"+hostID+"/heartbeat", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
 }
 
 // Register records the host kind and optional distribution profile.
@@ -205,11 +236,16 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 		if c.ActiveJobs != nil {
 			activeJobs = c.ActiveJobs()
 		}
-		if err := c.Heartbeat(ctx, hostID, tools, false, activeJobs...); err != nil {
+		hbRes, err := c.HeartbeatDetailed(ctx, hostID, tools, false, activeJobs...)
+		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			_ = c.Register(ctx, hostID, kind, prof)
+		} else if hbRes != nil && hbRes.PendingToolUpdate != nil && c.OnToolUpdate != nil {
+			go func(up PendingToolUpdate) {
+				_ = c.OnToolUpdate(ctx, up.Tools, up.Force)
+			}(*hbRes.PendingToolUpdate)
 		}
 		if c.OnTick != nil {
 			if err := c.OnTick(ctx, hostID); err != nil {
@@ -478,6 +514,10 @@ func (c Client) RemediateRepo(ctx context.Context, hostID, worktree string) erro
 
 
 func (c Client) post(ctx context.Context, path string, body any) error {
+	return c.postJSON(ctx, path, body, nil)
+}
+
+func (c Client) postJSON(ctx context.Context, path string, body any, out any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -500,10 +540,19 @@ func (c Client) post(ctx context.Context, path string, body any) error {
 				return lastErr
 			}
 		} else {
-			_ = resp.Body.Close()
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				if out != nil {
+					decErr := json.NewDecoder(resp.Body).Decode(out)
+					_ = resp.Body.Close()
+					if decErr != nil && decErr != io.EOF {
+						return decErr
+					}
+				} else {
+					_ = resp.Body.Close()
+				}
 				return nil
 			}
+			_ = resp.Body.Close()
 			lastErr = fmt.Errorf("control plane %s: %s", path, resp.Status)
 			if !IsTransientStatus(resp.StatusCode) || attempt == maxRetries {
 				return lastErr
