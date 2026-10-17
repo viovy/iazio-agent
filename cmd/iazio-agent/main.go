@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -59,7 +60,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		fmt.Fprintln(stdout, kind)
 		api := resolveLocalAPI(getenv)
 		profile := getenv("IAZIO_AGENT_PROFILE")
-		updateInterval := 6 * time.Hour
+		updateInterval := 30 * time.Minute
 		if raw := getenv("IAZIO_AGENT_UPDATE_INTERVAL"); raw != "" {
 			if d, err := time.ParseDuration(raw); err == nil {
 				updateInterval = d
@@ -67,7 +68,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				updateInterval = 0
 			}
 		}
-		updateSuite := getenv("IAZIO_AGENT_UPDATE_SUITE") == "1" || strings.ToLower(getenv("IAZIO_AGENT_UPDATE_SUITE")) == "true"
+		updateSuite := true
+		if raw := getenv("IAZIO_AGENT_UPDATE_SUITE"); raw != "" {
+			updateSuite = raw == "1" || strings.ToLower(raw) == "true"
+		}
 
 		for i := 1; i < len(args); i++ {
 			switch {
@@ -111,6 +115,56 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			runner := supervisor.NewOSRunner()
 			var client controlplane.Client
 
+			var updatingTools atomic.Bool
+			getTools := func() []controlplane.Tool {
+				home, _ := os.UserHomeDir()
+				dirs := inventory.DefaultDirs(getenv("PATH"), home, runtime.GOOS)
+				found := inventory.Scan(dirs)
+				classified, _ := inventory.Classify(found, nil)
+				var tools []controlplane.Tool
+				for _, t := range classified {
+					tools = append(tools, controlplane.Tool{
+						Name:    t.Name,
+						Path:    t.Path,
+						Version: t.Version,
+						Status:  t.Status,
+					})
+				}
+				return tools
+			}
+
+			doToolUpdate := func(ctx context.Context, targetTools []string, force bool) bool {
+				if !areAllReposCleanAndHarnessIdle(ctx, client, sup, host, api, stdout) {
+					return false
+				}
+				updatingTools.Store(true)
+				if api != "" {
+					_ = client.Heartbeat(ctx, host, getTools(), false)
+				}
+				defer func() {
+					updatingTools.Store(false)
+					if api != "" {
+						_ = client.Heartbeat(ctx, host, getTools(), false)
+					}
+				}()
+
+				opts := UpdateOptions{
+					Suite:       updateSuite,
+					Profile:     profile,
+					API:         api,
+					Force:       force,
+					TargetTools: targetTools,
+				}
+				updated, err := performUpdate(ctx, opts, stdout, stderr, getenv)
+				if err != nil {
+					if stderr != nil {
+						fmt.Fprintf(stderr, "[supervisor] update check error: %v\n", err)
+					}
+					return false
+				}
+				return updated
+			}
+
 			if updateInterval > 0 {
 				go func() {
 					select {
@@ -120,46 +174,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 
 					checkOnce := func() bool {
-						if api != "" {
-							detail, err := client.GetHost(runCtx, host)
-							if err == nil {
-								for _, r := range detail.Repos {
-									path := r.WorktreePath
-									if path == "" {
-										path = r.Path
-									}
-									if path == "" {
-										continue
-									}
-									if sup.Lock(path) == supervisor.LockRunning {
-										if stdout != nil {
-											fmt.Fprintf(stdout, "[supervisor] worktree %s is running a job; deferring background update\n", path)
-										}
-										return false
-									}
-									out, err := exec.CommandContext(runCtx, "git", "-C", path, "status", "--porcelain").CombinedOutput()
-									if err == nil && strings.TrimSpace(string(out)) != "" {
-										if stdout != nil {
-											fmt.Fprintf(stdout, "[supervisor] worktree %s is dirty; deferring background update\n", path)
-										}
-										return false
-									}
-								}
-							}
-						}
-
-						updated, err := performUpdate(runCtx, UpdateOptions{
-							Suite:   updateSuite,
-							Profile: profile,
-							API:     api,
-						}, stdout, stderr, getenv)
-						if err != nil {
-							if stderr != nil {
-								fmt.Fprintf(stderr, "[supervisor] update check error: %v\n", err)
-							}
-							return false
-						}
-						return updated
+						return doToolUpdate(runCtx, nil, false)
 					}
 
 					if checkOnce() {
@@ -190,21 +205,26 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			}
 			client = controlplane.Client{
 				BaseURL: api,
-				Tools: func() []controlplane.Tool {
-					home, _ := os.UserHomeDir()
-					dirs := inventory.DefaultDirs(getenv("PATH"), home, runtime.GOOS)
-					found := inventory.Scan(dirs)
-					classified, _ := inventory.Classify(found, nil)
-					var tools []controlplane.Tool
-					for _, t := range classified {
-						tools = append(tools, controlplane.Tool{
-							Name:    t.Name,
-							Path:    t.Path,
-							Version: t.Version,
-							Status:  t.Status,
-						})
+				Presence: func() string {
+					if updatingTools.Load() {
+						return "ONLINE_UPDATING_TOOLS"
 					}
-					return tools
+					return "ONLINE"
+				},
+				Tools: getTools,
+				OnToolUpdate: func(ctx context.Context, tools []string, force bool) error {
+					if stdout != nil {
+						fmt.Fprintf(stdout, "[supervisor] remote tool update requested: tools=%v force=%v\n", tools, force)
+					}
+					go func() {
+						if doToolUpdate(runCtx, tools, force) {
+							if stdout != nil {
+								fmt.Fprintln(stdout, "[supervisor] iazio-agent self-updated; restarting service...")
+							}
+							cancel()
+						}
+					}()
+					return nil
 				},
 				ActiveJobs: func() []controlplane.ActiveJob {
 					var jobs []controlplane.ActiveJob
@@ -798,4 +818,85 @@ func resolveHostID(getenv func(string) string, hostnameFn func() (string, error)
 		host += "-wsl"
 	}
 	return host
+}
+
+type repoAuditSubmodule struct {
+	Name           string `json:"name"`
+	Path           string `json:"path"`
+	IsClean        bool   `json:"is_clean"`
+	ModifiedCount  int    `json:"modified_count"`
+	UntrackedCount int    `json:"untracked_count"`
+}
+
+type repoAuditResult struct {
+	Total      int                  `json:"total"`
+	Clean      int                  `json:"clean"`
+	Dirty      int                  `json:"dirty"`
+	Submodules []repoAuditSubmodule `json:"submodules"`
+}
+
+func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
+	// First query autopilot-fleet audit -json
+	cmd := exec.CommandContext(ctx, "autopilot-fleet", "audit", "-json")
+	cmd.Dir = repoPath
+	if out, err := cmd.Output(); err == nil && len(out) > 0 {
+		var audit repoAuditResult
+		if json.Unmarshal(out, &audit) == nil {
+			if audit.Dirty > 0 {
+				return false
+			}
+			for _, sub := range audit.Submodules {
+				if !sub.IsClean || sub.ModifiedCount > 0 || sub.UntrackedCount > 0 {
+					return false
+				}
+			}
+		}
+	}
+	// Fallback/direct check with git status --porcelain
+	gitCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain")
+	if out, err := gitCmd.CombinedOutput(); err == nil {
+		if strings.TrimSpace(string(out)) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Client, sup *supervisor.Sup, host, api string, stdout io.Writer) bool {
+	if sup != nil && sup.HasRunningHarness() {
+		if stdout != nil {
+			fmt.Fprintln(stdout, "[supervisor] harness execution is active; deferring background tool update")
+		}
+		return false
+	}
+	if api != "" {
+		detail, err := client.GetHost(ctx, host)
+		if err == nil {
+			for _, r := range detail.Repos {
+				path := r.WorktreePath
+				if path == "" {
+					path = r.Path
+				}
+				if path == "" {
+					continue
+				}
+				if sup != nil {
+					lock := sup.Lock(path)
+					if lock == supervisor.LockRunning || lock == supervisor.LockCooling || lock == supervisor.LockPending {
+						if stdout != nil {
+							fmt.Fprintf(stdout, "[supervisor] worktree %s is busy (%s); deferring background tool update\n", path, lock)
+						}
+						return false
+					}
+				}
+				if !scanRepoFleetStatus(ctx, path) {
+					if stdout != nil {
+						fmt.Fprintf(stdout, "[supervisor] worktree %s is dirty; deferring background tool update\n", path)
+					}
+					return false
+				}
+			}
+		}
+	}
+	return true
 }

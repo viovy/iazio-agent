@@ -163,14 +163,15 @@ func defaultBaselineManifest(profile string) ManifestResponse {
 }
 
 type UpdateOptions struct {
-	Suite     bool
-	DryRun    bool
-	Force     bool
-	Profile   string
-	API       string
-	BinDir    string
-	OnTimeout string
-	Expired   bool
+	Suite       bool
+	DryRun      bool
+	Force       bool
+	Profile     string
+	API         string
+	BinDir      string
+	OnTimeout   string
+	Expired     bool
+	TargetTools []string
 }
 
 func performUpdate(ctx context.Context, opts UpdateOptions, stdout, stderr io.Writer, getenv func(string) string) (bool, error) {
@@ -231,7 +232,32 @@ func performUpdate(ctx context.Context, opts UpdateOptions, stdout, stderr io.Wr
 	ghToken := resolveGitHubToken(getenv)
 
 	var targets []ManifestToolItem
-	if opts.Suite {
+	if len(opts.TargetTools) > 0 {
+		targetMap := make(map[string]bool)
+		for _, name := range opts.TargetTools {
+			targetMap[strings.ToLower(strings.TrimSpace(name))] = true
+		}
+		for _, t := range manifest.Tools {
+			if targetMap[strings.ToLower(t.Name)] || targetMap[strings.ToLower(t.BinaryName)] {
+				targets = append(targets, t)
+			}
+		}
+		if len(targets) == 0 {
+			for _, name := range opts.TargetTools {
+				cleanName := strings.TrimSpace(name)
+				if cleanName == "" {
+					continue
+				}
+				targets = append(targets, ManifestToolItem{
+					Name:        cleanName,
+					Repository:  "viovy/" + cleanName,
+					BinaryName:  cleanName,
+					Description: cleanName,
+					Tier:        "baseline",
+				})
+			}
+		}
+	} else if opts.Suite {
 		targets = manifest.Tools
 	} else {
 		for _, t := range manifest.Tools {
@@ -297,6 +323,11 @@ func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer, get
 			opts.API = args[i]
 		case strings.HasPrefix(args[i], "--api="):
 			opts.API = strings.TrimPrefix(args[i], "--api=")
+		case args[i] == "--tool" && i+1 < len(args):
+			i++
+			opts.TargetTools = append(opts.TargetTools, args[i])
+		case strings.HasPrefix(args[i], "--tool="):
+			opts.TargetTools = append(opts.TargetTools, strings.TrimPrefix(args[i], "--tool="))
 		case args[i] == "--bin-dir" && i+1 < len(args):
 			i++
 			opts.BinDir = args[i]
@@ -346,13 +377,6 @@ func updateSingleTool(
 
 	destPath := filepath.Join(binDir, binName)
 	curVer := inventory.InspectInstalledVersion(destPath)
-
-	if !force && (strings.Contains(curVer, "-dev") || curVer == "dev" || curVer == "0.1.0-dev") {
-		if stdout != nil {
-			fmt.Fprintf(stdout, "  [*] %s: %s (dev version preserved, skip update)\n", tool.Name, curVer)
-		}
-		return false, nil
-	}
 
 	repo := tool.Repository
 	if !strings.Contains(repo, "/") {
@@ -635,6 +659,52 @@ func installExecutableSafe(destPath string, data []byte) error {
 	}
 
 	if runtime.GOOS == "windows" {
+		cleanStaleBackups(dir)
+		if err := installExecutableSafeDirect(destPath, data); err != nil {
+			return err
+		}
+
+		// Synchronize active running process executable if installed from alternate location
+		if currentExe, err := os.Executable(); err == nil && currentExe != "" {
+			if strings.EqualFold(filepath.Base(currentExe), filepath.Base(destPath)) &&
+				!strings.EqualFold(filepath.Clean(currentExe), filepath.Clean(destPath)) {
+				_ = installExecutableSafeDirect(currentExe, data)
+			}
+		}
+
+		// Synchronize %USERPROFILE%\bin and %USERPROFILE%\.local\bin to prevent PATH shadowing
+		userProfile := os.Getenv("USERPROFILE")
+		if userProfile != "" {
+			binDir1 := filepath.Join(userProfile, "bin")
+			binDir2 := filepath.Join(userProfile, ".local", "bin")
+			var altPath string
+			if strings.HasPrefix(strings.ToLower(destPath), strings.ToLower(binDir1)) {
+				altPath = filepath.Join(binDir2, filepath.Base(destPath))
+			} else if strings.HasPrefix(strings.ToLower(destPath), strings.ToLower(binDir2)) {
+				altPath = filepath.Join(binDir1, filepath.Base(destPath))
+			}
+			if altPath != "" {
+				if _, statErr := os.Stat(filepath.Dir(altPath)); statErr == nil {
+					_ = installExecutableSafeDirect(altPath, data)
+				}
+			}
+		}
+		return nil
+	}
+
+	tmpPath := fmt.Sprintf("%s.tmp.%d", destPath, time.Now().UnixNano())
+	if err := os.WriteFile(tmpPath, data, 0755); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, destPath)
+}
+
+func installExecutableSafeDirect(destPath string, data []byte) error {
+	dir := filepath.Dir(destPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
 		if _, err := os.Stat(destPath); err == nil {
 			f, err := os.OpenFile(destPath, os.O_WRONLY|os.O_TRUNC, 0755)
 			if err != nil {
@@ -648,12 +718,32 @@ func installExecutableSafe(destPath string, data []byte) error {
 		}
 		return os.WriteFile(destPath, data, 0755)
 	}
-
 	tmpPath := fmt.Sprintf("%s.tmp.%d", destPath, time.Now().UnixNano())
 	if err := os.WriteFile(tmpPath, data, 0755); err != nil {
 		return err
 	}
 	return os.Rename(tmpPath, destPath)
+}
+
+func cleanStaleBackups(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		if strings.Contains(name, ".old.") && strings.HasSuffix(name, ".exe") {
+			fullPath := filepath.Join(dir, name)
+			if info, err := ent.Info(); err == nil {
+				if time.Since(info.ModTime()) > 5*time.Minute {
+					_ = os.Remove(fullPath)
+				}
+			}
+		}
+	}
 }
 
 func inspectInstalledVersion(binaryPath string) string {

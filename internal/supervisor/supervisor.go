@@ -254,6 +254,18 @@ func (s *Sup) ActiveJobs() map[string]int {
 	return res
 }
 
+// HasRunningHarness reports whether any worktree is actively running, cooling, or pending correlation.
+func (s *Sup) HasRunningHarness() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, state := range s.locks {
+		if state == LockRunning || state == LockCooling || state == LockPending {
+			return true
+		}
+	}
+	return false
+}
+
 // RunningJob describes an active harness job.
 type RunningJob struct {
 	JobID        string
