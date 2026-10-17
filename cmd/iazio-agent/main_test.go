@@ -419,3 +419,70 @@ func TestSyncLocalEndpointsAndResolveLocalAPI(t *testing.T) {
 	}
 }
 
+func TestRunProbe(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Test probe default text output
+	var stdout, stderr bytes.Buffer
+	err := execute(ctx, []string{"probe"}, &stdout, &stderr, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("execute probe failed: %v", err)
+	}
+	outStr := stdout.String()
+	if !strings.Contains(outStr, "host=") || !strings.Contains(outStr, "version=") {
+		t.Errorf("unexpected probe output: %q", outStr)
+	}
+
+	// 2. Test probe --json output
+	stdout.Reset()
+	stderr.Reset()
+	err = execute(ctx, []string{"probe", "--json"}, &stdout, &stderr, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("execute probe --json failed: %v", err)
+	}
+	var res ProbeResult
+	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
+		t.Fatalf("failed to unmarshal probe JSON output: %v\nOutput: %s", err, stdout.String())
+	}
+	if res.HostID == "" || res.OS == "" || res.Arch == "" {
+		t.Errorf("incomplete probe result: %+v", res)
+	}
+
+	// 3. Test probe --help
+	stdout.Reset()
+	err = execute(ctx, []string{"probe", "--help"}, &stdout, &stderr, func(string) string { return "" })
+	if err != nil || !strings.Contains(stdout.String(), "usage: iazio-agent probe") {
+		t.Errorf("expected usage on probe --help, got err=%v out=%q", err, stdout.String())
+	}
+
+	// 4. Test probe with healthy mock API
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	stdout.Reset()
+	stderr.Reset()
+	err = execute(ctx, []string{"probe", "--json", "--check-api"}, &stdout, &stderr, func(k string) string {
+		if k == "IAZIO_AGENT_API" {
+			return srv.URL
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("execute probe with mock API failed: %v", err)
+	}
+	var apiRes ProbeResult
+	if err := json.Unmarshal(stdout.Bytes(), &apiRes); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	if apiRes.ControlPlaneStatus != "OK" {
+		t.Errorf("expected control plane status OK, got %q", apiRes.ControlPlaneStatus)
+	}
+}
+
