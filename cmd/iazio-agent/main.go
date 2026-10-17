@@ -40,15 +40,17 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		getenv = os.Getenv
 	}
 	if len(args) == 0 {
-		return fmt.Errorf("usage: iazio-agent version|auth|service|update|run")
+		return fmt.Errorf("usage: iazio-agent version|auth|service|update|run|probe")
 	}
 	switch args[0] {
 	case "version", "--version", "-v":
 		fmt.Fprintln(stdout, formatVersion())
 		return nil
 	case "help", "--help", "-h":
-		fmt.Fprintln(stdout, "usage: iazio-agent version|auth|service|update|run")
+		fmt.Fprintln(stdout, "usage: iazio-agent version|auth|service|update|run|probe")
 		return nil
+	case "probe", "health", "--healthcheck":
+		return runProbe(ctx, args[1:], stdout, stderr, getenv)
 	case "auth":
 		return runAuth(ctx, args[1:], stdout, getenv)
 	case "service":
