@@ -17,11 +17,14 @@ var (
 	procAssignProcessToJobObject = kernel32.NewProc("AssignProcessToJobObject")
 	procTerminateJobObject       = kernel32.NewProc("TerminateJobObject")
 	procCloseHandle              = kernel32.NewProc("CloseHandle")
+	procOpenProcess              = kernel32.NewProc("OpenProcess")
 )
 
 const (
 	jobObjectExtendedLimitInformation = 9
 	jobObjectLimitKillOnJobClose      = 0x2000
+	processSetQuota                   = 0x0100
+	processTerminate                  = 0x0001
 )
 
 type jobObjectBasicLimitInformation struct {
@@ -81,7 +84,12 @@ func postStartProc(cmd *exec.Cmd) {
 		uintptr(unsafe.Pointer(&info)),
 		unsafe.Sizeof(info),
 	)
-	procAssignProcessToJobObject.Call(jobHandle, uintptr(syscall.Handle(cmd.Process.Pid)))
+	rProc, _, _ := procOpenProcess.Call(uintptr(processSetQuota|processTerminate), 0, uintptr(cmd.Process.Pid))
+	if rProc != 0 {
+		hProc := rProc
+		procAssignProcessToJobObject.Call(jobHandle, hProc)
+		procCloseHandle.Call(hProc)
+	}
 
 	agentJobMu.Lock()
 	agentJobs[cmd.Process.Pid] = jobHandle
