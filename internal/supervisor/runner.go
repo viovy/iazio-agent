@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -184,3 +185,65 @@ func (r *OSRunner) Wait(pid int) (int, error) {
 	}
 	return 0, nil
 }
+
+// DockerConfig holds configuration parameters for launching an ephemeral containerized agent.
+type DockerConfig struct {
+	Image         string            `json:"image"`
+	Network       string            `json:"network,omitempty"`
+	MemoryMB      int64             `json:"memory_mb,omitempty"`
+	CPUs          float64           `json:"cpus,omitempty"`
+	CloneURL      string            `json:"clone_url,omitempty"`
+	WorktreeMount string            `json:"worktree_mount,omitempty"`
+	EnvVars       map[string]string `json:"env_vars,omitempty"`
+}
+
+// DockerRunner scaffolds the containerized isolation runner interface for autonomous story execution (ASE).
+// Full container lifecycle is executed when docker daemon interaction is enabled.
+type DockerRunner struct {
+	Config DockerConfig
+	host   Runner
+}
+
+// NewDockerRunner creates a new DockerRunner wrapping the provided configuration and fallback host runner.
+func NewDockerRunner(cfg DockerConfig, fallback Runner) *DockerRunner {
+	if fallback == nil {
+		fallback = NewOSRunner()
+	}
+	return &DockerRunner{
+		Config: cfg,
+		host:   fallback,
+	}
+}
+
+// Start launches either a docker container or delegates to the underlying host runner.
+func (d *DockerRunner) Start(argv []string) (int, error) {
+	if len(argv) == 0 {
+		return 0, errors.New("empty argv")
+	}
+	// If no image is configured, execute via host runner
+	if d.Config.Image == "" {
+		return d.host.Start(argv)
+	}
+
+	dockerArgv := []string{"docker", "run", "--rm"}
+	if d.Config.WorktreeMount != "" {
+		dockerArgv = append(dockerArgv, "-v", fmt.Sprintf("%s:/workspace", d.Config.WorktreeMount))
+	}
+	for k, v := range d.Config.EnvVars {
+		dockerArgv = append(dockerArgv, "-e", fmt.Sprintf("%s=%s", k, v))
+	}
+	dockerArgv = append(dockerArgv, d.Config.Image)
+	dockerArgv = append(dockerArgv, argv...)
+	return d.host.Start(dockerArgv)
+}
+
+// Signal sends a signal to the running agent.
+func (d *DockerRunner) Signal(pid int, sig string) error {
+	return d.host.Signal(pid, sig)
+}
+
+// Wait waits for the agent execution to finish.
+func (d *DockerRunner) Wait(pid int) (int, error) {
+	return d.host.Wait(pid)
+}
+
