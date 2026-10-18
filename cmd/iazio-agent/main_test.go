@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -485,4 +486,111 @@ func TestRunProbe(t *testing.T) {
 		t.Errorf("expected control plane status OK, got %q", apiRes.ControlPlaneStatus)
 	}
 }
+
+func TestInstallExecutableSafeDirect(t *testing.T) {
+	tmpDir := t.TempDir()
+	targetPath := filepath.Join(tmpDir, "sub", "test-bin")
+	data := []byte("#!/bin/sh\necho ok\n")
+
+	if err := installExecutableSafeDirect(targetPath, data); err != nil {
+		t.Fatalf("installExecutableSafeDirect failed: %v", err)
+	}
+
+	read, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("failed to read installed binary: %v", err)
+	}
+	if string(read) != string(data) {
+		t.Fatalf("content mismatch: got %q, want %q", string(read), string(data))
+	}
+
+	// Overwrite existing
+	newData := []byte("#!/bin/sh\necho updated\n")
+	if err := installExecutableSafeDirect(targetPath, newData); err != nil {
+		t.Fatalf("overwrite failed: %v", err)
+	}
+	read, _ = os.ReadFile(targetPath)
+	if string(read) != string(newData) {
+		t.Fatalf("updated content mismatch: got %q, want %q", string(read), string(newData))
+	}
+}
+
+func TestInstallExecutableSafe_AlternatePathSync(t *testing.T) {
+	tmpDir := t.TempDir()
+	fakeHome := filepath.Join(tmpDir, "home")
+	binDir1 := filepath.Join(fakeHome, ".local", "bin")
+	binDir2 := filepath.Join(fakeHome, ".iazio", "bin")
+	if err := os.MkdirAll(binDir1, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(binDir2, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("HOME", fakeHome)
+
+	target1 := filepath.Join(binDir1, "iazio-agent")
+	target2 := filepath.Join(binDir2, "iazio-agent")
+	// Pre-create target2 to simulate an existing alternate binary that must be kept in sync
+	if err := os.WriteFile(target2, []byte("old-binary"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	data := []byte("new-binary-content")
+	if err := installExecutableSafe(target1, data); err != nil {
+		t.Fatalf("installExecutableSafe failed: %v", err)
+	}
+
+	// Verify primary was written
+	if c, _ := os.ReadFile(target1); string(c) != string(data) {
+		t.Fatalf("primary not updated: %q", string(c))
+	}
+	// Verify alternate was synchronized
+	if c, _ := os.ReadFile(target2); string(c) != string(data) {
+		t.Fatalf("alternate not synchronized: %q", string(c))
+	}
+}
+
+func TestScanRepoFleetStatus_FailClosed(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Invalid or non-existent path fails closed (returns false)
+	if scanRepoFleetStatus(ctx, filepath.Join(t.TempDir(), "nonexistent")) {
+		t.Fatal("expected non-existent dir to fail closed")
+	}
+
+	// 2. Directory without git repo fails closed (returns false)
+	emptyDir := t.TempDir()
+	if scanRepoFleetStatus(ctx, emptyDir) {
+		t.Fatal("expected non-git dir to fail closed")
+	}
+
+	// 3. Git repo check
+	repoDir := t.TempDir()
+	if err := exec.Command("git", "init", repoDir).Run(); err != nil {
+		t.Skip("git not available")
+	}
+	_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Test").Run()
+	_ = exec.Command("git", "-C", repoDir, "config", "user.email", "test@test.local").Run()
+
+	file := filepath.Join(repoDir, "file.txt")
+	if err := os.WriteFile(file, []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// With untracked file, must return false (dirty)
+	if scanRepoFleetStatus(ctx, repoDir) {
+		t.Fatal("expected dirty repo to return false")
+	}
+
+	// Commit file
+	_ = exec.Command("git", "-C", repoDir, "add", "file.txt").Run()
+	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "init").Run()
+
+	// Clean repo must return true
+	if !scanRepoFleetStatus(ctx, repoDir) {
+		t.Fatal("expected clean committed repo to return true")
+	}
+}
+
 

@@ -512,6 +512,27 @@ func fetchRelease(ctx context.Context, client *http.Client, repo, version, token
 		}
 	}
 
+	if resp.StatusCode == http.StatusNotFound && (version == "" || version == "latest") {
+		listURL := fmt.Sprintf("https://api.github.com/repos/%s/releases", repo)
+		reqList, _ := http.NewRequestWithContext(ctx, http.MethodGet, listURL, nil)
+		if reqList != nil {
+			reqList.Header.Set("Accept", "application/vnd.github.v3+json")
+			reqList.Header.Set("User-Agent", "iazio-agent/1.0")
+			if token != "" {
+				reqList.Header.Set("Authorization", "Bearer "+token)
+			}
+			if respList, errList := client.Do(reqList); errList == nil {
+				defer respList.Body.Close()
+				if respList.StatusCode == http.StatusOK {
+					var list []gitHubRelease
+					if err := json.NewDecoder(respList.Body).Decode(&list); err == nil && len(list) > 0 {
+						return &list[0], nil
+					}
+				}
+			}
+		}
+	}
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
 	}
@@ -668,7 +689,9 @@ func installExecutableSafe(destPath string, data []byte) error {
 		if currentExe, err := os.Executable(); err == nil && currentExe != "" {
 			if strings.EqualFold(filepath.Base(currentExe), filepath.Base(destPath)) &&
 				!strings.EqualFold(filepath.Clean(currentExe), filepath.Clean(destPath)) {
-				_ = installExecutableSafeDirect(currentExe, data)
+				if err := installExecutableSafeDirect(currentExe, data); err != nil {
+					return fmt.Errorf("failed to synchronize running executable at %s: %w", currentExe, err)
+				}
 			}
 		}
 
@@ -684,19 +707,61 @@ func installExecutableSafe(destPath string, data []byte) error {
 				altPath = filepath.Join(binDir1, filepath.Base(destPath))
 			}
 			if altPath != "" {
-				if _, statErr := os.Stat(filepath.Dir(altPath)); statErr == nil {
-					_ = installExecutableSafeDirect(altPath, data)
+				if _, statErr := os.Stat(altPath); statErr == nil {
+					if err := installExecutableSafeDirect(altPath, data); err != nil {
+						return fmt.Errorf("failed to synchronize existing alternate binary at %s: %w", altPath, err)
+					}
+				} else if _, statErr := os.Stat(filepath.Dir(altPath)); statErr == nil {
+					if err := installExecutableSafeDirect(altPath, data); err != nil {
+						return fmt.Errorf("failed to initialize alternate binary at %s: %w", altPath, err)
+					}
 				}
 			}
 		}
 		return nil
 	}
 
-	tmpPath := fmt.Sprintf("%s.tmp.%d", destPath, time.Now().UnixNano())
-	if err := os.WriteFile(tmpPath, data, 0755); err != nil {
+	if err := installExecutableSafeDirect(destPath, data); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, destPath)
+
+	// Synchronize active running process executable on Unix if installed from alternate location
+	if currentExe, err := os.Executable(); err == nil && currentExe != "" {
+		if resolvedCurrent, err := filepath.EvalSymlinks(currentExe); err == nil {
+			currentExe = resolvedCurrent
+		}
+		cleanCurrent := filepath.Clean(currentExe)
+		cleanDest := filepath.Clean(destPath)
+		if filepath.Base(cleanCurrent) == filepath.Base(cleanDest) && cleanCurrent != cleanDest {
+			if err := installExecutableSafeDirect(cleanCurrent, data); err != nil {
+				return fmt.Errorf("failed to synchronize running executable at %s: %w", cleanCurrent, err)
+			}
+		}
+	}
+
+	// Synchronize ~/.local/bin and ~/.iazio/bin on Unix to prevent service / PATH shadowing
+	if home := os.Getenv("HOME"); home != "" {
+		binDir1 := filepath.Join(home, ".local", "bin")
+		binDir2 := filepath.Join(home, ".iazio", "bin")
+		var altPath string
+		if strings.HasPrefix(destPath, binDir1) {
+			altPath = filepath.Join(binDir2, filepath.Base(destPath))
+		} else if strings.HasPrefix(destPath, binDir2) {
+			altPath = filepath.Join(binDir1, filepath.Base(destPath))
+		}
+		if altPath != "" {
+			if _, statErr := os.Stat(altPath); statErr == nil {
+				if err := installExecutableSafeDirect(altPath, data); err != nil {
+					return fmt.Errorf("failed to synchronize existing alternate binary at %s: %w", altPath, err)
+				}
+			} else if _, statErr := os.Stat(filepath.Dir(altPath)); statErr == nil {
+				if err := installExecutableSafeDirect(altPath, data); err != nil {
+					return fmt.Errorf("failed to initialize alternate binary at %s: %w", altPath, err)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func installExecutableSafeDirect(destPath string, data []byte) error {

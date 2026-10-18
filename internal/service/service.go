@@ -277,8 +277,8 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=%s run
-Restart=on-failure
-RestartSec=60s
+Restart=always
+RestartSec=5s
 Environment=IAZIO_AGENT_NONINTERACTIVE=1
 %s
 [Install]
