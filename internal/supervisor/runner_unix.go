@@ -11,6 +11,8 @@ func setProcGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
+func postStartProc(cmd *exec.Cmd) {}
+
 func signalPID(pid int, sig string) error {
 	if pid <= 0 {
 		return nil
@@ -24,12 +26,19 @@ func signalPID(pid int, sig string) error {
 	default:
 		s = syscall.SIGTERM
 	}
-	return syscall.Kill(-pid, s)
+	err := syscall.Kill(-pid, s)
+	if err != nil {
+		_ = syscall.Kill(pid, s)
+	}
+	return err
 }
 
 func isProcessAlive(pid int) bool {
 	if pid <= 0 {
 		return false
+	}
+	if syscall.Kill(-pid, 0) == nil {
+		return true
 	}
 	return syscall.Kill(pid, 0) == nil
 }

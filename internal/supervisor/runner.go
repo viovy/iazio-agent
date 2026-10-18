@@ -150,6 +150,7 @@ func (r *OSRunner) Start(argv []string) (int, error) {
 	if err := cmd.Start(); err != nil {
 		return 0, err
 	}
+	postStartProc(cmd)
 	pid := cmd.Process.Pid
 	r.mu.Lock()
 	if r.cmds == nil {
