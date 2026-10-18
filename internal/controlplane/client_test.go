@@ -418,4 +418,42 @@ func TestPostFinishTransientRetrySuccess(t *testing.T) {
 	}
 }
 
+func TestLoopSkipsLeaseDuringToolUpdate(t *testing.T) {
+	var pollCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/poll") {
+			pollCalls++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := Client{
+		BaseURL: srv.URL,
+		Presence: func() string {
+			return "ONLINE_UPDATING_TOOLS"
+		},
+	}
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	err := c.Loop(ctx, "runner-1", "permanent", 10*time.Millisecond, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if pollCalls != 0 {
+		t.Fatalf("expected 0 poll calls while ONLINE_UPDATING_TOOLS, got %d", pollCalls)
+	}
+}
+
+
 

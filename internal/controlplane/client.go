@@ -254,6 +254,15 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 				}
 			}
 		}
+		if c.Presence != nil && c.Presence() == "ONLINE_UPDATING_TOOLS" {
+			// Dedicated tool updating state: block iazio-harness queue execution
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-tick.C:
+				continue
+			}
+		}
 		job, ok, err := c.NextLease(ctx, hostID)
 		if err != nil && ctx.Err() != nil {
 			return nil

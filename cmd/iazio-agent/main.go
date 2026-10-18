@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -143,10 +144,13 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				if api != "" {
 					_ = client.Heartbeat(ctx, host, getTools(), false)
 				}
+				var willRestart bool
 				defer func() {
-					updatingTools.Store(false)
-					if api != "" {
-						_ = client.Heartbeat(ctx, host, getTools(), false)
+					if !willRestart {
+						updatingTools.Store(false)
+						if api != "" {
+							_ = client.Heartbeat(ctx, host, getTools(), false)
+						}
 					}
 				}()
 
@@ -164,8 +168,16 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 					return false
 				}
+				if updated {
+					willRestart = true
+				}
 				return updated
 			}
+
+			var pendingRemoteMu sync.Mutex
+			var pendingRemoteTools []string
+			var pendingRemoteForce bool
+			var hasPendingRemote bool
 
 			if updateInterval > 0 {
 				go func() {
@@ -176,6 +188,21 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 
 					checkOnce := func() bool {
+						pendingRemoteMu.Lock()
+						t := pendingRemoteTools
+						f := pendingRemoteForce
+						isRemote := hasPendingRemote
+						pendingRemoteMu.Unlock()
+
+						if isRemote {
+							if doToolUpdate(runCtx, t, f) {
+								pendingRemoteMu.Lock()
+								hasPendingRemote = false
+								pendingRemoteMu.Unlock()
+								return true
+							}
+							return false
+						}
 						return doToolUpdate(runCtx, nil, false)
 					}
 
@@ -218,8 +245,23 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					if stdout != nil {
 						fmt.Fprintf(stdout, "[supervisor] remote tool update requested: tools=%v force=%v\n", tools, force)
 					}
+					pendingRemoteMu.Lock()
+					pendingRemoteTools = tools
+					pendingRemoteForce = force
+					hasPendingRemote = true
+					pendingRemoteMu.Unlock()
+
 					go func() {
-						if doToolUpdate(runCtx, tools, force) {
+						pendingRemoteMu.Lock()
+						t := pendingRemoteTools
+						f := pendingRemoteForce
+						pendingRemoteMu.Unlock()
+
+						if doToolUpdate(runCtx, t, f) {
+							pendingRemoteMu.Lock()
+							hasPendingRemote = false
+							pendingRemoteMu.Unlock()
+
 							if stdout != nil {
 								fmt.Fprintln(stdout, "[supervisor] iazio-agent self-updated; restarting service...")
 							}
@@ -831,20 +873,45 @@ type repoAuditSubmodule struct {
 }
 
 type repoAuditResult struct {
-	Total      int                  `json:"total"`
-	Clean      int                  `json:"clean"`
-	Dirty      int                  `json:"dirty"`
-	Submodules []repoAuditSubmodule `json:"submodules"`
+	TotalSubmodules int                  `json:"total_submodules"`
+	DirtyCount      int                  `json:"dirty_count"`
+	ErrorCount      int                  `json:"error_count"`
+	Submodules      []repoAuditSubmodule `json:"submodules"`
 }
 
 func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
-	// First query autopilot-fleet audit -json
+	// First: verify repoPath is a valid git repository top-level root
+	topCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--show-toplevel")
+	topOut, err := topCmd.Output()
+	if err != nil {
+		return false
+	}
+	cleanTop := filepath.Clean(strings.TrimSpace(string(topOut)))
+	cleanRepo := filepath.Clean(repoPath)
+	if resolvedRepo, rerr := filepath.EvalSymlinks(cleanRepo); rerr == nil {
+		cleanRepo = resolvedRepo
+	}
+	if resolvedTop, rerr := filepath.EvalSymlinks(cleanTop); rerr == nil {
+		cleanTop = resolvedTop
+	}
+	if cleanTop != cleanRepo {
+		return false
+	}
+
+	// Verify root worktree is completely clean
+	gitCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain")
+	out, err := gitCmd.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "" {
+		return false
+	}
+
+	// If autopilot-fleet audit is available, verify submodules
 	cmd := exec.CommandContext(ctx, "autopilot-fleet", "audit", "-json")
 	cmd.Dir = repoPath
-	if out, err := cmd.Output(); err == nil && len(out) > 0 {
+	if auditOut, err := cmd.Output(); err == nil && len(auditOut) > 0 {
 		var audit repoAuditResult
-		if json.Unmarshal(out, &audit) == nil {
-			if audit.Dirty > 0 {
+		if json.Unmarshal(auditOut, &audit) == nil {
+			if audit.DirtyCount > 0 || audit.ErrorCount > 0 {
 				return false
 			}
 			for _, sub := range audit.Submodules {
@@ -852,13 +919,6 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 					return false
 				}
 			}
-		}
-	}
-	// Fallback/direct check with git status --porcelain
-	gitCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain")
-	if out, err := gitCmd.CombinedOutput(); err == nil {
-		if strings.TrimSpace(string(out)) != "" {
-			return false
 		}
 	}
 	return true
@@ -873,30 +933,34 @@ func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Cli
 	}
 	if api != "" {
 		detail, err := client.GetHost(ctx, host)
-		if err == nil {
-			for _, r := range detail.Repos {
-				path := r.WorktreePath
-				if path == "" {
-					path = r.Path
-				}
-				if path == "" {
-					continue
-				}
-				if sup != nil {
-					lock := sup.Lock(path)
-					if lock == supervisor.LockRunning || lock == supervisor.LockCooling || lock == supervisor.LockPending {
-						if stdout != nil {
-							fmt.Fprintf(stdout, "[supervisor] worktree %s is busy (%s); deferring background tool update\n", path, lock)
-						}
-						return false
-					}
-				}
-				if !scanRepoFleetStatus(ctx, path) {
+		if err != nil {
+			if stdout != nil {
+				fmt.Fprintf(stdout, "[supervisor] warning: failed to fetch host details from control plane (%v); deferring tool update\n", err)
+			}
+			return false
+		}
+		for _, r := range detail.Repos {
+			path := r.WorktreePath
+			if path == "" {
+				path = r.Path
+			}
+			if path == "" {
+				continue
+			}
+			if sup != nil {
+				lock := sup.Lock(path)
+				if lock == supervisor.LockRunning || lock == supervisor.LockCooling || lock == supervisor.LockPending {
 					if stdout != nil {
-						fmt.Fprintf(stdout, "[supervisor] worktree %s is dirty; deferring background tool update\n", path)
+						fmt.Fprintf(stdout, "[supervisor] worktree %s is busy (%s); deferring background tool update\n", path, lock)
 					}
 					return false
 				}
+			}
+			if !scanRepoFleetStatus(ctx, path) {
+				if stdout != nil {
+					fmt.Fprintf(stdout, "[supervisor] worktree %s is dirty; deferring background tool update\n", path)
+				}
+				return false
 			}
 		}
 	}
