@@ -346,15 +346,18 @@ func (s *Sup) Deadline(path string) time.Time {
 	return s.deadline[path]
 }
 
-// GracefulStop sends TERM and, if the process is still alive, KILL after 10s.
+// GracefulStop sends TERM and forcefully reaps the process tree/group with KILL after 10s.
 func GracefulStop(signal func(pid int, sig string) error, alive func(pid int) bool, sleep func(time.Duration), pid int) {
+	if pid <= 0 {
+		return
+	}
 	if signal != nil {
 		_ = signal(pid, "TERM")
 	}
 	if sleep != nil {
 		sleep(TermGrace)
 	}
-	if alive != nil && alive(pid) && signal != nil {
+	if signal != nil {
 		_ = signal(pid, "KILL")
 	}
 }
