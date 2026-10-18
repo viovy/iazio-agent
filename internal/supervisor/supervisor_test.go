@@ -584,5 +584,55 @@ func TestReconcileHostCheckouts_AutoHealSuperseded(t *testing.T) {
 	}
 }
 
+type mockRunner struct {
+	lastArgv []string
+}
+
+func (m *mockRunner) Start(argv []string) (int, error) {
+	m.lastArgv = argv
+	return 12345, nil
+}
+
+func (m *mockRunner) Signal(pid int, sig string) error {
+	return nil
+}
+
+func (m *mockRunner) Wait(pid int) (int, error) {
+	return 0, nil
+}
+
+func TestDockerRunner_Dispatch(t *testing.T) {
+	mock := &mockRunner{}
+	// 1. Without image, delegates directly to host
+	drHost := NewDockerRunner(DockerConfig{}, mock)
+	pid, err := drHost.Start([]string{"autopilot", "ase", "--story", "STORY-123"})
+	if err != nil || pid != 12345 {
+		t.Fatalf("expected host delegation, got pid=%d err=%v", pid, err)
+	}
+	if len(mock.lastArgv) != 4 || mock.lastArgv[0] != "autopilot" {
+		t.Fatalf("unexpected host argv: %v", mock.lastArgv)
+	}
+
+	// 2. With image, constructs containerized invocation
+	cfg := DockerConfig{
+		Image:         "viovy/autopilot:latest",
+		WorktreeMount: "/repos/my-project",
+		EnvVars:       map[string]string{"ASE_MODE": "sandbox"},
+	}
+	drDocker := NewDockerRunner(cfg, mock)
+	pidDocker, err := drDocker.Start([]string{"autopilot", "ase"})
+	if err != nil || pidDocker != 12345 {
+		t.Fatalf("expected docker invocation, got pid=%d err=%v", pidDocker, err)
+	}
+	if len(mock.lastArgv) < 6 || mock.lastArgv[0] != "docker" || mock.lastArgv[1] != "run" {
+		t.Fatalf("expected docker run prefix, got: %v", mock.lastArgv)
+	}
+	joined := strings.Join(mock.lastArgv, " ")
+	if !strings.Contains(joined, "viovy/autopilot:latest") || !strings.Contains(joined, "/repos/my-project:/workspace") {
+		t.Fatalf("missing expected flags in docker argv: %s", joined)
+	}
+}
+
+
 
 
