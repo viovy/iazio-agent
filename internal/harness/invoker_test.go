@@ -47,7 +47,7 @@ func TestHelperProcess(t *testing.T) {
 				os.Exit(1)
 			}
 			res := StoryExecutionResult{
-				StoryID:      "STORY-IAZIO-0131",
+				StoryID:      "STORY-MOCK-001",
 				Submodule:    sub,
 				StoryPath:    "docs/stories/2026-10-19-test.story.md",
 				IndexUpdated: true,
@@ -105,8 +105,8 @@ func TestCLIInvoker_CreateStory_Success(t *testing.T) {
 		t.Fatalf("unexpected CreateStory error: %v", err)
 	}
 
-	if res.StoryID != "STORY-IAZIO-0131" {
-		t.Errorf("expected story_id STORY-IAZIO-0131, got %s", res.StoryID)
+	if res.StoryID != "STORY-MOCK-001" {
+		t.Errorf("expected story_id STORY-MOCK-001, got %s", res.StoryID)
 	}
 	if res.Submodule != "iazio-mcp" {
 		t.Errorf("expected submodule iazio-mcp, got %s", res.Submodule)
