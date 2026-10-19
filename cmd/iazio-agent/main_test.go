@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -116,13 +117,13 @@ func TestExecuteCommands(t *testing.T) {
 }
 
 func TestExecuteRunConnected(t *testing.T) {
-	var heartbeatReceived bool
+	var heartbeatReceived atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/register"):
 			w.WriteHeader(http.StatusOK)
 		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
-			heartbeatReceived = true
+			heartbeatReceived.Store(true)
 			w.WriteHeader(http.StatusOK)
 		case strings.HasSuffix(r.URL.Path, "/poll"):
 			w.WriteHeader(http.StatusNoContent)
@@ -135,7 +136,7 @@ func TestExecuteRunConnected(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		for i := 0; i < 60; i++ {
-			if heartbeatReceived {
+			if heartbeatReceived.Load() {
 				break
 			}
 			time.Sleep(50 * time.Millisecond)
@@ -157,7 +158,7 @@ func TestExecuteRunConnected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
-	if !heartbeatReceived {
+	if !heartbeatReceived.Load() {
 		t.Fatalf("expected heartbeat to be received")
 	}
 }

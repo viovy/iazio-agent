@@ -38,11 +38,49 @@ type PromptExecutionResult struct {
 	Output        string   `json:"output,omitempty"`
 }
 
+// CodebaseRepoInfo describes a repository returned by codebase repos.
+type CodebaseRepoInfo struct {
+	Name          string `json:"name"`
+	Path          string `json:"path"`
+	DefaultBranch string `json:"default_branch"`
+	GitTreeSHA    string `json:"git_tree_sha"`
+	Description   string `json:"description,omitempty"`
+}
+
+// CodebaseReposResult represents the output from iazio-harness codebase repos.
+type CodebaseReposResult struct {
+	Repos []CodebaseRepoInfo `json:"repos"`
+}
+
+// CodebaseChunk describes a source code chunk emitted by codebase export.
+type CodebaseChunk struct {
+	RepoName    string `json:"repo_name"`
+	FilePath    string `json:"file_path"`
+	StartLine   int    `json:"start_line"`
+	EndLine     int    `json:"end_line"`
+	Symbol      string `json:"symbol,omitempty"`
+	Content     string `json:"content"`
+	FileBlobSHA string `json:"file_blob_sha"`
+	GitTreeSHA  string `json:"git_tree_sha"`
+}
+
+// CodebaseExportResult represents the output from iazio-harness codebase export.
+type CodebaseExportResult struct {
+	RepoName     string          `json:"repo_name"`
+	BaseTreeSHA  string          `json:"base_tree_sha"`
+	GitTreeSHA   string          `json:"git_tree_sha"`
+	UpToDate     bool            `json:"up_to_date"`
+	DeletedFiles []string        `json:"deleted_files"`
+	Chunks       []CodebaseChunk `json:"chunks"`
+}
+
 // Invoker defines the contract for invoking iazio-harness on the host.
 // Direct calls to autopilot or edits to docs/stories/index.yml are strictly prohibited in iazio-agent.
 type Invoker interface {
 	CreateStory(ctx context.Context, payload json.RawMessage) (*StoryExecutionResult, error)
 	ExecutePrompt(ctx context.Context, payload json.RawMessage) (*PromptExecutionResult, error)
+	ListRepos(ctx context.Context) (*CodebaseReposResult, error)
+	ExportCodebase(ctx context.Context, payload json.RawMessage) (*CodebaseExportResult, error)
 }
 
 // CLIInvoker delegates story scaffolding and prompt runs to the iazio-harness binary.
@@ -109,6 +147,40 @@ func (c *CLIInvoker) ExecutePrompt(ctx context.Context, payload json.RawMessage)
 
 	if res.Output == "" && res.Summary != "" {
 		res.Output = res.Summary
+	}
+
+	return &res, nil
+}
+
+// ListRepos invokes `iazio-harness codebase repos --json`.
+func (c *CLIInvoker) ListRepos(ctx context.Context) (*CodebaseReposResult, error) {
+	stdout, stderr, err := c.runCommand(ctx, []string{"codebase", "repos", "--json"}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("iazio-harness codebase repos failed: %w (stderr: %s)", err, strings.TrimSpace(stderr))
+	}
+
+	var res CodebaseReposResult
+	if err := json.Unmarshal([]byte(stdout), &res); err != nil {
+		return nil, fmt.Errorf("failed to parse iazio-harness codebase repos output %q: %w", stdout, err)
+	}
+
+	return &res, nil
+}
+
+// ExportCodebase invokes `iazio-harness codebase export --json` passing payload on stdin.
+func (c *CLIInvoker) ExportCodebase(ctx context.Context, payload json.RawMessage) (*CodebaseExportResult, error) {
+	if len(payload) == 0 {
+		return nil, errors.New("empty payload for codebase export")
+	}
+
+	stdout, stderr, err := c.runCommand(ctx, []string{"codebase", "export", "--json"}, payload)
+	if err != nil {
+		return nil, fmt.Errorf("iazio-harness codebase export failed: %w (stderr: %s)", err, strings.TrimSpace(stderr))
+	}
+
+	var res CodebaseExportResult
+	if err := json.Unmarshal([]byte(stdout), &res); err != nil {
+		return nil, fmt.Errorf("failed to parse iazio-harness codebase export output %q: %w", stdout, err)
 	}
 
 	return &res, nil
