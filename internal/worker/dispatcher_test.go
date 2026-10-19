@@ -38,6 +38,21 @@ func (m *mockInvoker) ExecutePrompt(ctx context.Context, payload json.RawMessage
 	}, nil
 }
 
+func (m *mockInvoker) ListRepos(ctx context.Context) (*harness.CodebaseReposResult, error) {
+	return &harness.CodebaseReposResult{
+		Repos: []harness.CodebaseRepoInfo{
+			{Name: "iazio-mcp", Path: "iazio-mcp", DefaultBranch: "main"},
+		},
+	}, nil
+}
+
+func (m *mockInvoker) ExportCodebase(ctx context.Context, payload json.RawMessage) (*harness.CodebaseExportResult, error) {
+	return &harness.CodebaseExportResult{
+		RepoName: "iazio-mcp",
+		UpToDate: true,
+	}, nil
+}
+
 type mockControlPlane struct {
 	claimFunc    func(ctx context.Context, req ClaimRequest) (*Job, error)
 	completeFunc func(ctx context.Context, jobID string, req CompleteRequest) error

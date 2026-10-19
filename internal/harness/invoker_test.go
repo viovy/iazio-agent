@@ -80,6 +80,38 @@ func TestHelperProcess(t *testing.T) {
 			return
 		}
 		os.Exit(2)
+	case "codebase":
+		if len(args) >= 3 && args[1] == "repos" && args[2] == "--json" {
+			_ = json.NewEncoder(os.Stdout).Encode(CodebaseReposResult{
+				Repos: []CodebaseRepoInfo{
+					{
+						Name:          "iazio-mcp",
+						Path:          "iazio-mcp",
+						DefaultBranch: "main",
+						GitTreeSHA:    "tree-123",
+						Description:   "mock mcp",
+					},
+				},
+			})
+			return
+		}
+		if len(args) >= 3 && args[1] == "export" && args[2] == "--json" {
+			var payload map[string]any
+			if err := json.NewDecoder(os.Stdin).Decode(&payload); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid stdin JSON: %v\n", err)
+				os.Exit(1)
+			}
+			repo, _ := payload["repo_name"].(string)
+			_ = json.NewEncoder(os.Stdout).Encode(CodebaseExportResult{
+				RepoName:     repo,
+				GitTreeSHA:   "tree-456",
+				UpToDate:     true,
+				DeletedFiles: []string{},
+				Chunks:       []CodebaseChunk{},
+			})
+			return
+		}
+		os.Exit(2)
 	default:
 		os.Exit(2)
 	}
@@ -195,3 +227,54 @@ func TestCLIInvoker_ExecutePrompt_Success(t *testing.T) {
 		t.Errorf("expected output done, got %s", res.Output)
 	}
 }
+
+func TestCLIInvoker_ListRepos_Success(t *testing.T) {
+	inv := makeFakeInvoker(t)
+	tmpDir := t.TempDir()
+	fakeBin := tmpDir + "/fake-harness"
+	script := fmt.Sprintf("#!/bin/sh\nexport GO_WANT_HELPER_PROCESS=1\nexec %s -test.run=TestHelperProcess -- \"$@\"\n", os.Args[0])
+	if err := os.WriteFile(fakeBin, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write fake harness script: %v", err)
+	}
+	inv.HarnessBinary = fakeBin
+
+	res, err := inv.ListRepos(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected ListRepos error: %v", err)
+	}
+
+	if len(res.Repos) != 1 {
+		t.Fatalf("expected 1 repo, got %d", len(res.Repos))
+	}
+	if res.Repos[0].Name != "iazio-mcp" {
+		t.Errorf("expected repo name iazio-mcp, got %s", res.Repos[0].Name)
+	}
+	if res.Repos[0].GitTreeSHA != "tree-123" {
+		t.Errorf("expected git_tree_sha tree-123, got %s", res.Repos[0].GitTreeSHA)
+	}
+}
+
+func TestCLIInvoker_ExportCodebase_Success(t *testing.T) {
+	inv := makeFakeInvoker(t)
+	tmpDir := t.TempDir()
+	fakeBin := tmpDir + "/fake-harness"
+	script := fmt.Sprintf("#!/bin/sh\nexport GO_WANT_HELPER_PROCESS=1\nexec %s -test.run=TestHelperProcess -- \"$@\"\n", os.Args[0])
+	if err := os.WriteFile(fakeBin, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write fake harness script: %v", err)
+	}
+	inv.HarnessBinary = fakeBin
+
+	payload := json.RawMessage(`{"repo_name":"iazio-mcp","base_tree_sha":"tree-000"}`)
+	res, err := inv.ExportCodebase(context.Background(), payload)
+	if err != nil {
+		t.Fatalf("unexpected ExportCodebase error: %v", err)
+	}
+
+	if res.RepoName != "iazio-mcp" {
+		t.Errorf("expected repo_name iazio-mcp, got %s", res.RepoName)
+	}
+	if !res.UpToDate {
+		t.Error("expected up_to_date=true")
+	}
+}
+
