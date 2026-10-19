@@ -25,8 +25,17 @@ type StoryExecutionResult struct {
 
 // PromptExecutionResult represents the output from iazio-harness prompt execution.
 type PromptExecutionResult struct {
-	Status string `json:"status"`
-	Output string `json:"output,omitempty"`
+	PromptID      string   `json:"prompt_id,omitempty"`
+	Repo          string   `json:"repo,omitempty"`
+	TargetAgent   string   `json:"target_agent,omitempty"`
+	Status        string   `json:"status"`
+	ExitCode      int      `json:"exit_code,omitempty"`
+	GitHeadSHA    string   `json:"git_head_sha,omitempty"`
+	GitTreeSHA    string   `json:"git_tree_sha,omitempty"`
+	ModifiedFiles []string `json:"modified_files,omitempty"`
+	Summary       string   `json:"summary,omitempty"`
+	DurationMs    int64    `json:"duration_ms,omitempty"`
+	Output        string   `json:"output,omitempty"`
 }
 
 // Invoker defines the contract for invoking iazio-harness on the host.
@@ -78,15 +87,15 @@ func (c *CLIInvoker) CreateStory(ctx context.Context, payload json.RawMessage) (
 	return &res, nil
 }
 
-// ExecutePrompt invokes `iazio-harness run --json` passing the payload on stdin.
+// ExecutePrompt invokes `iazio-harness prompt run --json` passing the payload on stdin.
 func (c *CLIInvoker) ExecutePrompt(ctx context.Context, payload json.RawMessage) (*PromptExecutionResult, error) {
 	if len(payload) == 0 {
 		return nil, errors.New("empty payload for prompt execution")
 	}
 
-	stdout, stderr, err := c.runCommand(ctx, []string{"run", "--json"}, payload)
+	stdout, stderr, err := c.runCommand(ctx, []string{"prompt", "run", "--json"}, payload)
 	if err != nil {
-		return nil, fmt.Errorf("iazio-harness run failed: %w (stderr: %s)", err, strings.TrimSpace(stderr))
+		return nil, fmt.Errorf("iazio-harness prompt run failed: %w (stderr: %s)", err, strings.TrimSpace(stderr))
 	}
 
 	var res PromptExecutionResult
@@ -96,6 +105,10 @@ func (c *CLIInvoker) ExecutePrompt(ctx context.Context, payload json.RawMessage)
 			Status: "completed",
 			Output: stdout,
 		}, nil
+	}
+
+	if res.Output == "" && res.Summary != "" {
+		res.Output = res.Summary
 	}
 
 	return &res, nil

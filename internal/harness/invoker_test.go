@@ -56,13 +56,26 @@ func TestHelperProcess(t *testing.T) {
 			return
 		}
 		os.Exit(2)
+	case "prompt":
+		if len(args) >= 3 && args[1] == "run" && args[2] == "--json" {
+			var payload map[string]any
+			_ = json.NewDecoder(os.Stdin).Decode(&payload)
+			_ = json.NewEncoder(os.Stdout).Encode(PromptExecutionResult{
+				Status:  "completed",
+				Summary: "done",
+				Output:  "done",
+			})
+			return
+		}
+		os.Exit(2)
 	case "run":
 		if len(args) >= 2 && args[1] == "--json" {
 			var payload map[string]any
 			_ = json.NewDecoder(os.Stdin).Decode(&payload)
 			_ = json.NewEncoder(os.Stdout).Encode(PromptExecutionResult{
-				Status: "completed",
-				Output: "done",
+				Status:  "completed",
+				Summary: "done",
+				Output:  "done",
 			})
 			return
 		}
@@ -153,5 +166,32 @@ func TestCLIInvoker_Timeout(t *testing.T) {
 	_, err := inv.CreateStory(ctx, payload)
 	if err == nil {
 		t.Fatal("expected timeout error, got nil")
+	}
+}
+
+func TestCLIInvoker_ExecutePrompt_Success(t *testing.T) {
+	inv := makeFakeInvoker(t)
+	tmpDir := t.TempDir()
+	fakeBin := tmpDir + "/fake-harness"
+	script := fmt.Sprintf("#!/bin/sh\nexport GO_WANT_HELPER_PROCESS=1\nexec %s -test.run=TestHelperProcess -- \"$@\"\n", os.Args[0])
+	if err := os.WriteFile(fakeBin, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write fake harness script: %v", err)
+	}
+	inv.HarnessBinary = fakeBin
+
+	payload := json.RawMessage(`{"repo":"iazio-mcp","prompt":"Refactor test code"}`)
+	res, err := inv.ExecutePrompt(context.Background(), payload)
+	if err != nil {
+		t.Fatalf("unexpected ExecutePrompt error: %v", err)
+	}
+
+	if res.Status != "completed" {
+		t.Errorf("expected status completed, got %s", res.Status)
+	}
+	if res.Summary != "done" {
+		t.Errorf("expected summary done, got %s", res.Summary)
+	}
+	if res.Output != "done" {
+		t.Errorf("expected output done, got %s", res.Output)
 	}
 }
