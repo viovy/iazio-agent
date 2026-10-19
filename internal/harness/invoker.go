@@ -186,6 +186,18 @@ func (c *CLIInvoker) ExportCodebase(ctx context.Context, payload json.RawMessage
 	return &res, nil
 }
 
+// ListLocalRepos invokes `iazio-harness codebase repos --json` and returns []RepoManifest.
+func (c *CLIInvoker) ListLocalRepos(ctx context.Context) ([]RepoManifest, error) {
+	ci := &CLICodebaseInvoker{HarnessBinary: c.HarnessBinary, WorkDir: c.WorkDir}
+	return ci.ListLocalRepos(ctx)
+}
+
+// ExportRepoDelta invokes `iazio-harness codebase export --json` and returns *ExportResponse.
+func (c *CLIInvoker) ExportRepoDelta(ctx context.Context, req ExportRequest) (*ExportResponse, error) {
+	ci := &CLICodebaseInvoker{HarnessBinary: c.HarnessBinary, WorkDir: c.WorkDir}
+	return ci.ExportRepoDelta(ctx, req)
+}
+
 func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []byte) (string, string, error) {
 	cmd := exec.CommandContext(ctx, c.HarnessBinary, args...)
 	if c.WorkDir != "" {

@@ -249,3 +249,113 @@ func TestHTTPControlPlaneClient(t *testing.T) {
 		t.Errorf("unexpected complete payload received: %s", string(reportedComplete.Result))
 	}
 }
+
+type mockRepoSyncer struct {
+	triggeredRepos []string
+}
+
+func (m *mockRepoSyncer) TriggerRepoSync(repoName string) {
+	m.triggeredRepos = append(m.triggeredRepos, repoName)
+}
+
+func TestPostJobSyncTrigger_StoryCreate(t *testing.T) {
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:      "job-story-sync",
+			Type:    JobTypeStoryCreate,
+			Repo:    "iazio-mcp",
+			Payload: json.RawMessage(`{"title":"New Story"}`),
+		}, nil
+	}
+
+	inv := &mockInvoker{
+		createStoryFunc: func(ctx context.Context, payload json.RawMessage) (*harness.StoryExecutionResult, error) {
+			return &harness.StoryExecutionResult{
+				StoryID:   "STORY-123",
+				Submodule: "iazio-mcp",
+			}, nil
+		},
+	}
+
+	syncer := &mockRepoSyncer{}
+	d := NewDispatcher(cp, inv, "host-1", syncer)
+
+	processed, err := d.PollAndProcess(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected job to be processed")
+	}
+
+	if len(syncer.triggeredRepos) != 1 || syncer.triggeredRepos[0] != "iazio-mcp" {
+		t.Fatalf("expected syncer trigger for iazio-mcp, got %v", syncer.triggeredRepos)
+	}
+}
+
+func TestPostJobSyncTrigger_PromptExecute(t *testing.T) {
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:      "job-prompt-sync",
+			Type:    JobTypePromptExecute,
+			Repo:    "",
+			Payload: json.RawMessage(`{"repo":"iazio-harness"}`),
+		}, nil
+	}
+
+	inv := &mockInvoker{
+		executePromptFunc: func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+			return &harness.PromptExecutionResult{
+				Status: "completed",
+				Repo:   "iazio-harness",
+			}, nil
+		},
+	}
+
+	syncer := &mockRepoSyncer{}
+	d := NewDispatcher(cp, inv, "host-1", syncer)
+
+	processed, err := d.PollAndProcess(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected job to be processed")
+	}
+
+	if len(syncer.triggeredRepos) != 1 || syncer.triggeredRepos[0] != "iazio-harness" {
+		t.Fatalf("expected syncer trigger for iazio-harness, got %v", syncer.triggeredRepos)
+	}
+}
+
+func TestPostJobSyncTrigger_NoTriggerOnFailure(t *testing.T) {
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:      "job-fail",
+			Type:    JobTypeStoryCreate,
+			Repo:    "iazio-mcp",
+			Payload: json.RawMessage(`{}`),
+		}, nil
+	}
+
+	inv := &mockInvoker{
+		createStoryFunc: func(ctx context.Context, payload json.RawMessage) (*harness.StoryExecutionResult, error) {
+			return nil, errors.New("harness error")
+		},
+	}
+
+	syncer := &mockRepoSyncer{}
+	d := NewDispatcher(cp, inv, "host-1", syncer)
+
+	_, err := d.PollAndProcess(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	if len(syncer.triggeredRepos) != 0 {
+		t.Fatalf("expected 0 syncer triggers on job failure, got %v", syncer.triggeredRepos)
+	}
+}
