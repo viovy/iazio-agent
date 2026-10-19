@@ -141,22 +141,38 @@ func (c *HTTPControlPlaneClient) CompleteJob(ctx context.Context, jobID string, 
 	return nil
 }
 
+// RepoSyncer defines the contract for triggering an on-demand codebase delta sync for a repository.
+type RepoSyncer interface {
+	TriggerRepoSync(repoName string)
+}
+
 // Dispatcher coordinates claiming jobs from the control plane and routing them to iazio-harness.
 type Dispatcher struct {
 	client   ControlPlaneClient
 	invoker  harness.Invoker
 	hostID   string
 	jobTypes []string
+	syncer   RepoSyncer
 }
 
-// NewDispatcher constructs a new Dispatcher.
-func NewDispatcher(client ControlPlaneClient, invoker harness.Invoker, hostID string) *Dispatcher {
+// NewDispatcher constructs a new Dispatcher, optionally accepting a RepoSyncer for immediate post-job sync hooks.
+func NewDispatcher(client ControlPlaneClient, invoker harness.Invoker, hostID string, syncer ...RepoSyncer) *Dispatcher {
+	var s RepoSyncer
+	if len(syncer) > 0 {
+		s = syncer[0]
+	}
 	return &Dispatcher{
 		client:   client,
 		invoker:  invoker,
 		hostID:   hostID,
 		jobTypes: []string{JobTypeStoryCreate, JobTypePromptExecute},
+		syncer:   s,
 	}
+}
+
+// SetSyncer sets or updates the RepoSyncer on the Dispatcher.
+func (d *Dispatcher) SetSyncer(syncer RepoSyncer) {
+	d.syncer = syncer
 }
 
 // PollAndProcess claims one job and processes it. Returns (true, err) if a job was processed,
@@ -189,6 +205,15 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		}
 		resBytes, _ := json.Marshal(res)
 		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{Result: resBytes})
+		if compErr == nil && d.syncer != nil {
+			targetRepo := job.Repo
+			if targetRepo == "" && res != nil {
+				targetRepo = res.Submodule
+			}
+			if targetRepo != "" {
+				d.syncer.TriggerRepoSync(targetRepo)
+			}
+		}
 		return true, compErr
 
 	case JobTypePromptExecute:
@@ -199,6 +224,15 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		}
 		resBytes, _ := json.Marshal(res)
 		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{Result: resBytes})
+		if compErr == nil && d.syncer != nil {
+			targetRepo := job.Repo
+			if targetRepo == "" && res != nil {
+				targetRepo = res.Repo
+			}
+			if targetRepo != "" {
+				d.syncer.TriggerRepoSync(targetRepo)
+			}
+		}
 		return true, compErr
 
 	default:
