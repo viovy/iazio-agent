@@ -44,7 +44,7 @@ if [ "$1" = "codebase" ] && [ "$2" = "repos" ] && [ "$3" = "--json" ]; then
       "description": "MCP server bridging iazio-api and iazio-harness-api"
     },
     {
-      "name": "meta-repo",
+      "name": "iazio",
       "path": ".",
       "default_branch": "main",
       "git_tree_sha": "9f8e7d6c5b4a3210123456789abcdef012345678",
@@ -72,7 +72,7 @@ exit 1
 	if repos[0].Name != "iazio-mcp" || repos[0].GitTreeSHA != "4b825dc642cb6eb9a060e54bf8d69288fbee4904" {
 		t.Errorf("unexpected repo[0]: %+v", repos[0])
 	}
-	if repos[1].Name != "meta-repo" || repos[1].Path != "." {
+	if repos[1].Name != "iazio" || repos[1].Path != "." {
 		t.Errorf("unexpected repo[1]: %+v", repos[1])
 	}
 }
