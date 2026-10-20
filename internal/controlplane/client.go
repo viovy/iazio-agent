@@ -196,6 +196,12 @@ func (c Client) NextLease(ctx context.Context, hostID string) (Assignment, bool,
 	return Assignment{}, false, lastErr
 }
 
+// HostDaemonLoop registers the host and executes periodic heartbeats, tool inventory synchronization,
+// and process supervisor health checks without task dispatching or repository inspection (ADR-0118).
+func (c Client) HostDaemonLoop(ctx context.Context, hostID, kind string, every time.Duration, profile ...string) error {
+	return c.Loop(ctx, hostID, kind, every, nil, profile...)
+}
+
 // Loop registers the host, then heartbeats and polls for a lease until ctx is cancelled.
 func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Duration, onJob func(Assignment) error, profile ...string) error {
 	if every <= 0 {
@@ -263,23 +269,25 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 				continue
 			}
 		}
-		job, ok, err := c.NextLease(ctx, hostID)
-		if err != nil && ctx.Err() != nil {
-			return nil
-		}
-		if ok && onJob != nil {
-			if err := onJob(job); err != nil {
-				if ctx.Err() != nil {
-					return nil
-				}
-			}
-			// When a job just executed, immediately poll again to drain active queues without 30s delay
-			select {
-			case <-ctx.Done():
+		if onJob != nil {
+			job, ok, err := c.NextLease(ctx, hostID)
+			if err != nil && ctx.Err() != nil {
 				return nil
-			default:
-				tick.Reset(every)
-				continue
+			}
+			if ok {
+				if err := onJob(job); err != nil {
+					if ctx.Err() != nil {
+						return nil
+					}
+				}
+				// When a job just executed, immediately poll again to drain active queues without 30s delay
+				select {
+				case <-ctx.Done():
+					return nil
+				default:
+					tick.Reset(every)
+					continue
+				}
 			}
 		}
 		select {
