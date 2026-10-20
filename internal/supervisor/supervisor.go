@@ -23,8 +23,6 @@ const (
 
 	// TermGrace is the wait between TERM and KILL.
 	TermGrace = 10 * time.Second
-	// CoolingOff is how long a lock stays reserved after a harness exits.
-	CoolingOff = 10 * time.Second
 	// DefaultJobDuration is the execution timeout (65m), providing a 5m grace
 	// buffer beyond the default 60m engine timeout so the child harness can finish
 	// diagnostics, auto-healing, and terminal exit reporting before supervisor SIGKILL.
@@ -43,6 +41,9 @@ const (
 	// ReasonProcessDied is stored when a child harness process terminates unexpectedly.
 	ReasonProcessDied = "process_died"
 )
+
+// CoolingOff is how long a lock stays reserved after a harness exits.
+var CoolingOff = 10 * time.Second
 
 // Runner executes a harness child. Tests substitute it.
 type Runner interface {

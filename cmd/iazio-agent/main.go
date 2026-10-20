@@ -36,6 +36,8 @@ func main() {
 	}
 }
 
+var initialUpdateDelay = 5 * time.Second
+
 func execute(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
 	if getenv == nil {
 		getenv = os.Getenv
@@ -183,7 +185,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					select {
 					case <-runCtx.Done():
 						return
-					case <-time.After(5 * time.Second):
+					case <-time.After(initialUpdateDelay):
 					}
 
 					checkOnce := func() bool {
@@ -568,7 +570,7 @@ func copyBinary(src, dest string) error {
 	return os.Rename(tmp, dest)
 }
 
-func execCommand(name string, args ...string) error {
+var execCommand = func(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

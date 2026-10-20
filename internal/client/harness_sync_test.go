@@ -3,8 +3,10 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -161,3 +163,131 @@ func TestHarnessSyncClient_Exhausted503(t *testing.T) {
 		t.Fatal("expected error when 503 retries exhausted, got nil")
 	}
 }
+
+func TestIsTransientNetError(t *testing.T) {
+	if isTransientNetError(nil) {
+		t.Fatal("nil error should not be transient")
+	}
+	if !isTransientNetError(errors.New("connection refused")) {
+		t.Fatal("connection refused should be transient")
+	}
+	if !isTransientNetError(errors.New("read: connection reset by peer")) {
+		t.Fatal("connection reset should be transient")
+	}
+	if !isTransientNetError(errors.New("write: broken pipe")) {
+		t.Fatal("broken pipe should be transient")
+	}
+	if !isTransientNetError(errors.New("unexpected eof")) {
+		t.Fatal("eof should be transient")
+	}
+	if isTransientNetError(errors.New("unauthorized 401")) {
+		t.Fatal("regular error should not be transient")
+	}
+}
+
+func TestNewHTTPHarnessSyncClient_Defaults(t *testing.T) {
+	c := NewHTTPHarnessSyncClient("http://localhost:8080/", "tok", nil)
+	if c.HTTPClient == nil {
+		t.Fatal("expected default HTTPClient")
+	}
+	if c.BaseURL != "http://localhost:8080" {
+		t.Fatalf("expected trimmed baseURL, got %s", c.BaseURL)
+	}
+}
+
+func TestDoRequestWithRetry_NonTransient(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad request", http.StatusBadRequest)
+	}))
+	defer ts.Close()
+
+	c := NewHTTPHarnessSyncClient(ts.URL, "tok", ts.Client())
+	c.MaxRetries = 3
+	_, err := c.SyncRepos(context.Background(), RepoSyncRequest{HostID: "test"})
+	if err == nil {
+		t.Fatal("expected error on 400 Bad Request")
+	}
+}
+
+func TestDoRequestWithRetry_ContextCancelled_And_DecodeError(t *testing.T) {
+	// 1. Context cancelled during retry
+	ts503 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "server busy", http.StatusServiceUnavailable)
+	}))
+	defer ts503.Close()
+
+	c := NewHTTPHarnessSyncClient(ts503.URL, "tok", ts503.Client())
+	c.InitialBackoff = 50 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err := c.SyncRepos(ctx, RepoSyncRequest{HostID: "test"})
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	// 2. Decode error on malformed JSON
+	tsBadJSON := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{invalid-json"))
+	}))
+	defer tsBadJSON.Close()
+
+	cBad := NewHTTPHarnessSyncClient(tsBadJSON.URL, "tok", tsBadJSON.Client())
+	_, err = cBad.SyncRepos(context.Background(), RepoSyncRequest{HostID: "test"})
+	if err == nil || !strings.Contains(err.Error(), "decode repos sync response") {
+		t.Fatalf("expected decode error, got %v", err)
+	}
+
+	_, err = cBad.SyncCodebase(context.Background(), CodebaseSyncRequest{RepoName: "test"})
+	if err == nil || !strings.Contains(err.Error(), "decode codebase sync response") {
+		t.Fatalf("expected decode error, got %v", err)
+	}
+}
+
+func TestHarnessSyncClient_NegativeConfigAndSuccessStatusCodes(t *testing.T) {
+	// 1. Negative config defaults
+	c := NewHTTPHarnessSyncClient("http://localhost:1234", "", nil)
+	c.MaxRetries = -1
+	c.InitialBackoff = -1
+
+	// 2. Status 201 Created and 204 No Content
+	tsSuccess := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "repos") {
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"host_id":"test","out_of_sync":[]}`))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer tsSuccess.Close()
+
+	cSuccess := NewHTTPHarnessSyncClient(tsSuccess.URL, "", tsSuccess.Client())
+	cSuccess.MaxRetries = -1
+	cSuccess.InitialBackoff = -1
+
+	res, err := cSuccess.SyncRepos(context.Background(), RepoSyncRequest{HostID: "test"})
+	if err != nil || res == nil {
+		t.Fatalf("expected success on 201 Created: res=%+v err=%v", res, err)
+	}
+
+	// 3. Transient net errors
+	if isTransientNetError(nil) {
+		t.Fatal("expected false for nil net error")
+	}
+	if !isTransientNetError(errors.New("connection reset by peer")) {
+		t.Fatal("expected true for connection reset")
+	}
+	if !isTransientNetError(errors.New("connection refused")) {
+		t.Fatal("expected true for connection refused")
+	}
+	if isTransientNetError(errors.New("some regular error")) {
+		t.Fatal("expected false for regular error")
+	}
+}
+
+
+

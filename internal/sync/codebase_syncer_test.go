@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -296,3 +297,87 @@ func TestCodebaseSyncer_SyncRepo_Single(t *testing.T) {
 		t.Fatalf("expected target repo iazio-mcp, got %s", checkedRepo)
 	}
 }
+
+func TestResolveConfig(t *testing.T) {
+	// Default
+	t.Setenv("CODEBASE_SYNC_INTERVAL", "")
+	cfg := ResolveConfig("host-1")
+	if cfg.HostID != "host-1" || cfg.Interval != DefaultSyncInterval {
+		t.Fatalf("unexpected default config: %+v", cfg)
+	}
+
+	// Duration string
+	t.Setenv("CODEBASE_SYNC_INTERVAL", "5m")
+	cfg5m := ResolveConfig("host-1")
+	if cfg5m.Interval != 5*time.Minute {
+		t.Fatalf("expected 5m interval, got %v", cfg5m.Interval)
+	}
+
+	// Seconds integer
+	t.Setenv("CODEBASE_SYNC_INTERVAL", "45")
+	cfg45s := ResolveConfig("host-1")
+	if cfg45s.Interval != 45*time.Second {
+		t.Fatalf("expected 45s interval, got %v", cfg45s.Interval)
+	}
+}
+
+func TestCodebaseSyncer_ErrorsAndValidation(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Nil invoker or client
+	sNil := &CodebaseSyncer{}
+	if err := sNil.SyncAll(ctx); err == nil || !strings.Contains(err.Error(), "codebase invoker not configured") {
+		t.Fatalf("expected invoker not configured error, got: %v", err)
+	}
+	if err := sNil.SyncRepo(ctx, "repo1"); err == nil || !strings.Contains(err.Error(), "codebase invoker not configured") {
+		t.Fatalf("expected invoker not configured error, got: %v", err)
+	}
+
+	mockInv := &mockCodebaseInvoker{}
+	sClientNil := &CodebaseSyncer{invoker: mockInv}
+	if err := sClientNil.SyncAll(ctx); err == nil || !strings.Contains(err.Error(), "harness sync client not configured") {
+		t.Fatalf("expected client not configured error, got: %v", err)
+	}
+	if err := sClientNil.SyncRepo(ctx, "repo1"); err == nil || !strings.Contains(err.Error(), "harness sync client not configured") {
+		t.Fatalf("expected client not configured error, got: %v", err)
+	}
+
+	// 2. ListLocalRepos failure
+	errInvoker := &mockCodebaseInvoker{
+		listLocalReposFunc: func(ctx context.Context) ([]harness.RepoManifest, error) {
+			return nil, errors.New("cannot list repos")
+		},
+	}
+	mockCli := &mockHarnessSyncClient{}
+	sErr := NewCodebaseSyncer(errInvoker, mockCli, SyncerConfig{HostID: "h1"})
+	if err := sErr.SyncAll(ctx); err == nil || !strings.Contains(err.Error(), "list local repos") {
+		t.Fatalf("expected list local repos error, got: %v", err)
+	}
+	if err := sErr.SyncRepo(ctx, "repo1"); err == nil || !strings.Contains(err.Error(), "list local repos") {
+		t.Fatalf("expected list local repos error, got: %v", err)
+	}
+
+	// 3. SyncRepo when target repo is not found in manifests
+	okInvoker := &mockCodebaseInvoker{
+		listLocalReposFunc: func(ctx context.Context) ([]harness.RepoManifest, error) {
+			return []harness.RepoManifest{{Name: "other-repo"}}, nil
+		},
+	}
+	sNotFound := NewCodebaseSyncer(okInvoker, mockCli, SyncerConfig{HostID: "h1"})
+	if err := sNotFound.SyncRepo(ctx, "missing-repo"); err == nil || !strings.Contains(err.Error(), "not found in local manifests") {
+		t.Fatalf("expected not found error, got: %v", err)
+	}
+
+	// 4. SyncRepos handshake error in SyncRepo
+	errCli := &mockHarnessSyncClient{
+		syncReposFunc: func(ctx context.Context, req client.RepoSyncRequest) (*client.RepoSyncResponse, error) {
+			return nil, errors.New("handshake failed")
+		},
+	}
+	sHandshakeErr := NewCodebaseSyncer(okInvoker, errCli, SyncerConfig{HostID: "h1"})
+	if err := sHandshakeErr.SyncRepo(ctx, "other-repo"); err == nil || !strings.Contains(err.Error(), "handshake") {
+		t.Fatalf("expected handshake error, got: %v", err)
+	}
+}
+
+
