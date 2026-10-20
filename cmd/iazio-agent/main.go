@@ -115,7 +115,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			defer cancel()
 
 			sup := supervisor.New(time.Now)
-			runner := supervisor.NewOSRunner()
 			var client controlplane.Client
 
 			var updatingTools atomic.Bool
@@ -285,250 +284,23 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					reaped := sup.Tick()
 					for _, r := range reaped {
 						if stderr != nil {
-							fmt.Fprintf(stderr, "[supervisor] reaped stalled or terminated harness job %q on %s (reason: %s)\n",
-								r.JobID, r.WorktreePath, r.Reason)
+							fmt.Fprintf(stderr, "[supervisor] reaped stalled or terminated process %q (reason: %s)\n",
+								r.JobID, r.Reason)
 						}
 						if r.JobID != "" {
 							_ = client.AbandonJob(ctx, r.JobID, r.Reason)
 						}
 					}
-					detail, err := client.GetHost(ctx, hostID)
-					if err != nil {
-						if stderr != nil {
-							fmt.Fprintf(stderr, "reconcile get host error for %s: %v\n", hostID, err)
-						}
-						return nil
+					// Host resource telemetry check
+					if home, err := os.UserHomeDir(); err == nil && home != "" {
+						_, _ = preflight.FreeSpace(home)
 					}
-					repoStates := make([]supervisor.RepoState, 0, len(detail.Repos))
-					for _, r := range detail.Repos {
-						path := r.WorktreePath
-						if path == "" {
-							path = r.Path
-						}
-						repoStates = append(repoStates, supervisor.RepoState{
-							WorktreePath:   path,
-							Queue:          r.Queue,
-							Reason:         r.Reason,
-							DiscardPending: r.DiscardPending,
-							Lock:           r.Lock,
-							RunningJobID:   r.RunningJobID,
-						})
-					}
-					supervisor.ReconcileStrandedCheckouts(
-						ctx,
-						hostID,
-						repoStates,
-						func(w string) bool {
-							l := sup.Lock(w)
-							return l == supervisor.LockRunning || l == supervisor.LockCooling
-						},
-						func(ctx context.Context, jobID, reason string) error {
-							return client.AbandonJob(ctx, jobID, reason)
-						},
-						func(ctx context.Context, hostID, worktree string) error {
-							return client.RemediateRepo(ctx, hostID, worktree)
-						},
-						stdout,
-						stderr,
-					)
-					supervisor.ReconcileHostCheckouts(
-						repoStates,
-						func(w string) bool { return sup.Lock(w) == supervisor.LockIdle },
-						func(w string) error {
-							gitCmd := func(args ...string) error {
-								cmd := exec.CommandContext(ctx, "git", append([]string{"-C", w}, args...)...)
-								return cmd.Run()
-							}
-							return supervisor.DiscardCheckout(true, false, nil, gitCmd)
-						},
-						func(w string) (bool, error) {
-							out, err := exec.CommandContext(ctx, "git", "-C", w, "status", "--porcelain").CombinedOutput()
-							if err != nil {
-								return false, err
-							}
-							return strings.TrimSpace(string(out)) == "", nil
-						},
-						func(w string) error {
-							return client.ResumeRepo(ctx, hostID, w)
-						},
-						stdout,
-						stderr,
-						func(w string) (bool, error) {
-							bytes, err := preflight.FreeSpace(w)
-							if err != nil {
-								return false, err
-							}
-							return bytes >= preflight.RequiredMinFreeBytes(), nil
-						},
-					)
 					return nil
 				},
 			}
-			return client.Loop(runCtx, host, kind, 30*time.Second, func(job controlplane.Assignment) error {
-				if sup.Lock(job.WorktreePath) == supervisor.LockRunning {
-					fmt.Fprintf(os.Stderr, "worktree %s busy with another job; declining assignment %s\n", job.WorktreePath, job.ID)
-					_ = client.DeclineJob(ctx, job.ID, "worktree_busy")
-					time.Sleep(2 * time.Second)
-					return nil
-				}
-				rep, err := preflight.Collect(ctx, job.WorktreePath, job.DocsHubPath, job.Kind)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "preflight collect error for %s: %v\n", job.WorktreePath, err)
-					_ = client.DeclineJob(ctx, job.ID, fmt.Sprintf("preflight_collect_error: %v", err))
-					time.Sleep(2 * time.Second)
-					return nil
-				}
-				dec := preflight.Decide(rep)
-				if dec.Reason != "" {
-					if _, postErr := client.PostPreflight(ctx, host, job.WorktreePath, rep); postErr != nil {
-						fmt.Fprintf(os.Stderr, "post preflight error for %s: %v\n", job.WorktreePath, postErr)
-					}
-					_ = client.DeclineJob(ctx, job.ID, fmt.Sprintf("preflight_rejected: %s", dec.Reason))
-					time.Sleep(2 * time.Second)
-					return nil
-				}
-				if err := sup.Spawn(runner, job.ID, api, job.WorktreePath, job.DocsHubPath, ""); err != nil {
-					fmt.Fprintf(os.Stderr, "spawn error for job %s: %v\n", job.ID, err)
-					_ = client.DeclineJob(ctx, job.ID, fmt.Sprintf("spawn_error: %v", err))
-					time.Sleep(2 * time.Second)
-					return nil
-				}
-				jobPID := sup.PID(job.WorktreePath)
-				if stdout != nil {
-					fmt.Fprintf(stdout, "[supervisor] spawned harness job %s (PID %d) on %s\n", job.ID, jobPID, job.WorktreePath)
-				}
-				go func(worktree, docsHub, jobID, kind, storyID string, pid int) {
-					exitCode, waitErr := runner.Wait(pid)
-					if stdout != nil {
-						fmt.Fprintf(stdout, "[supervisor] harness job %s (PID %d) on %s exited with code %d (waitErr: %v)\n", jobID, pid, worktree, exitCode, waitErr)
-					}
-					sup.BeginCooling(worktree)
-					time.Sleep(supervisor.CoolingOff)
-
-					workPorc := ""
-					hubPorc := ""
-					if out, err := exec.Command("git", "-C", worktree, "status", "--porcelain").CombinedOutput(); err == nil {
-						workPorc = strings.TrimSpace(preflight.CleanPorcelain(string(out)))
-					}
-					if docsHub != "" {
-						if out, err := exec.Command("git", "-C", docsHub, "status", "--porcelain").CombinedOutput(); err == nil {
-							hubPorc = strings.TrimSpace(preflight.CleanPorcelain(string(out)))
-						}
-					}
-					isClean := (workPorc == "")
-					aseOk := (waitErr == nil && exitCode == 0 && isClean)
-
-					// Check for auto-healable SIR immediately post-run
-					if !isClean {
-						healable, sirID, sirBranch, _ := supervisor.DetectAutoHealableSIR(worktree)
-						if healable {
-							gitCmd := func(args ...string) error {
-								return exec.Command("git", append([]string{"-C", worktree}, args...)...).Run()
-							}
-							if err := supervisor.AutoHealSupersededWorktree(true, sirBranch, gitCmd); err == nil {
-								_ = supervisor.ArchiveSIR(worktree, sirID)
-								if out, err := exec.Command("git", "-C", worktree, "status", "--porcelain").CombinedOutput(); err == nil {
-									workPorc = strings.TrimSpace(preflight.CleanPorcelain(string(out)))
-									if workPorc == "" {
-										isClean = true
-										aseOk = (waitErr == nil && exitCode == 0)
-									}
-								}
-							}
-						}
-					}
-
-					// Check harness execution checkpoint if present
-					checkpointPath := filepath.Join(worktree, ".iazio", "execution-checkpoint.json")
-					if cpData, err := os.ReadFile(checkpointPath); err == nil {
-						var cp struct {
-							ASEComplete bool `json:"ase_complete"`
-							ExitCode    int  `json:"exit_code"`
-						}
-						if json.Unmarshal(cpData, &cp) == nil {
-							if cp.ASEComplete && isClean {
-								aseOk = true
-							}
-						}
-					}
-
-					storyDone := false
-					if storyID != "" {
-						matches, _ := filepath.Glob(filepath.Join(worktree, "docs", "stories", "*.story.md"))
-						for _, m := range matches {
-							if data, err := os.ReadFile(m); err == nil {
-								content := string(data)
-								if strings.Contains(content, storyID) && (strings.Contains(content, "status: DONE") || strings.Contains(content, "status: \"DONE\"") || strings.Contains(content, "status: 'DONE'")) {
-									storyDone = true
-									break
-								}
-							}
-						}
-					}
-
-					// If not yet considered complete but worktree is clean, check if story completed on origin/main
-					if !aseOk && isClean {
-						branchOut, _ := exec.Command("git", "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD").CombinedOutput()
-						curBranch := strings.TrimSpace(string(branchOut))
-						branchMerged := false
-
-						if curBranch != "" && curBranch != "main" && curBranch != "master" {
-							if exec.Command("git", "-C", worktree, "merge-base", "--is-ancestor", "HEAD", "origin/main").Run() == nil {
-								branchMerged = true
-							} else if storyID != "" {
-								if out, err := exec.Command("git", "-C", worktree, "log", "origin/main", "-n", "1", "--grep="+storyID, "--format=%H").CombinedOutput(); err == nil && strings.TrimSpace(string(out)) != "" {
-									branchMerged = true
-								}
-							}
-							if !branchMerged {
-								if out, err := exec.Command("git", "-C", worktree, "log", "origin/main", "-n", "1", "--grep="+curBranch, "--format=%H").CombinedOutput(); err == nil && strings.TrimSpace(string(out)) != "" {
-									branchMerged = true
-								}
-							}
-
-							if branchMerged {
-								// Auto-heal to main
-								if exec.Command("git", "-C", worktree, "checkout", "main").Run() == nil {
-									_ = exec.Command("git", "-C", worktree, "pull", "--ff-only").Run()
-									_ = exec.Command("git", "-C", worktree, "branch", "-D", curBranch).Run()
-									aseOk = true
-									if stdout != nil {
-										fmt.Fprintf(stdout, "[supervisor] auto-healed merged branch %s to main on %s for job %s\n", curBranch, worktree, jobID)
-									}
-								} else {
-									aseOk = true
-								}
-							}
-						} else if curBranch == "main" || curBranch == "master" {
-							// On main: only consider complete if story is confirmed DONE or merged on origin/main
-							if storyDone {
-								aseOk = true
-							} else if storyID != "" {
-								if out, err := exec.Command("git", "-C", worktree, "log", "origin/main", "-n", "1", "--grep="+storyID, "--format=%H").CombinedOutput(); err == nil && strings.TrimSpace(string(out)) != "" {
-									if logMsg, err := exec.Command("git", "-C", worktree, "log", "origin/main", "-n", "5", "--grep="+storyID, "--format=%s %b").CombinedOutput(); err == nil {
-										lower := strings.ToLower(string(logMsg))
-										if strings.Contains(lower, "closeout") || strings.Contains(lower, "done") {
-											aseOk = true
-										}
-									}
-								}
-							}
-						}
-					}
-
-					finish := controlplane.FinishReport{
-						Kind:          kind,
-						ASEComplete:   aseOk,
-						WorkPorcelain: workPorc,
-						HubPorcelain:  hubPorc,
-						StoryDraftOK:  (waitErr == nil && exitCode == 0) || aseOk,
-						HubPushOK:     (waitErr == nil && exitCode == 0) || aseOk,
-					}
-					_, _ = client.PostFinish(context.Background(), host, worktree, jobID, finish)
-					sup.Promote()
-				}(job.WorktreePath, job.DocsHubPath, job.ID, job.Kind, job.StoryID, jobPID)
-				return nil
-			}, profile)
+			// ADR-0118: iazio-agent is strictly a host node daemon (registration, updates, process watchdog, telemetry).
+			// Task execution, SIR remediation, and repository orchestration belong strictly to iazio-harness and autopilot.
+			return client.HostDaemonLoop(runCtx, host, kind, 30*time.Second, profile)
 		}
 
 		if ctx.Err() != nil {
