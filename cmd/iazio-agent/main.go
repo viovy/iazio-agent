@@ -363,16 +363,34 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					if envRoot := getenv("IAZIO_FLEET_ROOT"); envRoot != "" {
 						return envRoot
 					}
+					var candidateRoots []string
 					if home, err := os.UserHomeDir(); err == nil && home != "" {
 						workDir := filepath.Join(home, "work")
 						if entries, err := os.ReadDir(workDir); err == nil {
 							for _, e := range entries {
 								if e.IsDir() {
-									cand := filepath.Join(workDir, e.Name())
-									if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
-										return cand
-									}
+									candidateRoots = append(candidateRoots, filepath.Join(workDir, e.Name()))
 								}
+							}
+						}
+					}
+					if entries, err := os.ReadDir("/work"); err == nil {
+						for _, e := range entries {
+							if e.IsDir() {
+								candidateRoots = append(candidateRoots, filepath.Join("/work", e.Name()))
+							}
+						}
+					}
+					for _, cand := range candidateRoots {
+						gmPath := filepath.Join(cand, ".gitmodules")
+						if b, err := os.ReadFile(gmPath); err == nil {
+							if clean == "." || clean == "" || clean == "root" || strings.Contains(string(b), clean) {
+								_ = os.Setenv("IAZIO_FLEET_ROOT", cand)
+								return cand
+							}
+							if _, err := os.Stat(filepath.Join(cand, clean)); err == nil {
+								_ = os.Setenv("IAZIO_FLEET_ROOT", cand)
+								return cand
 							}
 						}
 					}
