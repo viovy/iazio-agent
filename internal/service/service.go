@@ -57,6 +57,35 @@ func resolveHarnessAPIURL() string {
 	return DefaultFleetAPI
 }
 
+func resolveElasticsearchURL() string {
+	if esEnv := strings.TrimSpace(os.Getenv("IAZIO_ELASTICSEARCH_URL")); esEnv != "" {
+		return esEnv
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		cfgPath := filepath.Join(home, ".iazio", "agent.json")
+		if data, err := os.ReadFile(cfgPath); err == nil {
+			var cfg struct {
+				ElasticsearchURL string `json:"elasticsearch_url"`
+			}
+			if err := json.Unmarshal(data, &cfg); err == nil && strings.TrimSpace(cfg.ElasticsearchURL) != "" {
+				return strings.TrimSpace(cfg.ElasticsearchURL)
+			}
+		}
+		cfgPath2 := filepath.Join(home, ".iazio", "config.json")
+		if data, err := os.ReadFile(cfgPath2); err == nil {
+			var cfg struct {
+				Endpoints map[string]string `json:"endpoints"`
+			}
+			if err := json.Unmarshal(data, &cfg); err == nil && cfg.Endpoints != nil {
+				if v, ok := cfg.Endpoints["elasticsearch"]; ok && strings.TrimSpace(v) != "" {
+					return strings.TrimSpace(v)
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // ActionText returns the dry-run text for a service action.
 // Install yields a launchd plist, a systemd user unit, or a Task Scheduler command.
 func ActionText(goos, action, bin string, force bool) string {
@@ -184,6 +213,10 @@ func darwinPlist(bin, logPath string) string {
 	if p := os.Getenv("PATH"); p != "" {
 		pathXml = fmt.Sprintf("\n\t\t<key>PATH</key>\n\t\t<string>%s</string>", p)
 	}
+	esXml := ""
+	if esEnv := resolveElasticsearchURL(); esEnv != "" {
+		esXml = fmt.Sprintf("\n\t\t<key>IAZIO_ELASTICSEARCH_URL</key>\n\t\t<string>%s</string>", esEnv)
+	}
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -206,7 +239,7 @@ func darwinPlist(bin, logPath string) string {
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>IAZIO_AGENT_NONINTERACTIVE</key>
-		<string>1</string>%s%s%s%s
+		<string>1</string>%s%s%s%s%s
 	</dict>
 	<key>StandardOutPath</key>
 	<string>%s</string>
@@ -214,7 +247,7 @@ func darwinPlist(bin, logPath string) string {
 	<string>%s</string>
 </dict>
 </plist>
-`, agentLabel, bin, apiXml, homeXml, userXml, pathXml, logPath, logPath)
+`, agentLabel, bin, apiXml, homeXml, userXml, pathXml, esXml, logPath, logPath)
 }
 
 func agentLogPath() string {
@@ -270,6 +303,10 @@ func linuxUnit(bin string) string {
 	if apiEnv := resolveHarnessAPIURL(); apiEnv != "" {
 		apiLine = fmt.Sprintf("Environment=IAZIO_HARNESS_API_URL=%s\n", apiEnv)
 	}
+	esLine := ""
+	if esEnv := resolveElasticsearchURL(); esEnv != "" {
+		esLine = fmt.Sprintf("Environment=IAZIO_ELASTICSEARCH_URL=%s\n", esEnv)
+	}
 	return fmt.Sprintf(`[Unit]
 Description=iazio-agent user supervisor
 After=network.target
@@ -280,10 +317,10 @@ ExecStart=%s run
 Restart=always
 RestartSec=5s
 Environment=IAZIO_AGENT_NONINTERACTIVE=1
-%s
+%s%s
 [Install]
 WantedBy=default.target
-`, bin, apiLine)
+`, bin, apiLine, esLine)
 }
 
 // IsWSL reports whether the current environment is Windows Subsystem for Linux (WSL).

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/auth"
+	"github.com/viovy/iazio-agent/internal/elasticlog"
 	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-agent/internal/harness"
 	"github.com/viovy/iazio-agent/internal/inventory"
@@ -123,6 +124,35 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			profile = "generic"
 		}
 		host := resolveHostID(getenv, os.Hostname, nil)
+		esURL := strings.TrimSpace(getenv("IAZIO_ELASTICSEARCH_URL"))
+		if esURL == "" {
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				cfgFile := filepath.Join(home, ".iazio", "agent.json")
+				if data, err := os.ReadFile(cfgFile); err == nil {
+					var raw struct {
+						ElasticsearchURL string `json:"elasticsearch_url"`
+					}
+					if err := json.Unmarshal(data, &raw); err == nil {
+						esURL = strings.TrimSpace(raw.ElasticsearchURL)
+					}
+				}
+			}
+		}
+		if esURL == "" {
+			esURL = "https://192.168.1.19:9200"
+		}
+		sink := elasticlog.New(elasticlog.Config{
+			URL:         esURL,
+			ServiceName: "iazio-agent",
+			Version:     formatVersion(),
+			HostName:    host,
+		})
+		defer func() { _ = sink.Close() }()
+		sink.Info("iazio-agent supervisor starting", map[string]any{
+			"host_kind": string(kind),
+			"api_url":   api,
+			"profile":   profile,
+		})
 		if ctx.Err() == nil {
 			runCtx, cancel := context.WithCancel(ctx)
 			defer cancel()

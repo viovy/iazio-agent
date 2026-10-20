@@ -318,6 +318,23 @@ func TestUserDaemonLinuxFallback(t *testing.T) {
 	}
 }
 
+func TestResolveElasticsearchURL(t *testing.T) {
+	t.Setenv("IAZIO_ELASTICSEARCH_URL", "https://custom.es.local:9200")
+	if got := resolveElasticsearchURL(); got != "https://custom.es.local:9200" {
+		t.Fatalf("expected custom ES URL, got %q", got)
+	}
+	t.Setenv("IAZIO_ELASTICSEARCH_URL", "")
+	home := t.TempDir()
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("HOME", home)
+	cfgDir := filepath.Join(home, ".iazio")
+	_ = os.MkdirAll(cfgDir, 0o755)
+	_ = os.WriteFile(filepath.Join(cfgDir, "agent.json"), []byte(`{"elasticsearch_url":"https://agent.json.es:9200"}`), 0o600)
+	if got := resolveElasticsearchURL(); got != "https://agent.json.es:9200" {
+		t.Fatalf("expected agent.json ES URL, got %q", got)
+	}
+}
+
 func TestResolveHarnessAPIURLDefaults(t *testing.T) {
 	t.Setenv("IAZIO_HARNESS_API_URL", "")
 	home := t.TempDir()
