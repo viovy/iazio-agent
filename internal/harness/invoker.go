@@ -11,6 +11,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/telemetry"
 )
 
 const defaultGracePeriod = 2 * time.Second
@@ -202,6 +204,11 @@ func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []
 	cmd := exec.CommandContext(ctx, c.HarnessBinary, args...)
 	if c.WorkDir != "" {
 		cmd.Dir = c.WorkDir
+	}
+
+	cmd.Env = os.Environ()
+	if span := telemetry.SpanFromContext(ctx); span != nil {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("TRACEPARENT=00-%s-%s-01", span.TraceID, span.ID))
 	}
 
 	cmd.Stdin = bytes.NewReader(stdinData)
