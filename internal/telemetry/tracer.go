@@ -167,7 +167,7 @@ func NewZipkinExporter(endpoint string) *ZipkinExporter {
 		} else if env := os.Getenv("OTEL_EXPORTER_ZIPKIN_ENDPOINT"); env != "" {
 			clean = strings.TrimRight(strings.TrimSpace(env), "/")
 		} else {
-			clean = "https://tian.go.ro/zipkin"
+			clean = "http://localhost:9411"
 		}
 	}
 	if !strings.HasSuffix(clean, "/api/v2/spans") {
@@ -523,7 +523,7 @@ func InitGlobalTracer(serviceName, zipkinURL string) func() {
 		} else if env := os.Getenv("OTEL_EXPORTER_ZIPKIN_ENDPOINT"); env != "" {
 			zipkinURL = env
 		} else {
-			zipkinURL = "https://tian.go.ro/zipkin"
+			zipkinURL = "http://localhost:9411"
 		}
 	}
 
