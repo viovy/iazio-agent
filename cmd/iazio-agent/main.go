@@ -364,13 +364,15 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						return envRoot
 					}
 					if home, err := os.UserHomeDir(); err == nil && home != "" {
-						for _, cand := range []string{
-							filepath.Join(home, "work", "meta-repo"),
-							filepath.Join(home, "work", "meta-repo-02"),
-							filepath.Join(home, "meta-repo"),
-						} {
-							if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
-								return cand
+						workDir := filepath.Join(home, "work")
+						if entries, err := os.ReadDir(workDir); err == nil {
+							for _, e := range entries {
+								if e.IsDir() {
+									cand := filepath.Join(workDir, e.Name())
+									if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
+										return cand
+									}
+								}
 							}
 						}
 					}
@@ -492,8 +494,15 @@ func runService(args []string, stdout io.Writer, getenv func(string) string) err
 	}
 }
 
+var isSystemdAvailable = service.IsSystemdAvailable
+
 func applyLinux(action, bin string, stdout io.Writer, force bool) error {
-	if !service.IsSystemdAvailable() {
+	switch action {
+	case "install", "start", "stop", "restart", "uninstall", "status":
+	default:
+		return fmt.Errorf("unknown service action %s", action)
+	}
+	if !isSystemdAvailable() || os.Getenv("IAZIO_DISABLE_SYSTEMD") == "1" {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return err

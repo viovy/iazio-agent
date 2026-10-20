@@ -1177,6 +1177,7 @@ func TestApplyPlatformFunctions_Direct(t *testing.T) {
 	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)
 	t.Setenv("USERPROFILE", fakeHome)
+	t.Setenv("IAZIO_DISABLE_SYSTEMD", "1")
 
 	// 1. Darwin
 	if err := applyDarwin("invalid_action", "bin"); err == nil {
@@ -1281,6 +1282,7 @@ func TestRunService_NonDryRunLifecycle(t *testing.T) {
 	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)
 	t.Setenv("USERPROFILE", fakeHome)
+	t.Setenv("IAZIO_DISABLE_SYSTEMD", "1")
 
 	origExec := execCommand
 	t.Cleanup(func() {
