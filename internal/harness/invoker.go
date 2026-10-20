@@ -134,6 +134,8 @@ func (c *CLIInvoker) ExecutePrompt(ctx context.Context, payload json.RawMessage)
 		return nil, errors.New("empty payload for prompt execution")
 	}
 
+	payload = EnsurePromptPayload("", payload)
+
 	stdout, stderr, err := c.runCommand(ctx, []string{"prompt", "run", "--json"}, payload)
 	if err != nil {
 		return nil, fmt.Errorf("iazio-harness prompt run failed: %w (stderr: %s)", err, strings.TrimSpace(stderr))
@@ -232,4 +234,30 @@ func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []
 	stderrStr := stderrBuf.String()
 
 	return stdoutStr, stderrStr, err
+}
+
+// EnsurePromptPayload ensures that a prompt payload JSON contains a valid prompt_id field.
+func EnsurePromptPayload(jobID string, raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return raw
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return raw
+	}
+	promptID, _ := m["prompt_id"].(string)
+	if strings.TrimSpace(promptID) == "" {
+		storyID, _ := m["story_id"].(string)
+		if strings.TrimSpace(storyID) != "" {
+			m["prompt_id"] = "prompt-" + strings.TrimSpace(storyID)
+		} else if strings.TrimSpace(jobID) != "" {
+			m["prompt_id"] = "prompt-" + strings.TrimSpace(jobID)
+		} else {
+			m["prompt_id"] = fmt.Sprintf("prompt-%d", time.Now().UnixNano())
+		}
+		if updated, err := json.Marshal(m); err == nil {
+			return updated
+		}
+	}
+	return raw
 }

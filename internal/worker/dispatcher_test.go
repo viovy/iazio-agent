@@ -549,5 +549,55 @@ func (m *mockInvokerWithWorkDirCapture) WithWorkDir(workDir string) harness.Invo
 	return m
 }
 
+func TestDispatcher_PromptExecute_AutoInjectsPromptID(t *testing.T) {
+	ctx := context.Background()
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:      "job-exec-789",
+			Type:    JobTypePromptExecute,
+			Repo:    "iazio-mcp",
+			Payload: json.RawMessage(`{"story_id":"STORY-TEST-99","prompt":"implement feature"}`),
+		}, nil
+	}
+
+	var capturedPayload json.RawMessage
+	inv := &mockInvoker{
+		executePromptFunc: func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+			capturedPayload = payload
+			return &harness.PromptExecutionResult{
+				PromptID: "prompt-STORY-TEST-99",
+				Status:   "completed",
+				Output:   "done",
+			}, nil
+		},
+	}
+
+	d := NewDispatcher(cp, inv, "host-1")
+	processed, err := d.PollAndProcess(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected job to be processed")
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal(capturedPayload, &m); err != nil {
+		t.Fatalf("failed unmarshaling captured payload: %v", err)
+	}
+	if m["prompt_id"] != "prompt-STORY-TEST-99" {
+		t.Fatalf("expected injected prompt_id 'prompt-STORY-TEST-99', got %v", m["prompt_id"])
+	}
+
+	comp, ok := cp.completedJobs["job-exec-789"]
+	if !ok {
+		t.Fatal("expected job-exec-789 to be marked completed")
+	}
+	if comp.Error != "" {
+		t.Fatalf("expected no error in completion, got: %s", comp.Error)
+	}
+}
+
 
 
