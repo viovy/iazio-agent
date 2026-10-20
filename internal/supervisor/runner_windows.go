@@ -21,10 +21,10 @@ var (
 )
 
 const (
-	jobObjectExtendedLimitInformation = 9
-	jobObjectLimitKillOnJobClose      = 0x2000
-	processSetQuota                   = 0x0100
-	processTerminate                  = 0x0001
+	jobObjectExtendedLimitInformationClass = 9
+	jobObjectLimitKillOnJobClose           = 0x2000
+	processSetQuota                        = 0x0100
+	processTerminate                       = 0x0001
 )
 
 type jobObjectBasicLimitInformation struct {
@@ -80,7 +80,7 @@ func postStartProc(cmd *exec.Cmd) {
 	}
 	procSetInformationJobObject.Call(
 		jobHandle,
-		jobObjectExtendedLimitInformation,
+		uintptr(jobObjectExtendedLimitInformationClass),
 		uintptr(unsafe.Pointer(&info)),
 		unsafe.Sizeof(info),
 	)
