@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/viovy/iazio-agent/internal/harness"
@@ -359,3 +360,139 @@ func TestPostJobSyncTrigger_NoTriggerOnFailure(t *testing.T) {
 		t.Fatalf("expected 0 syncer triggers on job failure, got %v", syncer.triggeredRepos)
 	}
 }
+
+func TestDispatcher_SetSyncerAndNilValidation(t *testing.T) {
+	d := NewDispatcher(nil, nil, "host-1")
+	syncer := &mockRepoSyncer{}
+	d.SetSyncer(syncer)
+	if d.syncer != syncer {
+		t.Fatal("expected syncer to be set")
+	}
+
+	// Nil client validation
+	_, err := d.PollAndProcess(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "client not configured") {
+		t.Fatalf("expected client not configured error, got %v", err)
+	}
+
+	// Nil invoker validation
+	d2 := NewDispatcher(&mockControlPlane{}, nil, "host-1")
+	_, err = d2.PollAndProcess(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "invoker not configured") {
+		t.Fatalf("expected invoker not configured error, got %v", err)
+	}
+
+	// Default HTTP client
+	client := NewHTTPControlPlaneClient("http://localhost:8080/", "tok", nil)
+	if client.HTTPClient == nil {
+		t.Fatal("expected default http client")
+	}
+}
+
+func TestHTTPControlPlaneClient_ClaimAndCompleteBranches(t *testing.T) {
+	// 1. 204 No Content
+	srv204 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv204.Close()
+
+	cli := NewHTTPControlPlaneClient(srv204.URL, "", srv204.Client())
+	job, err := cli.ClaimJob(context.Background(), ClaimRequest{HostID: "h1"})
+	if err != nil || job != nil {
+		t.Fatalf("expected nil job on 204: job=%+v err=%v", job, err)
+	}
+
+	// 2. 500 Server error
+	srv500 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "server error", http.StatusInternalServerError)
+	}))
+	defer srv500.Close()
+
+	cli500 := NewHTTPControlPlaneClient(srv500.URL, "", srv500.Client())
+	_, err = cli500.ClaimJob(context.Background(), ClaimRequest{HostID: "h1"})
+	if err == nil || !strings.Contains(err.Error(), "status 500") {
+		t.Fatalf("expected status 500 error, got %v", err)
+	}
+
+	err = cli500.CompleteJob(context.Background(), "job-1", CompleteRequest{})
+	if err == nil || !strings.Contains(err.Error(), "status 500") {
+		t.Fatalf("expected status 500 error on complete, got %v", err)
+	}
+
+	// 3. Decode error
+	srvBadJSON := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{invalid-json"))
+	}))
+	defer srvBadJSON.Close()
+
+	cliBad := NewHTTPControlPlaneClient(srvBadJSON.URL, "", srvBadJSON.Client())
+	_, err = cliBad.ClaimJob(context.Background(), ClaimRequest{HostID: "h1"})
+	if err == nil || !strings.Contains(err.Error(), "decode claim response") {
+		t.Fatalf("expected decode error, got %v", err)
+	}
+}
+
+func TestDispatcher_UnsupportedAndErrorJobs(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Claim job with empty ID returns nil, nil
+	srvEmptyID := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(Job{ID: ""})
+	}))
+	defer srvEmptyID.Close()
+
+	cliEmpty := NewHTTPControlPlaneClient(srvEmptyID.URL, "", srvEmptyID.Client())
+	job, err := cliEmpty.ClaimJob(ctx, ClaimRequest{HostID: "h1"})
+	if err != nil || job != nil {
+		t.Fatalf("expected nil job when ID is empty: %+v err=%v", job, err)
+	}
+
+	// 2. Unsupported job type
+	invoker := &mockInvoker{}
+	cli := newMockControlPlane()
+	cli.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{ID: "j-unsupp", Type: "unknown_job_type"}, nil
+	}
+	d := NewDispatcher(cli, invoker, "h1")
+	processed, err := d.PollAndProcess(ctx)
+	if !processed || err == nil || !strings.Contains(err.Error(), "unsupported job type") {
+		t.Fatalf("expected unsupported job type error, got processed=%v err=%v", processed, err)
+	}
+
+	// 3. CreateStory failure in PollAndProcess
+	cliStory := newMockControlPlane()
+	cliStory.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{ID: "j-story-err", Type: JobTypeStoryCreate}, nil
+	}
+	invStoryErr := &mockInvoker{
+		createStoryFunc: func(ctx context.Context, payload json.RawMessage) (*harness.StoryExecutionResult, error) {
+			return nil, errors.New("cannot create story")
+		},
+	}
+	dStory := NewDispatcher(cliStory, invStoryErr, "h1")
+	processed, err = dStory.PollAndProcess(ctx)
+	if !processed || err == nil || !strings.Contains(err.Error(), "cannot create story") {
+		t.Fatalf("expected create story error, got processed=%v err=%v", processed, err)
+	}
+
+	// 4. ExecutePrompt failure in PollAndProcess
+	cliPrompt := newMockControlPlane()
+	cliPrompt.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{ID: "j-prompt-err", Type: JobTypePromptExecute}, nil
+	}
+	invPromptErr := &mockInvoker{
+		executePromptFunc: func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+			return nil, errors.New("cannot execute prompt")
+		},
+	}
+	dPrompt := NewDispatcher(cliPrompt, invPromptErr, "h1")
+	processed, err = dPrompt.PollAndProcess(ctx)
+	if !processed || err == nil || !strings.Contains(err.Error(), "cannot execute prompt") {
+		t.Fatalf("expected execute prompt error, got processed=%v err=%v", processed, err)
+	}
+}
+
+
+

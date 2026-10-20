@@ -278,3 +278,95 @@ func TestCLIInvoker_ExportCodebase_Success(t *testing.T) {
 	}
 }
 
+func TestCLIInvoker_ListLocalRepos_And_ExportRepoDelta(t *testing.T) {
+	inv := makeFakeInvoker(t)
+	tmpDir := t.TempDir()
+	fakeBin := tmpDir + "/fake-harness"
+	script := fmt.Sprintf("#!/bin/sh\nexport GO_WANT_HELPER_PROCESS=1\nexec %s -test.run=TestHelperProcess -- \"$@\"\n", os.Args[0])
+	if err := os.WriteFile(fakeBin, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write fake harness script: %v", err)
+	}
+	inv.HarnessBinary = fakeBin
+
+	repos, err := inv.ListLocalRepos(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected ListLocalRepos error: %v", err)
+	}
+	if len(repos) != 1 || repos[0].Name != "iazio-mcp" {
+		t.Fatalf("unexpected repos: %+v", repos)
+	}
+
+	exp, err := inv.ExportRepoDelta(context.Background(), ExportRequest{
+		RepoName:    "iazio-mcp",
+		BaseTreeSHA: "tree-000",
+	})
+	if err != nil {
+		t.Fatalf("unexpected ExportRepoDelta error: %v", err)
+	}
+	if exp.RepoName != "iazio-mcp" || !exp.UpToDate {
+		t.Fatalf("unexpected export delta: %+v", exp)
+	}
+}
+
+func TestNewInvokers_EnvDefaults(t *testing.T) {
+	t.Setenv("IAZIO_HARNESS_BIN", "/custom/bin/iazio-harness")
+	inv := NewCLIInvoker("", "/tmp/work")
+	if inv.HarnessBinary != "/custom/bin/iazio-harness" {
+		t.Fatalf("expected env binary, got %s", inv.HarnessBinary)
+	}
+
+	t.Setenv("IAZIO_HARNESS_BIN", "")
+	invDef := NewCLIInvoker("", "")
+	if invDef.HarnessBinary != "iazio-harness" {
+		t.Fatalf("expected default binary iazio-harness, got %s", invDef.HarnessBinary)
+	}
+
+	t.Setenv("IAZIO_HARNESS_BIN", "/custom/bin/harness")
+	ci := NewCodebaseInvoker("", "")
+	if ci.HarnessBinary != "/custom/bin/harness" {
+		t.Fatalf("expected env binary for codebase invoker, got %s", ci.HarnessBinary)
+	}
+}
+
+func TestCLIInvoker_PayloadValidationAndPlainTextFallback(t *testing.T) {
+	ctx := context.Background()
+	inv := &CLIInvoker{HarnessBinary: "/bin/echo"}
+
+	// 1. Empty payload checks
+	if _, err := inv.CreateStory(ctx, nil); err == nil || !strings.Contains(err.Error(), "empty payload") {
+		t.Fatalf("expected empty payload error for CreateStory: %v", err)
+	}
+	if _, err := inv.ExecutePrompt(ctx, []byte{}); err == nil || !strings.Contains(err.Error(), "empty payload") {
+		t.Fatalf("expected empty payload error for ExecutePrompt: %v", err)
+	}
+	if _, err := inv.ExportCodebase(ctx, nil); err == nil || !strings.Contains(err.Error(), "empty payload") {
+		t.Fatalf("expected empty payload error for ExportCodebase: %v", err)
+	}
+
+	// 2. ExecutePrompt plain text fallback (echo outputs non-JSON plain text)
+	res, err := inv.ExecutePrompt(ctx, json.RawMessage(`{"prompt":"hi"}`))
+	if err != nil {
+		t.Fatalf("unexpected error on plain text fallback: %v", err)
+	}
+	if res.Status != "completed" {
+		t.Fatalf("expected status completed, got: %s", res.Status)
+	}
+
+	// 3. Binary execution failure
+	badInv := &CLIInvoker{HarnessBinary: "/nonexistent/path/for/harness"}
+	if _, err := badInv.CreateStory(ctx, json.RawMessage(`{}`)); err == nil {
+		t.Fatal("expected error on bad binary for CreateStory")
+	}
+	if _, err := badInv.ExecutePrompt(ctx, json.RawMessage(`{}`)); err == nil {
+		t.Fatal("expected error on bad binary for ExecutePrompt")
+	}
+	if _, err := badInv.ListRepos(ctx); err == nil {
+		t.Fatal("expected error on bad binary for ListRepos")
+	}
+	if _, err := badInv.ExportCodebase(ctx, json.RawMessage(`{}`)); err == nil {
+		t.Fatal("expected error on bad binary for ExportCodebase")
+	}
+}
+
+
+

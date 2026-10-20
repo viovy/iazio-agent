@@ -1,8 +1,10 @@
 package service
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf16"
@@ -214,6 +216,51 @@ func TestWindowsLifecycleCommands(t *testing.T) {
 	}
 }
 
+func TestActionTextAndApply_EdgeCases(t *testing.T) {
+	// 1. ActionText default action is install
+	txt := ActionText("darwin", "", "bin", false)
+	if !strings.Contains(txt, "io.iazio.iazio-agent") {
+		t.Fatalf("expected darwin plist for default action, got: %s", txt)
+	}
+
+	// 2. ActionText windows install with force and API URL
+	t.Setenv("IAZIO_HARNESS_API_URL", "http://harness.api")
+	txtWin := ActionText("windows", "install", "bin", true)
+	if !strings.Contains(txtWin, "/F") || !strings.Contains(txtWin, "IAZIO_HARNESS_API_URL=http://harness.api") {
+		t.Fatalf("expected /F and API URL in windows install, got: %s", txtWin)
+	}
+
+	// 3. ActionText windows other actions
+	txtWinStatus := ActionText("windows", "status", "bin", false)
+	if !strings.Contains(txtWinStatus, "schtasks /Query") {
+		t.Fatalf("expected Query, got: %s", txtWinStatus)
+	}
+
+	// 4. Apply with nil execFn returns text without error
+	res, err := Apply("darwin", "start", "bin", false, false, nil)
+	if err != nil || res == "" {
+		t.Fatalf("expected success with nil execFn: res=%s err=%v", res, err)
+	}
+
+	// 5. Apply with dry=true does not invoke execFn
+	res, err = Apply("linux", "status", "bin", true, false, func(string, ...string) error {
+		t.Fatal("should not be called when dry is true")
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 6. Apply when execFn fails
+	_, err = Apply("linux", "start", "bin", false, false, func(string, ...string) error {
+		return errors.New("command failed")
+	})
+	if err == nil {
+		t.Fatal("expected error when execFn fails")
+	}
+}
+
+
 func TestSuiteAllowed(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -320,6 +367,373 @@ func TestBuildInstallAndUninstallCrontab(t *testing.T) {
 	emptyUninstalled := BuildUninstallCrontab(BuildInstallCrontab("", runnerPath))
 	if emptyUninstalled != "" {
 		t.Errorf("expected empty string when only iazio-agent was present, got %q", emptyUninstalled)
+	}
+}
+
+func TestControlArgv_AllPlatforms(t *testing.T) {
+	// Darwin
+	for _, act := range []string{"install", "uninstall", "start", "stop", "restart"} {
+		args := controlArgv("darwin", act, false)
+		if len(args) == 0 || args[0] != "launchctl" {
+			t.Fatalf("expected launchctl for darwin %s, got %v", act, args)
+		}
+	}
+
+	// Windows
+	for _, act := range []string{"install", "start", "stop", "restart", "uninstall", "status"} {
+		args := controlArgv("windows", act, true)
+		if len(args) == 0 || args[0] != "schtasks" {
+			t.Fatalf("expected schtasks for windows %s, got %v", act, args)
+		}
+	}
+
+	// Linux
+	for _, act := range []string{"install", "start", "stop", "restart", "status"} {
+		args := controlArgv("linux", act, true)
+		if len(args) == 0 || args[0] != "systemctl" {
+			t.Fatalf("expected systemctl for linux %s, got %v", act, args)
+		}
+	}
+}
+
+func TestDaemonPIDLifecycle(t *testing.T) {
+	home := t.TempDir()
+	pidPath := filepath.Join(home, ".iazio", "agent.pid")
+	_ = os.MkdirAll(filepath.Dir(pidPath), 0755)
+
+	// Non-existent PID file
+	if isDaemonPIDAlive(pidPath) {
+		t.Fatal("expected false for missing pid file")
+	}
+	alive, _ := StatusUserDaemonAt(home)
+	if alive {
+		t.Fatal("expected false for StatusUserDaemonAt with missing file")
+	}
+
+	// Invalid PID content
+	_ = os.WriteFile(pidPath, []byte("invalid-pid"), 0644)
+	if isDaemonPIDAlive(pidPath) {
+		t.Fatal("expected false for invalid pid file")
+	}
+	alive, _ = StatusUserDaemonAt(home)
+	if alive {
+		t.Fatal("expected false for StatusUserDaemonAt with invalid pid")
+	}
+	_ = StopUserDaemonAt(home)
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatal("expected invalid pid file cleaned up by StopUserDaemonAt")
+	}
+
+	// Alive PID (current process)
+	myPID := os.Getpid()
+	_ = os.WriteFile(pidPath, []byte(strconv.Itoa(myPID)), 0644)
+	if !isDaemonPIDAlive(pidPath) {
+		t.Fatal("expected true for current process PID")
+	}
+	alive, gotPID := StatusUserDaemonAt(home)
+	if !alive || gotPID != myPID {
+		t.Fatalf("expected alive=true and pid=%d, got alive=%v pid=%d", myPID, alive, gotPID)
+	}
+}
+
+func TestAgentLogPath(t *testing.T) {
+	path := agentLogPath()
+	if !strings.Contains(path, "agent.log") {
+		t.Fatalf("unexpected agentLogPath: %s", path)
+	}
+}
+
+func TestInstallErrors(t *testing.T) {
+	home := t.TempDir()
+
+	// InstallDarwinAt errors
+	if err := InstallDarwinAt(home, "", func(string, ...string) error { return nil }); err == nil {
+		t.Fatal("expected error on empty binary for InstallDarwinAt")
+	}
+	if err := InstallDarwinAt(home, "bin", nil); err == nil {
+		t.Fatal("expected error on nil runner for InstallDarwinAt")
+	}
+
+	// InstallLinuxAt errors
+	if err := InstallLinuxAt(home, "bin", nil); err == nil {
+		t.Fatal("expected error on nil runner for InstallLinuxAt")
+	}
+
+	// InstallWindowsAt errors
+	if err := InstallWindowsAt(home, "bin", "user", nil); err == nil {
+		t.Fatal("expected error on nil runner for InstallWindowsAt")
+	}
+
+	// windowsLogonUser
+	t.Setenv("USERNAME", "winuser")
+	if windowsLogonUser() != "winuser" {
+		t.Fatal("expected winuser")
+	}
+	t.Setenv("USERNAME", "")
+	t.Setenv("USER", "unixuser")
+	if windowsLogonUser() != "unixuser" {
+		t.Fatal("expected unixuser")
+	}
+
+	// execCommand
+	if err := execCommand("echo", "ok"); err != nil {
+		t.Fatalf("expected nil for echo: %v", err)
+	}
+	if err := execCommand("nonexistent_service_cmd_xyz"); err == nil {
+		t.Fatal("expected error on nonexistent command")
+	}
+
+	// IsWSL and IsSystemdAvailable
+	_ = IsWSL()
+	_ = IsSystemdAvailable()
+
+	// StartUserDaemonAt branches with mock runner
+	testHome := t.TempDir()
+	pidFile := filepath.Join(testHome, ".iazio", "agent.pid")
+	_ = os.MkdirAll(filepath.Dir(pidFile), 0755)
+	_ = os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644)
+	// 1. Alive PID returns nil immediately
+	if err := StartUserDaemonAt(testHome, "bin", func(string, ...string) error { return errors.New("should not run") }); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Not alive, runnerPath exists, calls run
+	_ = os.Remove(pidFile)
+	runnerFile := filepath.Join(testHome, ".iazio", "daemon", "runner.sh")
+	_ = os.MkdirAll(filepath.Dir(runnerFile), 0755)
+	_ = os.WriteFile(runnerFile, []byte("#!/bin/sh\n"), 0755)
+	var startedCmd string
+	err := StartUserDaemonAt(testHome, "bin", func(name string, args ...string) error {
+		startedCmd = name + " " + strings.Join(args, " ")
+		return nil
+	})
+	if err != nil || !strings.Contains(startedCmd, runnerFile) {
+		t.Fatalf("expected runner script executed, got err=%v cmd=%s", err, startedCmd)
+	}
+}
+
+
+
+func TestInstallDarwinAt(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, "bin", "iazio-agent")
+
+	if err := InstallDarwinAt(home, "", func(string, ...string) error { return nil }); err == nil {
+		t.Fatal("expected error for empty bin")
+	}
+	if err := InstallDarwinAt(home, bin, nil); err == nil {
+		t.Fatal("expected error for nil runner")
+	}
+
+	var commands []string
+	runner := func(name string, args ...string) error {
+		commands = append(commands, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	if err := InstallDarwinAt(home, bin, runner); err != nil {
+		t.Fatalf("InstallDarwinAt failed: %v", err)
+	}
+
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", agentLabel+".plist")
+	if _, err := os.Stat(plistPath); err != nil {
+		t.Fatalf("plist missing: %v", err)
+	}
+	if len(commands) < 3 {
+		t.Fatalf("expected at least 3 launchctl commands, got %v", commands)
+	}
+
+	// Test bootstrap failure error handling
+	failBootstrap := func(name string, args ...string) error {
+		if len(args) > 0 && args[0] == "bootstrap" {
+			return errors.New("bootstrap failed")
+		}
+		return nil
+	}
+	if err := InstallDarwinAt(home, bin, failBootstrap); err == nil {
+		t.Fatal("expected error when bootstrap fails")
+	}
+
+	// Test enable failure error handling
+	failEnable := func(name string, args ...string) error {
+		if len(args) > 0 && args[0] == "enable" {
+			return errors.New("enable failed")
+		}
+		return nil
+	}
+	if err := InstallDarwinAt(home, bin, failEnable); err == nil {
+		t.Fatal("expected error when enable fails")
+	}
+}
+
+func TestInstallLinuxAt(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, "bin", "iazio-agent")
+
+	if err := InstallLinuxAt(home, bin, nil); err == nil {
+		t.Fatal("expected error for nil runner")
+	}
+
+	var commands []string
+	runner := func(name string, args ...string) error {
+		commands = append(commands, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	if err := InstallLinuxAt(home, bin, runner); err != nil {
+		t.Fatalf("InstallLinuxAt failed: %v", err)
+	}
+
+	unitPath := filepath.Join(home, ".config", "systemd", "user", "iazio-agent.service")
+	if _, err := os.Stat(unitPath); err != nil {
+		t.Fatalf("service unit missing: %v", err)
+	}
+	if len(commands) != 3 {
+		t.Fatalf("expected 3 systemctl/loginctl commands, got %v", commands)
+	}
+
+	// Test command failure error propagation
+	failRunner := func(name string, args ...string) error {
+		return errors.New("command failed")
+	}
+	if err := InstallLinuxAt(home, bin, failRunner); err == nil {
+		t.Fatal("expected error when runner fails")
+	}
+}
+
+func TestInstallWindowsAt(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, "bin", "iazio-agent.exe")
+
+	if err := InstallWindowsAt(home, bin, "DOMAIN\\user", nil); err == nil {
+		t.Fatal("expected error for nil runner")
+	}
+
+	var commands []string
+	runner := func(name string, args ...string) error {
+		commands = append(commands, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	if err := InstallWindowsAt(home, bin, "DOMAIN\\user", runner); err != nil {
+		t.Fatalf("InstallWindowsAt failed: %v", err)
+	}
+
+	batPath := filepath.Join(home, ".iazio", "tasks", "iazio-agent.bat")
+	xmlPath := filepath.Join(home, ".iazio", "tasks", "iazio-agent.xml")
+	if _, err := os.Stat(batPath); err != nil {
+		t.Fatalf("bat missing: %v", err)
+	}
+	if _, err := os.Stat(xmlPath); err != nil {
+		t.Fatalf("xml missing: %v", err)
+	}
+	if len(commands) != 2 || !strings.Contains(commands[0], "schtasks /Create") {
+		t.Fatalf("unexpected schtasks command: %v", commands)
+	}
+}
+
+func TestDaemonPIDLifecycleExtended(t *testing.T) {
+	home := t.TempDir()
+	pidDir := filepath.Join(home, ".iazio")
+	_ = os.MkdirAll(pidDir, 0o755)
+	pidFile := filepath.Join(pidDir, "agent.pid")
+
+	// Status when file doesn't exist
+	alive, pid := StatusUserDaemonAt(home)
+	if alive || pid != 0 {
+		t.Fatalf("expected not alive when no pid file, got %v, %d", alive, pid)
+	}
+
+	// Stop when file doesn't exist
+	if err := StopUserDaemonAt(home); err != nil {
+		t.Fatal(err)
+	}
+
+	// Status when corrupt PID
+	_ = os.WriteFile(pidFile, []byte("invalid-pid"), 0o600)
+	alive, pid = StatusUserDaemonAt(home)
+	if alive || pid != 0 {
+		t.Fatalf("expected not alive on invalid pid")
+	}
+	_ = StopUserDaemonAt(home)
+	if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
+		t.Fatal("expected corrupt pid file cleaned up by StopUserDaemonAt")
+	}
+
+	// Status when negative or zero PID
+	_ = os.WriteFile(pidFile, []byte("0"), 0o600)
+	alive, pid = StatusUserDaemonAt(home)
+	if alive || pid != 0 {
+		t.Fatalf("expected not alive on zero pid")
+	}
+	_ = StopUserDaemonAt(home)
+
+	// Status with current process PID (alive)
+	myPID := strconv.Itoa(os.Getpid())
+	_ = os.WriteFile(pidFile, []byte(myPID), 0o600)
+	alive, pid = StatusUserDaemonAt(home)
+	if !alive || pid != os.Getpid() {
+		t.Fatalf("expected alive for current pid, got alive=%v pid=%d", alive, pid)
+	}
+
+	// StartUserDaemonAt when already alive
+	err := StartUserDaemonAt(home, "bin", func(string, ...string) error {
+		t.Fatal("should not invoke runner if already alive")
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(pidFile)
+}
+
+func TestSetupUserCrontab(t *testing.T) {
+	var runArgs []string
+	runner := func(name string, args ...string) error {
+		runArgs = append(runArgs, name+" "+strings.Join(args, " "))
+		return nil
+	}
+	if err := setupUserCrontab("/tmp/runner.sh", runner); err != nil {
+		t.Fatal(err)
+	}
+	if len(runArgs) == 0 || !strings.Contains(runArgs[0], "crontab -") {
+		t.Fatalf("expected crontab runner invocation, got %v", runArgs)
+	}
+}
+
+func TestInstallWrapperFunctions(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("USERPROFILE", fakeHome)
+
+	origExec := execCommand
+	t.Cleanup(func() {
+		execCommand = origExec
+	})
+	execCommand = func(string, ...string) error {
+		return nil
+	}
+
+	bin := filepath.Join(fakeHome, "bin", "iazio-agent")
+
+	// 1. InstallDarwin
+	if err := InstallDarwin(bin); err != nil {
+		t.Fatalf("InstallDarwin failed: %v", err)
+	}
+
+	// 2. InstallUserDaemon
+	if err := InstallUserDaemon(bin); err != nil {
+		t.Fatalf("InstallUserDaemon failed: %v", err)
+	}
+
+	// 3. InstallLinux
+	if err := InstallLinux(bin); err != nil {
+		t.Fatalf("InstallLinux failed: %v", err)
+	}
+
+	// 4. InstallWindows
+	if err := InstallWindows(bin); err != nil {
+		t.Fatalf("InstallWindows failed: %v", err)
 	}
 }
 

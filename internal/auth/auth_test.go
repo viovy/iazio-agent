@@ -1,12 +1,14 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -158,6 +160,188 @@ func TestEndpointRequired(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestConfigPathAndStatus(t *testing.T) {
+	tmpDir := t.TempDir()
+	p := ConfigPathFrom(tmpDir, func(string) string { return "" })
+	if !strings.Contains(p, "agent.json") {
+		t.Fatalf("unexpected ConfigPathFrom: %s", p)
+	}
+
+	pEnv := ConfigPathFrom("", func(k string) string {
+		if k == "IAZIO_AGENT_CONFIG" {
+			return "/custom/path/agent.json"
+		}
+		return ""
+	})
+	if pEnv != "/custom/path/agent.json" {
+		t.Fatalf("unexpected pEnv: %s", pEnv)
+	}
+
+	// Corrupted status JSON
+	badFile := filepath.Join(tmpDir, "bad.json")
+	_ = os.WriteFile(badFile, []byte("{invalid-json"), 0600)
+	if _, err := ReadStatus(badFile); err == nil {
+		t.Fatal("expected error on corrupted JSON")
+	}
+
+	// ReadStatus on directory (read error that is not NotExist)
+	if _, err := ReadStatus(tmpDir); err == nil {
+		t.Fatal("expected error on reading directory as status file")
+	}
+
+	// Default ConfigPath() call
+	_ = ConfigPath()
+}
+
+func TestDeviceAuthURL(t *testing.T) {
+	cfg := Config{DeviceURL: "https://auth.example/dev"}
+	u := DeviceAuthURL(cfg, func(k string) string {
+		if k == "IAZIO_DEVICE_AUTH_URL" {
+			return "https://override.example/dev"
+		}
+		return ""
+	})
+	if u != "https://override.example/dev" {
+		t.Fatalf("expected override URL, got %s", u)
+	}
+
+	uDefault := DeviceAuthURL(cfg, nil)
+	if uDefault != "https://auth.example/dev" {
+		t.Fatalf("expected cfg DeviceURL, got %s", uDefault)
+	}
+}
+
+func TestOpenBrowserValidation(t *testing.T) {
+	// Invalid URL
+	if err := OpenBrowser("ht tp://invalid url"); err == nil {
+		t.Fatal("expected error on malformed URL")
+	}
+
+	// Unsupported scheme
+	if err := OpenBrowser("ftp://example.com"); err == nil {
+		t.Fatal("expected error on unsupported scheme")
+	}
+}
+
+func TestLoginErrors(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "agent.json")
+
+	// Missing endpoints
+	err := Login(t.Context(), LoginOptions{
+		Getenv: func(k string) string {
+			if k == "IAZIO_AGENT_CONFIG" {
+				return cfgPath
+			}
+			return ""
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "auth endpoints are not configured") {
+		t.Fatalf("expected not configured error, got: %v", err)
+	}
+
+	// Server error 500 on device start
+	srvErr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "server error", http.StatusInternalServerError)
+	}))
+	defer srvErr.Close()
+
+	err = Login(t.Context(), LoginOptions{
+		Getenv: func(k string) string {
+			switch k {
+			case "IAZIO_AGENT_CONFIG":
+				return cfgPath
+			case "IAZIO_DEVICE_AUTH_URL":
+				return srvErr.URL
+			case "IAZIO_TOKEN_URL":
+				return srvErr.URL
+			default:
+				return ""
+			}
+		},
+		HTTP: srvErr.Client(),
+	})
+	if err == nil {
+		t.Fatal("expected error on 500 response")
+	}
+
+	// Denied device flow
+	mux := http.NewServeMux()
+	mux.HandleFunc("/device", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"device_code":               "dev-code",
+			"verification_uri_complete": "https://example.test/device",
+			"interval":                  0,
+		})
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "access_denied"})
+	})
+	srvDenied := httptest.NewServer(mux)
+	defer srvDenied.Close()
+
+	err = Login(t.Context(), LoginOptions{
+		Getenv: func(k string) string {
+			switch k {
+			case "IAZIO_AGENT_CONFIG":
+				return cfgPath
+			case "IAZIO_DEVICE_AUTH_URL":
+				return srvDenied.URL + "/device"
+			case "IAZIO_TOKEN_URL":
+				return srvDenied.URL + "/token"
+			default:
+				return ""
+			}
+		},
+		OpenBrowser: func(string) error { return nil },
+		HTTP:        srvDenied.Client(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "denied") {
+		t.Fatalf("expected denied error, got: %v", err)
+	}
+}
+
+func TestStartDeviceAndPollTokenEdgeCases(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. startDevice missing device code
+	srvNoCode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"device_code": ""})
+	}))
+	defer srvNoCode.Close()
+
+	_, err := startDevice(ctx, srvNoCode.Client(), srvNoCode.URL)
+	if err == nil || !strings.Contains(err.Error(), "no device code") {
+		t.Fatalf("expected no device code error, got %v", err)
+	}
+
+	// 2. pollToken slow_down (returns pending=true)
+	srvSlow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "slow_down"})
+	}))
+	defer srvSlow.Close()
+
+	tok, pending, err := pollToken(ctx, srvSlow.Client(), srvSlow.URL, "dev-code")
+	if err != nil || tok != "" || !pending {
+		t.Fatalf("expected pending=true on slow_down: tok=%q pending=%v err=%v", tok, pending, err)
+	}
+
+	// 3. load error on corrupted file
+	tmpDir := t.TempDir()
+	badFile := filepath.Join(tmpDir, "corrupted.json")
+	_ = os.WriteFile(badFile, []byte("not-json"), 0644)
+	if _, err := load(badFile); err == nil {
+		t.Fatal("expected error on load corrupted file")
+	}
+
+	// 4. save error on invalid path
+	if err := save("/dev/null/forbidden/file.json", Config{}); err == nil {
+		t.Fatal("expected error on save invalid path")
+	}
+}
+
+
 
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {

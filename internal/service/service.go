@@ -686,7 +686,7 @@ func windowsLogonUser() string {
 	return strings.TrimSpace(current.Username)
 }
 
-func execCommand(name string, args ...string) error {
+var execCommand = func(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

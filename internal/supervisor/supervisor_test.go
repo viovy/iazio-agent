@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -378,6 +379,55 @@ func TestReconcileHostCheckouts(t *testing.T) {
 	}
 }
 
+func TestReconcileHostCheckouts_Errors(t *testing.T) {
+	// 1. Nil validation returns immediately without panic
+	ReconcileHostCheckouts(nil, nil, nil, nil, nil, nil, nil)
+	ReconcileHostCheckouts(nil, func(string) bool { return true }, nil, nil, nil, nil, nil)
+
+	// 2. Error branches
+	repos := []RepoState{
+		{WorktreePath: ""}, // empty skipped
+		{WorktreePath: "/work/discard-err", DiscardPending: true},
+		{WorktreePath: "/work/clean-err", Queue: "PAUSED", Reason: "HALTED_DIRTY"},
+		{WorktreePath: "/work/clean-resume-err", Queue: "PAUSED", Reason: "HALTED_DIRTY"},
+		{WorktreePath: "/work/disk-err", Reason: "HALTED_DISK"},
+		{WorktreePath: "/work/disk-resume-err", Reason: "HALTED_DISK"},
+	}
+
+	var stderr bytes.Buffer
+	isLockIdle := func(string) bool { return true }
+	discardErr := func(string) error { return errors.New("discard failed") }
+	isCleanErr := func(w string) (bool, error) {
+		if w == "/work/clean-err" {
+			return false, errors.New("git status failed")
+		}
+		return true, nil
+	}
+	checkDiskErr := func(w string) (bool, error) {
+		if w == "/work/disk-err" {
+			return false, errors.New("statfs failed")
+		}
+		return true, nil
+	}
+	resumeErr := func(w string) error {
+		if strings.Contains(w, "resume-err") {
+			return errors.New("resume failed")
+		}
+		return nil
+	}
+
+	ReconcileHostCheckouts(repos, isLockIdle, discardErr, isCleanErr, resumeErr, nil, &stderr, checkDiskErr)
+
+	errText := stderr.String()
+	if !strings.Contains(errText, "discard checkout error") ||
+		!strings.Contains(errText, "check clean status error") ||
+		!strings.Contains(errText, "check disk status error") ||
+		!strings.Contains(errText, "resume repo error") {
+		t.Fatalf("missing expected error messages in stderr: %s", errText)
+	}
+}
+
+
 func TestReconcileStrandedCheckouts(t *testing.T) {
 	repos := []RepoState{
 		{
@@ -632,6 +682,122 @@ func TestDockerRunner_Dispatch(t *testing.T) {
 		t.Fatalf("missing expected flags in docker argv: %s", joined)
 	}
 }
+
+func TestSupervisor_ActiveJobs_HasRunningHarness_Reason(t *testing.T) {
+	s := New(nil)
+
+	// Initially idle
+	if s.HasRunningHarness() {
+		t.Fatal("expected no running harness initially")
+	}
+
+	_ = s.TrySpawn("/repos/app1")
+	s.mu.Lock()
+	s.pids["/repos/app1"] = 4321
+	s.reasons["/repos/app1"] = "completed_ok"
+	s.mu.Unlock()
+
+	if !s.HasRunningHarness() {
+		t.Fatal("expected running harness")
+	}
+
+	active := s.ActiveJobs()
+	if len(active) != 1 || active["/repos/app1"] != 4321 {
+		t.Fatalf("unexpected active jobs: %+v", active)
+	}
+
+	if s.Reason("/repos/app1") != "completed_ok" {
+		t.Fatalf("expected completed_ok, got %s", s.Reason("/repos/app1"))
+	}
+
+	// MarkIdle
+	s.MarkIdle("/repos/app1")
+	if s.HasRunningHarness() {
+		t.Fatal("expected no running harness after MarkIdle")
+	}
+
+	// Loop detector checks
+	res := s.CheckLoop("edit", "some output")
+	if res.IsLoop {
+		t.Fatal("unexpected loop detected on first action")
+	}
+	s.ResetLoopDetector()
+}
+
+func TestResolveBinaryAndRunnerSignal(t *testing.T) {
+	// 1. Resolve known binary
+	resolved := ResolveBinary("git")
+	if resolved == "" {
+		t.Fatal("expected git to be resolved")
+	}
+
+	// 2. Resolve absolute path
+	if ResolveBinary("/bin/echo") != "/bin/echo" {
+		t.Fatal("expected absolute path unchanged")
+	}
+
+	// 3. Resolve from fake home .iazio/bin
+	fakeHome := t.TempDir()
+	iazioBin := filepath.Join(fakeHome, ".iazio", "bin")
+	_ = os.MkdirAll(iazioBin, 0755)
+	customTool := filepath.Join(iazioBin, "custom-iazio-tool")
+	_ = os.WriteFile(customTool, []byte("#!/bin/sh\n"), 0755)
+
+	t.Setenv("HOME", fakeHome)
+	if got := ResolveBinary("custom-iazio-tool"); got != customTool {
+		t.Fatalf("expected custom tool resolved from .iazio/bin, got %s", got)
+	}
+
+	// 4. Fallback when not found
+	if got := ResolveBinary("non-existent-binary-12345"); got != "non-existent-binary-12345" {
+		t.Fatalf("expected fallback to name, got %s", got)
+	}
+
+	// 5. Runner execution and signal
+	runner := NewOSRunner()
+	pid, err := runner.Start([]string{"sleep", "5"})
+	if err == nil && pid > 0 {
+		_ = runner.Signal(pid, "TERM")
+		_, _ = runner.Wait(pid)
+	}
+
+	// 6. DockerRunner Signal and Wait
+	mockHost := &mockRunner{}
+	dr := &DockerRunner{
+		host: mockHost,
+		Config: DockerConfig{
+			Image: "test-image:latest",
+		},
+	}
+	_ = dr.Signal(1234, "TERM")
+	code, err := dr.Wait(1234)
+	if err != nil || code != 0 {
+		t.Fatalf("unexpected DockerRunner wait: code=%d err=%v", code, err)
+	}
+
+	// 7. runner_unix functions
+	postStartProc(nil)
+	if !isProcessAlive(os.Getpid()) {
+		t.Fatal("expected current pid to be alive")
+	}
+	if isProcessAlive(-1) {
+		t.Fatal("expected -1 pid not alive")
+	}
+	if isProcessAlive(99999999) {
+		t.Fatal("expected non-existent pid not alive")
+	}
+	if err := signalPID(0, "TERM"); err != nil {
+		t.Fatalf("expected nil for pid <= 0: %v", err)
+	}
+	cmd := exec.Command("sleep", "10")
+	if err := cmd.Start(); err == nil {
+		_ = signalPID(cmd.Process.Pid, "UNKNOWN_SIG")
+		_ = signalPID(cmd.Process.Pid, "KILL")
+		_ = cmd.Wait()
+	}
+}
+
+
 
 
 

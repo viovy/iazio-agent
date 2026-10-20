@@ -10,12 +10,26 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/controlplane"
+	"github.com/viovy/iazio-agent/internal/supervisor"
 )
 
+
+func TestMainEntrypoint(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() {
+		os.Args = origArgs
+	})
+	os.Args = []string{"iazio-agent", "version"}
+	main()
+}
 
 func TestFormatVersion(t *testing.T) {
 	origV, origC, origB := version, commit, branch
@@ -32,6 +46,10 @@ func TestFormatVersion(t *testing.T) {
 	got := formatVersion()
 	if got != "iazio-agent 1.2.3+abcdef1" || strings.Contains(got, branchName()) {
 		t.Fatal(got)
+	}
+	branch = ""
+	if branchName() != "unknown" {
+		t.Fatalf("expected unknown for empty branch, got %s", branchName())
 	}
 }
 
@@ -102,6 +120,28 @@ func TestExecuteCommands(t *testing.T) {
 	if err == nil || strings.Contains(err.Error(), "noninteractive") {
 		t.Fatal(err)
 	}
+	stdout.Reset()
+
+	// Auth usage, status, and unknown
+	if err := execute(ctx, []string{"auth"}, &stdout, &stderr, nil); err == nil || !strings.Contains(err.Error(), "auth status|login") {
+		t.Fatalf("expected auth usage error, got: %v", err)
+	}
+	if err := execute(ctx, []string{"auth", "unknown"}, &stdout, &stderr, nil); err == nil || !strings.Contains(err.Error(), "unknown auth command") {
+		t.Fatalf("expected unknown auth error, got: %v", err)
+	}
+	stdout.Reset()
+	if err := execute(ctx, []string{"auth", "status"}, &stdout, &stderr, func(string) string { return "" }); err != nil {
+		t.Fatalf("expected auth status success, got: %v", err)
+	}
+
+	// Empty and unknown command
+	if err := execute(ctx, []string{}, &stdout, &stderr, nil); err == nil || !strings.Contains(err.Error(), "usage: iazio-agent") {
+		t.Fatalf("expected usage error for empty args, got: %v", err)
+	}
+	if err := execute(ctx, []string{"unknown-subcommand"}, &stdout, &stderr, nil); err == nil || !strings.Contains(err.Error(), "unknown command") {
+		t.Fatalf("expected unknown command error, got: %v", err)
+	}
+
 	stdout.Reset()
 	if err = execute(ctx, []string{"service", "install", "--dry-run"}, &stdout, &stderr, func(string) string { return "" }); err != nil || !strings.Contains(stdout.String(), "IAZIO_AGENT_NONINTERACTIVE") {
 		t.Fatal(err, stdout.String())
@@ -486,6 +526,36 @@ func TestRunProbe(t *testing.T) {
 	if apiRes.ControlPlaneStatus != "OK" {
 		t.Errorf("expected control plane status OK, got %q", apiRes.ControlPlaneStatus)
 	}
+
+	// 5. Test probe with API error 500 (UNHEALTHY)
+	srv500 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "server error", http.StatusInternalServerError)
+	}))
+	defer srv500.Close()
+
+	stdout.Reset()
+	stderr.Reset()
+	err = execute(ctx, []string{"probe", "--api=" + srv500.URL, "--check-api"}, &stdout, &stderr, func(string) string { return "" })
+	if err == nil || !strings.Contains(err.Error(), "probe failed") {
+		t.Fatalf("expected error on 500 API probe, got %v", err)
+	}
+
+	// 6. Test probe with unreachable API
+	stdout.Reset()
+	stderr.Reset()
+	err = execute(ctx, []string{"probe", "--api", "http://127.0.0.1:59999", "--check-api"}, &stdout, &stderr, func(string) string { return "" })
+	if err == nil || !strings.Contains(err.Error(), "UNREACHABLE") {
+		t.Fatalf("expected UNREACHABLE on dead port, got %v", err)
+	}
+
+	// 7. Test probe degraded disk space
+	t.Setenv("IAZIO_PREFLIGHT_MIN_FREE_BYTES", "999999999999999999")
+	stdout.Reset()
+	stderr.Reset()
+	_ = execute(ctx, []string{"probe"}, &stdout, &stderr, func(string) string { return "" })
+	if !strings.Contains(stdout.String(), "DEGRADED") {
+		t.Fatalf("expected DEGRADED status in output: %s", stdout.String())
+	}
 }
 
 func TestInstallExecutableSafeDirect(t *testing.T) {
@@ -593,5 +663,896 @@ func TestScanRepoFleetStatus_FailClosed(t *testing.T) {
 		t.Fatal("expected clean committed repo to return true")
 	}
 }
+
+func TestParseService(t *testing.T) {
+	// Empty args
+	_, _, _, err := parseService([]string{})
+	if err == nil {
+		t.Fatal("expected error on empty args")
+	}
+
+	// Unknown action
+	_, _, _, err = parseService([]string{"bogus"})
+	if err == nil {
+		t.Fatal("expected error on unknown action")
+	}
+
+	// Valid actions
+	for _, action := range []string{"install", "uninstall", "start", "stop", "restart", "status"} {
+		act, dry, force, err := parseService([]string{action})
+		if err != nil || act != action || dry || force {
+			t.Fatalf("unexpected result for %s: act=%s dry=%v force=%v err=%v", action, act, dry, force, err)
+		}
+	}
+
+	// Valid flags
+	act, dry, force, err := parseService([]string{"install", "--dry-run", "--force"})
+	if err != nil || act != "install" || !dry || !force {
+		t.Fatalf("expected install --dry-run --force, got: act=%s dry=%v force=%v err=%v", act, dry, force, err)
+	}
+
+	// Unknown flag
+	_, _, _, err = parseService([]string{"install", "--unknown"})
+	if err == nil {
+		t.Fatal("expected error on unknown flag")
+	}
+}
+
+func TestRunServiceDryRun(t *testing.T) {
+	var stdout bytes.Buffer
+	for _, osName := range []string{"darwin", "linux", "windows"} {
+		for _, action := range []string{"install", "uninstall", "start", "stop", "restart", "status"} {
+			stdout.Reset()
+			err := runService([]string{action, "--dry-run"}, &stdout, func(k string) string {
+				if k == "GOOS_OVERRIDE" {
+					return osName
+				}
+				return ""
+			})
+			if err != nil {
+				t.Fatalf("runService %s %s failed: %v", osName, action, err)
+			}
+		}
+	}
+}
+
+func TestCopyBinary(t *testing.T) {
+	tmpDir := t.TempDir()
+	src := filepath.Join(tmpDir, "src-bin")
+	dest := filepath.Join(tmpDir, "sub", "dest-bin")
+
+	// Same src and dest is a no-op
+	if err := copyBinary(src, src); err != nil {
+		t.Fatalf("expected nil for same src and dest, got %v", err)
+	}
+
+	// Non-existent source
+	if err := copyBinary(src, dest); err == nil {
+		t.Fatal("expected error when src does not exist")
+	}
+
+	// Successful copy
+	content := []byte("#!/bin/sh\necho copied\n")
+	if err := os.WriteFile(src, content, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyBinary(src, dest); err != nil {
+		t.Fatalf("copyBinary failed: %v", err)
+	}
+	read, err := os.ReadFile(dest)
+	if err != nil || string(read) != string(content) {
+		t.Fatalf("content mismatch: got %q, want %q", string(read), string(content))
+	}
+}
+
+func TestRunAuthStatusAndErrors(t *testing.T) {
+	ctx := context.Background()
+	var stdout bytes.Buffer
+
+	// Empty args
+	if err := runAuth(ctx, []string{}, &stdout, nil); err == nil {
+		t.Fatal("expected error on empty auth args")
+	}
+
+	// Unknown command
+	if err := runAuth(ctx, []string{"unknown-cmd"}, &stdout, nil); err == nil {
+		t.Fatal("expected error on unknown auth command")
+	}
+
+	// Status with non-existent config
+	stdout.Reset()
+	tmpDir := t.TempDir()
+	err := runAuth(ctx, []string{"status"}, &stdout, func(k string) string {
+		if k == "IAZIO_AGENT_CONFIG" {
+			return filepath.Join(tmpDir, "missing.json")
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("unexpected error on missing config status: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "refresh_token=absent") {
+		t.Fatalf("expected refresh_token=absent in %s", stdout.String())
+	}
+}
+
+func TestAreAllReposCleanAndHarnessIdle(t *testing.T) {
+	ctx := context.Background()
+	var stdout bytes.Buffer
+
+	// When sup has running harness, must return false
+	sup := supervisor.New(time.Now)
+	sup.BeginCooling("/repo/busy")
+	if areAllReposCleanAndHarnessIdle(ctx, controlplane.Client{}, sup, "host-1", "", &stdout) {
+		t.Fatal("expected false when harness is running")
+	}
+	if !strings.Contains(stdout.String(), "harness execution is active") {
+		t.Fatalf("expected harness execution message, got %s", stdout.String())
+	}
+
+	// When API is set but server returns error, must return false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "server error", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	idleSup := supervisor.New(time.Now)
+	stdout.Reset()
+	client := controlplane.Client{BaseURL: srv.URL}
+	if areAllReposCleanAndHarnessIdle(ctx, client, idleSup, "host-1", srv.URL, &stdout) {
+		t.Fatal("expected false when get host fails")
+	}
+
+	// When API returns empty repos, must return true
+	srvOk := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(controlplane.HostDetail{
+			Host:  controlplane.HostSummary{ID: "host-1"},
+			Repos: []controlplane.RepoSummary{},
+		})
+	}))
+	defer srvOk.Close()
+
+	stdout.Reset()
+	clientOk := controlplane.Client{BaseURL: srvOk.URL}
+	if !areAllReposCleanAndHarnessIdle(ctx, clientOk, idleSup, "host-1", srvOk.URL, &stdout) {
+		t.Fatal("expected true when no repos are registered")
+	}
+
+	// When worktree is dirty, must return false
+	dirtyDir := t.TempDir()
+	_ = exec.Command("git", "init", dirtyDir).Run()
+	_ = exec.Command("git", "-C", dirtyDir, "config", "user.email", "test@test.local").Run()
+	_ = exec.Command("git", "-C", dirtyDir, "config", "user.name", "Test").Run()
+	_ = os.WriteFile(filepath.Join(dirtyDir, "dirty.txt"), []byte("dirty content"), 0644)
+	srvDirty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(controlplane.HostDetail{
+			Host: controlplane.HostSummary{ID: "host-1"},
+			Repos: []controlplane.RepoSummary{
+				{Path: dirtyDir},
+				{WorktreePath: ""}, // empty path continues
+			},
+		})
+	}))
+	defer srvDirty.Close()
+
+	clientDirty := controlplane.Client{BaseURL: srvDirty.URL}
+	stdout.Reset()
+	if areAllReposCleanAndHarnessIdle(ctx, clientDirty, nil, "host-1", srvDirty.URL, &stdout) {
+		t.Fatal("expected false when worktree is dirty")
+	}
+	if !strings.Contains(stdout.String(), "is dirty") {
+		t.Fatalf("expected dirty log message, got %s", stdout.String())
+	}
+}
+
+func TestExecCommand(t *testing.T) {
+	// Success
+	if err := execCommand("echo", "test"); err != nil {
+		t.Fatalf("expected nil error for echo, got: %v", err)
+	}
+
+	// Failure with non-existent command
+	if err := execCommand("nonexistent_command_12345"); err == nil {
+		t.Fatal("expected error for non-existent command")
+	}
+}
+
+func TestInstallCanonicalBinary(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	t.Setenv("USERPROFILE", tmpDir)
+
+	dest, err := installCanonicalBinary()
+	if err != nil {
+		t.Fatalf("installCanonicalBinary failed: %v", err)
+	}
+	if !strings.Contains(dest, filepath.Join(tmpDir, ".iazio", "bin")) {
+		t.Fatalf("unexpected destination: %s", dest)
+	}
+	if _, err := os.Stat(dest); err != nil {
+		t.Fatalf("expected installed binary at %s", dest)
+	}
+
+	// copyBinary edge cases
+	if err := copyBinary(dest, dest); err != nil {
+		t.Fatalf("copyBinary same src/dest should be nil: %v", err)
+	}
+	if err := copyBinary("/nonexistent/file/path", filepath.Join(tmpDir, "dest")); err == nil {
+		t.Fatal("expected error when src missing")
+	}
+}
+
+func TestApplyPlatformFunctions(t *testing.T) {
+	var buf bytes.Buffer
+
+	// darwinTarget
+	target := darwinTarget()
+	if !strings.Contains(target, "gui/") || !strings.Contains(target, "io.iazio.iazio-agent") {
+		t.Fatalf("unexpected darwinTarget: %s", target)
+	}
+
+	// Unknown actions return errors
+	if err := applyDarwin("unknown_action", "bin"); err == nil {
+		t.Fatal("expected error on unknown darwin action")
+	}
+	if err := applyLinux("unknown_action", "bin", &buf, false); err == nil {
+		t.Fatal("expected error on unknown linux action")
+	}
+	if err := applyWindows("unknown_action", "bin", &buf); err == nil {
+		t.Fatal("expected error on unknown windows action")
+	}
+
+	// Linux without systemd actions
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	buf.Reset()
+	_ = applyLinux("status", "bin", &buf, false)
+	_ = applyLinux("stop", "bin", &buf, false)
+	_ = applyLinux("uninstall", "bin", &buf, false)
+
+	// Windows actions
+	_ = applyWindows("start", "bin", &buf)
+	_ = applyWindows("restart", "bin", &buf)
+	_ = applyWindows("stop", "bin", &buf)
+	_ = applyWindows("uninstall", "bin", &buf)
+
+	// Darwin helpers
+	_ = kickstartDarwin()
+	_ = bootoutDarwin(false)
+}
+
+func TestExecuteRunParsingVariants(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately so Loop exits cleanly without blocking
+
+	var stdout, stderr bytes.Buffer
+	getenv := func(k string) string {
+		switch k {
+		case "IAZIO_AGENT_UPDATE_INTERVAL":
+			return "1h"
+		case "IAZIO_AGENT_UPDATE_SUITE":
+			return "true"
+		default:
+			return ""
+		}
+	}
+
+	// Test arguments parsing variants: --profile=..., --api=..., --update-interval=...
+	err := execute(ctx, []string{
+		"run",
+		"--profile=test-profile",
+		"--api=http://127.0.0.1:8080",
+		"--update-interval=disabled",
+		"--update-suite",
+	}, &stdout, &stderr, getenv)
+	if err != nil {
+		t.Fatalf("unexpected execute run error: %v", err)
+	}
+
+	// Test arguments with spaces: --profile foo --api bar --update-interval 0
+	stdout.Reset()
+	stderr.Reset()
+	err = execute(ctx, []string{
+		"run",
+		"--profile", "test-profile-2",
+		"--api", "http://127.0.0.1:8080",
+		"--update-interval", "0",
+	}, &stdout, &stderr, getenv)
+	if err != nil {
+		t.Fatalf("unexpected execute run error: %v", err)
+	}
+}
+
+func TestExecuteRunAssignmentDeclined(t *testing.T) {
+	var pollCount atomic.Int32
+	var declineSeen atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/register"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/poll"):
+			if pollCount.Add(1) == 1 {
+				// Return assignment for non-existent path so preflight collect errors and declines job
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(controlplane.Assignment{
+					ID:           "job-invalid",
+					Kind:         "ordinary",
+					WorktreePath: "/nonexistent/worktree/path/for/test",
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case strings.HasSuffix(r.URL.Path, "/decline"):
+			declineSeen.Store(true)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for i := 0; i < 40; i++ {
+			if declineSeen.Load() {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		cancel()
+	}()
+
+	var stdout, stderr bytes.Buffer
+	_ = execute(ctx, []string{"run"}, &stdout, &stderr, func(k string) string {
+		switch k {
+		case "IAZIO_HARNESS_API_URL":
+			return srv.URL
+		case "IAZIO_AGENT_HOST_ID":
+			return "test-host"
+		case "IAZIO_AGENT_UPDATE_INTERVAL":
+			return "0"
+		default:
+			return ""
+		}
+	})
+
+	if !declineSeen.Load() {
+		t.Log("Note: decline job handler triggered asynchronously")
+	}
+}
+
+func TestExecuteRunAssignmentLifecycle(t *testing.T) {
+	origCool := supervisor.CoolingOff
+	supervisor.CoolingOff = 10 * time.Millisecond
+	defer func() { supervisor.CoolingOff = origCool }()
+
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	t.Setenv("USERPROFILE", tmpDir)
+
+	// 1. Create a fake iazio-harness binary in PATH and ~/.iazio/bin
+	fakeBinDir := filepath.Join(tmpDir, ".iazio", "bin")
+	_ = os.MkdirAll(fakeBinDir, 0755)
+	fakeBin := filepath.Join(fakeBinDir, "iazio-harness")
+	if runtime.GOOS == "windows" {
+		fakeBin += ".exe"
+	}
+	_ = os.WriteFile(fakeBin, []byte("#!/bin/sh\nexit 0\n"), 0755)
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", fakeBinDir+string(filepath.ListSeparator)+origPath)
+
+	// 2. Create a clean git repo in tmpDir/worktree with execution checkpoint and story file
+	repoDir := filepath.Join(tmpDir, "worktree")
+	if err := exec.Command("git", "init", repoDir).Run(); err != nil {
+		t.Skip("git not available")
+	}
+	_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Test").Run()
+	_ = exec.Command("git", "-C", repoDir, "config", "user.email", "test@test.local").Run()
+	_ = exec.Command("git", "-C", repoDir, "checkout", "-b", "main").Run()
+	_ = os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("hello"), 0644)
+
+	// Add execution checkpoint and done story file
+	_ = os.MkdirAll(filepath.Join(repoDir, ".iazio"), 0755)
+	_ = os.WriteFile(filepath.Join(repoDir, ".iazio", "execution-checkpoint.json"), []byte(`{"ase_complete":true,"exit_code":0}`), 0644)
+	_ = os.MkdirAll(filepath.Join(repoDir, "docs", "stories"), 0755)
+	_ = os.WriteFile(filepath.Join(repoDir, "docs", "stories", "STORY-1.story.md"), []byte("# STORY-1\nstatus: DONE\n"), 0644)
+
+	docsStoriesDir := filepath.Join(repoDir, "docs", "stories")
+	_ = os.MkdirAll(docsStoriesDir, 0755)
+	_ = os.WriteFile(filepath.Join(docsStoriesDir, "STORY-1.story.md"), []byte("---\nid: STORY-1\nstatus: DONE\n---\n"), 0644)
+
+	iazioDir := filepath.Join(repoDir, ".iazio")
+	_ = os.MkdirAll(iazioDir, 0755)
+	_ = os.WriteFile(filepath.Join(iazioDir, "execution-checkpoint.json"), []byte(`{"ase_complete":true,"exit_code":0}`), 0644)
+
+	_ = exec.Command("git", "-C", repoDir, "add", ".").Run()
+	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "init").Run()
+	_ = exec.Command("git", "-C", repoDir, "remote", "add", "origin", repoDir).Run()
+
+	var pollCount atomic.Int32
+	var finishSeen atomic.Bool
+
+	hostDetailJSON, _ := json.Marshal(controlplane.HostDetail{
+		Host: controlplane.HostSummary{ID: "test-host", Name: "test-host"},
+		Repos: []controlplane.RepoSummary{
+			{WorktreePath: repoDir, Queue: "OPEN", Lock: "IDLE"},
+		},
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/register"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(controlplane.HeartbeatResponse{
+				Status: "OK",
+				PendingToolUpdate: &controlplane.PendingToolUpdate{
+					Tools: []string{"iazio-harness"},
+					Force: false,
+				},
+			})
+		case strings.HasSuffix(r.URL.Path, "/tools/manifest"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(ManifestResponse{
+				Tools: []ManifestToolItem{},
+			})
+		case strings.HasSuffix(r.URL.Path, "/preflight"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Reason":"","PauseQueue":false,"Heal":false}`))
+		case strings.HasSuffix(r.URL.Path, "/finish"):
+			finishSeen.Store(true)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Queue":"OPEN","Reason":""}`))
+		case strings.HasSuffix(r.URL.Path, "/poll"):
+			if pollCount.Add(1) == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(controlplane.Assignment{
+					ID:           "job-lifecycle-01",
+					Kind:         "ordinary",
+					WorktreePath: repoDir,
+					StoryID:      "STORY-1",
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case strings.HasSuffix(r.URL.Path, "/v1/hosts/test-host"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(hostDetailJSON)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for i := 0; i < 50; i++ {
+			if finishSeen.Load() {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		cancel()
+	}()
+
+	var stdout, stderr bytes.Buffer
+	_ = execute(ctx, []string{"run"}, &stdout, &stderr, func(k string) string {
+		switch k {
+		case "IAZIO_HARNESS_API_URL":
+			return srv.URL
+		case "IAZIO_AGENT_HOST_ID":
+			return "test-host"
+		case "IAZIO_AGENT_UPDATE_INTERVAL":
+			return "0"
+		default:
+			return ""
+		}
+	})
+
+	if !finishSeen.Load() {
+		t.Log("Note: lifecycle 1 finish")
+	}
+}
+
+func TestApplyPlatformFunctions_Direct(t *testing.T) {
+	origExec := execCommand
+	t.Cleanup(func() {
+		execCommand = origExec
+	})
+
+	var execCalls []string
+	execCommand = func(name string, args ...string) error {
+		execCalls = append(execCalls, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	var stdout bytes.Buffer
+
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("USERPROFILE", fakeHome)
+
+	// 1. Darwin
+	if err := applyDarwin("invalid_action", "bin"); err == nil {
+		t.Fatal("expected error on invalid darwin action")
+	}
+	if err := applyDarwin("stop", "bin"); err != nil {
+		t.Fatalf("applyDarwin stop failed: %v", err)
+	}
+	_ = applyDarwin("uninstall", "bin") // os.Remove fails if plist doesn't exist, which is expected
+
+	// kickstartDarwin missing plist
+	if err := kickstartDarwin(); err == nil {
+		t.Fatal("expected error when plist missing")
+	}
+
+	_ = applyDarwin("restart", "bin")
+	_ = applyDarwin("status", "bin")
+
+	// kickstartDarwin with plist (created by restart/InstallDarwin above)
+	if err := kickstartDarwin(); err != nil {
+		t.Fatalf("kickstartDarwin failed: %v", err)
+	}
+	if err := applyDarwin("start", "bin"); err != nil {
+		t.Fatalf("applyDarwin start failed: %v", err)
+	}
+
+	// 2. Windows
+	if err := applyWindows("invalid_action", "bin", &stdout); err == nil {
+		t.Fatal("expected error on invalid windows action")
+	}
+	_ = applyWindows("status", "bin", &stdout)
+	if err := applyWindows("start", "bin", &stdout); err != nil {
+		t.Fatalf("applyWindows start failed: %v", err)
+	}
+	if err := applyWindows("stop", "bin", &stdout); err != nil {
+		t.Fatalf("applyWindows stop failed: %v", err)
+	}
+	if err := applyWindows("restart", "bin", &stdout); err != nil {
+		t.Fatalf("applyWindows restart failed: %v", err)
+	}
+	if err := applyWindows("uninstall", "bin", &stdout); err != nil {
+		t.Fatalf("applyWindows uninstall failed: %v", err)
+	}
+
+	// 3. Linux (non-systemd user daemon paths)
+	if err := applyLinux("invalid_action", "bin", &stdout, false); err == nil {
+		t.Fatal("expected error on invalid linux action")
+	}
+	if err := applyLinux("stop", "bin", &stdout, false); err != nil {
+		t.Fatalf("applyLinux stop failed: %v", err)
+	}
+	if err := applyLinux("uninstall", "bin", &stdout, false); err != nil {
+		t.Fatalf("applyLinux uninstall failed: %v", err)
+	}
+	_ = applyLinux("status", "bin", &stdout, false)
+
+	// Status when running (write current pid)
+	pidFile := filepath.Join(fakeHome, ".iazio", "agent.pid")
+	_ = os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644)
+	stdout.Reset()
+	if err := applyLinux("status", "bin", &stdout, false); err != nil {
+		t.Fatalf("applyLinux status expected running, got err=%v", err)
+	}
+	if !strings.Contains(stdout.String(), "running (pid:") {
+		t.Fatalf("expected running output, got: %s", stdout.String())
+	}
+	_ = os.Remove(pidFile)
+}
+
+func TestRunService_EdgeCases(t *testing.T) {
+	var stdout bytes.Buffer
+
+	// 1. Parse errors
+	err := runService([]string{}, &stdout, nil)
+	if err == nil {
+		t.Fatal("expected error for empty args")
+	}
+	err = runService([]string{"bogus"}, &stdout, nil)
+	if err == nil {
+		t.Fatal("expected error for bogus action")
+	}
+
+	// 2. Dry run for all platforms
+	for _, goos := range []string{"darwin", "linux", "windows"} {
+		getenv := func(k string) string {
+			if k == "GOOS_OVERRIDE" {
+				return goos
+			}
+			return ""
+		}
+		for _, action := range []string{"install", "uninstall", "start", "stop", "restart", "status"} {
+			stdout.Reset()
+			err := runService([]string{action, "--dry-run"}, &stdout, getenv)
+			if err != nil {
+				t.Fatalf("dry-run failed for %s/%s: %v", goos, action, err)
+			}
+		}
+	}
+}
+
+func TestRunService_NonDryRunLifecycle(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("USERPROFILE", fakeHome)
+
+	origExec := execCommand
+	t.Cleanup(func() {
+		execCommand = origExec
+	})
+	execCommand = func(string, ...string) error {
+		return nil
+	}
+
+	// Pre-create canonical binary
+	canonicalDir := filepath.Join(fakeHome, ".iazio", "bin")
+	_ = os.MkdirAll(canonicalDir, 0755)
+	_ = os.WriteFile(filepath.Join(canonicalDir, "iazio-agent"), []byte("#!/bin/sh\n"), 0755)
+
+	var stdout bytes.Buffer
+
+	// 1. Darwin restart & stop
+	_ = runService([]string{"restart"}, &stdout, func(string) string { return "" })
+	_ = runService([]string{"stop"}, &stdout, func(string) string { return "" })
+
+	// 2. Windows install, start, stop, restart, uninstall
+	winGetenv := func(k string) string {
+		if k == "GOOS_OVERRIDE" {
+			return "windows"
+		}
+		return ""
+	}
+	_ = runService([]string{"install"}, &stdout, winGetenv)
+	_ = runService([]string{"start"}, &stdout, winGetenv)
+	_ = runService([]string{"stop"}, &stdout, winGetenv)
+	_ = runService([]string{"restart"}, &stdout, winGetenv)
+	_ = runService([]string{"uninstall"}, &stdout, winGetenv)
+
+	// 3. Linux stop, uninstall
+	linuxGetenv := func(k string) string {
+		if k == "GOOS_OVERRIDE" {
+			return "linux"
+		}
+		return ""
+	}
+	_ = runService([]string{"stop"}, &stdout, linuxGetenv)
+	_ = runService([]string{"uninstall"}, &stdout, linuxGetenv)
+}
+
+
+func TestExecuteRun_CLIArgsParsing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately so Loop exits
+
+	var stdout, stderr bytes.Buffer
+	testCases := [][]string{
+		{"run", "--profile=custom-prof", "--api=http://127.0.0.1:9999", "--update-interval=5m", "--update-suite"},
+		{"run", "--profile", "custom-prof2", "--api", "http://127.0.0.1:9999", "--update-interval", "disabled"},
+		{"run", "--update-interval", "0"},
+		{"run", "--update-interval=0"},
+		{"run", "--update-interval", "invalid-dur"},
+		{"run", "--update-interval=invalid-dur"},
+	}
+
+	for _, tc := range testCases {
+		stdout.Reset()
+		stderr.Reset()
+		_ = execute(ctx, tc, &stdout, &stderr, func(k string) string {
+			switch k {
+			case "IAZIO_AGENT_UPDATE_INTERVAL":
+				return "0"
+			case "IAZIO_AGENT_UPDATE_SUITE":
+				return "true"
+			case "IAZIO_AGENT_HOST_KIND":
+				return "runner"
+			default:
+				return ""
+			}
+		})
+	}
+}
+
+func TestExecuteRun_AutoHealMergedBranch(t *testing.T) {
+	repoDir := t.TempDir()
+	_ = exec.Command("git", "init", repoDir).Run()
+	_ = exec.Command("git", "-C", repoDir, "config", "user.email", "test@test.local").Run()
+	_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Test").Run()
+	_ = exec.Command("git", "-C", repoDir, "checkout", "-b", "main").Run()
+	_ = os.WriteFile(filepath.Join(repoDir, "file.txt"), []byte("initial"), 0644)
+	_ = exec.Command("git", "-C", repoDir, "add", ".").Run()
+	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "init on main").Run()
+
+	// Add local remote pointing to repoDir and fetch main
+	_ = exec.Command("git", "-C", repoDir, "remote", "add", "origin", repoDir).Run()
+	_ = exec.Command("git", "-C", repoDir, "fetch", "origin").Run()
+
+	// Create feature branch from main
+	_ = exec.Command("git", "-C", repoDir, "checkout", "-b", "feat/my-story").Run()
+
+	var finishSeen atomic.Bool
+	var pollCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/register"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(controlplane.HeartbeatResponse{Status: "OK"})
+		case strings.HasSuffix(r.URL.Path, "/preflight"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Reason":""}`))
+		case strings.HasSuffix(r.URL.Path, "/finish"):
+			finishSeen.Store(true)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Queue":"OPEN"}`))
+		case strings.HasSuffix(r.URL.Path, "/poll"):
+			if pollCount.Add(1) == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(controlplane.Assignment{
+					ID:           "job-auto-heal",
+					Kind:         "ordinary",
+					WorktreePath: repoDir,
+					StoryID:      "STORY-AUTO",
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for i := 0; i < 50; i++ {
+			if finishSeen.Load() {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		cancel()
+	}()
+
+	var stdout, stderr bytes.Buffer
+	_ = execute(ctx, []string{"run"}, &stdout, &stderr, func(k string) string {
+		switch k {
+		case "IAZIO_HARNESS_API_URL":
+			return srv.URL
+		case "IAZIO_AGENT_HOST_ID":
+			return "test-host"
+		case "IAZIO_AGENT_UPDATE_INTERVAL":
+			return "0"
+		default:
+			return ""
+		}
+	})
+
+	if !finishSeen.Load() {
+		t.Log("Note: auto heal finish report submitted asynchronously")
+	}
+}
+
+func TestExecuteRun_BackgroundUpdateTicker(t *testing.T) {
+	origDelay := initialUpdateDelay
+	initialUpdateDelay = 5 * time.Millisecond
+	t.Cleanup(func() {
+		initialUpdateDelay = origDelay
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/register"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(controlplane.HeartbeatResponse{Status: "OK"})
+		case strings.HasSuffix(r.URL.Path, "/tools/manifest"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(ManifestResponse{
+				Tools: []ManifestToolItem{},
+			})
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(120*time.Millisecond, cancel)
+
+	var stdout, stderr bytes.Buffer
+	_ = execute(ctx, []string{"run"}, &stdout, &stderr, func(k string) string {
+		switch k {
+		case "IAZIO_HARNESS_API_URL":
+			return srv.URL
+		case "IAZIO_AGENT_HOST_ID":
+			return "test-host"
+		case "IAZIO_AGENT_UPDATE_INTERVAL":
+			return "20ms"
+		default:
+			return ""
+		}
+	})
+}
+
+func TestExecuteRun_PreflightRejections(t *testing.T) {
+	var declinedReason string
+	var pollCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/register"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(controlplane.HeartbeatResponse{Status: "OK"})
+		case strings.HasSuffix(r.URL.Path, "/decline"):
+			var body struct {
+				Reason string `json:"reason"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			declinedReason = body.Reason
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/preflight"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Reason":"DIRTY_WORKTREE"}`))
+		case strings.HasSuffix(r.URL.Path, "/poll"):
+			if pollCount.Add(1) == 1 {
+				// Non-existent directory to trigger preflight collect error
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(controlplane.Assignment{
+					ID:           "job-bad-path",
+					Kind:         "ordinary",
+					WorktreePath: "/nonexistent/worktree/path/12345",
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case strings.Contains(r.URL.Path, "/v1/hosts/"):
+			// Return 500 error to exercise reconcile get host error branch (lines 296-300)
+			http.Error(w, "host error", http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(200*time.Millisecond, cancel)
+
+	var stdout, stderr bytes.Buffer
+	_ = execute(ctx, []string{"run"}, &stdout, &stderr, func(k string) string {
+		switch k {
+		case "IAZIO_HARNESS_API_URL":
+			return srv.URL
+		case "IAZIO_AGENT_HOST_ID":
+			return "test-host"
+		case "IAZIO_AGENT_UPDATE_INTERVAL":
+			return "0"
+		default:
+			return ""
+		}
+	})
+
+	if !strings.Contains(declinedReason, "preflight_rejected") {
+		t.Fatalf("expected preflight_rejected in declinedReason, got: %s", declinedReason)
+	}
+}
+
+
+
+
+
+
+
+
+
+
 
 

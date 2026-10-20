@@ -455,5 +455,189 @@ func TestLoopSkipsLeaseDuringToolUpdate(t *testing.T) {
 	}
 }
 
+func TestAbandon_Resume_Remediate(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := Client{BaseURL: srv.URL}
+	ctx := context.Background()
+
+	if err := c.AbandonJob(ctx, "job-99", "stalled"); err != nil {
+		t.Fatalf("AbandonJob failed: %v", err)
+	}
+	if err := c.ResumeJob(ctx, "job-99"); err != nil {
+		t.Fatalf("ResumeJob failed: %v", err)
+	}
+	if err := c.RemediateRepo(ctx, "host-1", "/worktree"); err != nil {
+		t.Fatalf("RemediateRepo failed: %v", err)
+	}
+
+	joined := strings.Join(paths, " ")
+	if !strings.Contains(joined, "/v1/jobs/job-99/abandon") ||
+		!strings.Contains(joined, "/v1/jobs/job-99/resume") ||
+		!strings.Contains(joined, "/v1/repos/host-1/remediate") {
+		t.Fatalf("unexpected paths recorded: %s", joined)
+	}
+}
+
+func TestGetHost_Error(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := Client{BaseURL: srv.URL}
+	_, err := c.GetHost(context.Background(), "unknown-host")
+	if err == nil {
+		t.Fatal("expected error on 404 from GetHost")
+	}
+}
+
+func TestControlplaneTransientAndRetryParams(t *testing.T) {
+	c := Client{MaxRetries: -1, InitialBackoff: -1}
+	max, backoff := c.retryParams()
+	if max != 0 || backoff != DefaultInitialBackoff {
+		t.Fatalf("unexpected retry params for negative: max=%d backoff=%v", max, backoff)
+	}
+
+	if IsTransientError(nil) {
+		t.Fatal("expected false for nil error")
+	}
+	if !IsTransientError(errors.New("connection reset by peer")) {
+		t.Fatal("expected true for connection reset")
+	}
+	if IsTransientError(errors.New("bad request")) {
+		t.Fatal("expected false for bad request")
+	}
+}
+
+func TestNextLease_ErrorsAndEmpty(t *testing.T) {
+	// 1. Empty body returns ok=false
+	srvEmpty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srvEmpty.Close()
+
+	c := Client{BaseURL: srvEmpty.URL}
+	job, ok, err := c.NextLease(context.Background(), "host-1")
+	if err != nil || ok || job.ID != "" {
+		t.Fatalf("expected empty lease, got: job=%+v ok=%v err=%v", job, ok, err)
+	}
+
+	// 2. 500 error exhausted retries
+	srvErr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "server error", http.StatusInternalServerError)
+	}))
+	defer srvErr.Close()
+
+	cErr := Client{BaseURL: srvErr.URL, MaxRetries: 1, InitialBackoff: 5 * time.Millisecond}
+	_, _, err = cErr.NextLease(context.Background(), "host-1")
+	if err == nil {
+		t.Fatal("expected error on 500 NextLease")
+	}
+
+	// 3. PostPreflight and PostFinish 500 error
+	_, err = cErr.PostPreflight(context.Background(), "host-1", "/work", nil)
+	if err == nil {
+		t.Fatal("expected error on 500 PostPreflight")
+	}
+
+	_, err = cErr.PostFinish(context.Background(), "host-1", "/work", "job-1", nil)
+	if err == nil {
+		t.Fatal("expected error on 500 PostFinish")
+	}
+}
+
+func TestClient_HTTPAndRegisterProfiles(t *testing.T) {
+	// 1. http() method
+	cDefault := Client{}
+	if cDefault.http() != defaultHTTPClient {
+		t.Fatal("expected defaultHTTPClient when HTTP is nil")
+	}
+	customHTTP := &http.Client{Timeout: 5 * time.Second}
+	cCustom := Client{HTTP: customHTTP}
+	if cCustom.http() != customHTTP {
+		t.Fatal("expected customHTTP when HTTP is provided")
+	}
+
+	// 2. Register with and without profile
+	var lastBody map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&lastBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := Client{BaseURL: srv.URL}
+	ctx := context.Background()
+
+	// Without profile
+	if err := c.Register(ctx, "host-1", "ordinary"); err != nil {
+		t.Fatal(err)
+	}
+	if lastBody["profile"] != "" {
+		t.Fatalf("expected empty profile, got: %s", lastBody["profile"])
+	}
+
+	// With profile
+	if err := c.Register(ctx, "host-1", "ordinary", "special-profile"); err != nil {
+		t.Fatal(err)
+	}
+	if lastBody["profile"] != "special-profile" {
+		t.Fatalf("expected special-profile, got: %s", lastBody["profile"])
+	}
+}
+
+func TestGetHost_ErrorsAndToken(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		if strings.HasSuffix(r.URL.Path, "bad-json") {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{not valid json`))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "err-500") {
+			http.Error(w, "internal err", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"host":{"id":"ok-host"}}`))
+	}))
+	defer srv.Close()
+
+	c := Client{BaseURL: srv.URL, Token: "test-token-123"}
+	ctx := context.Background()
+
+	// Token verification
+	detail, err := c.GetHost(ctx, "ok-host")
+	if err != nil || detail.Host.ID != "ok-host" {
+		t.Fatalf("unexpected detail: %+v err=%v", detail, err)
+	}
+	if gotAuth != "Bearer test-token-123" {
+		t.Fatalf("expected Bearer token, got: %s", gotAuth)
+	}
+
+	// 500 error
+	_, err = c.GetHost(ctx, "err-500")
+	if err == nil {
+		t.Fatal("expected error on 500 response")
+	}
+
+	// Bad JSON
+	_, err = c.GetHost(ctx, "bad-json")
+	if err == nil {
+		t.Fatal("expected error on bad JSON")
+	}
+}
+
+
+
+
 
 
