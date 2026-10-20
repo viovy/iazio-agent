@@ -21,13 +21,19 @@ import (
 
 	"github.com/viovy/iazio-agent/internal/auth"
 	"github.com/viovy/iazio-agent/internal/controlplane"
+	"github.com/viovy/iazio-agent/internal/harness"
 	"github.com/viovy/iazio-agent/internal/inventory"
 	"github.com/viovy/iazio-agent/internal/preflight"
 	"github.com/viovy/iazio-agent/internal/service"
 	"github.com/viovy/iazio-agent/internal/supervisor"
+	"github.com/viovy/iazio-agent/internal/telemetry"
+	"github.com/viovy/iazio-agent/internal/worker"
 )
 
 func main() {
+	flushTracer := telemetry.InitGlobalTracer("iazio-agent", "")
+	defer flushTracer()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := execute(ctx, os.Args[1:], os.Stdout, os.Stderr, os.Getenv); err != nil {
@@ -45,6 +51,11 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 	if len(args) == 0 {
 		return fmt.Errorf("usage: iazio-agent version|auth|service|update|run|probe")
 	}
+	_, span := telemetry.StartSpan(ctx, "agent."+args[0],
+		telemetry.WithKind("INTERNAL"),
+		telemetry.WithTag("cli.command", args[0]),
+	)
+	defer span.End()
 	switch args[0] {
 	case "version", "--version", "-v":
 		fmt.Fprintln(stdout, formatVersion())
@@ -300,9 +311,45 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return nil
 				},
 			}
-			// ADR-0118: iazio-agent is strictly a host node daemon (registration, updates, process watchdog, telemetry).
-			// Task execution, SIR remediation, and repository orchestration belong strictly to iazio-harness and autopilot.
-			return client.HostDaemonLoop(runCtx, host, kind, 30*time.Second, profile)
+
+			if api != "" {
+				cpClient := worker.NewHTTPControlPlaneClient(api, "", nil)
+				cliInvoker := harness.NewCLIInvoker("", "")
+				disp := worker.NewDispatcher(cpClient, cliInvoker, host)
+				go func() {
+					pollTicker := time.NewTicker(3 * time.Second)
+					defer pollTicker.Stop()
+					for {
+						select {
+						case <-runCtx.Done():
+							return
+						case <-pollTicker.C:
+							for {
+								processed, err := disp.PollAndProcess(runCtx)
+								if err != nil || !processed || runCtx.Err() != nil {
+									break
+								}
+							}
+						}
+					}
+				}()
+			}
+
+			onJob := func(a controlplane.Assignment) error {
+				if a.ID == "" {
+					return nil
+				}
+				_, span := telemetry.StartSpan(runCtx, "agent.execute_lease",
+					telemetry.WithTag("job.id", a.ID),
+					telemetry.WithTag("worktree.path", a.WorktreePath),
+					telemetry.WithTag("story.id", a.StoryID),
+				)
+				defer span.End()
+				r := &supervisor.OSRunner{}
+				return sup.Spawn(r, a.ID, api, a.WorktreePath, a.DocsHubPath, "")
+			}
+
+			return client.Loop(runCtx, host, kind, 30*time.Second, onJob, profile)
 		}
 
 		if ctx.Err() != nil {
