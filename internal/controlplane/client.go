@@ -468,15 +468,18 @@ type HostSummary struct {
 
 // RepoSummary is repository status on a host.
 type RepoSummary struct {
-	Path           string `json:"path"`
-	WorktreePath   string `json:"worktree_path"`
-	Queue          string `json:"queue"`
-	Lock           string `json:"lock"`
-	Reason         string `json:"reason"`
-	DiscardPending bool   `json:"discard_pending"`
-	DocsHubPath    string `json:"docs_hub_path"`
-	CloneURL       string `json:"clone_url"`
-	RunningJobID   string `json:"running_job_id,omitempty"`
+	Path                         string `json:"path"`
+	WorktreePath                 string `json:"worktree_path"`
+	Queue                        string `json:"queue"`
+	Lock                         string `json:"lock"`
+	Reason                       string `json:"reason"`
+	DiscardPending               bool   `json:"discard_pending"`
+	DocsHubPath                  string `json:"docs_hub_path"`
+	CloneURL                     string `json:"clone_url"`
+	RunningJobID                 string `json:"running_job_id,omitempty"`
+	Alias                        string `json:"alias,omitempty"`
+	RepoAlias                    string `json:"repo_alias,omitempty"`
+	GlobalQueueAllocationEnabled bool   `json:"global_queue_allocation_enabled,omitempty"`
 }
 
 // GetHost returns host details and registered repos from the control plane.

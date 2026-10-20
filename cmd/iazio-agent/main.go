@@ -316,6 +316,66 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				cpClient := worker.NewHTTPControlPlaneClient(api, "", nil)
 				cliInvoker := harness.NewCLIInvoker("", "")
 				disp := worker.NewDispatcher(cpClient, cliInvoker, host)
+				disp.SetWorktreeResolver(func(repoName string) string {
+					clean := strings.TrimSpace(repoName)
+					if detail, err := client.GetHost(runCtx, host); err == nil {
+						for _, r := range detail.Repos {
+							wt := r.WorktreePath
+							if wt == "" {
+								wt = r.Path
+							}
+							if wt == "" {
+								continue
+							}
+							if r.Alias == clean || r.RepoAlias == clean || filepath.Base(wt) == clean {
+								return wt
+							}
+							gmPath := filepath.Join(wt, ".gitmodules")
+							if b, err := os.ReadFile(gmPath); err == nil {
+								if strings.Contains(string(b), clean) {
+									return wt
+								}
+							}
+						}
+						if clean == "." || clean == "" || clean == "root" {
+							for _, r := range detail.Repos {
+								if r.GlobalQueueAllocationEnabled {
+									wt := r.WorktreePath
+									if wt == "" {
+										wt = r.Path
+									}
+									if wt != "" {
+										return wt
+									}
+								}
+							}
+							if len(detail.Repos) > 0 {
+								wt := detail.Repos[0].WorktreePath
+								if wt == "" {
+									wt = detail.Repos[0].Path
+								}
+								if wt != "" {
+									return wt
+								}
+							}
+						}
+					}
+					if envRoot := getenv("IAZIO_FLEET_ROOT"); envRoot != "" {
+						return envRoot
+					}
+					if home, err := os.UserHomeDir(); err == nil && home != "" {
+						for _, cand := range []string{
+							filepath.Join(home, "work", "meta-repo"),
+							filepath.Join(home, "work", "meta-repo-02"),
+							filepath.Join(home, "meta-repo"),
+						} {
+							if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
+								return cand
+							}
+						}
+					}
+					return ""
+				})
 				go func() {
 					pollTicker := time.NewTicker(3 * time.Second)
 					defer pollTicker.Stop()

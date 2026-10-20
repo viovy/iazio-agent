@@ -83,6 +83,7 @@ type Invoker interface {
 	ExecutePrompt(ctx context.Context, payload json.RawMessage) (*PromptExecutionResult, error)
 	ListRepos(ctx context.Context) (*CodebaseReposResult, error)
 	ExportCodebase(ctx context.Context, payload json.RawMessage) (*CodebaseExportResult, error)
+	WithWorkDir(workDir string) Invoker
 }
 
 // CLIInvoker delegates story scaffolding and prompt runs to the iazio-harness binary.
@@ -200,6 +201,13 @@ func (c *CLIInvoker) ExportRepoDelta(ctx context.Context, req ExportRequest) (*E
 	return ci.ExportRepoDelta(ctx, req)
 }
 
+// WithWorkDir returns a shallow copy of the CLIInvoker with the specified workDir.
+func (c *CLIInvoker) WithWorkDir(workDir string) Invoker {
+	clone := *c
+	clone.WorkDir = workDir
+	return &clone
+}
+
 func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []byte) (string, string, error) {
 	cmd := exec.CommandContext(ctx, c.HarnessBinary, args...)
 	if c.WorkDir != "" {
@@ -207,6 +215,9 @@ func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []
 	}
 
 	cmd.Env = os.Environ()
+	if c.WorkDir != "" {
+		cmd.Env = append(cmd.Env, "IAZIO_FLEET_ROOT="+c.WorkDir)
+	}
 	if span := telemetry.SpanFromContext(ctx); span != nil {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("TRACEPARENT=00-%s-%s-01", span.TraceID, span.ID))
 	}

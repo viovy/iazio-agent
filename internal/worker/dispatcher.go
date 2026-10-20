@@ -149,13 +149,17 @@ type RepoSyncer interface {
 	TriggerRepoSync(repoName string)
 }
 
+// WorktreeResolver maps a repository name or relative submodule to an absolute worktree directory on the host.
+type WorktreeResolver func(repo string) string
+
 // Dispatcher coordinates claiming jobs from the control plane and routing them to iazio-harness.
 type Dispatcher struct {
-	client   ControlPlaneClient
-	invoker  harness.Invoker
-	hostID   string
-	jobTypes []string
-	syncer   RepoSyncer
+	client           ControlPlaneClient
+	invoker          harness.Invoker
+	hostID           string
+	jobTypes         []string
+	syncer           RepoSyncer
+	worktreeResolver WorktreeResolver
 }
 
 // NewDispatcher constructs a new Dispatcher, optionally accepting a RepoSyncer for immediate post-job sync hooks.
@@ -176,6 +180,11 @@ func NewDispatcher(client ControlPlaneClient, invoker harness.Invoker, hostID st
 // SetSyncer sets or updates the RepoSyncer on the Dispatcher.
 func (d *Dispatcher) SetSyncer(syncer RepoSyncer) {
 	d.syncer = syncer
+}
+
+// SetWorktreeResolver configures a custom worktree resolver on the Dispatcher.
+func (d *Dispatcher) SetWorktreeResolver(r WorktreeResolver) {
+	d.worktreeResolver = r
 }
 
 // PollAndProcess claims one job and processes it. Returns (true, err) if a job was processed,
@@ -212,9 +221,16 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	ctx, span := telemetry.StartSpan(ctx, "dispatcher.processJob", spanOpts...)
 	defer span.End()
 
+	invoker := d.invoker
+	if d.worktreeResolver != nil {
+		if wt := d.worktreeResolver(job.Repo); wt != "" {
+			invoker = invoker.WithWorkDir(wt)
+		}
+	}
+
 	switch job.Type {
 	case JobTypeStoryCreate:
-		res, err := d.invoker.CreateStory(ctx, job.Payload)
+		res, err := invoker.CreateStory(ctx, job.Payload)
 		if err != nil {
 			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{Error: err.Error()})
 			return true, err
@@ -233,7 +249,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		return true, compErr
 
 	case JobTypePromptExecute:
-		res, err := d.invoker.ExecutePrompt(ctx, job.Payload)
+		res, err := invoker.ExecutePrompt(ctx, job.Payload)
 		if err != nil {
 			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{Error: err.Error()})
 			return true, err
