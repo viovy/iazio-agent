@@ -31,6 +31,8 @@ type Job struct {
 	TargetHost  string          `json:"target_host,omitempty"`
 	TargetAgent string          `json:"target_agent,omitempty"`
 	Payload     json.RawMessage `json:"payload"`
+	TraceID     string          `json:"trace_id,omitempty"`
+	ParentID    string          `json:"parent_id,omitempty"`
 }
 
 // ClaimRequest is sent to claim pending jobs.
@@ -197,12 +199,17 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	ctx, span := telemetry.StartSpan(ctx, "dispatcher.processJob",
+	var spanOpts []telemetry.SpanOption
+	if job.TraceID != "" {
+		spanOpts = append(spanOpts, telemetry.WithParentTrace(job.TraceID, job.ParentID))
+	}
+	spanOpts = append(spanOpts,
 		telemetry.WithTag("job.id", job.ID),
 		telemetry.WithTag("job.type", job.Type),
 		telemetry.WithTag("job.repo", job.Repo),
 		telemetry.WithTag("job.target_agent", job.TargetAgent),
 	)
+	ctx, span := telemetry.StartSpan(ctx, "dispatcher.processJob", spanOpts...)
 	defer span.End()
 
 	switch job.Type {
