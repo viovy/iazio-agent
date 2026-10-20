@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/harness"
+	"github.com/viovy/iazio-agent/internal/telemetry"
 )
 
 // Supported job types.
@@ -195,6 +196,14 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	if job == nil {
 		return false, nil
 	}
+
+	ctx, span := telemetry.StartSpan(ctx, "dispatcher.processJob",
+		telemetry.WithTag("job.id", job.ID),
+		telemetry.WithTag("job.type", job.Type),
+		telemetry.WithTag("job.repo", job.Repo),
+		telemetry.WithTag("job.target_agent", job.TargetAgent),
+	)
+	defer span.End()
 
 	switch job.Type {
 	case JobTypeStoryCreate:
