@@ -54,6 +54,10 @@ func (m *mockInvoker) ExportCodebase(ctx context.Context, payload json.RawMessag
 	}, nil
 }
 
+func (m *mockInvoker) WithWorkDir(workDir string) harness.Invoker {
+	return m
+}
+
 type mockControlPlane struct {
 	claimFunc    func(ctx context.Context, req ClaimRequest) (*Job, error)
 	completeFunc func(ctx context.Context, jobID string, req CompleteRequest) error
@@ -492,6 +496,57 @@ func TestDispatcher_UnsupportedAndErrorJobs(t *testing.T) {
 	if !processed || err == nil || !strings.Contains(err.Error(), "cannot execute prompt") {
 		t.Fatalf("expected execute prompt error, got processed=%v err=%v", processed, err)
 	}
+}
+
+func TestDispatcher_WorktreeResolver(t *testing.T) {
+	ctx := context.Background()
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:      "job-resolver",
+			Type:    JobTypeStoryCreate,
+			Repo:    "iazio-mcp",
+			Payload: json.RawMessage(`{}`),
+		}, nil
+	}
+
+	var capturedWorkDir string
+	inv := &mockInvokerWithWorkDirCapture{
+		onWithWorkDir: func(dir string) {
+			capturedWorkDir = dir
+		},
+	}
+
+	d := NewDispatcher(cp, inv, "host-1")
+	d.SetWorktreeResolver(func(repo string) string {
+		if repo == "iazio-mcp" {
+			return "/custom/worktree/iazio-mcp"
+		}
+		return ""
+	})
+
+	processed, err := d.PollAndProcess(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected job to be processed")
+	}
+	if capturedWorkDir != "/custom/worktree/iazio-mcp" {
+		t.Fatalf("expected workDir '/custom/worktree/iazio-mcp', got %q", capturedWorkDir)
+	}
+}
+
+type mockInvokerWithWorkDirCapture struct {
+	mockInvoker
+	onWithWorkDir func(dir string)
+}
+
+func (m *mockInvokerWithWorkDirCapture) WithWorkDir(workDir string) harness.Invoker {
+	if m.onWithWorkDir != nil {
+		m.onWithWorkDir(workDir)
+	}
+	return m
 }
 
 
