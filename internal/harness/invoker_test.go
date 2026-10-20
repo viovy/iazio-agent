@@ -368,5 +368,60 @@ func TestCLIInvoker_PayloadValidationAndPlainTextFallback(t *testing.T) {
 	}
 }
 
+func TestEnsurePromptPayload(t *testing.T) {
+	// 1. Existing prompt_id remains unchanged
+	raw1 := json.RawMessage(`{"prompt_id":"existing-123","prompt":"test"}`)
+	out1 := EnsurePromptPayload("job-999", raw1)
+	var m1 map[string]any
+	if err := json.Unmarshal(out1, &m1); err != nil {
+		t.Fatalf("failed unmarshaling out1: %v", err)
+	}
+	if m1["prompt_id"] != "existing-123" {
+		t.Fatalf("expected existing-123, got %v", m1["prompt_id"])
+	}
+
+	// 2. Missing prompt_id, has story_id -> prompt-<story_id>
+	raw2 := json.RawMessage(`{"story_id":"STORY-ABC","prompt":"test"}`)
+	out2 := EnsurePromptPayload("job-999", raw2)
+	var m2 map[string]any
+	if err := json.Unmarshal(out2, &m2); err != nil {
+		t.Fatalf("failed unmarshaling out2: %v", err)
+	}
+	if m2["prompt_id"] != "prompt-STORY-ABC" {
+		t.Fatalf("expected prompt-STORY-ABC, got %v", m2["prompt_id"])
+	}
+
+	// 3. Missing prompt_id, missing story_id, has jobID -> prompt-<jobID>
+	raw3 := json.RawMessage(`{"prompt":"test"}`)
+	out3 := EnsurePromptPayload("job-999", raw3)
+	var m3 map[string]any
+	if err := json.Unmarshal(out3, &m3); err != nil {
+		t.Fatalf("failed unmarshaling out3: %v", err)
+	}
+	if m3["prompt_id"] != "prompt-job-999" {
+		t.Fatalf("expected prompt-job-999, got %v", m3["prompt_id"])
+	}
+
+	// 4. Missing prompt_id, story_id, and jobID -> auto-generated prompt-<timestamp>
+	raw4 := json.RawMessage(`{"prompt":"test"}`)
+	out4 := EnsurePromptPayload("", raw4)
+	var m4 map[string]any
+	if err := json.Unmarshal(out4, &m4); err != nil {
+		t.Fatalf("failed unmarshaling out4: %v", err)
+	}
+	pID, ok := m4["prompt_id"].(string)
+	if !ok || !strings.HasPrefix(pID, "prompt-") {
+		t.Fatalf("expected prefix prompt-, got %v", m4["prompt_id"])
+	}
+
+	// 5. Empty or invalid JSON
+	if string(EnsurePromptPayload("j", nil)) != "" {
+		t.Fatal("expected empty for nil")
+	}
+	if string(EnsurePromptPayload("j", json.RawMessage(`invalid-json`))) != "invalid-json" {
+		t.Fatal("expected original raw message for invalid json")
+	}
+}
+
 
 

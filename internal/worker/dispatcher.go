@@ -249,7 +249,8 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		return true, compErr
 
 	case JobTypePromptExecute:
-		res, err := invoker.ExecutePrompt(ctx, job.Payload)
+		payload := EnsurePromptID(job.ID, job.Payload)
+		res, err := invoker.ExecutePrompt(ctx, payload)
 		if err != nil {
 			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{Error: err.Error()})
 			return true, err
@@ -272,4 +273,9 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{Error: unsupportedErr})
 		return true, errors.New(unsupportedErr)
 	}
+}
+
+// EnsurePromptID ensures that a prompt payload JSON contains a valid prompt_id field.
+func EnsurePromptID(jobID string, raw json.RawMessage) json.RawMessage {
+	return harness.EnsurePromptPayload(jobID, raw)
 }
