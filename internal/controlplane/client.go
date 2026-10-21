@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -20,12 +22,14 @@ const (
 	DefaultInitialBackoff = 100 * time.Millisecond
 )
 
-// IsTransientStatus reports whether a status code represents a temporary gateway or overload condition.
+// IsTransientStatus reports whether a status code represents a temporary gateway, internal server reboot, or overload condition.
 func IsTransientStatus(status int) bool {
-	return status == http.StatusBadGateway ||
+	return status == http.StatusInternalServerError ||
+		status == http.StatusBadGateway ||
 		status == http.StatusServiceUnavailable ||
 		status == http.StatusGatewayTimeout ||
-		status == http.StatusTooManyRequests
+		status == http.StatusTooManyRequests ||
+		status == http.StatusRequestTimeout
 }
 
 // IsTransientError reports whether an error represents a temporary network error or connection refused/reset.
@@ -44,6 +48,13 @@ func IsTransientError(err error) bool {
 		strings.Contains(msg, "eof")
 }
 
+// CommandEnvelope describes an instruction dispatched from the control plane to the agent.
+type CommandEnvelope struct {
+	Type    string          `json:"type"` // e.g. "PING", "CHECK_FLEET_GIT_STATUS", "UPDATE_TOOLS"
+	ID      string          `json:"id"`
+	Payload json.RawMessage `json:"payload,omitempty"`
+}
+
 // Client posts heartbeats and finish checks. It does not send IDE credentials.
 type Client struct {
 	BaseURL        string
@@ -54,6 +65,7 @@ type Client struct {
 	ActiveJobs     func() []ActiveJob
 	OnTick         func(ctx context.Context, hostID string) error
 	OnToolUpdate   func(ctx context.Context, tools []string, force bool) error
+	OnCommand      func(ctx context.Context, cmd CommandEnvelope) error
 	MaxRetries     int
 	InitialBackoff time.Duration
 }
@@ -97,6 +109,7 @@ type PendingToolUpdate struct {
 type HeartbeatResponse struct {
 	Status            string             `json:"status"`
 	PendingToolUpdate *PendingToolUpdate `json:"pending_tool_update,omitempty"`
+	PendingCommands   []CommandEnvelope  `json:"pending_commands,omitempty"`
 }
 
 // Heartbeat marks the host online, stores the tool inventory, and reports active jobs.
@@ -186,10 +199,14 @@ func (c Client) NextLease(ctx context.Context, hostID string) (Assignment, bool,
 				return Assignment{}, false, lastErr
 			}
 		}
+		jitter := time.Duration(0)
+		if backoff > 0 {
+			jitter = time.Duration(rand.Int63n(int64(backoff/2 + 1)))
+		}
 		select {
 		case <-ctx.Done():
 			return Assignment{}, false, ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(backoff + jitter):
 		}
 		backoff *= 2
 	}
@@ -202,7 +219,7 @@ func (c Client) HostDaemonLoop(ctx context.Context, hostID, kind string, every t
 	return c.Loop(ctx, hostID, kind, every, nil, profile...)
 }
 
-// Loop registers the host, then heartbeats and polls for a lease until ctx is cancelled.
+// Loop registers the host, starts a decoupled heartbeat engine, and polls for a lease until ctx is cancelled.
 func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Duration, onJob func(Assignment) error, profile ...string) error {
 	if every <= 0 {
 		every = 30 * time.Second
@@ -231,9 +248,21 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 			}
 		}
 	}
-	tick := time.NewTicker(every)
-	defer tick.Stop()
-	for {
+
+	hbInterval := every
+	if hbInterval > 3*time.Second {
+		hbInterval = 3 * time.Second
+	}
+	if hbInterval < 1*time.Second {
+		hbInterval = 1 * time.Second
+	}
+
+	sendHB := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "[SIR: PANIC_RECOVERED] recovered panic in sendHB: %v\n", r)
+			}
+		}()
 		var tools []Tool
 		if c.Tools != nil {
 			tools = c.Tools()
@@ -245,55 +274,84 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 		hbRes, err := c.HeartbeatDetailed(ctx, hostID, tools, false, activeJobs...)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return
 			}
 			_ = c.Register(ctx, hostID, kind, prof)
-		} else if hbRes != nil && hbRes.PendingToolUpdate != nil && c.OnToolUpdate != nil {
-			go func(up PendingToolUpdate) {
-				_ = c.OnToolUpdate(ctx, up.Tools, up.Force)
-			}(*hbRes.PendingToolUpdate)
+		} else if hbRes != nil {
+			if hbRes.PendingToolUpdate != nil && c.OnToolUpdate != nil {
+				go func(up PendingToolUpdate) {
+					_ = c.OnToolUpdate(ctx, up.Tools, up.Force)
+				}(*hbRes.PendingToolUpdate)
+			}
+			if len(hbRes.PendingCommands) > 0 && c.OnCommand != nil {
+				for _, cmd := range hbRes.PendingCommands {
+					go func(cmd CommandEnvelope) {
+						_ = c.OnCommand(ctx, cmd)
+					}(cmd)
+				}
+			}
 		}
 		if c.OnTick != nil {
-			if err := c.OnTick(ctx, hostID); err != nil {
+			_ = c.OnTick(ctx, hostID)
+		}
+	}
+
+	// Immediate initial heartbeat
+	sendHB()
+
+	// Decoupled heartbeat goroutine: keeps presence alive even during long job runs or update tasks
+	go func() {
+		hbTicker := time.NewTicker(hbInterval)
+		defer hbTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hbTicker.C:
+				sendHB()
+			}
+		}
+	}()
+
+	if onJob == nil {
+		<-ctx.Done()
+		return nil
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		if c.Presence != nil && c.Presence() == "ONLINE_UPDATING_TOOLS" {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(2 * time.Second):
+				continue
+			}
+		}
+
+		job, ok, err := c.NextLease(ctx, hostID)
+		if err != nil && ctx.Err() != nil {
+			return nil
+		}
+		if ok {
+			if err := onJob(job); err != nil {
 				if ctx.Err() != nil {
 					return nil
 				}
 			}
+			// When a job just executed, immediately poll again to drain active queues
+			continue
 		}
-		if c.Presence != nil && c.Presence() == "ONLINE_UPDATING_TOOLS" {
-			// Dedicated tool updating state: block iazio-harness queue execution
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-tick.C:
-				continue
-			}
-		}
-		if onJob != nil {
-			job, ok, err := c.NextLease(ctx, hostID)
-			if err != nil && ctx.Err() != nil {
-				return nil
-			}
-			if ok {
-				if err := onJob(job); err != nil {
-					if ctx.Err() != nil {
-						return nil
-					}
-				}
-				// When a job just executed, immediately poll again to drain active queues without 30s delay
-				select {
-				case <-ctx.Done():
-					return nil
-				default:
-					tick.Reset(every)
-					continue
-				}
-			}
-		}
+
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-tick.C:
+		case <-time.After(every):
 		}
 	}
 }
@@ -533,6 +591,39 @@ func (c Client) RemediateRepo(ctx context.Context, hostID, worktree string) erro
 }
 
 
+// RepoRuntimeStatus contains near real-time git and ASE telemetry for a repository.
+type RepoRuntimeStatus struct {
+	RepoPath             string    `json:"repo_path"`
+	Alias                string    `json:"alias,omitempty"`
+	IsClean              bool      `json:"is_clean"`
+	Branch               string    `json:"branch,omitempty"`
+	Porcelain            string    `json:"porcelain,omitempty"`
+	SubmodulesClean      bool      `json:"submodules_clean"`
+	DirtySubmodules      []string  `json:"dirty_submodules,omitempty"`
+	ASEState             string    `json:"ase_state,omitempty"` // IDLE, RUNNING, SUSPENDED_HITL, FAILED_DIRTY, ORPHANED
+	ActiveStoryID        string    `json:"active_story_id,omitempty"`
+	ActiveTool           string    `json:"active_tool,omitempty"`
+	ToolLiveness         string    `json:"tool_liveness,omitempty"`
+	ExecutionProvenance  string    `json:"execution_provenance,omitempty"`
+	ActiveConversationID string    `json:"active_conversation_id,omitempty"`
+	LastCheckedAt        time.Time `json:"last_checked_at"`
+}
+
+// PostRepoStatus sends real-time repository runtime telemetry to the control plane.
+func (c Client) PostRepoStatus(ctx context.Context, hostID string, statuses []RepoRuntimeStatus) error {
+	return c.post(ctx, "/v1/hosts/"+hostID+"/repos/status", statuses)
+}
+
+// PostPingAck notifies the control plane that a live PING command was received and handled by the agent.
+func (c Client) PostPingAck(ctx context.Context, hostID, pingID, agentVersion string) error {
+	payload := map[string]string{
+		"ping_id":       pingID,
+		"agent_version": agentVersion,
+		"acked_at":      time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	return c.post(ctx, "/v1/hosts/"+hostID+"/ping-ack", payload)
+}
+
 func (c Client) post(ctx context.Context, path string, body any) error {
 	return c.postJSON(ctx, path, body, nil)
 }
@@ -578,10 +669,14 @@ func (c Client) postJSON(ctx context.Context, path string, body any, out any) er
 				return lastErr
 			}
 		}
+		jitter := time.Duration(0)
+		if backoff > 0 {
+			jitter = time.Duration(rand.Int63n(int64(backoff/2 + 1)))
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(backoff + jitter):
 		}
 		backoff *= 2
 	}

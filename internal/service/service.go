@@ -315,7 +315,9 @@ After=network.target
 Type=simple
 ExecStart=%s run
 Restart=always
-RestartSec=5s
+RestartSec=3s
+StartLimitIntervalSec=0
+OOMScoreAdjust=-500
 Environment=IAZIO_AGENT_NONINTERACTIVE=1
 %s%s
 [Install]

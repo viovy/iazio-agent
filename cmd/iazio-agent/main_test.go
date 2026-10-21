@@ -1522,6 +1522,28 @@ func TestExecuteRun_DaemonPreflightTelemetry(t *testing.T) {
 	}
 }
 
+func TestProbeRepoRuntime(t *testing.T) {
+	tempDir := t.TempDir()
+	cmd := exec.Command("git", "init", tempDir)
+	if err := cmd.Run(); err != nil {
+		t.Skip("git not available")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	st := probeRepoRuntime(ctx, tempDir, "temp-alias")
+	if st.RepoPath != tempDir || st.Alias != "temp-alias" {
+		t.Fatalf("unexpected repo runtime status: %+v", st)
+	}
+
+	_ = os.WriteFile(filepath.Join(tempDir, "test.txt"), []byte("hello"), 0644)
+	st2 := probeRepoRuntime(ctx, tempDir, "temp-alias")
+	if st2.IsClean {
+		t.Fatalf("expected dirty repo, got clean: %+v", st2)
+	}
+}
+
+
 
 
 
