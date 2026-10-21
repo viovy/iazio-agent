@@ -403,6 +403,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				disp.SetWorktreeResolver(func(repoName string) string {
 					clean := strings.TrimSpace(repoName)
 					if detail, err := client.GetHost(runCtx, host); err == nil {
+						// 1. Direct match by repo alias or basename
 						for _, r := range detail.Repos {
 							wt := r.WorktreePath
 							if wt == "" {
@@ -413,6 +414,31 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							}
 							if r.Alias == clean || r.RepoAlias == clean || filepath.Base(wt) == clean {
 								return wt
+							}
+						}
+						// 2. Submodule match: prefer primary meta-repo root
+						for _, r := range detail.Repos {
+							if r.Alias == "meta-repo" || r.RepoAlias == "meta-repo" || filepath.Base(r.WorktreePath) == "meta-repo" {
+								wt := r.WorktreePath
+								if wt == "" {
+									wt = r.Path
+								}
+								gmPath := filepath.Join(wt, ".gitmodules")
+								if b, err := os.ReadFile(gmPath); err == nil {
+									if strings.Contains(string(b), clean) {
+										return wt
+									}
+								}
+							}
+						}
+						// 3. Any other worktree containing submodule in .gitmodules
+						for _, r := range detail.Repos {
+							wt := r.WorktreePath
+							if wt == "" {
+								wt = r.Path
+							}
+							if wt == "" {
+								continue
 							}
 							gmPath := filepath.Join(wt, ".gitmodules")
 							if b, err := os.ReadFile(gmPath); err == nil {
