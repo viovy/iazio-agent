@@ -282,6 +282,30 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						go func() {
 							_ = doToolUpdate(runCtx, nil, false)
 						}()
+					case "PING":
+						if stdout != nil {
+							fmt.Fprintf(stdout, "[supervisor] received PING command (%s); host is reachable\n", cmd.ID)
+						}
+					case "CHECK_FLEET_GIT_STATUS":
+						go func() {
+							detail, err := client.GetHost(runCtx, host)
+							if err != nil || len(detail.Repos) == 0 {
+								return
+							}
+							var statuses []controlplane.RepoRuntimeStatus
+							for _, r := range detail.Repos {
+								p := r.WorktreePath
+								if p == "" {
+									p = r.Path
+								}
+								if p != "" {
+									statuses = append(statuses, probeRepoRuntime(runCtx, p, r.Alias))
+								}
+							}
+							if len(statuses) > 0 {
+								_ = client.PostRepoStatus(runCtx, host, statuses)
+							}
+						}()
 					}
 					return nil
 				},
@@ -418,7 +442,11 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}()
 
 				go func() {
-					defer func() { _ = recover() }()
+					defer func() {
+						if r := recover(); r != nil {
+							fmt.Fprintf(os.Stderr, "[SIR: PANIC_RECOVERED] recovered panic in repo status probe: %v\n", r)
+						}
+					}()
 					repoTicker := time.NewTicker(20 * time.Second)
 					defer repoTicker.Stop()
 					for {
@@ -918,7 +946,11 @@ func restartOrExecSelf(stdout io.Writer) {
 			if resolved, err := filepath.EvalSymlinks(selfBin); err == nil {
 				selfBin = resolved
 			}
-			_ = syscall.Exec(selfBin, os.Args, os.Environ())
+			execErr := syscall.Exec(selfBin, os.Args, os.Environ())
+			if execErr != nil {
+				fmt.Fprintf(os.Stderr, "[SIR: AUTO_RESTART_FAIL] syscall.Exec(%s) failed: %v; exiting non-zero for systemd recovery\n", selfBin, execErr)
+				os.Exit(1)
+			}
 		}
 	}
 }

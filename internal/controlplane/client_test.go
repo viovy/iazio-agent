@@ -345,10 +345,10 @@ func TestLoopRegisterRetry(t *testing.T) {
 }
 
 func TestControlplaneTransientStatusAndError(t *testing.T) {
-	if !IsTransientStatus(502) || !IsTransientStatus(503) || !IsTransientStatus(504) || !IsTransientStatus(429) {
+	if !IsTransientStatus(500) || !IsTransientStatus(502) || !IsTransientStatus(503) || !IsTransientStatus(504) || !IsTransientStatus(429) {
 		t.Fatal("expected transient statuses")
 	}
-	if IsTransientStatus(400) || IsTransientStatus(404) || IsTransientStatus(500) {
+	if IsTransientStatus(400) || IsTransientStatus(404) {
 		t.Fatal("non-transient status considered transient")
 	}
 	if !IsTransientError(errors.New("dial tcp: connection refused")) {

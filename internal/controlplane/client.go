@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -21,9 +22,10 @@ const (
 	DefaultInitialBackoff = 100 * time.Millisecond
 )
 
-// IsTransientStatus reports whether a status code represents a temporary gateway or overload condition.
+// IsTransientStatus reports whether a status code represents a temporary gateway, internal server reboot, or overload condition.
 func IsTransientStatus(status int) bool {
-	return status == http.StatusBadGateway ||
+	return status == http.StatusInternalServerError ||
+		status == http.StatusBadGateway ||
 		status == http.StatusServiceUnavailable ||
 		status == http.StatusGatewayTimeout ||
 		status == http.StatusTooManyRequests ||
@@ -254,7 +256,9 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 
 	sendHB := func() {
 		defer func() {
-			_ = recover()
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "[SIR: PANIC_RECOVERED] recovered panic in sendHB: %v\n", r)
+			}
 		}()
 		var tools []Tool
 		if c.Tools != nil {
