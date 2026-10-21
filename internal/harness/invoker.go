@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -218,7 +219,18 @@ func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []
 
 	cmd.Env = os.Environ()
 	if c.WorkDir != "" {
-		cmd.Env = append(cmd.Env, "IAZIO_FLEET_ROOT="+c.WorkDir)
+		fleetRoot := c.WorkDir
+		for {
+			if _, err := os.Stat(filepath.Join(fleetRoot, ".gitmodules")); err == nil {
+				cmd.Env = append(cmd.Env, "IAZIO_FLEET_ROOT="+fleetRoot)
+				break
+			}
+			parent := filepath.Dir(fleetRoot)
+			if parent == fleetRoot {
+				break
+			}
+			fleetRoot = parent
+		}
 	}
 	if span := telemetry.SpanFromContext(ctx); span != nil {
 		cmd.Env = append(cmd.Env,

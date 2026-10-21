@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +34,9 @@ func TestHelperProcess(t *testing.T) {
 
 	cmd := args[0]
 	switch cmd {
+	case "env":
+		fmt.Print(os.Getenv("IAZIO_FLEET_ROOT"))
+		return
 	case "story":
 		if len(args) >= 3 && args[1] == "create" && args[2] == "--json" {
 			// Read stdin
@@ -420,6 +424,29 @@ func TestEnsurePromptPayload(t *testing.T) {
 	}
 	if string(EnsurePromptPayload("j", json.RawMessage(`invalid-json`))) != "invalid-json" {
 		t.Fatal("expected original raw message for invalid json")
+	}
+}
+
+func TestCLIInvoker_FleetRootPropagation(t *testing.T) {
+	tmpDir := t.TempDir()
+	fleetDir := filepath.Join(tmpDir, "sample-fleet")
+	childDir := filepath.Join(fleetDir, "components", "child-module")
+	_ = os.MkdirAll(childDir, 0755)
+	_ = os.WriteFile(filepath.Join(fleetDir, ".gitmodules"), []byte("submodule"), 0644)
+
+	fakeBin := tmpDir + "/fake-harness"
+	script := fmt.Sprintf("#!/bin/sh\nexport GO_WANT_HELPER_PROCESS=1\nexec %s -test.run=TestHelperProcess -- \"$@\"\n", os.Args[0])
+	if err := os.WriteFile(fakeBin, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write fake harness script: %v", err)
+	}
+
+	inv := NewCLIInvoker(fakeBin, childDir)
+	res, _, err := inv.runCommand(context.Background(), []string{"env"}, nil)
+	if err != nil {
+		t.Fatalf("runCommand failed: %v", err)
+	}
+	if strings.TrimSpace(res) != fleetDir {
+		t.Fatalf("expected fleetDir %s, got %s", fleetDir, strings.TrimSpace(res))
 	}
 }
 

@@ -403,45 +403,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				disp.SetWorktreeResolver(func(repoName string) string {
 					clean := strings.TrimSpace(repoName)
 					if detail, err := client.GetHost(runCtx, host); err == nil {
-						for _, r := range detail.Repos {
-							wt := r.WorktreePath
-							if wt == "" {
-								wt = r.Path
-							}
-							if wt == "" {
-								continue
-							}
-							if r.Alias == clean || r.RepoAlias == clean || filepath.Base(wt) == clean {
-								return wt
-							}
-							gmPath := filepath.Join(wt, ".gitmodules")
-							if b, err := os.ReadFile(gmPath); err == nil {
-								if strings.Contains(string(b), clean) {
-									return wt
-								}
-							}
-						}
-						if clean == "." || clean == "" || clean == "root" {
-							for _, r := range detail.Repos {
-								if r.GlobalQueueAllocationEnabled {
-									wt := r.WorktreePath
-									if wt == "" {
-										wt = r.Path
-									}
-									if wt != "" {
-										return wt
-									}
-								}
-							}
-							if len(detail.Repos) > 0 {
-								wt := detail.Repos[0].WorktreePath
-								if wt == "" {
-									wt = detail.Repos[0].Path
-								}
-								if wt != "" {
-									return wt
-								}
-							}
+						if wt := resolveWorktreeFromHostDetail(detail, repoName); wt != "" {
+							return wt
 						}
 					}
 					if envRoot := getenv("IAZIO_FLEET_ROOT"); envRoot != "" {
@@ -1194,4 +1157,81 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 		}
 	}
 	return st
+}
+
+// resolveWorktreeFromHostDetail resolves a target worktree from the host's registered repos.
+func resolveWorktreeFromHostDetail(detail controlplane.HostDetail, repoName string) string {
+	clean := strings.TrimSpace(repoName)
+	// 1. Direct match by repo alias or basename
+	for _, r := range detail.Repos {
+		wt := r.WorktreePath
+		if wt == "" {
+			wt = r.Path
+		}
+		if wt == "" {
+			continue
+		}
+		if r.Alias == clean || r.RepoAlias == clean || filepath.Base(wt) == clean {
+			return wt
+		}
+	}
+	// 2. Submodule match: prefer primary worktree without auxiliary numeric suffix (e.g. -02, -03)
+	for _, r := range detail.Repos {
+		wt := r.WorktreePath
+		if wt == "" {
+			wt = r.Path
+		}
+		if wt == "" {
+			continue
+		}
+		base := filepath.Base(wt)
+		if strings.Contains(base, "-0") || strings.Contains(base, "-1") || strings.Contains(base, "-2") {
+			continue
+		}
+		gmPath := filepath.Join(wt, ".gitmodules")
+		if b, err := os.ReadFile(gmPath); err == nil {
+			if strings.Contains(string(b), clean) {
+				return wt
+			}
+		}
+	}
+	// 3. Any other worktree containing submodule in .gitmodules
+	for _, r := range detail.Repos {
+		wt := r.WorktreePath
+		if wt == "" {
+			wt = r.Path
+		}
+		if wt == "" {
+			continue
+		}
+		gmPath := filepath.Join(wt, ".gitmodules")
+		if b, err := os.ReadFile(gmPath); err == nil {
+			if strings.Contains(string(b), clean) {
+				return wt
+			}
+		}
+	}
+	if clean == "." || clean == "" || clean == "root" {
+		for _, r := range detail.Repos {
+			if r.GlobalQueueAllocationEnabled {
+				wt := r.WorktreePath
+				if wt == "" {
+					wt = r.Path
+				}
+				if wt != "" {
+					return wt
+				}
+			}
+		}
+		if len(detail.Repos) > 0 {
+			wt := detail.Repos[0].WorktreePath
+			if wt == "" {
+				wt = detail.Repos[0].Path
+			}
+			if wt != "" {
+				return wt
+			}
+		}
+	}
+	return ""
 }
