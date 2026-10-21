@@ -1057,6 +1057,10 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 		var res struct {
 			Branch               string   `json:"branch"`
 			IsClean              bool     `json:"is_clean"`
+			Ahead                int      `json:"ahead"`
+			Behind               int      `json:"behind"`
+			ModifiedFiles        []string `json:"modified_files"`
+			UntrackedFiles       []string `json:"untracked_files"`
 			SubmodulesClean      bool     `json:"submodules_clean"`
 			DirtySubmodules      []string `json:"dirty_submodules"`
 			ASEState             string   `json:"ase_state"`
@@ -1077,6 +1081,16 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 			st.ToolLiveness = res.ToolLiveness
 			st.ExecutionProvenance = res.ExecutionProvenance
 			st.ActiveConversationID = res.ActiveConversationID
+			if len(res.ModifiedFiles) > 0 || len(res.UntrackedFiles) > 0 {
+				var pLines []string
+				for _, m := range res.ModifiedFiles {
+					pLines = append(pLines, "M "+m)
+				}
+				for _, u := range res.UntrackedFiles {
+					pLines = append(pLines, "?? "+u)
+				}
+				st.Porcelain = strings.Join(pLines, "\n")
+			}
 			return st
 		}
 	}
