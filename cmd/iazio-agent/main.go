@@ -388,6 +388,15 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				cpClient := worker.NewHTTPControlPlaneClient(api, "", nil)
 				cliInvoker := harness.NewCLIInvoker("", "")
 				disp := worker.NewDispatcher(cpClient, cliInvoker, host)
+				disp.SetToolUpdater(func(ctx context.Context, tools []string, force bool) error {
+					if stdout != nil {
+						fmt.Fprintf(stdout, "[dispatcher] tool update job executing: tools=%v force=%v\n", tools, force)
+					}
+					if !doToolUpdate(ctx, tools, force) {
+						return fmt.Errorf("tool update failed")
+					}
+					return nil
+				})
 				disp.SetWorktreeResolver(func(repoName string) string {
 					clean := strings.TrimSpace(repoName)
 					if detail, err := client.GetHost(runCtx, host); err == nil {
@@ -469,7 +478,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return ""
 				})
 				go func() {
-					pollTicker := time.NewTicker(3 * time.Second)
+					pollTicker := time.NewTicker(2 * time.Second)
 					defer pollTicker.Stop()
 					for {
 						select {

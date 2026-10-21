@@ -21,6 +21,7 @@ import (
 const (
 	JobTypeStoryCreate   = "story.create"
 	JobTypePromptExecute = "prompt.execute"
+	JobTypeToolsUpdate   = "agent.tools.update"
 )
 
 // DefaultJobExecutionTimeout is the maximum duration an individual job can run before being terminated.
@@ -28,14 +29,15 @@ const DefaultJobExecutionTimeout = 30 * time.Minute
 
 // Job describes a unit of work received from the control plane.
 type Job struct {
-	ID          string          `json:"id"`
-	Type        string          `json:"type"`
-	Repo        string          `json:"repo"`
-	TargetHost  string          `json:"target_host,omitempty"`
-	TargetAgent string          `json:"target_agent,omitempty"`
-	Payload     json.RawMessage `json:"payload"`
-	TraceID     string          `json:"trace_id,omitempty"`
-	ParentID    string          `json:"parent_id,omitempty"`
+	ID           string          `json:"id"`
+	Type         string          `json:"type"`
+	Repo         string          `json:"repo"`
+	TargetHost   string          `json:"target_host,omitempty"`
+	TargetAgent  string          `json:"target_agent,omitempty"`
+	Payload      json.RawMessage `json:"payload"`
+	TraceID      string          `json:"trace_id,omitempty"`
+	ParentID     string          `json:"parent_id,omitempty"`
+	FencingToken int64           `json:"fencing_token,omitempty"`
 }
 
 // ClaimRequest is sent to claim pending jobs.
@@ -46,14 +48,21 @@ type ClaimRequest struct {
 
 // CompleteRequest reports the final outcome of a job.
 type CompleteRequest struct {
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  string          `json:"error,omitempty"`
+	FencingToken int64           `json:"fencing_token,omitempty"`
+	Result       json.RawMessage `json:"result,omitempty"`
+	Error        string          `json:"error,omitempty"`
+}
+
+// HeartbeatRequest extends the lease of an active claimed job.
+type HeartbeatRequest struct {
+	FencingToken int64 `json:"fencing_token"`
 }
 
 // ControlPlaneClient defines communication with iazio-harness-api for agent jobs.
 type ControlPlaneClient interface {
 	ClaimJob(ctx context.Context, req ClaimRequest) (*Job, error)
 	CompleteJob(ctx context.Context, jobID string, req CompleteRequest) error
+	HeartbeatJob(ctx context.Context, jobID string, fencingToken int64) error
 }
 
 // HTTPControlPlaneClient is a concrete implementation of ControlPlaneClient over HTTP.
@@ -147,6 +156,36 @@ func (c *HTTPControlPlaneClient) CompleteJob(ctx context.Context, jobID string, 
 	return nil
 }
 
+// HeartbeatJob calls POST /api/v1/agent/jobs/{job_id}/heartbeat.
+func (c *HTTPControlPlaneClient) HeartbeatJob(ctx context.Context, jobID string, fencingToken int64) error {
+	url := fmt.Sprintf("%s/api/v1/agent/jobs/%s/heartbeat", c.BaseURL, jobID)
+	bodyBytes, err := json.Marshal(HeartbeatRequest{FencingToken: fencingToken})
+	if err != nil {
+		return fmt.Errorf("marshal heartbeat request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("create heartbeat request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if c.AuthToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.AuthToken)
+	}
+
+	resp, err := c.HTTPClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("execute heartbeat request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("heartbeat returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
 // RepoSyncer defines the contract for triggering an on-demand codebase delta sync for a repository.
 type RepoSyncer interface {
 	TriggerRepoSync(repoName string)
@@ -154,6 +193,9 @@ type RepoSyncer interface {
 
 // WorktreeResolver maps a repository name or relative submodule to an absolute worktree directory on the host.
 type WorktreeResolver func(repo string) string
+
+// ToolUpdater defines the callback to execute tool suite updates.
+type ToolUpdater func(ctx context.Context, tools []string, force bool) error
 
 // Dispatcher coordinates claiming jobs from the control plane and routing them to iazio-harness.
 type Dispatcher struct {
@@ -163,6 +205,7 @@ type Dispatcher struct {
 	jobTypes         []string
 	syncer           RepoSyncer
 	worktreeResolver WorktreeResolver
+	toolUpdater      ToolUpdater
 	jobTimeout       time.Duration
 }
 
@@ -176,7 +219,7 @@ func NewDispatcher(client ControlPlaneClient, invoker harness.Invoker, hostID st
 		client:     client,
 		invoker:    invoker,
 		hostID:     hostID,
-		jobTypes:   []string{JobTypeStoryCreate, JobTypePromptExecute},
+		jobTypes:   []string{JobTypeStoryCreate, JobTypePromptExecute, JobTypeToolsUpdate},
 		syncer:     s,
 		jobTimeout: DefaultJobExecutionTimeout,
 	}
@@ -195,6 +238,11 @@ func (d *Dispatcher) SetSyncer(syncer RepoSyncer) {
 // SetWorktreeResolver configures a custom worktree resolver on the Dispatcher.
 func (d *Dispatcher) SetWorktreeResolver(r WorktreeResolver) {
 	d.worktreeResolver = r
+}
+
+// SetToolUpdater configures an optional tool updater callback on the Dispatcher.
+func (d *Dispatcher) SetToolUpdater(u ToolUpdater) {
+	d.toolUpdater = u
 }
 
 // PollAndProcess claims one job and processes it. Returns (true, err) if a job was processed,
@@ -245,15 +293,37 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	execCtx, execCancel := context.WithTimeout(ctx, timeout)
 	defer execCancel()
 
+	hbCtx, hbCancel := context.WithCancel(ctx)
+	defer hbCancel()
+	if job.FencingToken > 0 {
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-hbCtx.Done():
+					return
+				case <-ticker.C:
+					if err := d.client.HeartbeatJob(hbCtx, job.ID, job.FencingToken); err != nil {
+						if strings.Contains(err.Error(), "409") || strings.Contains(err.Error(), "LEASE_FENCED") {
+							execCancel()
+							return
+						}
+					}
+				}
+			}
+		}()
+	}
+
 	switch job.Type {
 	case JobTypeStoryCreate:
 		res, err := invoker.CreateStory(execCtx, job.Payload)
 		if err != nil {
-			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{Error: err.Error()})
+			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: err.Error()})
 			return true, err
 		}
 		resBytes, _ := json.Marshal(res)
-		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{Result: resBytes})
+		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Result: resBytes})
 		if compErr == nil && d.syncer != nil {
 			targetRepo := job.Repo
 			if targetRepo == "" && res != nil {
@@ -269,11 +339,11 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		payload := EnsurePromptID(job.ID, job.Payload)
 		res, err := invoker.ExecutePrompt(execCtx, payload)
 		if err != nil {
-			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{Error: err.Error()})
+			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: err.Error()})
 			return true, err
 		}
 		resBytes, _ := json.Marshal(res)
-		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{Result: resBytes})
+		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Result: resBytes})
 		if compErr == nil && d.syncer != nil {
 			targetRepo := job.Repo
 			if targetRepo == "" && res != nil {
@@ -285,9 +355,27 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		}
 		return true, compErr
 
+	case JobTypeToolsUpdate:
+		var p struct {
+			Tools []string `json:"tools"`
+			Force bool     `json:"force"`
+		}
+		_ = json.Unmarshal(job.Payload, &p)
+		if d.toolUpdater != nil {
+			if err := d.toolUpdater(execCtx, p.Tools, p.Force); err != nil {
+				_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: err.Error()})
+				return true, err
+			}
+		}
+		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{
+			FencingToken: job.FencingToken,
+			Result:       json.RawMessage(`{"updated":true}`),
+		})
+		return true, compErr
+
 	default:
 		unsupportedErr := fmt.Sprintf("unsupported job type: %s", job.Type)
-		_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{Error: unsupportedErr})
+		_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: unsupportedErr})
 		return true, errors.New(unsupportedErr)
 	}
 }

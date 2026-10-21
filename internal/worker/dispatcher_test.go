@@ -87,6 +87,10 @@ func (m *mockControlPlane) CompleteJob(ctx context.Context, jobID string, req Co
 	return nil
 }
 
+func (m *mockControlPlane) HeartbeatJob(ctx context.Context, jobID string, fencingToken int64) error {
+	return nil
+}
+
 func TestDispatcher_StoryCreate_Success(t *testing.T) {
 	cp := newMockControlPlane()
 	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
@@ -646,5 +650,47 @@ func TestDispatcher_JobExecutionTimeout(t *testing.T) {
 	}
 	if !strings.Contains(comp.Error, "context deadline exceeded") && !strings.Contains(comp.Error, "deadline exceeded") {
 		t.Fatalf("expected deadline exceeded error in completion report, got: %s", comp.Error)
+	}
+}
+
+func TestDispatcher_ToolsUpdate_Success(t *testing.T) {
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:           "job-tu-1",
+			Type:         JobTypeToolsUpdate,
+			Payload:      json.RawMessage(`{"tools":["autopilot"],"force":true}`),
+			FencingToken: 42,
+		}, nil
+	}
+
+	toolUpdateCalled := false
+	inv := &mockInvoker{}
+	d := NewDispatcher(cp, inv, "host-1")
+	d.SetToolUpdater(func(ctx context.Context, tools []string, force bool) error {
+		toolUpdateCalled = true
+		if len(tools) != 1 || tools[0] != "autopilot" || !force {
+			t.Errorf("unexpected tool update params: tools=%v force=%v", tools, force)
+		}
+		return nil
+	})
+
+	processed, err := d.PollAndProcess(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected job to be processed")
+	}
+	if !toolUpdateCalled {
+		t.Fatal("expected tool updater to be called")
+	}
+
+	comp, ok := cp.completedJobs["job-tu-1"]
+	if !ok {
+		t.Fatal("expected completion report for job-tu-1")
+	}
+	if comp.FencingToken != 42 {
+		t.Fatalf("expected fencing token 42, got %d", comp.FencingToken)
 	}
 }
