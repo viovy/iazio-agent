@@ -23,6 +23,9 @@ const (
 	JobTypePromptExecute = "prompt.execute"
 )
 
+// DefaultJobExecutionTimeout is the maximum duration an individual job can run before being terminated.
+const DefaultJobExecutionTimeout = 30 * time.Minute
+
 // Job describes a unit of work received from the control plane.
 type Job struct {
 	ID          string          `json:"id"`
@@ -160,6 +163,7 @@ type Dispatcher struct {
 	jobTypes         []string
 	syncer           RepoSyncer
 	worktreeResolver WorktreeResolver
+	jobTimeout       time.Duration
 }
 
 // NewDispatcher constructs a new Dispatcher, optionally accepting a RepoSyncer for immediate post-job sync hooks.
@@ -169,12 +173,18 @@ func NewDispatcher(client ControlPlaneClient, invoker harness.Invoker, hostID st
 		s = syncer[0]
 	}
 	return &Dispatcher{
-		client:   client,
-		invoker:  invoker,
-		hostID:   hostID,
-		jobTypes: []string{JobTypeStoryCreate, JobTypePromptExecute},
-		syncer:   s,
+		client:     client,
+		invoker:    invoker,
+		hostID:     hostID,
+		jobTypes:   []string{JobTypeStoryCreate, JobTypePromptExecute},
+		syncer:     s,
+		jobTimeout: DefaultJobExecutionTimeout,
 	}
+}
+
+// SetJobTimeout sets a custom per-job execution timeout for the Dispatcher.
+func (d *Dispatcher) SetJobTimeout(timeout time.Duration) {
+	d.jobTimeout = timeout
 }
 
 // SetSyncer sets or updates the RepoSyncer on the Dispatcher.
@@ -228,9 +238,16 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		}
 	}
 
+	timeout := d.jobTimeout
+	if timeout <= 0 {
+		timeout = DefaultJobExecutionTimeout
+	}
+	execCtx, execCancel := context.WithTimeout(ctx, timeout)
+	defer execCancel()
+
 	switch job.Type {
 	case JobTypeStoryCreate:
-		res, err := invoker.CreateStory(ctx, job.Payload)
+		res, err := invoker.CreateStory(execCtx, job.Payload)
 		if err != nil {
 			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{Error: err.Error()})
 			return true, err
@@ -250,7 +267,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 
 	case JobTypePromptExecute:
 		payload := EnsurePromptID(job.ID, job.Payload)
-		res, err := invoker.ExecutePrompt(ctx, payload)
+		res, err := invoker.ExecutePrompt(execCtx, payload)
 		if err != nil {
 			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{Error: err.Error()})
 			return true, err
