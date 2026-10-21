@@ -1629,6 +1629,69 @@ EOF
 	}
 }
 
+func TestResolveWorktreeFromHostDetail(t *testing.T) {
+	tempRoot := t.TempDir()
+	primaryWT := filepath.Join(tempRoot, "umbrella-root")
+	auxWT := filepath.Join(tempRoot, "umbrella-root-02")
+	_ = os.MkdirAll(primaryWT, 0755)
+	_ = os.MkdirAll(auxWT, 0755)
+
+	_ = os.WriteFile(filepath.Join(primaryWT, ".gitmodules"), []byte(`[submodule "child-pkg"]
+	path = child-pkg
+`), 0644)
+	_ = os.WriteFile(filepath.Join(auxWT, ".gitmodules"), []byte(`[submodule "child-pkg"]
+	path = child-pkg
+`), 0644)
+
+	detail := controlplane.HostDetail{
+		Repos: []controlplane.RepoSummary{
+			{
+				Alias:        "alias-repo",
+				WorktreePath: "/path/alias",
+			},
+			{
+				RepoAlias: "repo-alias-name",
+				Path:      "/path/repo-alias",
+			},
+			{
+				WorktreePath: auxWT,
+			},
+			{
+				WorktreePath:                 primaryWT,
+				GlobalQueueAllocationEnabled: true,
+			},
+		},
+	}
+
+	// 1. Exact alias match
+	if wt := resolveWorktreeFromHostDetail(detail, "alias-repo"); wt != "/path/alias" {
+		t.Fatalf("expected /path/alias, got %s", wt)
+	}
+
+	// 2. RepoAlias match
+	if wt := resolveWorktreeFromHostDetail(detail, "repo-alias-name"); wt != "/path/repo-alias" {
+		t.Fatalf("expected /path/repo-alias, got %s", wt)
+	}
+
+	// 3. Submodule match prefers primaryWT (not auxWT which has -02)
+	if wt := resolveWorktreeFromHostDetail(detail, "child-pkg"); wt != primaryWT {
+		t.Fatalf("expected primaryWT %s, got %s", primaryWT, wt)
+	}
+
+	// 4. Root matches GlobalQueueAllocationEnabled
+	if wt := resolveWorktreeFromHostDetail(detail, "."); wt != primaryWT {
+		t.Fatalf("expected primaryWT for root '.', got %s", wt)
+	}
+	if wt := resolveWorktreeFromHostDetail(detail, "root"); wt != primaryWT {
+		t.Fatalf("expected primaryWT for 'root', got %s", wt)
+	}
+
+	// 5. Unknown repo returns empty
+	if wt := resolveWorktreeFromHostDetail(detail, "nonexistent"); wt != "" {
+		t.Fatalf("expected empty for nonexistent, got %s", wt)
+	}
+}
+
 
 
 
