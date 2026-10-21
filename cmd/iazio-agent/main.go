@@ -416,18 +416,23 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 								return wt
 							}
 						}
-						// 2. Submodule match: prefer primary meta-repo root
+						// 2. Submodule match: prefer primary worktree without auxiliary numeric suffix (e.g. -02, -03)
 						for _, r := range detail.Repos {
-							if r.Alias == "meta-repo" || r.RepoAlias == "meta-repo" || filepath.Base(r.WorktreePath) == "meta-repo" {
-								wt := r.WorktreePath
-								if wt == "" {
-									wt = r.Path
-								}
-								gmPath := filepath.Join(wt, ".gitmodules")
-								if b, err := os.ReadFile(gmPath); err == nil {
-									if strings.Contains(string(b), clean) {
-										return wt
-									}
+							wt := r.WorktreePath
+							if wt == "" {
+								wt = r.Path
+							}
+							if wt == "" {
+								continue
+							}
+							base := filepath.Base(wt)
+							if strings.Contains(base, "-0") || strings.Contains(base, "-1") || strings.Contains(base, "-2") {
+								continue
+							}
+							gmPath := filepath.Join(wt, ".gitmodules")
+							if b, err := os.ReadFile(gmPath); err == nil {
+								if strings.Contains(string(b), clean) {
+									return wt
 								}
 							}
 						}
