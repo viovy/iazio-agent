@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -601,3 +602,49 @@ func TestDispatcher_PromptExecute_AutoInjectsPromptID(t *testing.T) {
 
 
 
+
+func TestDispatcher_JobExecutionTimeout(t *testing.T) {
+	ctx := context.Background()
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:      "job-timeout-1",
+			Type:    JobTypePromptExecute,
+			Repo:    "iazio-mcp",
+			Payload: json.RawMessage(`{"prompt":"hang forever"}`),
+		}, nil
+	}
+
+	inv := &mockInvoker{
+		executePromptFunc: func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+				return &harness.PromptExecutionResult{Status: "completed"}, nil
+			}
+		},
+	}
+
+	d := NewDispatcher(cp, inv, "host-1")
+	d.SetJobTimeout(30 * time.Millisecond)
+
+	processed, err := d.PollAndProcess(ctx)
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	if !processed {
+		t.Fatal("expected job to be processed")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected DeadlineExceeded, got %v", err)
+	}
+
+	comp, ok := cp.completedJobs["job-timeout-1"]
+	if !ok {
+		t.Fatal("expected job-timeout-1 to be marked completed with error")
+	}
+	if !strings.Contains(comp.Error, "context deadline exceeded") && !strings.Contains(comp.Error, "deadline exceeded") {
+		t.Fatalf("expected deadline exceeded error in completion report, got: %s", comp.Error)
+	}
+}
