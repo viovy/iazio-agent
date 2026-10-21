@@ -636,6 +636,40 @@ func TestGetHost_ErrorsAndToken(t *testing.T) {
 	}
 }
 
+func TestPostRepoStatusAndPingAck(t *testing.T) {
+	var seenPaths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPaths = append(seenPaths, r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+
+	c := Client{BaseURL: srv.URL}
+	ctx := context.Background()
+
+	statuses := []RepoRuntimeStatus{
+		{
+			RepoPath: "/work/app",
+			Alias:    "app",
+			Branch:   "main",
+			IsClean:  true,
+		},
+	}
+	if err := c.PostRepoStatus(ctx, "host-1", statuses); err != nil {
+		t.Fatalf("PostRepoStatus failed: %v", err)
+	}
+
+	if err := c.PostPingAck(ctx, "host-1", "ping-123", "1.0.0"); err != nil {
+		t.Fatalf("PostPingAck failed: %v", err)
+	}
+
+	if len(seenPaths) != 2 || seenPaths[0] != "/v1/hosts/host-1/repos/status" || seenPaths[1] != "/v1/hosts/host-1/ping-ack" {
+		t.Fatalf("unexpected paths: %v", seenPaths)
+	}
+}
+
+
 
 
 
