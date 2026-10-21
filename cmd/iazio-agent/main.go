@@ -286,6 +286,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						if stdout != nil {
 							fmt.Fprintf(stdout, "[supervisor] received PING command (%s); host is reachable\n", cmd.ID)
 						}
+						go func() {
+							_ = client.PostPingAck(runCtx, host, cmd.ID, version)
+						}()
 					case "CHECK_FLEET_GIT_STATUS":
 						go func() {
 							detail, err := client.GetHost(runCtx, host)

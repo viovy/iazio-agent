@@ -611,6 +611,16 @@ func (c Client) PostRepoStatus(ctx context.Context, hostID string, statuses []Re
 	return c.post(ctx, "/v1/hosts/"+hostID+"/repos/status", statuses)
 }
 
+// PostPingAck notifies the control plane that a live PING command was received and handled by the agent.
+func (c Client) PostPingAck(ctx context.Context, hostID, pingID, agentVersion string) error {
+	payload := map[string]string{
+		"ping_id":       pingID,
+		"agent_version": agentVersion,
+		"acked_at":      time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	return c.post(ctx, "/v1/hosts/"+hostID+"/ping-ack", payload)
+}
+
 func (c Client) post(ctx context.Context, path string, body any) error {
 	return c.postJSON(ctx, path, body, nil)
 }
