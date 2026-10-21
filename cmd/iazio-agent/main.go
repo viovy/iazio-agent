@@ -73,6 +73,12 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 	case "update":
 		return runUpdate(ctx, args[1:], stdout, stderr, getenv)
 	case "run":
+		defer func() {
+			if getenv("IAZIO_AGENT_NONINTERACTIVE") != "1" && runtime.GOOS == "linux" && service.IsSystemdAvailable() {
+				home, _ := os.UserHomeDir()
+				_ = service.ReviveCheck(home, nil)
+			}
+		}()
 		kind := supervisor.HostKind(getenv("IAZIO_AGENT_HOST_KIND"))
 		fmt.Fprintln(stdout, kind)
 		api := resolveLocalAPI(getenv)
@@ -600,6 +606,39 @@ func runService(args []string, stdout io.Writer, getenv func(string) string) err
 	if dry {
 		return nil
 	}
+	switch action {
+	case "dev-install":
+		src := ""
+		for _, a := range args[1:] {
+			if !strings.HasPrefix(a, "-") {
+				src = a
+				break
+			}
+		}
+		home, _ := os.UserHomeDir()
+		if err := service.DevInstall(src, home, execCommand); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "iazio-agent dev version installed and supervisor active")
+		return nil
+	case "pause":
+		home, _ := os.UserHomeDir()
+		if err := service.PauseService(home, execCommand); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "iazio-agent service paused (maintenance mode active)")
+		return nil
+	case "resume":
+		home, _ := os.UserHomeDir()
+		if err := service.ResumeService(home, execCommand); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "iazio-agent service resumed (maintenance mode cleared)")
+		return nil
+	case "revive-check":
+		home, _ := os.UserHomeDir()
+		return service.ReviveCheck(home, execCommand)
+	}
 	switch goos {
 	case "darwin":
 		return applyDarwin(action, bin)
@@ -617,7 +656,7 @@ var isSystemdAvailable = service.IsSystemdAvailable
 
 func applyLinux(action, bin string, stdout io.Writer, force bool) error {
 	switch action {
-	case "install", "start", "stop", "restart", "uninstall", "status":
+	case "install", "start", "stop", "restart", "uninstall", "status", "dev-install", "pause", "resume", "revive-check":
 	default:
 		return fmt.Errorf("unknown service action %s", action)
 	}
@@ -820,17 +859,17 @@ func parseService(args []string) (action string, dry, force bool, err error) {
 	}
 	action = args[0]
 	switch action {
-	case "install", "uninstall", "start", "stop", "restart", "status":
+	case "install", "uninstall", "start", "stop", "restart", "status", "dev-install", "pause", "resume", "revive-check":
 	default:
 		return "", false, false, fmt.Errorf("unknown service action %s", action)
 	}
 	for _, arg := range args[1:] {
-		switch arg {
-		case "--dry-run":
+		switch {
+		case arg == "--dry-run":
 			dry = true
-		case "--force":
+		case arg == "--force":
 			force = true
-		default:
+		case strings.HasPrefix(arg, "-"):
 			return "", false, false, fmt.Errorf("unknown service flag %s", arg)
 		}
 	}

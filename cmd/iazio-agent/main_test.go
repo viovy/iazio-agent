@@ -678,7 +678,7 @@ func TestParseService(t *testing.T) {
 	}
 
 	// Valid actions
-	for _, action := range []string{"install", "uninstall", "start", "stop", "restart", "status"} {
+	for _, action := range []string{"install", "uninstall", "start", "stop", "restart", "status", "dev-install", "pause", "resume", "revive-check"} {
 		act, dry, force, err := parseService([]string{action})
 		if err != nil || act != action || dry || force {
 			t.Fatalf("unexpected result for %s: act=%s dry=%v force=%v err=%v", action, act, dry, force, err)
@@ -701,7 +701,7 @@ func TestParseService(t *testing.T) {
 func TestRunServiceDryRun(t *testing.T) {
 	var stdout bytes.Buffer
 	for _, osName := range []string{"darwin", "linux", "windows"} {
-		for _, action := range []string{"install", "uninstall", "start", "stop", "restart", "status"} {
+		for _, action := range []string{"install", "uninstall", "start", "stop", "restart", "status", "dev-install", "pause", "resume", "revive-check"} {
 			stdout.Reset()
 			err := runService([]string{action, "--dry-run"}, &stdout, func(k string) string {
 				if k == "GOOS_OVERRIDE" {

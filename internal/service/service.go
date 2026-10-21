@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -91,6 +93,16 @@ func resolveElasticsearchURL() string {
 func ActionText(goos, action, bin string, force bool) string {
 	if action == "" {
 		action = "install"
+	}
+	switch action {
+	case "dev-install":
+		return fmt.Sprintf("hot-swap %s and restart supervisor", bin)
+	case "pause":
+		return "pause supervisor and place maintenance lock"
+	case "resume":
+		return "resume supervisor and remove maintenance lock"
+	case "revive-check":
+		return "check supervisor health and auto-revive if inactive"
 	}
 	if action == "install" {
 		switch goos {
@@ -325,6 +337,282 @@ WantedBy=default.target
 `, bin, apiLine, esLine)
 }
 
+// LinuxWatcherPath returns the systemd .path unit definition to monitor binary replacements.
+func LinuxWatcherPath(bin string) string {
+	return fmt.Sprintf(`[Unit]
+Description=Watch iazio-agent binary for updates and dev replacements
+After=network.target
+
+[Path]
+PathModified=%s
+Unit=iazio-agent-watcher.service
+
+[Install]
+WantedBy=default.target
+`, bin)
+}
+
+// LinuxWatcherService returns the oneshot service that restarts the agent on binary changes.
+func LinuxWatcherService() string {
+	return `[Unit]
+Description=Auto-restart iazio-agent on binary replacement
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --user restart iazio-agent.service
+`
+}
+
+// LinuxWatchdogTimer returns the periodic timer definition that triggers revive-check.
+func LinuxWatchdogTimer() string {
+	return `[Unit]
+Description=iazio-agent auto-revive watchdog timer
+After=network.target
+
+[Timer]
+OnBootSec=1m
+OnUnitActiveSec=2m
+AccuracySec=10s
+Unit=iazio-agent-watchdog.service
+
+[Install]
+WantedBy=timers.target default.target
+`
+}
+
+// LinuxWatchdogService returns the watchdog service definition executing revive-check.
+func LinuxWatchdogService(bin string) string {
+	return fmt.Sprintf(`[Unit]
+Description=iazio-agent auto-revive watchdog
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=%s service revive-check
+`, bin)
+}
+
+// InstallLinuxResilience installs and enables the .path watcher and .timer watchdog units.
+func InstallLinuxResilience(home, bin string, run func(name string, args ...string) error) error {
+	if run == nil {
+		run = execCommand
+	}
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		return err
+	}
+
+	pathUnitFile := filepath.Join(unitDir, "iazio-agent-watcher.path")
+	if err := os.WriteFile(pathUnitFile, []byte(LinuxWatcherPath(bin)), 0o644); err != nil {
+		return err
+	}
+
+	watcherServiceFile := filepath.Join(unitDir, "iazio-agent-watcher.service")
+	if err := os.WriteFile(watcherServiceFile, []byte(LinuxWatcherService()), 0o644); err != nil {
+		return err
+	}
+
+	timerUnitFile := filepath.Join(unitDir, "iazio-agent-watchdog.timer")
+	if err := os.WriteFile(timerUnitFile, []byte(LinuxWatchdogTimer()), 0o644); err != nil {
+		return err
+	}
+
+	watchdogServiceFile := filepath.Join(unitDir, "iazio-agent-watchdog.service")
+	if err := os.WriteFile(watchdogServiceFile, []byte(LinuxWatchdogService(bin)), 0o644); err != nil {
+		return err
+	}
+
+	if err := run("systemctl", "--user", "daemon-reload"); err != nil {
+		return err
+	}
+	_ = run("systemctl", "--user", "enable", "--now", "iazio-agent-watcher.path")
+	_ = run("systemctl", "--user", "enable", "--now", "iazio-agent-watchdog.timer")
+	return nil
+}
+
+// copyBinaryAtomic copies a binary to dest using a temporary file and atomic rename,
+// which avoids ETXTBSY (text file busy) if dest is currently running.
+func copyBinaryAtomic(src, dest string) error {
+	if src == dest {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	tmp := fmt.Sprintf("%s.tmp.%d", dest, time.Now().UnixNano())
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, dest)
+}
+
+// DevInstall safely hot-swaps the active binary with srcBinary and ensures the service is running.
+func DevInstall(srcBinary, home string, run func(name string, args ...string) error) error {
+	if home == "" {
+		h, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		home = h
+	}
+	if run == nil {
+		run = execCommand
+	}
+	if srcBinary == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("resolve executable: %w", err)
+		}
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			srcBinary = resolved
+		} else {
+			srcBinary = exe
+		}
+	}
+	srcBinary, err := filepath.Abs(srcBinary)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(srcBinary)
+	if err != nil {
+		return fmt.Errorf("source binary not found: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("source binary is a directory: %s", srcBinary)
+	}
+
+	destDir := filepath.Join(home, ".iazio", "bin")
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return err
+	}
+	binName := "iazio-agent"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	dest := filepath.Join(destDir, binName)
+
+	if err := copyBinaryAtomic(srcBinary, dest); err != nil {
+		return fmt.Errorf("atomic binary swap failed: %w", err)
+	}
+	localBin := filepath.Join(home, ".local", "bin", binName)
+	_ = copyBinaryAtomic(srcBinary, localBin)
+
+	// Remove maintenance lock if present
+	_ = os.Remove(filepath.Join(home, ".iazio", "maintenance.lock"))
+
+	// Ensure resilience units are active
+	if runtime.GOOS == "linux" && IsSystemdAvailable() {
+		_ = InstallLinuxResilience(home, dest, run)
+		if err := run("systemctl", "--user", "restart", "iazio-agent.service"); err != nil {
+			return fmt.Errorf("restart service: %w", err)
+		}
+	} else if runtime.GOOS == "darwin" {
+		_ = run("launchctl", "kickstart", "-k", fmt.Sprintf("gui/%d/%s", os.Getuid(), agentLabel))
+	} else if runtime.GOOS == "windows" {
+		_ = run("schtasks", "/Run", "/TN", "iazio-agent")
+	}
+	return nil
+}
+
+// ReviveCheck checks if the agent service is active, and if inactive and not locked, starts it.
+func ReviveCheck(home string, run func(name string, args ...string) error) error {
+	if home == "" {
+		h, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		home = h
+	}
+	if run == nil {
+		run = execCommand
+	}
+	lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
+	if info, err := os.Stat(lockFile); err == nil {
+		// Maintenance lock exists. Check if it expired (> 2 hours max safety window)
+		if time.Since(info.ModTime()) > 2*time.Hour {
+			_ = os.Remove(lockFile)
+		} else {
+			return nil // Maintenance pause intentionally active
+		}
+	}
+	if runtime.GOOS == "linux" && IsSystemdAvailable() {
+		cmd := exec.Command("systemctl", "--user", "is-active", "--quiet", "iazio-agent.service")
+		if err := cmd.Run(); err != nil {
+			// Inactive! Start it.
+			return run("systemctl", "--user", "start", "iazio-agent.service")
+		}
+	}
+	return nil
+}
+
+// PauseService sets maintenance mode and cleanly stops the supervisor.
+func PauseService(home string, run func(name string, args ...string) error) error {
+	if home == "" {
+		h, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		home = h
+	}
+	if run == nil {
+		run = execCommand
+	}
+	lockDir := filepath.Join(home, ".iazio")
+	_ = os.MkdirAll(lockDir, 0o755)
+	lockFile := filepath.Join(lockDir, "maintenance.lock")
+	now := time.Now().Format(time.RFC3339)
+	_ = os.WriteFile(lockFile, []byte(fmt.Sprintf("paused_at=%s\n", now)), 0o644)
+	if runtime.GOOS == "linux" && IsSystemdAvailable() {
+		return run("systemctl", "--user", "stop", "iazio-agent.service")
+	} else if runtime.GOOS == "darwin" {
+		return run("launchctl", "stop", fmt.Sprintf("gui/%d/%s", os.Getuid(), agentLabel))
+	} else if runtime.GOOS == "windows" {
+		return run("schtasks", "/End", "/TN", "iazio-agent")
+	}
+	return nil
+}
+
+// ResumeService removes maintenance mode and starts the supervisor.
+func ResumeService(home string, run func(name string, args ...string) error) error {
+	if home == "" {
+		h, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		home = h
+	}
+	if run == nil {
+		run = execCommand
+	}
+	lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
+	_ = os.Remove(lockFile)
+	if runtime.GOOS == "linux" && IsSystemdAvailable() {
+		return run("systemctl", "--user", "start", "iazio-agent.service")
+	} else if runtime.GOOS == "darwin" {
+		return run("launchctl", "start", fmt.Sprintf("gui/%d/%s", os.Getuid(), agentLabel))
+	} else if runtime.GOOS == "windows" {
+		return run("schtasks", "/Run", "/TN", "iazio-agent")
+	}
+	return nil
+}
+
 // IsWSL reports whether the current environment is Windows Subsystem for Linux (WSL).
 func IsWSL() bool {
 	return IsWSLWith(os.Getenv, func() ([]byte, error) {
@@ -396,6 +684,9 @@ func InstallLinux(bin string) error {
 	err = InstallLinuxAt(home, bin, execCommand)
 	if err != nil && (strings.Contains(err.Error(), "Failed to connect to bus") || strings.Contains(err.Error(), "No such file or directory")) {
 		return InstallUserDaemon(bin)
+	}
+	if err == nil {
+		_ = InstallLinuxResilience(home, bin, execCommand)
 	}
 	return err
 }

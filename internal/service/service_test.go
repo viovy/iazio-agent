@@ -754,6 +754,107 @@ func TestInstallWrapperFunctions(t *testing.T) {
 	}
 }
 
+func TestResilienceUnitsAndWatcher(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+
+	var commands []string
+	runner := func(name string, args ...string) error {
+		commands = append(commands, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	if err := InstallLinuxResilience(home, bin, runner); err != nil {
+		t.Fatalf("InstallLinuxResilience failed: %v", err)
+	}
+
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	for _, unitName := range []string{
+		"iazio-agent-watcher.path",
+		"iazio-agent-watcher.service",
+		"iazio-agent-watchdog.timer",
+		"iazio-agent-watchdog.service",
+	} {
+		p := filepath.Join(unitDir, unitName)
+		content, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("expected unit file %s: %v", unitName, err)
+		}
+		if len(content) == 0 {
+			t.Fatalf("unit file %s is empty", unitName)
+		}
+	}
+
+	joined := strings.Join(commands, "\n")
+	if !strings.Contains(joined, "enable --now iazio-agent-watcher.path") ||
+		!strings.Contains(joined, "enable --now iazio-agent-watchdog.timer") {
+		t.Fatalf("expected watcher and watchdog enable commands, got: %s", joined)
+	}
+}
+
+func TestPauseResumeAndReviveCheck(t *testing.T) {
+	home := t.TempDir()
+	var commands []string
+	runner := func(name string, args ...string) error {
+		commands = append(commands, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	// 1. Pause
+	if err := PauseService(home, runner); err != nil {
+		t.Fatalf("PauseService failed: %v", err)
+	}
+	lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
+	if _, err := os.Stat(lockFile); err != nil {
+		t.Fatalf("expected lock file: %v", err)
+	}
+
+	// 2. ReviveCheck while paused -> should do nothing (no start command)
+	commands = nil
+	if err := ReviveCheck(home, runner); err != nil {
+		t.Fatalf("ReviveCheck failed: %v", err)
+	}
+	if len(commands) != 0 {
+		t.Fatalf("expected 0 commands while paused, got %v", commands)
+	}
+
+	// 3. Resume
+	if err := ResumeService(home, runner); err != nil {
+		t.Fatalf("ResumeService failed: %v", err)
+	}
+	if _, err := os.Stat(lockFile); !os.IsNotExist(err) {
+		t.Fatal("expected lock file to be removed")
+	}
+}
+
+func TestDevInstallHotSwap(t *testing.T) {
+	home := t.TempDir()
+	srcDir := t.TempDir()
+	srcBin := filepath.Join(srcDir, "iazio-agent-dev")
+	if err := os.WriteFile(srcBin, []byte("#!/bin/sh\necho dev\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	var commands []string
+	runner := func(name string, args ...string) error {
+		commands = append(commands, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	if err := DevInstall(srcBin, home, runner); err != nil {
+		t.Fatalf("DevInstall failed: %v", err)
+	}
+
+	dest := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+	data, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("installed binary not found: %v", err)
+	}
+	if !strings.Contains(string(data), "echo dev") {
+		t.Fatalf("unexpected content in installed binary: %s", string(data))
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (func() bool {
 		for i := 0; i+len(sub) <= len(s); i++ {
