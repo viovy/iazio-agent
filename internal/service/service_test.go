@@ -103,7 +103,7 @@ func TestInstallLinuxAndWindowsUnits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(unit), "WantedBy=default.target") || !strings.Contains(string(unit), "RestartSec=5s") || !strings.Contains(string(unit), "Restart=always") {
+	if !strings.Contains(string(unit), "WantedBy=default.target") || !strings.Contains(string(unit), "RestartSec=3s") || !strings.Contains(string(unit), "Restart=always") {
 		t.Fatal(string(unit))
 	}
 	joined := strings.Join(cmds, "\n")

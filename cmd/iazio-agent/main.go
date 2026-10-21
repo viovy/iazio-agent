@@ -219,9 +219,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 
 					if checkOnce() {
-						if stdout != nil {
-							fmt.Fprintln(stdout, "[supervisor] iazio-agent self-updated; restarting service...")
-						}
+						restartOrExecSelf(stdout)
 						cancel()
 						return
 					}
@@ -234,9 +232,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							return
 						case <-ticker.C:
 							if checkOnce() {
-								if stdout != nil {
-									fmt.Fprintln(stdout, "[supervisor] iazio-agent self-updated; restarting service...")
-								}
+								restartOrExecSelf(stdout)
 								cancel()
 								return
 							}
@@ -274,12 +270,19 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							hasPendingRemote = false
 							pendingRemoteMu.Unlock()
 
-							if stdout != nil {
-								fmt.Fprintln(stdout, "[supervisor] iazio-agent self-updated; restarting service...")
-							}
+							restartOrExecSelf(stdout)
 							cancel()
 						}
 					}()
+					return nil
+				},
+				OnCommand: func(ctx context.Context, cmd controlplane.CommandEnvelope) error {
+					switch cmd.Type {
+					case "TRIGGER_IDLE_UPDATE":
+						go func() {
+							_ = doToolUpdate(runCtx, nil, false)
+						}()
+					}
 					return nil
 				},
 				ActiveJobs: func() []controlplane.ActiveJob {
@@ -409,6 +412,37 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 								if err != nil || !processed || runCtx.Err() != nil {
 									break
 								}
+							}
+						}
+					}
+				}()
+
+				go func() {
+					defer func() { _ = recover() }()
+					repoTicker := time.NewTicker(20 * time.Second)
+					defer repoTicker.Stop()
+					for {
+						select {
+						case <-runCtx.Done():
+							return
+						case <-repoTicker.C:
+							detail, err := client.GetHost(runCtx, host)
+							if err != nil || len(detail.Repos) == 0 {
+								continue
+							}
+							var statuses []controlplane.RepoRuntimeStatus
+							for _, r := range detail.Repos {
+								p := r.WorktreePath
+								if p == "" {
+									p = r.Path
+								}
+								if p == "" {
+									continue
+								}
+								statuses = append(statuses, probeRepoRuntime(runCtx, p, r.Alias))
+							}
+							if len(statuses) > 0 {
+								_ = client.PostRepoStatus(runCtx, host, statuses)
 							}
 						}
 					}
@@ -873,4 +907,131 @@ func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Cli
 		}
 	}
 	return true
+}
+
+func restartOrExecSelf(stdout io.Writer) {
+	if stdout != nil {
+		fmt.Fprintln(stdout, "[supervisor] iazio-agent self-updated; executing in-PID handoff to updated binary...")
+	}
+	if runtime.GOOS != "windows" {
+		if selfBin, err := os.Executable(); err == nil {
+			if resolved, err := filepath.EvalSymlinks(selfBin); err == nil {
+				selfBin = resolved
+			}
+			_ = syscall.Exec(selfBin, os.Args, os.Environ())
+		}
+	}
+}
+
+func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.RepoRuntimeStatus {
+	st := controlplane.RepoRuntimeStatus{
+		RepoPath:      repoPath,
+		Alias:         alias,
+		IsClean:       true,
+		LastCheckedAt: time.Now(),
+	}
+
+	// Try iazio-harness fleet-status --json first
+	harnessBin := "iazio-harness"
+	if home, err := os.UserHomeDir(); err == nil {
+		p := filepath.Join(home, ".iazio", "bin", "iazio-harness")
+		if _, err := os.Stat(p); err == nil {
+			harnessBin = p
+		}
+	}
+	harnessCmd := exec.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--json")
+	if out, err := harnessCmd.Output(); err == nil && len(out) > 0 {
+		var res struct {
+			Branch               string   `json:"branch"`
+			IsClean              bool     `json:"is_clean"`
+			SubmodulesClean      bool     `json:"submodules_clean"`
+			DirtySubmodules      []string `json:"dirty_submodules"`
+			ASEState             string   `json:"ase_state"`
+			ActiveStoryID        string   `json:"active_story_id"`
+			AgentTool            string   `json:"agent_tool"`
+			ToolLiveness         string   `json:"tool_liveness"`
+			ExecutionProvenance  string   `json:"execution_provenance"`
+			ActiveConversationID string   `json:"active_conversation_id"`
+		}
+		if json.Unmarshal(out, &res) == nil {
+			st.Branch = res.Branch
+			st.IsClean = res.IsClean
+			st.SubmodulesClean = res.SubmodulesClean
+			st.DirtySubmodules = res.DirtySubmodules
+			st.ASEState = res.ASEState
+			st.ActiveStoryID = res.ActiveStoryID
+			st.ActiveTool = res.AgentTool
+			st.ToolLiveness = res.ToolLiveness
+			st.ExecutionProvenance = res.ExecutionProvenance
+			st.ActiveConversationID = res.ActiveConversationID
+			return st
+		}
+	}
+
+	// Fallback git status & branch
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain=v2", "--branch")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		lines := strings.Split(string(out), "\n")
+		var porcelainLines []string
+		for _, l := range lines {
+			l = strings.TrimSpace(l)
+			if l == "" {
+				continue
+			}
+			if strings.HasPrefix(l, "# branch.head ") {
+				st.Branch = strings.TrimPrefix(l, "# branch.head ")
+			} else if !strings.HasPrefix(l, "# ") {
+				porcelainLines = append(porcelainLines, l)
+			}
+		}
+		st.Porcelain = strings.Join(porcelainLines, "\n")
+		st.IsClean = len(porcelainLines) == 0
+	} else {
+		st.IsClean = false
+		st.Porcelain = err.Error()
+	}
+
+	// Submodules check
+	subCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "status", "--recursive")
+	if subOut, err := subCmd.CombinedOutput(); err == nil {
+		subLines := strings.Split(string(subOut), "\n")
+		st.SubmodulesClean = true
+		for _, l := range subLines {
+			l = strings.TrimSpace(l)
+			if l == "" {
+				continue
+			}
+			if strings.HasPrefix(l, "+") || strings.HasPrefix(l, "U") || strings.HasPrefix(l, "-") {
+				st.SubmodulesClean = false
+				parts := strings.Fields(l)
+				if len(parts) >= 2 {
+					st.DirtySubmodules = append(st.DirtySubmodules, parts[1])
+				}
+			}
+		}
+	}
+
+	// ASE state
+	statePath := filepath.Join(repoPath, ".autopilot", "state.json")
+	if b, err := os.ReadFile(statePath); err == nil {
+		var s struct {
+			State   string `json:"state"`
+			StoryID string `json:"story_id"`
+		}
+		if json.Unmarshal(b, &s) == nil {
+			st.ASEState = s.State
+			st.ActiveStoryID = s.StoryID
+		}
+	}
+	if st.ASEState == "" {
+		if _, err := os.Stat(filepath.Join(repoPath, ".ase", "active.lock")); err == nil {
+			st.ASEState = "RUNNING"
+		} else if _, err := os.Stat(filepath.Join(repoPath, ".autopilot", "lock")); err == nil {
+			st.ASEState = "RUNNING"
+		} else {
+			st.ASEState = "IDLE"
+		}
+	}
+	return st
 }
