@@ -19,6 +19,8 @@ import (
 )
 
 const agentLabel = "io.iazio.iazio-agent"
+const watcherLabel = "io.iazio.iazio-agent-watcher"
+const watchdogLabel = "io.iazio.iazio-agent-watchdog"
 
 // DefaultFleetAPI is the default canonical fleet control plane API URL.
 const DefaultFleetAPI = ""
@@ -229,6 +231,12 @@ func darwinPlist(bin, logPath string) string {
 	if esEnv := resolveElasticsearchURL(); esEnv != "" {
 		esXml = fmt.Sprintf("\n\t\t<key>IAZIO_ELASTICSEARCH_URL</key>\n\t\t<string>%s</string>", esEnv)
 	}
+	maintenancePath := ""
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		maintenancePath = filepath.Join(home, ".iazio", "maintenance.lock")
+	} else {
+		maintenancePath = filepath.Join(".iazio", "maintenance.lock")
+	}
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -243,11 +251,24 @@ func darwinPlist(bin, logPath string) string {
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
-	<true/>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+		<key>PathState</key>
+		<dict>
+			<key>%s</key>
+			<false/>
+		</dict>
+	</dict>
 	<key>ThrottleInterval</key>
-	<integer>60</integer>
+	<integer>3</integer>
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>65536</integer>
+	</dict>
 	<key>ProcessType</key>
-	<string>Background</string>
+	<string>Standard</string>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>IAZIO_AGENT_NONINTERACTIVE</key>
@@ -259,7 +280,133 @@ func darwinPlist(bin, logPath string) string {
 	<string>%s</string>
 </dict>
 </plist>
-`, agentLabel, bin, apiXml, homeXml, userXml, pathXml, esXml, logPath, logPath)
+`, agentLabel, bin, maintenancePath, apiXml, homeXml, userXml, pathXml, esXml, logPath, logPath)
+}
+
+// DarwinWatcherPlist returns the LaunchAgent plist definition to monitor binary replacements.
+func DarwinWatcherPlist(bin, logPath string) string {
+	domain := "gui/" + strconv.Itoa(os.Getuid())
+	target := domain + "/" + agentLabel
+	launchctlBin := "/bin/launchctl"
+	if p, err := exec.LookPath("launchctl"); err == nil && p != "" {
+		launchctlBin = p
+	}
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>%s</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>%s</string>
+		<string>kickstart</string>
+		<string>-k</string>
+		<string>%s</string>
+	</array>
+	<key>WatchPaths</key>
+	<array>
+		<string>%s</string>
+	</array>
+	<key>StandardOutPath</key>
+	<string>%s</string>
+	<key>StandardErrorPath</key>
+	<string>%s</string>
+</dict>
+</plist>
+`, watcherLabel, launchctlBin, target, bin, logPath, logPath)
+}
+
+// DarwinWatchdogPlist returns the periodic LaunchAgent plist definition that triggers revive-check.
+func DarwinWatchdogPlist(bin, logPath string) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>%s</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>%s</string>
+		<string>service</string>
+		<string>revive-check</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>120</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>%s</string>
+	<key>StandardErrorPath</key>
+	<string>%s</string>
+</dict>
+</plist>
+`, watchdogLabel, bin, logPath, logPath)
+}
+
+// InstallDarwinResilience installs and enables the watcher and watchdog LaunchAgents.
+func InstallDarwinResilience(home, bin string, run func(name string, args ...string) error) error {
+	if run == nil {
+		run = execCommand
+	}
+	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
+	logDir := filepath.Join(home, ".iazio", "logs")
+	logPath := filepath.Join(logDir, "agent.log")
+	if err := os.MkdirAll(launchAgentsDir, 0o755); err != nil {
+		return fmt.Errorf("create LaunchAgents directory: %w", err)
+	}
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return fmt.Errorf("create log directory: %w", err)
+	}
+
+	watcherPlistPath := filepath.Join(launchAgentsDir, watcherLabel+".plist")
+	if err := os.WriteFile(watcherPlistPath, []byte(DarwinWatcherPlist(bin, logPath)), 0o644); err != nil {
+		return fmt.Errorf("write watcher plist: %w", err)
+	}
+
+	watchdogPlistPath := filepath.Join(launchAgentsDir, watchdogLabel+".plist")
+	if err := os.WriteFile(watchdogPlistPath, []byte(DarwinWatchdogPlist(bin, logPath)), 0o644); err != nil {
+		return fmt.Errorf("write watchdog plist: %w", err)
+	}
+
+	domain := "gui/" + strconv.Itoa(os.Getuid())
+	watcherTarget := domain + "/" + watcherLabel
+	watchdogTarget := domain + "/" + watchdogLabel
+
+	_ = run("launchctl", "bootout", watcherTarget)
+	if err := run("launchctl", "bootstrap", domain, watcherPlistPath); err != nil {
+		return fmt.Errorf("launchctl bootstrap watcher: %w", err)
+	}
+	if err := run("launchctl", "enable", watcherTarget); err != nil {
+		return fmt.Errorf("launchctl enable watcher: %w", err)
+	}
+
+	_ = run("launchctl", "bootout", watchdogTarget)
+	if err := run("launchctl", "bootstrap", domain, watchdogPlistPath); err != nil {
+		return fmt.Errorf("launchctl bootstrap watchdog: %w", err)
+	}
+	if err := run("launchctl", "enable", watchdogTarget); err != nil {
+		return fmt.Errorf("launchctl enable watchdog: %w", err)
+	}
+	return nil
+}
+
+// UninstallDarwinResilience unloads and deletes the watcher and watchdog LaunchAgents.
+func UninstallDarwinResilience(home string, run func(name string, args ...string) error) error {
+	if run == nil {
+		run = execCommand
+	}
+	domain := "gui/" + strconv.Itoa(os.Getuid())
+	watcherTarget := domain + "/" + watcherLabel
+	watchdogTarget := domain + "/" + watchdogLabel
+
+	_ = run("launchctl", "bootout", watcherTarget)
+	_ = run("launchctl", "bootout", watchdogTarget)
+
+	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
+	_ = os.Remove(filepath.Join(launchAgentsDir, watcherLabel+".plist"))
+	_ = os.Remove(filepath.Join(launchAgentsDir, watchdogLabel+".plist"))
+	return nil
 }
 
 func agentLogPath() string {
@@ -306,6 +453,9 @@ func InstallDarwinAt(home, bin string, run func(name string, args ...string) err
 	}
 	if err := run("launchctl", "enable", target); err != nil {
 		return fmt.Errorf("launchctl enable: %w", err)
+	}
+	if err := InstallDarwinResilience(home, bin, run); err != nil {
+		return fmt.Errorf("install darwin resilience: %w", err)
 	}
 	return nil
 }
@@ -524,6 +674,7 @@ func DevInstall(srcBinary, home string, run func(name string, args ...string) er
 			return fmt.Errorf("restart service: %w", err)
 		}
 	} else if runtime.GOOS == "darwin" {
+		_ = InstallDarwinResilience(home, dest, run)
 		_ = run("launchctl", "kickstart", "-k", fmt.Sprintf("gui/%d/%s", os.Getuid(), agentLabel))
 	} else if runtime.GOOS == "windows" {
 		_ = run("schtasks", "/Run", "/TN", "iazio-agent")
@@ -553,10 +704,29 @@ func ReviveCheck(home string, run func(name string, args ...string) error) error
 		}
 	}
 	if runtime.GOOS == "linux" && IsSystemdAvailable() {
-		cmd := exec.Command("systemctl", "--user", "is-active", "--quiet", "iazio-agent.service")
-		if err := cmd.Run(); err != nil {
+		_, err := statusCheckCommand("systemctl", "--user", "is-active", "--quiet", "iazio-agent.service")
+		if err != nil {
 			// Inactive! Start it.
 			return run("systemctl", "--user", "start", "iazio-agent.service")
+		}
+	} else if runtime.GOOS == "darwin" {
+		domain := "gui/" + strconv.Itoa(os.Getuid())
+		target := domain + "/" + agentLabel
+		out, err := statusCheckCommand("launchctl", "print", target)
+		outStr := string(out)
+		isDead := err != nil || strings.Contains(outStr, "job state = exited") || !strings.Contains(outStr, "pid =")
+		if isDead {
+			plistPath := filepath.Join(home, "Library", "LaunchAgents", agentLabel+".plist")
+			_ = run("launchctl", "bootstrap", domain, plistPath)
+			return run("launchctl", "kickstart", "-k", target)
+		}
+	} else if runtime.GOOS == "windows" {
+		out, err := statusCheckCommand("schtasks", "/Query", "/TN", "iazio-agent", "/FO", "LIST")
+		if err == nil {
+			running, _, ok := ParseSchtasksStatus(string(out))
+			if ok && !running {
+				return run("schtasks", "/Run", "/TN", "iazio-agent")
+			}
 		}
 	}
 	return nil
@@ -606,11 +776,25 @@ func ResumeService(home string, run func(name string, args ...string) error) err
 	if runtime.GOOS == "linux" && IsSystemdAvailable() {
 		return run("systemctl", "--user", "start", "iazio-agent.service")
 	} else if runtime.GOOS == "darwin" {
-		return run("launchctl", "start", fmt.Sprintf("gui/%d/%s", os.Getuid(), agentLabel))
+		return run("launchctl", "kickstart", "-k", fmt.Sprintf("gui/%d/%s", os.Getuid(), agentLabel))
 	} else if runtime.GOOS == "windows" {
 		return run("schtasks", "/Run", "/TN", "iazio-agent")
 	}
 	return nil
+}
+
+// ParseSchtasksStatus extracts the Status field from `schtasks /Query /FO LIST` output.
+// ok is false when the Status: line is absent so callers fail closed instead of
+// treating unparseable output as a successful status probe.
+func ParseSchtasksStatus(out string) (running bool, status string, ok bool) {
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if strings.HasPrefix(trimmed, "Status:") {
+			statusVal := strings.TrimSpace(strings.TrimPrefix(trimmed, "Status:"))
+			return strings.EqualFold(statusVal, "Running"), statusVal, true
+		}
+	}
+	return false, "", false
 }
 
 // IsWSL reports whether the current environment is Windows Subsystem for Linux (WSL).
@@ -1023,4 +1207,31 @@ var execCommand = func(name string, args ...string) error {
 		return fmt.Errorf("%s %v: %w: %s", name, args, err, string(out))
 	}
 	return nil
+}
+
+var statusCheckCommand = func(name string, args ...string) ([]byte, error) {
+	cmd := exec.Command(name, args...)
+	return cmd.CombinedOutput()
+}
+
+// SetExecCommandForTest sets the command runner and optional status checker for testing,
+// returning a cleanup function to restore originals.
+func SetExecCommandForTest(runner func(name string, args ...string) error, statusChecker ...func(name string, args ...string) ([]byte, error)) func() {
+	origExec := execCommand
+	origStatus := statusCheckCommand
+	if runner != nil {
+		execCommand = runner
+	}
+	if len(statusChecker) > 0 && statusChecker[0] != nil {
+		statusCheckCommand = statusChecker[0]
+	} else if runner != nil {
+		statusCheckCommand = func(name string, args ...string) ([]byte, error) {
+			err := runner(name, args...)
+			return nil, err
+		}
+	}
+	return func() {
+		execCommand = origExec
+		statusCheckCommand = origStatus
+	}
 }

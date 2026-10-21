@@ -18,9 +18,14 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/controlplane"
+	"github.com/viovy/iazio-agent/internal/service"
 	"github.com/viovy/iazio-agent/internal/supervisor"
 )
 
+
+func init() {
+	isTesting = true
+}
 
 func TestMainEntrypoint(t *testing.T) {
 	origArgs := os.Args
@@ -1162,8 +1167,10 @@ func TestExecuteRunAssignmentLifecycle(t *testing.T) {
 
 func TestApplyPlatformFunctions_Direct(t *testing.T) {
 	origExec := execCommand
+	origExecOutput := execCommandOutput
 	t.Cleanup(func() {
 		execCommand = origExec
+		execCommandOutput = origExecOutput
 	})
 
 	var execCalls []string
@@ -1171,6 +1178,18 @@ func TestApplyPlatformFunctions_Direct(t *testing.T) {
 		execCalls = append(execCalls, name+" "+strings.Join(args, " "))
 		return nil
 	}
+	execCommandOutput = func(name string, args ...string) ([]byte, error) {
+		execCalls = append(execCalls, name+" "+strings.Join(args, " "))
+		return []byte("pid = 1234"), nil
+	}
+	restoreServiceExec := service.SetExecCommandForTest(func(name string, args ...string) error {
+		execCalls = append(execCalls, name+" "+strings.Join(args, " "))
+		return nil
+	}, func(name string, args ...string) ([]byte, error) {
+		execCalls = append(execCalls, name+" "+strings.Join(args, " "))
+		return []byte("pid = 1234"), nil
+	})
+	t.Cleanup(restoreServiceExec)
 
 	var stdout bytes.Buffer
 
@@ -1285,12 +1304,23 @@ func TestRunService_NonDryRunLifecycle(t *testing.T) {
 	t.Setenv("IAZIO_DISABLE_SYSTEMD", "1")
 
 	origExec := execCommand
+	origExecOutput := execCommandOutput
 	t.Cleanup(func() {
 		execCommand = origExec
+		execCommandOutput = origExecOutput
 	})
 	execCommand = func(string, ...string) error {
 		return nil
 	}
+	execCommandOutput = func(string, ...string) ([]byte, error) {
+		return []byte("pid = 1234"), nil
+	}
+	restoreServiceExec := service.SetExecCommandForTest(func(string, ...string) error {
+		return nil
+	}, func(string, ...string) ([]byte, error) {
+		return []byte("pid = 1234"), nil
+	})
+	t.Cleanup(restoreServiceExec)
 
 	// Pre-create canonical binary
 	canonicalDir := filepath.Join(fakeHome, ".iazio", "bin")
