@@ -291,6 +291,12 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						}()
 					case "CHECK_FLEET_GIT_STATUS":
 						go func() {
+							target := strings.TrimSpace(cmd.Payload)
+							if target != "" {
+								st := probeRepoRuntime(runCtx, target, filepath.Base(target))
+								_ = client.PostRepoStatus(runCtx, host, []controlplane.RepoRuntimeStatus{st})
+								return
+							}
 							detail, err := client.GetHost(runCtx, host)
 							if err != nil || len(detail.Repos) == 0 {
 								return
