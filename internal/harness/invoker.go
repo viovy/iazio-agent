@@ -221,7 +221,11 @@ func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []
 		cmd.Env = append(cmd.Env, "IAZIO_FLEET_ROOT="+c.WorkDir)
 	}
 	if span := telemetry.SpanFromContext(ctx); span != nil {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("TRACEPARENT=00-%s-%s-01", span.TraceID, span.ID))
+		cmd.Env = append(cmd.Env,
+			fmt.Sprintf("TRACEPARENT=00-%s-%s-01", span.TraceID, span.ID),
+			"ZIPKIN_TRACE_ID="+span.TraceID,
+			"TRACE_ID="+span.TraceID,
+		)
 	}
 
 	cmd.Stdin = bytes.NewReader(stdinData)
@@ -238,6 +242,11 @@ func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []
 
 // EnsurePromptPayload ensures that a prompt payload JSON contains a valid prompt_id field.
 func EnsurePromptPayload(jobID string, raw json.RawMessage) json.RawMessage {
+	return EnsurePromptPayloadWithTrace(jobID, "", raw)
+}
+
+// EnsurePromptPayloadWithTrace ensures that a prompt payload JSON contains a valid prompt_id and trace_id.
+func EnsurePromptPayloadWithTrace(jobID, traceID string, raw json.RawMessage) json.RawMessage {
 	if len(raw) == 0 {
 		return raw
 	}
@@ -245,6 +254,7 @@ func EnsurePromptPayload(jobID string, raw json.RawMessage) json.RawMessage {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return raw
 	}
+	changed := false
 	promptID, _ := m["prompt_id"].(string)
 	if strings.TrimSpace(promptID) == "" {
 		storyID, _ := m["story_id"].(string)
@@ -255,6 +265,14 @@ func EnsurePromptPayload(jobID string, raw json.RawMessage) json.RawMessage {
 		} else {
 			m["prompt_id"] = fmt.Sprintf("prompt-%d", time.Now().UnixNano())
 		}
+		changed = true
+	}
+	pTraceID, _ := m["trace_id"].(string)
+	if strings.TrimSpace(pTraceID) == "" && strings.TrimSpace(traceID) != "" {
+		m["trace_id"] = strings.TrimSpace(traceID)
+		changed = true
+	}
+	if changed {
 		if updated, err := json.Marshal(m); err == nil {
 			return updated
 		}
