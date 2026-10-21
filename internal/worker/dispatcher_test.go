@@ -87,6 +87,10 @@ func (m *mockControlPlane) CompleteJob(ctx context.Context, jobID string, req Co
 	return nil
 }
 
+func (m *mockControlPlane) HeartbeatJob(ctx context.Context, jobID string, fencingToken int64) error {
+	return nil
+}
+
 func TestDispatcher_StoryCreate_Success(t *testing.T) {
 	cp := newMockControlPlane()
 	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
@@ -646,5 +650,170 @@ func TestDispatcher_JobExecutionTimeout(t *testing.T) {
 	}
 	if !strings.Contains(comp.Error, "context deadline exceeded") && !strings.Contains(comp.Error, "deadline exceeded") {
 		t.Fatalf("expected deadline exceeded error in completion report, got: %s", comp.Error)
+	}
+}
+
+func TestDispatcher_ToolsUpdate_Success(t *testing.T) {
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:           "job-tu-1",
+			Type:         JobTypeToolsUpdate,
+			Payload:      json.RawMessage(`{"tools":["autopilot"],"force":true}`),
+			FencingToken: 42,
+		}, nil
+	}
+
+	toolUpdateCalled := false
+	inv := &mockInvoker{}
+	d := NewDispatcher(cp, inv, "host-1")
+	d.SetToolUpdater(func(ctx context.Context, tools []string, force bool) error {
+		toolUpdateCalled = true
+		if len(tools) != 1 || tools[0] != "autopilot" || !force {
+			t.Errorf("unexpected tool update params: tools=%v force=%v", tools, force)
+		}
+		return nil
+	})
+
+	processed, err := d.PollAndProcess(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected job to be processed")
+	}
+	if !toolUpdateCalled {
+		t.Fatal("expected tool updater to be called")
+	}
+
+	comp, ok := cp.completedJobs["job-tu-1"]
+	if !ok {
+		t.Fatal("expected completion report for job-tu-1")
+	}
+	if comp.FencingToken != 42 {
+		t.Fatalf("expected fencing token 42, got %d", comp.FencingToken)
+	}
+}
+
+func TestHTTPControlPlaneClient_AllMethods(t *testing.T) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/v1/agent/jobs/claim", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var req ClaimRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		if req.HostID == "empty" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if req.HostID == "blank-job" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(Job{})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(Job{
+			ID:           "claimed-1",
+			Type:         JobTypePromptExecute,
+			FencingToken: 12,
+		})
+	})
+
+	mux.HandleFunc("/api/v1/agent/jobs/job-1/complete", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		var req CompleteRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		if req.FencingToken == 999 {
+			http.Error(w, "fenced", http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mux.HandleFunc("/api/v1/agent/jobs/job-1/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		var req HeartbeatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		if req.FencingToken == 999 {
+			http.Error(w, "fenced", http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := NewHTTPControlPlaneClient(srv.URL, "test-token", srv.Client())
+
+	ctx := context.Background()
+
+	// 1. Claim success
+	job, err := client.ClaimJob(ctx, ClaimRequest{HostID: "host-1"})
+	if err != nil {
+		t.Fatalf("ClaimJob error: %v", err)
+	}
+	if job == nil || job.ID != "claimed-1" || job.FencingToken != 12 {
+		t.Fatalf("unexpected claimed job: %+v", job)
+	}
+
+	// 2. Claim NoContent
+	jobNC, err := client.ClaimJob(ctx, ClaimRequest{HostID: "empty"})
+	if err != nil {
+		t.Fatalf("ClaimJob NoContent error: %v", err)
+	}
+	if jobNC != nil {
+		t.Fatalf("expected nil job for NoContent, got %+v", jobNC)
+	}
+
+	// 3. Claim blank job
+	jobBlank, err := client.ClaimJob(ctx, ClaimRequest{HostID: "blank-job"})
+	if err != nil {
+		t.Fatalf("ClaimJob blank error: %v", err)
+	}
+	if jobBlank != nil {
+		t.Fatalf("expected nil job for blank, got %+v", jobBlank)
+	}
+
+	// 4. Complete success
+	if err := client.CompleteJob(ctx, "job-1", CompleteRequest{FencingToken: 12, Result: json.RawMessage(`{"ok":true}`)}); err != nil {
+		t.Fatalf("CompleteJob error: %v", err)
+	}
+
+	// 5. Complete failure (fenced)
+	if err := client.CompleteJob(ctx, "job-1", CompleteRequest{FencingToken: 999, Result: json.RawMessage(`{"ok":true}`)}); err == nil {
+		t.Fatal("expected error for fenced completion")
+	}
+
+	// 6. Heartbeat success
+	if err := client.HeartbeatJob(ctx, "job-1", 12); err != nil {
+		t.Fatalf("HeartbeatJob error: %v", err)
+	}
+
+	// 7. Heartbeat failure (fenced)
+	if err := client.HeartbeatJob(ctx, "job-1", 999); err == nil {
+		t.Fatal("expected error for fenced heartbeat")
 	}
 }

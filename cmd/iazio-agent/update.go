@@ -545,16 +545,64 @@ func fetchRelease(ctx context.Context, client *http.Client, repo, version, token
 }
 
 func findMatchingAsset(rel *gitHubRelease, toolName, targetOS, targetArch string) (*gitHubAsset, error) {
+	normTool := strings.ToLower(strings.TrimSpace(toolName))
+
+	isPlatformMatch := func(lower string) bool {
+		if strings.HasSuffix(lower, ".txt") || strings.HasSuffix(lower, ".sig") {
+			return false
+		}
+		osMatch := strings.Contains(lower, targetOS)
+		archMatch := strings.Contains(lower, targetArch) || (targetArch == "amd64" && strings.Contains(lower, "x86_64"))
+		return osMatch && archMatch
+	}
+
+	// 1. Exact component prefix: <toolName>_<version>... or <toolName>-<version>...
+	if normTool != "" {
+		for i := range rel.Assets {
+			a := &rel.Assets[i]
+			lower := strings.ToLower(a.Name)
+			if !isPlatformMatch(lower) {
+				continue
+			}
+			if strings.HasPrefix(lower, normTool+"_") || strings.HasPrefix(lower, normTool+"-") || strings.HasPrefix(lower, normTool+".") {
+				return a, nil
+			}
+		}
+
+		// 2. Contains toolName
+		for i := range rel.Assets {
+			a := &rel.Assets[i]
+			lower := strings.ToLower(a.Name)
+			if !isPlatformMatch(lower) {
+				continue
+			}
+			if strings.Contains(lower, normTool) {
+				return a, nil
+			}
+		}
+	}
+
+	// 3. Multi-binary bundle or suite archive fallback (e.g. contains "build-release" or "bundle" or "plugins")
 	for i := range rel.Assets {
 		a := &rel.Assets[i]
 		lower := strings.ToLower(a.Name)
-		if strings.HasSuffix(lower, ".txt") || strings.HasSuffix(lower, ".sig") {
+		if !isPlatformMatch(lower) {
 			continue
 		}
-		if strings.Contains(lower, targetOS) && (strings.Contains(lower, targetArch) || (targetArch == "amd64" && strings.Contains(lower, "x86_64"))) {
+		if strings.Contains(lower, "build-release") || strings.Contains(lower, "bundle") || strings.Contains(lower, "plugins") {
 			return a, nil
 		}
 	}
+
+	// 4. Default: first platform matching asset
+	for i := range rel.Assets {
+		a := &rel.Assets[i]
+		lower := strings.ToLower(a.Name)
+		if isPlatformMatch(lower) {
+			return a, nil
+		}
+	}
+
 	return nil, fmt.Errorf("no asset matching %s/%s in release %s", targetOS, targetArch, rel.TagName)
 }
 

@@ -174,6 +174,40 @@ func TestFindMatchingAsset(t *testing.T) {
 	}
 }
 
+func TestFindMatchingAsset_MultiComponentSuite(t *testing.T) {
+	rel := &gitHubRelease{
+		TagName: "v0.0.479",
+		Assets: []gitHubAsset{
+			{Name: "autopilot-backlog_0.0.479_linux_amd64.tar.gz"},
+			{Name: "autopilot-fleet_0.0.479_linux_amd64.tar.gz"},
+			{Name: "autopilot-story_0.0.479_linux_amd64.tar.gz"},
+			{Name: "autopilot-plugins-internal-build-release_0.0.479_linux_amd64.tar.gz"},
+		},
+	}
+
+	// 1. Specific tool matches its dedicated component asset, NOT the first asset (backlog)
+	assetFleet, err := findMatchingAsset(rel, "autopilot-fleet", "linux", "amd64")
+	if err != nil || assetFleet.Name != "autopilot-fleet_0.0.479_linux_amd64.tar.gz" {
+		t.Fatalf("expected fleet archive, got %+v, err: %v", assetFleet, err)
+	}
+
+	assetStory, err := findMatchingAsset(rel, "autopilot-story", "linux", "amd64")
+	if err != nil || assetStory.Name != "autopilot-story_0.0.479_linux_amd64.tar.gz" {
+		t.Fatalf("expected story archive, got %+v, err: %v", assetStory, err)
+	}
+
+	assetBacklog, err := findMatchingAsset(rel, "autopilot-backlog", "linux", "amd64")
+	if err != nil || assetBacklog.Name != "autopilot-backlog_0.0.479_linux_amd64.tar.gz" {
+		t.Fatalf("expected backlog archive, got %+v, err: %v", assetBacklog, err)
+	}
+
+	// 2. Unmatched tool falls back to combined bundle
+	assetBundle, err := findMatchingAsset(rel, "autopilot-extra-plugin", "linux", "amd64")
+	if err != nil || assetBundle.Name != "autopilot-plugins-internal-build-release_0.0.479_linux_amd64.tar.gz" {
+		t.Fatalf("expected bundle fallback, got %+v, err: %v", assetBundle, err)
+	}
+}
+
 func TestFindChecksumsAsset(t *testing.T) {
 	rel := &gitHubRelease{
 		Assets: []gitHubAsset{
