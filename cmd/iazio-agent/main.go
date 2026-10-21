@@ -291,7 +291,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						}()
 					case "CHECK_FLEET_GIT_STATUS":
 						go func() {
-							target := strings.TrimSpace(cmd.Payload)
+							target := strings.Trim(strings.TrimSpace(string(cmd.Payload)), "\"")
 							if target != "" {
 								st := probeRepoRuntime(runCtx, target, filepath.Base(target))
 								_ = client.PostRepoStatus(runCtx, host, []controlplane.RepoRuntimeStatus{st})
@@ -500,7 +500,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				return sup.Spawn(r, a.ID, api, a.WorktreePath, a.DocsHubPath, "")
 			}
 
-			return client.Loop(runCtx, host, kind, 30*time.Second, onJob, profile)
+			return client.Loop(runCtx, host, kind, 3*time.Second, onJob, profile)
 		}
 
 		if ctx.Err() != nil {
@@ -906,7 +906,7 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Client, sup *supervisor.Sup, host, api string, stdout io.Writer) bool {
 	if sup != nil && sup.HasRunningHarness() {
 		if stdout != nil {
-			fmt.Fprintln(stdout, "[supervisor] harness execution is active; deferring background tool update")
+			fmt.Fprintln(stdout, "[SIR: IDLE_UPDATE_DEFERRED] reason=\"harness execution is active\"")
 		}
 		return false
 	}
@@ -914,7 +914,7 @@ func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Cli
 		detail, err := client.GetHost(ctx, host)
 		if err != nil {
 			if stdout != nil {
-				fmt.Fprintf(stdout, "[supervisor] warning: failed to fetch host details from control plane (%v); deferring tool update\n", err)
+				fmt.Fprintf(stdout, "[SIR: IDLE_UPDATE_DEFERRED] reason=\"failed to fetch host details: %v\"\n", err)
 			}
 			return false
 		}
@@ -930,14 +930,14 @@ func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Cli
 				lock := sup.Lock(path)
 				if lock == supervisor.LockRunning || lock == supervisor.LockCooling || lock == supervisor.LockPending {
 					if stdout != nil {
-						fmt.Fprintf(stdout, "[supervisor] worktree %s is busy (%s); deferring background tool update\n", path, lock)
+						fmt.Fprintf(stdout, "[SIR: IDLE_UPDATE_DEFERRED] worktree=\"%s\" lock=\"%s\"\n", path, lock)
 					}
 					return false
 				}
 			}
 			if !scanRepoFleetStatus(ctx, path) {
 				if stdout != nil {
-					fmt.Fprintf(stdout, "[supervisor] worktree %s is dirty; deferring background tool update\n", path)
+					fmt.Fprintf(stdout, "[SIR: IDLE_UPDATE_DEFERRED] worktree=\"%s\" reason=\"worktree is dirty\"\n", path)
 				}
 				return false
 			}
@@ -951,15 +951,18 @@ func restartOrExecSelf(stdout io.Writer) {
 		fmt.Fprintln(stdout, "[supervisor] iazio-agent self-updated; executing in-PID handoff to updated binary...")
 	}
 	if runtime.GOOS != "windows" {
-		if selfBin, err := os.Executable(); err == nil {
-			if resolved, err := filepath.EvalSymlinks(selfBin); err == nil {
-				selfBin = resolved
-			}
-			execErr := syscall.Exec(selfBin, os.Args, os.Environ())
-			if execErr != nil {
-				fmt.Fprintf(os.Stderr, "[SIR: AUTO_RESTART_FAIL] syscall.Exec(%s) failed: %v; exiting non-zero for systemd recovery\n", selfBin, execErr)
-				os.Exit(1)
-			}
+		selfBin, err := os.Executable()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[SIR: AUTO_RESTART_FAIL] os.Executable() failed: %v; exiting non-zero for systemd recovery\n", err)
+			os.Exit(1)
+		}
+		if resolved, err := filepath.EvalSymlinks(selfBin); err == nil {
+			selfBin = resolved
+		}
+		execErr := syscall.Exec(selfBin, os.Args, os.Environ())
+		if execErr != nil {
+			fmt.Fprintf(os.Stderr, "[SIR: AUTO_RESTART_FAIL] syscall.Exec(%s) failed: %v; exiting non-zero for systemd recovery\n", selfBin, execErr)
+			os.Exit(1)
 		}
 	}
 }

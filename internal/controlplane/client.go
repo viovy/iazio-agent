@@ -250,8 +250,11 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 	}
 
 	hbInterval := every
-	if hbInterval > 15*time.Second {
-		hbInterval = 15 * time.Second
+	if hbInterval > 3*time.Second {
+		hbInterval = 3 * time.Second
+	}
+	if hbInterval < 1*time.Second {
+		hbInterval = 1 * time.Second
 	}
 
 	sendHB := func() {
