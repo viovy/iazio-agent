@@ -168,6 +168,13 @@ func (r *Resolver) DetectDirtyWorktreeContext(worktree string) DirtyContext {
 					ctx.StoryID = sid
 					break
 				}
+				fullPath := filepath.Join(worktree, rel)
+				if b, err := os.ReadFile(fullPath); err == nil {
+					if sid := ExtractStoryID(string(b)); sid != "" {
+						ctx.StoryID = sid
+						break
+					}
+				}
 			}
 		}
 	}
