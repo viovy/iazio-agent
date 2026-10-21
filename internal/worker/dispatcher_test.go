@@ -694,3 +694,126 @@ func TestDispatcher_ToolsUpdate_Success(t *testing.T) {
 		t.Fatalf("expected fencing token 42, got %d", comp.FencingToken)
 	}
 }
+
+func TestHTTPControlPlaneClient_AllMethods(t *testing.T) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/v1/agent/jobs/claim", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var req ClaimRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		if req.HostID == "empty" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if req.HostID == "blank-job" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(Job{})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(Job{
+			ID:           "claimed-1",
+			Type:         JobTypePromptExecute,
+			FencingToken: 12,
+		})
+	})
+
+	mux.HandleFunc("/api/v1/agent/jobs/job-1/complete", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		var req CompleteRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		if req.FencingToken == 999 {
+			http.Error(w, "fenced", http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mux.HandleFunc("/api/v1/agent/jobs/job-1/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		var req HeartbeatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		if req.FencingToken == 999 {
+			http.Error(w, "fenced", http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := NewHTTPControlPlaneClient(srv.URL, "test-token", srv.Client())
+
+	ctx := context.Background()
+
+	// 1. Claim success
+	job, err := client.ClaimJob(ctx, ClaimRequest{HostID: "host-1"})
+	if err != nil {
+		t.Fatalf("ClaimJob error: %v", err)
+	}
+	if job == nil || job.ID != "claimed-1" || job.FencingToken != 12 {
+		t.Fatalf("unexpected claimed job: %+v", job)
+	}
+
+	// 2. Claim NoContent
+	jobNC, err := client.ClaimJob(ctx, ClaimRequest{HostID: "empty"})
+	if err != nil {
+		t.Fatalf("ClaimJob NoContent error: %v", err)
+	}
+	if jobNC != nil {
+		t.Fatalf("expected nil job for NoContent, got %+v", jobNC)
+	}
+
+	// 3. Claim blank job
+	jobBlank, err := client.ClaimJob(ctx, ClaimRequest{HostID: "blank-job"})
+	if err != nil {
+		t.Fatalf("ClaimJob blank error: %v", err)
+	}
+	if jobBlank != nil {
+		t.Fatalf("expected nil job for blank, got %+v", jobBlank)
+	}
+
+	// 4. Complete success
+	if err := client.CompleteJob(ctx, "job-1", CompleteRequest{FencingToken: 12, Result: json.RawMessage(`{"ok":true}`)}); err != nil {
+		t.Fatalf("CompleteJob error: %v", err)
+	}
+
+	// 5. Complete failure (fenced)
+	if err := client.CompleteJob(ctx, "job-1", CompleteRequest{FencingToken: 999, Result: json.RawMessage(`{"ok":true}`)}); err == nil {
+		t.Fatal("expected error for fenced completion")
+	}
+
+	// 6. Heartbeat success
+	if err := client.HeartbeatJob(ctx, "job-1", 12); err != nil {
+		t.Fatalf("HeartbeatJob error: %v", err)
+	}
+
+	// 7. Heartbeat failure (fenced)
+	if err := client.HeartbeatJob(ctx, "job-1", 999); err == nil {
+		t.Fatal("expected error for fenced heartbeat")
+	}
+}

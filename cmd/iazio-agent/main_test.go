@@ -1543,6 +1543,63 @@ func TestProbeRepoRuntime(t *testing.T) {
 	}
 }
 
+func TestProbeRepoRuntime_HarnessOutput(t *testing.T) {
+	tempHome := t.TempDir()
+	binDir := filepath.Join(tempHome, ".iazio", "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("failed to create bin dir: %v", err)
+	}
+	mockHarness := filepath.Join(binDir, "iazio-harness")
+	script := `#!/bin/sh
+cat << 'EOF'
+{
+  "branch": "feat/mock-test",
+  "is_clean": false,
+  "ahead": 1,
+  "behind": 0,
+  "modified_files": ["main.go"],
+  "untracked_files": ["foo.txt"],
+  "submodules_clean": false,
+  "dirty_submodules": ["submod1"],
+  "ase_state": "active",
+  "active_story_id": "STORY-1",
+  "agent_tool": "autopilot",
+  "tool_liveness": "alive",
+  "execution_provenance": "prov",
+  "active_conversation_id": "conv-123"
+}
+EOF
+`
+	if err := os.WriteFile(mockHarness, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write mock harness: %v", err)
+	}
+
+	t.Setenv("HOME", tempHome)
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+origPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	st := probeRepoRuntime(ctx, "/any/path", "test-alias")
+	if st.Branch != "feat/mock-test" {
+		t.Fatalf("expected branch feat/mock-test, got %s", st.Branch)
+	}
+	if st.IsClean {
+		t.Fatal("expected IsClean false")
+	}
+	if st.SubmodulesClean {
+		t.Fatal("expected SubmodulesClean false")
+	}
+	if len(st.DirtySubmodules) != 1 || st.DirtySubmodules[0] != "submod1" {
+		t.Fatalf("unexpected dirty submodules: %v", st.DirtySubmodules)
+	}
+	if !strings.Contains(st.Porcelain, "M main.go") || !strings.Contains(st.Porcelain, "?? foo.txt") {
+		t.Fatalf("expected porcelain to contain modified and untracked files, got %s", st.Porcelain)
+	}
+}
+
+
 
 
 
