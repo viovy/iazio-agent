@@ -604,7 +604,7 @@ func runService(args []string, stdout io.Writer, getenv func(string) string) err
 			bin = canonical
 		}
 	}
-	if !dry && action == "install" {
+	if !dry && (action == "install" || action == "restart") {
 		installed, err := installCanonicalBinary()
 		if err != nil {
 			return err
@@ -764,7 +764,9 @@ func kickstartDarwin() error {
 		return fmt.Errorf("LaunchAgent is not installed")
 	}
 	_ = execCommand("launchctl", "bootstrap", "gui/"+strconv.Itoa(os.Getuid()), plist)
-	_ = service.InstallDarwinResilience(home, filepath.Join(home, ".iazio", "bin", "iazio-agent"), execCommand)
+	if err := service.InstallDarwinResilience(home, filepath.Join(home, ".iazio", "bin", "iazio-agent"), execCommand); err != nil {
+		return fmt.Errorf("install darwin resilience: %w", err)
+	}
 	return execCommand("launchctl", "kickstart", "-k", darwinTarget())
 }
 

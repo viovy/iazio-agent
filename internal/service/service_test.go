@@ -854,6 +854,12 @@ func TestDevInstallHotSwap(t *testing.T) {
 	if !strings.Contains(string(data), "echo dev") {
 		t.Fatalf("unexpected content in installed binary: %s", string(data))
 	}
+	joined := strings.Join(commands, "\n")
+	if runtime.GOOS == "darwin" {
+		if !strings.Contains(joined, "bootstrap") || !strings.Contains(joined, "kickstart") {
+			t.Fatalf("expected bootstrap and kickstart commands on darwin, got:\n%s", joined)
+		}
+	}
 }
 
 func contains(s, sub string) bool {
@@ -890,8 +896,8 @@ func TestDarwinResilienceUnits(t *testing.T) {
 	if !strings.Contains(watcherPlist, "<key>WatchPaths</key>") || !strings.Contains(watcherPlist, bin) {
 		t.Fatalf("expected WatchPaths with %s, got %s", bin, watcherPlist)
 	}
-	if !strings.Contains(watcherPlist, "kickstart") {
-		t.Fatalf("expected kickstart in watcher plist, got %s", watcherPlist)
+	if !strings.Contains(watcherPlist, "revive-check") {
+		t.Fatalf("expected revive-check in watcher plist, got %s", watcherPlist)
 	}
 
 	watchdogPlist := DarwinWatchdogPlist(bin, logPath)
@@ -963,8 +969,10 @@ func TestReviveCheckDarwin(t *testing.T) {
 		t.Fatalf("ReviveCheck failed: %v", err)
 	}
 	joined := strings.Join(runCommands, "\n")
-	if runtime.GOOS == "darwin" && !strings.Contains(joined, "kickstart") {
-		t.Fatalf("expected kickstart on dead darwin service, got:\n%s", joined)
+	if runtime.GOOS == "darwin" {
+		if !strings.Contains(joined, "bootout") || !strings.Contains(joined, "bootstrap") || !strings.Contains(joined, "kickstart") {
+			t.Fatalf("expected bootout, bootstrap, and kickstart on dead darwin service, got:\n%s", joined)
+		}
 	}
 
 	// 2. Service is running -> ReviveCheck does nothing
@@ -989,6 +997,12 @@ func TestDarwinPlistHardening(t *testing.T) {
 	}
 	if !strings.Contains(plist, "<key>PathState</key>") || !strings.Contains(plist, "maintenance.lock") {
 		t.Errorf("expected PathState maintenance.lock in plist, got:\n%s", plist)
+	}
+	if !strings.Contains(plist, "<false/>") {
+		t.Errorf("expected <false/> for maintenance.lock PathState in plist, got:\n%s", plist)
+	}
+	if strings.Contains(plist, "SuccessfulExit") {
+		t.Errorf("expected SuccessfulExit to be absent for Restart=always parity in plist, got:\n%s", plist)
 	}
 	if !strings.Contains(plist, "<key>SoftResourceLimits</key>") || !strings.Contains(plist, "<integer>65536</integer>") {
 		t.Errorf("expected SoftResourceLimits in plist, got:\n%s", plist)

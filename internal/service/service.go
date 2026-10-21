@@ -252,8 +252,6 @@ func darwinPlist(bin, logPath string) string {
 	<true/>
 	<key>KeepAlive</key>
 	<dict>
-		<key>SuccessfulExit</key>
-		<false/>
 		<key>PathState</key>
 		<dict>
 			<key>%s</key>
@@ -285,12 +283,6 @@ func darwinPlist(bin, logPath string) string {
 
 // DarwinWatcherPlist returns the LaunchAgent plist definition to monitor binary replacements.
 func DarwinWatcherPlist(bin, logPath string) string {
-	domain := "gui/" + strconv.Itoa(os.Getuid())
-	target := domain + "/" + agentLabel
-	launchctlBin := "/bin/launchctl"
-	if p, err := exec.LookPath("launchctl"); err == nil && p != "" {
-		launchctlBin = p
-	}
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -300,9 +292,8 @@ func DarwinWatcherPlist(bin, logPath string) string {
 	<key>ProgramArguments</key>
 	<array>
 		<string>%s</string>
-		<string>kickstart</string>
-		<string>-k</string>
-		<string>%s</string>
+		<string>service</string>
+		<string>revive-check</string>
 	</array>
 	<key>WatchPaths</key>
 	<array>
@@ -314,7 +305,7 @@ func DarwinWatcherPlist(bin, logPath string) string {
 	<string>%s</string>
 </dict>
 </plist>
-`, watcherLabel, launchctlBin, target, bin, logPath, logPath)
+`, watcherLabel, bin, bin, logPath, logPath)
 }
 
 // DarwinWatchdogPlist returns the periodic LaunchAgent plist definition that triggers revive-check.
@@ -674,8 +665,12 @@ func DevInstall(srcBinary, home string, run func(name string, args ...string) er
 			return fmt.Errorf("restart service: %w", err)
 		}
 	} else if runtime.GOOS == "darwin" {
-		_ = InstallDarwinResilience(home, dest, run)
-		_ = run("launchctl", "kickstart", "-k", fmt.Sprintf("gui/%d/%s", os.Getuid(), agentLabel))
+		if err := InstallDarwinResilience(home, dest, run); err != nil {
+			return fmt.Errorf("install darwin resilience: %w", err)
+		}
+		if err := run("launchctl", "kickstart", "-k", fmt.Sprintf("gui/%d/%s", os.Getuid(), agentLabel)); err != nil {
+			return fmt.Errorf("kickstart service: %w", err)
+		}
 	} else if runtime.GOOS == "windows" {
 		_ = run("schtasks", "/Run", "/TN", "iazio-agent")
 	}
@@ -717,7 +712,10 @@ func ReviveCheck(home string, run func(name string, args ...string) error) error
 		isDead := err != nil || strings.Contains(outStr, "job state = exited") || !strings.Contains(outStr, "pid =")
 		if isDead {
 			plistPath := filepath.Join(home, "Library", "LaunchAgents", agentLabel+".plist")
-			_ = run("launchctl", "bootstrap", domain, plistPath)
+			_ = run("launchctl", "bootout", target)
+			if err := run("launchctl", "bootstrap", domain, plistPath); err != nil {
+				return fmt.Errorf("launchctl bootstrap: %w", err)
+			}
 			return run("launchctl", "kickstart", "-k", target)
 		}
 	} else if runtime.GOOS == "windows" {
