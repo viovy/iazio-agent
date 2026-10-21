@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -853,6 +854,12 @@ func TestDevInstallHotSwap(t *testing.T) {
 	if !strings.Contains(string(data), "echo dev") {
 		t.Fatalf("unexpected content in installed binary: %s", string(data))
 	}
+	joined := strings.Join(commands, "\n")
+	if runtime.GOOS == "darwin" {
+		if !strings.Contains(joined, "bootstrap") || !strings.Contains(joined, "kickstart") {
+			t.Fatalf("expected bootstrap and kickstart commands on darwin, got:\n%s", joined)
+		}
+	}
 }
 
 func contains(s, sub string) bool {
@@ -875,4 +882,129 @@ func decodeUTF16LE(b []byte) string {
 		units[i] = uint16(b[i*2]) | uint16(b[i*2+1])<<8
 	}
 	return string(utf16.Decode(units))
+}
+
+func TestDarwinResilienceUnits(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+	logPath := filepath.Join(home, ".iazio", "logs", "agent.log")
+
+	watcherPlist := DarwinWatcherPlist(bin, logPath)
+	if !strings.Contains(watcherPlist, watcherLabel) {
+		t.Fatalf("expected watcher label, got %s", watcherPlist)
+	}
+	if !strings.Contains(watcherPlist, "<key>WatchPaths</key>") || !strings.Contains(watcherPlist, bin) {
+		t.Fatalf("expected WatchPaths with %s, got %s", bin, watcherPlist)
+	}
+	if !strings.Contains(watcherPlist, "revive-check") {
+		t.Fatalf("expected revive-check in watcher plist, got %s", watcherPlist)
+	}
+
+	watchdogPlist := DarwinWatchdogPlist(bin, logPath)
+	if !strings.Contains(watchdogPlist, watchdogLabel) {
+		t.Fatalf("expected watchdog label, got %s", watchdogPlist)
+	}
+	if !strings.Contains(watchdogPlist, "<key>StartInterval</key>\n\t<integer>120</integer>") {
+		t.Fatalf("expected StartInterval 120, got %s", watchdogPlist)
+	}
+	if !strings.Contains(watchdogPlist, "revive-check") {
+		t.Fatalf("expected revive-check, got %s", watchdogPlist)
+	}
+
+	var commands []string
+	runner := func(name string, args ...string) error {
+		commands = append(commands, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	if err := InstallDarwinResilience(home, bin, runner); err != nil {
+		t.Fatalf("InstallDarwinResilience failed: %v", err)
+	}
+
+	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
+	if _, err := os.Stat(filepath.Join(launchAgentsDir, watcherLabel+".plist")); err != nil {
+		t.Fatalf("watcher plist missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(launchAgentsDir, watchdogLabel+".plist")); err != nil {
+		t.Fatalf("watchdog plist missing: %v", err)
+	}
+
+	joined := strings.Join(commands, "\n")
+	if !strings.Contains(joined, "bootstrap") || !strings.Contains(joined, "enable") {
+		t.Fatalf("expected bootstrap and enable commands, got:\n%s", joined)
+	}
+
+	// Uninstall resilience
+	commands = nil
+	if err := UninstallDarwinResilience(home, runner); err != nil {
+		t.Fatalf("UninstallDarwinResilience failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(launchAgentsDir, watcherLabel+".plist")); !os.IsNotExist(err) {
+		t.Fatalf("expected watcher plist removed")
+	}
+	if _, err := os.Stat(filepath.Join(launchAgentsDir, watchdogLabel+".plist")); !os.IsNotExist(err) {
+		t.Fatalf("expected watchdog plist removed")
+	}
+}
+
+func TestReviveCheckDarwin(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+	_ = os.MkdirAll(filepath.Dir(bin), 0755)
+	_ = os.WriteFile(bin, []byte("#!/bin/sh\n"), 0755)
+
+	var runCommands []string
+	runner := func(name string, args ...string) error {
+		runCommands = append(runCommands, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	// 1. Service is dead (status check returns exited/no pid) -> ReviveCheck triggers kickstart
+	restore := SetExecCommandForTest(runner, func(name string, args ...string) ([]byte, error) {
+		return []byte("job state = exited\nlast exit code = 78"), nil
+	})
+	defer restore()
+
+	if err := ReviveCheck(home, runner); err != nil {
+		t.Fatalf("ReviveCheck failed: %v", err)
+	}
+	joined := strings.Join(runCommands, "\n")
+	if runtime.GOOS == "darwin" {
+		if !strings.Contains(joined, "bootout") || !strings.Contains(joined, "bootstrap") || !strings.Contains(joined, "kickstart") {
+			t.Fatalf("expected bootout, bootstrap, and kickstart on dead darwin service, got:\n%s", joined)
+		}
+	}
+
+	// 2. Service is running -> ReviveCheck does nothing
+	runCommands = nil
+	restore2 := SetExecCommandForTest(runner, func(name string, args ...string) ([]byte, error) {
+		return []byte("pid = 4567\nstate = running"), nil
+	})
+	defer restore2()
+
+	if err := ReviveCheck(home, runner); err != nil {
+		t.Fatalf("ReviveCheck running failed: %v", err)
+	}
+	if runtime.GOOS == "darwin" && len(runCommands) != 0 {
+		t.Fatalf("expected 0 commands when service running, got: %v", runCommands)
+	}
+}
+
+func TestDarwinPlistHardening(t *testing.T) {
+	plist := darwinPlist("/opt/iazio/bin/iazio-agent", "/opt/iazio/logs/agent.log")
+	if !strings.Contains(plist, "<key>ThrottleInterval</key>\n\t<integer>3</integer>") {
+		t.Errorf("expected ThrottleInterval 3s in plist, got:\n%s", plist)
+	}
+	if !strings.Contains(plist, "<key>PathState</key>") || !strings.Contains(plist, "maintenance.lock") {
+		t.Errorf("expected PathState maintenance.lock in plist, got:\n%s", plist)
+	}
+	if !strings.Contains(plist, "<false/>") {
+		t.Errorf("expected <false/> for maintenance.lock PathState in plist, got:\n%s", plist)
+	}
+	if strings.Contains(plist, "SuccessfulExit") {
+		t.Errorf("expected SuccessfulExit to be absent for Restart=always parity in plist, got:\n%s", plist)
+	}
+	if !strings.Contains(plist, "<key>SoftResourceLimits</key>") || !strings.Contains(plist, "<integer>65536</integer>") {
+		t.Errorf("expected SoftResourceLimits in plist, got:\n%s", plist)
+	}
 }

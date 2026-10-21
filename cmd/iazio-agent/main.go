@@ -44,6 +44,7 @@ func main() {
 }
 
 var initialUpdateDelay = 5 * time.Second
+var isTesting = false
 
 func execute(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
 	if getenv == nil {
@@ -74,9 +75,11 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		return runUpdate(ctx, args[1:], stdout, stderr, getenv)
 	case "run":
 		defer func() {
-			if getenv("IAZIO_AGENT_NONINTERACTIVE") != "1" && runtime.GOOS == "linux" && service.IsSystemdAvailable() {
-				home, _ := os.UserHomeDir()
-				_ = service.ReviveCheck(home, nil)
+			if !isTesting && getenv("IAZIO_AGENT_NONINTERACTIVE") != "1" {
+				if (runtime.GOOS == "linux" && service.IsSystemdAvailable()) || runtime.GOOS == "darwin" {
+					home, _ := os.UserHomeDir()
+					_ = service.ReviveCheck(home, execCommand)
+				}
 			}
 		}()
 		kind := supervisor.HostKind(getenv("IAZIO_AGENT_HOST_KIND"))
@@ -601,7 +604,7 @@ func runService(args []string, stdout io.Writer, getenv func(string) string) err
 			bin = canonical
 		}
 	}
-	if !dry && action == "install" {
+	if !dry && (action == "install" || action == "restart") {
 		installed, err := installCanonicalBinary()
 		if err != nil {
 			return err
@@ -708,18 +711,29 @@ func applyDarwin(action, bin string) error {
 	switch action {
 	case "install", "restart":
 		_ = bootoutDarwin(false)
-		return service.InstallDarwin(bin)
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		return service.InstallDarwinAt(home, bin, execCommand)
 	case "start":
 		return kickstartDarwin()
 	case "stop", "uninstall":
 		return bootoutDarwin(action == "uninstall")
 	case "status":
-		out, err := exec.Command("launchctl", "print", darwinTarget()).CombinedOutput()
+		out, err := execCommandOutput("launchctl", "print", darwinTarget())
 		if err != nil {
 			return fmt.Errorf("service not loaded: %s", strings.TrimSpace(string(out)))
 		}
 		if strings.Contains(string(out), "pid =") && !strings.Contains(string(out), "job state = exited") {
-			fmt.Println("running")
+			fmt.Println("running (io.iazio.iazio-agent)")
+			wOut, wErr := execCommandOutput("launchctl", "print", darwinWatcherTarget())
+			if wErr == nil && !strings.Contains(string(wOut), "job state = exited") {
+				fmt.Println("active (io.iazio.iazio-agent-watcher)")
+			}
+			if wdOut, wdErr := execCommandOutput("launchctl", "print", darwinWatchdogTarget()); wdErr == nil && !strings.Contains(string(wdOut), "job state = exited") {
+				fmt.Println("active (io.iazio.iazio-agent-watchdog)")
+			}
 			return nil
 		}
 		return fmt.Errorf("installed but not running")
@@ -732,6 +746,14 @@ func darwinTarget() string {
 	return "gui/" + strconv.Itoa(os.Getuid()) + "/io.iazio.iazio-agent"
 }
 
+func darwinWatcherTarget() string {
+	return "gui/" + strconv.Itoa(os.Getuid()) + "/io.iazio.iazio-agent-watcher"
+}
+
+func darwinWatchdogTarget() string {
+	return "gui/" + strconv.Itoa(os.Getuid()) + "/io.iazio.iazio-agent-watchdog"
+}
+
 func kickstartDarwin() error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -742,34 +764,31 @@ func kickstartDarwin() error {
 		return fmt.Errorf("LaunchAgent is not installed")
 	}
 	_ = execCommand("launchctl", "bootstrap", "gui/"+strconv.Itoa(os.Getuid()), plist)
-	return execCommand("launchctl", "kickstart", "-k", "-p", darwinTarget())
+	if err := service.InstallDarwinResilience(home, filepath.Join(home, ".iazio", "bin", "iazio-agent"), execCommand); err != nil {
+		return fmt.Errorf("install darwin resilience: %w", err)
+	}
+	return execCommand("launchctl", "kickstart", "-k", darwinTarget())
 }
 
 func bootoutDarwin(remove bool) error {
-	_ = execCommand("launchctl", "bootout", darwinTarget())
-	if !remove {
-		return nil
-	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
 	}
+	if remove {
+		_ = service.UninstallDarwinResilience(home, execCommand)
+	} else {
+		_ = execCommand("launchctl", "bootout", darwinWatcherTarget())
+		_ = execCommand("launchctl", "bootout", darwinWatchdogTarget())
+	}
+	_ = execCommand("launchctl", "bootout", darwinTarget())
+	if !remove {
+		return nil
+	}
 	return os.Remove(filepath.Join(home, "Library", "LaunchAgents", "io.iazio.iazio-agent.plist"))
 }
 
-// parseSchtasksStatus extracts the Status field from `schtasks /Query /FO LIST` output.
-// ok is false when the Status: line is absent so callers fail closed instead of
-// treating unparseable output as a successful status probe.
-func parseSchtasksStatus(out string) (running bool, status string, ok bool) {
-	for _, line := range strings.Split(out, "\n") {
-		trimmed := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
-		if strings.HasPrefix(trimmed, "Status:") {
-			statusVal := strings.TrimSpace(strings.TrimPrefix(trimmed, "Status:"))
-			return strings.EqualFold(statusVal, "Running"), statusVal, true
-		}
-	}
-	return false, "", false
-}
+var parseSchtasksStatus = service.ParseSchtasksStatus
 
 func applyWindows(action, _ string, stdout io.Writer) error {
 	switch action {
@@ -860,6 +879,11 @@ var execCommand = func(name string, args ...string) error {
 		return fmt.Errorf("%s: %s", name, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+var execCommandOutput = func(name string, args ...string) ([]byte, error) {
+	cmd := exec.Command(name, args...)
+	return cmd.CombinedOutput()
 }
 
 func parseService(args []string) (action string, dry, force bool, err error) {
