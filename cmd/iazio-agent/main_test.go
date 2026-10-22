@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,11 +14,14 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/controlplane"
+	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/service"
 	"github.com/viovy/iazio-agent/internal/supervisor"
 )
@@ -1691,6 +1695,92 @@ func TestResolveWorktreeFromHostDetail(t *testing.T) {
 		t.Fatalf("expected empty for nonexistent, got %s", wt)
 	}
 }
+
+func TestOnJob_RepoBusyRefusal(t *testing.T) {
+	wt := t.TempDir()
+	var abandonSeen atomic.Bool
+	var abandonReason string
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/abandon") {
+			mu.Lock()
+			abandonSeen.Store(true)
+			var body struct {
+				Reason string `json:"reason"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			abandonReason = body.Reason
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Simulate active lock held by current process PID
+	info := repolock.LockInfo{
+		JobID:          "job-prior-1192",
+		PID:            os.Getpid(),
+		Engine:         "agy",
+		ConversationID: "conv-active-1192",
+		Status:         "RUNNING",
+	}
+	lockHandle, err := repolock.Acquire(wt, info, func(pid int) bool { return pid == os.Getpid() })
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	defer lockHandle.Release()
+
+	sup := supervisor.New(time.Now)
+	client := controlplane.Client{BaseURL: srv.URL}
+	var stderr bytes.Buffer
+
+	// Define onJob logic matching agent execution
+	onJob := func(a controlplane.Assignment) error {
+		lockInfo, lockErr := repolock.Read(a.WorktreePath)
+		if lockErr == nil && lockInfo.JobID != "" && lockInfo.JobID != a.ID {
+			checkPID := lockInfo.PID
+			if lockInfo.HarnessPID > 0 {
+				checkPID = lockInfo.HarnessPID
+			}
+			if checkPID > 0 {
+				p, findErr := os.FindProcess(checkPID)
+				if findErr == nil && p.Signal(syscall.Signal(0)) == nil {
+					fmt.Fprintf(&stderr, "[agent] refusing concurrent job %s on %s: worktree actively locked by job %s (pid %d)\n",
+						a.ID, a.WorktreePath, lockInfo.JobID, checkPID)
+					_ = client.AbandonJob(context.Background(), a.ID, "REPO_BUSY")
+					return fmt.Errorf("repository %s busy with job %s", a.WorktreePath, lockInfo.JobID)
+				}
+			}
+		}
+		return sup.Spawn(supervisor.NewOSRunner(), a.ID, srv.URL, a.WorktreePath, "", "")
+	}
+
+	assignment := controlplane.Assignment{
+		ID:           "job-concurrent-1193",
+		WorktreePath: wt,
+	}
+
+	err = onJob(assignment)
+	if err == nil {
+		t.Fatal("expected onJob to fail with repository busy error")
+	}
+	if !strings.Contains(err.Error(), "busy with job job-prior-1192") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !abandonSeen.Load() {
+		t.Fatal("expected AbandonJob to be called with REPO_BUSY")
+	}
+	mu.Lock()
+	gotReason := abandonReason
+	mu.Unlock()
+	if gotReason != "REPO_BUSY" {
+		t.Fatalf("expected abandon reason REPO_BUSY, got %q", gotReason)
+	}
+}
+
 
 
 

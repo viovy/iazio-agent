@@ -196,10 +196,10 @@ func TestResolveForStory_NoPollutionAcrossDifferentStories(t *testing.T) {
 	revDir := filepath.Join(worktree, "docs", "reviews")
 	_ = os.MkdirAll(revDir, 0o755)
 
-	// Old historical review for STORY-IAZIO-0098
+	// Old historical review for STORY-LEGACY-0098
 	oldConv := "0ddc4208-8d7a-490b-86bb-1dee2e91ae82"
-	revFile := filepath.Join(revDir, "2026-10-09-review-v0-26991d-STORY-IAZIO-0098.md")
-	revContent := "---\nstory_id: STORY-IAZIO-0098\nconversation_id: \"" + oldConv + "\"\n---\n"
+	revFile := filepath.Join(revDir, "2026-10-09-review-v0-26991d-STORY-LEGACY-0098.md")
+	revContent := "---\nstory_id: STORY-LEGACY-0098\nconversation_id: \"" + oldConv + "\"\n---\n"
 	_ = os.WriteFile(revFile, []byte(revContent), 0o644)
 
 	resolver := &Resolver{

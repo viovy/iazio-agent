@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/repolock"
 )
 
 type mockRunner struct {
@@ -272,3 +274,51 @@ func TestWatchdog_StatePersistence(t *testing.T) {
 		t.Fatalf("persisted job fields mismatch: %+v", got)
 	}
 }
+
+func TestWatchdog_AdoptsConversationFromRepoLock(t *testing.T) {
+	wt := t.TempDir()
+	info := repolock.LockInfo{
+		JobID:          "job-recover",
+		PID:            9999,
+		ConversationID: "conv-from-repolock-456",
+		StoryID:        "STORY-RECOVER-1",
+		Status:         "RUNNING",
+	}
+	handle, err := repolock.Acquire(wt, info, func(pid int) bool { return pid == 9999 })
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	defer handle.Release()
+
+	var spawnedWithConv string
+	w := New(Options{
+		StateFile: filepath.Join(t.TempDir(), "watchdog.json"),
+		IsAlive:   func(pid int) bool { return false }, // simulate harness crashed
+		Spawner: func(ctx context.Context, job TrackedJob) (int, error) {
+			spawnedWithConv = job.ConversationID
+			return 1234, nil
+		},
+	})
+
+	w.Track(TrackedJob{
+		JobID:          "job-recover",
+		WorktreePath:   wt,
+		ConversationID: "", // Initially empty!
+		PID:            9999,
+	})
+
+	// CheckInterrupted runs
+	res := w.CheckInterrupted(context.Background())
+	if len(res) == 0 {
+		t.Fatal("expected interrupted job to be detected")
+	}
+
+	if spawnedWithConv != "conv-from-repolock-456" {
+		t.Fatalf("expected spawner to receive adopted conversation 'conv-from-repolock-456', got: %q", spawnedWithConv)
+	}
+	got, _ := w.GetJob("job-recover")
+	if got.ConversationID != "conv-from-repolock-456" {
+		t.Fatalf("expected tracked job conversation updated to 'conv-from-repolock-456', got: %q", got.ConversationID)
+	}
+}
+

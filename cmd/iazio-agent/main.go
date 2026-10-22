@@ -25,6 +25,7 @@ import (
 	"github.com/viovy/iazio-agent/internal/harness"
 	"github.com/viovy/iazio-agent/internal/inventory"
 	"github.com/viovy/iazio-agent/internal/preflight"
+	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/service"
 	"github.com/viovy/iazio-agent/internal/supervisor"
 	"github.com/viovy/iazio-agent/internal/telemetry"
@@ -280,6 +281,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 				}()
 			}
+			var wd *watchdog.Watchdog
 			client = controlplane.Client{
 				BaseURL: api,
 				Presence: func() string {
@@ -360,12 +362,28 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				},
 				ActiveJobs: func() []controlplane.ActiveJob {
 					var jobs []controlplane.ActiveJob
+					seen := make(map[string]bool)
 					for _, rj := range sup.RunningJobs() {
-						jobs = append(jobs, controlplane.ActiveJob{
-							JobID:        rj.JobID,
-							WorktreePath: rj.WorktreePath,
-							PID:          rj.PID,
-						})
+						if rj.JobID != "" && !seen[rj.JobID] {
+							seen[rj.JobID] = true
+							jobs = append(jobs, controlplane.ActiveJob{
+								JobID:        rj.JobID,
+								WorktreePath: rj.WorktreePath,
+								PID:          rj.PID,
+							})
+						}
+					}
+					if wd != nil {
+						for _, wj := range wd.ActiveJobs() {
+							if wj.JobID != "" && !seen[wj.JobID] {
+								seen[wj.JobID] = true
+								jobs = append(jobs, controlplane.ActiveJob{
+									JobID:        wj.JobID,
+									WorktreePath: wj.WorktreePath,
+									PID:          wj.PID,
+								})
+							}
+						}
 					}
 					return jobs
 				},
@@ -375,6 +393,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						if stderr != nil {
 							fmt.Fprintf(stderr, "[supervisor] reaped stalled or terminated process %q (reason: %s)\n",
 								r.JobID, r.Reason)
+						}
+						// If watchdog is actively managing or resuming this job, do not abandon it to control plane
+						if wd != nil && wd.IsTracked(r.JobID) {
+							continue
 						}
 						if r.JobID != "" {
 							_ = client.AbandonJob(ctx, r.JobID, r.Reason)
@@ -499,7 +521,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			}
 
 			wdRunner := supervisor.NewOSRunner()
-			var wd *watchdog.Watchdog
 			spawner := func(sCtx context.Context, job watchdog.TrackedJob) (int, error) {
 				argv := []string{
 					"iazio-harness", "run",
@@ -527,27 +548,57 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					telemetry.WithTag("story.id", a.StoryID),
 				)
 				defer span.End()
-				err := sup.Spawn(wdRunner, a.ID, api, a.WorktreePath, a.DocsHubPath, "")
-				if err == nil {
-					pid := sup.PID(a.WorktreePath)
-					convID := a.ResumeConversationID
-					if convID == "" && len(a.ConversationIDs) > 0 {
-						convID = a.ConversationIDs[len(a.ConversationIDs)-1]
+
+				// Repo lock verification: refuse duplicate/concurrent jobs in the same worktree
+				lockInfo, lockErr := repolock.Read(a.WorktreePath)
+				if lockErr == nil && lockInfo.JobID != "" && lockInfo.JobID != a.ID {
+					checkPID := lockInfo.PID
+					if lockInfo.HarnessPID > 0 {
+						checkPID = lockInfo.HarnessPID
 					}
-					wd.Track(watchdog.TrackedJob{
-						JobID:          a.ID,
-						ScheduleID:     a.ScheduleID,
-						WorktreePath:   a.WorktreePath,
-						DocsHubPath:    a.DocsHubPath,
-						APIURL:         api,
-						Engine:         a.Engine,
-						Prompt:         a.Prompt,
-						StoryID:        a.StoryID,
-						ConversationID: convID,
-						PID:            pid,
-					})
+					if checkPID > 0 {
+						// Check if process is still alive
+						p, findErr := os.FindProcess(checkPID)
+						if findErr == nil && p.Signal(syscall.Signal(0)) == nil {
+							if stderr != nil {
+								fmt.Fprintf(stderr, "[agent] refusing concurrent job %s on %s: worktree actively locked by job %s (pid %d)\n",
+									a.ID, a.WorktreePath, lockInfo.JobID, checkPID)
+							}
+							_ = client.AbandonJob(runCtx, a.ID, "REPO_BUSY")
+							return fmt.Errorf("repository %s busy with job %s", a.WorktreePath, lockInfo.JobID)
+						}
+					}
 				}
-				return err
+
+				err := sup.Spawn(wdRunner, a.ID, api, a.WorktreePath, a.DocsHubPath, "")
+				if err != nil {
+					if strings.Contains(err.Error(), "busy") {
+						_ = client.AbandonJob(runCtx, a.ID, "REPO_BUSY")
+					}
+					return err
+				}
+
+				pid := sup.PID(a.WorktreePath)
+				convID := a.ResumeConversationID
+				if convID == "" && len(a.ConversationIDs) > 0 {
+					convID = a.ConversationIDs[len(a.ConversationIDs)-1]
+				}
+				if convID == "" && lockInfo.ConversationID != "" {
+					convID = lockInfo.ConversationID
+				}
+				wd.Track(watchdog.TrackedJob{
+					JobID:          a.ID,
+					ScheduleID:     a.ScheduleID,
+					WorktreePath:   a.WorktreePath,
+					DocsHubPath:    a.DocsHubPath,
+					APIURL:         api,
+					Engine:         a.Engine,
+					Prompt:         a.Prompt,
+					StoryID:        a.StoryID,
+					ConversationID: convID,
+					PID:            pid,
+				})
+				return nil
 			}
 
 			return client.Loop(runCtx, host, kind, 3*time.Second, onJob, profile)

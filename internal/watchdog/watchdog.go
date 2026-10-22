@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/viovy/iazio-agent/internal/repolock"
+	"github.com/viovy/iazio-agent/internal/sessionstore"
 	"github.com/viovy/iazio-agent/internal/supervisor"
 )
 
@@ -238,6 +240,30 @@ func (w *Watchdog) attemptResume(jobID string) {
 		return
 	}
 
+	// Early and eager conversation ID capture before resuming
+	if job.ConversationID == "" && job.WorktreePath != "" {
+		if lockInfo, err := repolock.Read(job.WorktreePath); err == nil && lockInfo.ConversationID != "" {
+			job.ConversationID = lockInfo.ConversationID
+		}
+	}
+	if job.ConversationID == "" && job.WorktreePath != "" {
+		cpFile := filepath.Join(job.WorktreePath, ".iazio", "execution-checkpoint.json")
+		if data, err := os.ReadFile(cpFile); err == nil {
+			var cp struct {
+				ConversationID string `json:"conversation_id"`
+			}
+			if err := json.Unmarshal(data, &cp); err == nil && cp.ConversationID != "" {
+				job.ConversationID = cp.ConversationID
+			}
+		}
+	}
+	if job.ConversationID == "" && job.WorktreePath != "" && job.StoryID != "" {
+		resolver := sessionstore.DefaultResolver()
+		if sess, err := resolver.ResolveForStory(job.WorktreePath, job.StoryID); err == nil && sess != nil && sess.ConversationID != "" {
+			job.ConversationID = sess.ConversationID
+		}
+	}
+
 	job.ResumeCount++
 	job.Status = StatusResumed
 	jobCopy := *job
@@ -295,6 +321,22 @@ func (w *Watchdog) CheckInterrupted(ctx context.Context) []TrackedJob {
 	for id, job := range w.jobs {
 		if job.Status == StatusCompleted || job.Status == StatusFailed {
 			continue
+		}
+		// Eagerly refresh conversation ID while process is still alive
+		if job.ConversationID == "" && job.WorktreePath != "" {
+			if lockInfo, err := repolock.Read(job.WorktreePath); err == nil && lockInfo.ConversationID != "" {
+				job.ConversationID = lockInfo.ConversationID
+			} else {
+				cpFile := filepath.Join(job.WorktreePath, ".iazio", "execution-checkpoint.json")
+				if data, err := os.ReadFile(cpFile); err == nil {
+					var cp struct {
+						ConversationID string `json:"conversation_id"`
+					}
+					if err := json.Unmarshal(data, &cp); err == nil && cp.ConversationID != "" {
+						job.ConversationID = cp.ConversationID
+					}
+				}
+			}
 		}
 		if job.PID > 0 && !w.isAlive(job.PID) {
 			job.Status = StatusTerminatedUnexpectedly
@@ -357,4 +399,25 @@ func (w *Watchdog) MarkCompleted(jobID string) {
 		j.UpdatedAt = w.now().UTC()
 		w.persistStateLocked()
 	}
+}
+
+// ActiveJobs returns a snapshot of all jobs currently running or in resume flow.
+func (w *Watchdog) ActiveJobs() []TrackedJob {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var res []TrackedJob
+	for _, j := range w.jobs {
+		if j.Status == StatusRunning || j.Status == StatusResumed || j.Status == StatusTerminatedUnexpectedly {
+			res = append(res, *j)
+		}
+	}
+	return res
+}
+
+// IsTracked reports whether a job is currently tracked and in-flight.
+func (w *Watchdog) IsTracked(jobID string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	j, ok := w.jobs[jobID]
+	return ok && j != nil && j.Status != StatusCompleted && j.Status != StatusFailed
 }
