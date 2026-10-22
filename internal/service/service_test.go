@@ -1380,11 +1380,20 @@ func TestPauseAndResume_DefaultRunner(t *testing.T) {
 	if err := PauseService(home, nil); err != nil {
 		t.Fatalf("PauseService failed: %v", err)
 	}
+	lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
+	if _, err := os.Stat(lockFile); err != nil {
+		t.Fatalf("expected maintenance.lock to exist: %v", err)
+	}
+
 	if err := ResumeService(home, nil); err != nil {
 		t.Fatalf("ResumeService failed: %v", err)
 	}
-	if len(runCalls) == 0 {
-		t.Fatal("expected default execCommand to be invoked")
+	if _, err := os.Stat(lockFile); !os.IsNotExist(err) {
+		t.Fatalf("expected maintenance.lock to be removed")
+	}
+
+	if IsSystemdAvailable() && len(runCalls) == 0 {
+		t.Fatal("expected default execCommand to be invoked on systemd host")
 	}
 }
 
