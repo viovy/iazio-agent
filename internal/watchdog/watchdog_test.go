@@ -322,3 +322,47 @@ func TestWatchdog_AdoptsConversationFromRepoLock(t *testing.T) {
 	}
 }
 
+func TestWatchdog_HelperMethods(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "watchdog-helpers.json")
+	w := New(Options{
+		StateFile: stateFile,
+		IsAlive:   func(pid int) bool { return true },
+	})
+
+	w.Track(TrackedJob{
+		JobID:        "job-active-1",
+		WorktreePath: "/tmp/wt1",
+		PID:          1001,
+	})
+	w.Track(TrackedJob{
+		JobID:        "job-active-2",
+		WorktreePath: "/tmp/wt2",
+		PID:          1002,
+	})
+
+	if !w.IsTracked("job-active-1") {
+		t.Fatalf("expected job-active-1 to be tracked")
+	}
+
+	active := w.ActiveJobs()
+	if len(active) != 2 {
+		t.Fatalf("expected 2 active jobs, got %d", len(active))
+	}
+
+	w.MarkCompleted("job-active-1")
+	if w.IsTracked("job-active-1") {
+		t.Fatalf("expected completed job-active-1 not to be tracked as active")
+	}
+
+	j, err := w.GetJob("job-active-1")
+	if err != nil || j.Status != StatusCompleted {
+		t.Fatalf("expected job-active-1 to be StatusCompleted, got err=%v, status=%s", err, j.Status)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	w.StartWatchguard(ctx, 10*time.Millisecond)
+	time.Sleep(25 * time.Millisecond)
+	cancel()
+}
+
+

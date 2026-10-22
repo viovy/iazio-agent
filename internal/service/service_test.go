@@ -1008,3 +1008,44 @@ func TestDarwinPlistHardening(t *testing.T) {
 		t.Errorf("expected SoftResourceLimits in plist, got:\n%s", plist)
 	}
 }
+
+func TestParseSchtasksStatus(t *testing.T) {
+	out := "Folder: \\\nTaskName: \\iazio-agent\nStatus: Running\n"
+	running, status, ok := ParseSchtasksStatus(out)
+	if !ok || !running || status != "Running" {
+		t.Fatalf("unexpected result: ok=%v, running=%v, status=%s", ok, running, status)
+	}
+
+	outReady := "Status: Ready\n"
+	running, status, ok = ParseSchtasksStatus(outReady)
+	if !ok || running || status != "Ready" {
+		t.Fatalf("unexpected ready result: ok=%v, running=%v, status=%s", ok, running, status)
+	}
+
+	outEmpty := "No status here\n"
+	running, status, ok = ParseSchtasksStatus(outEmpty)
+	if ok || running || status != "" {
+		t.Fatalf("expected not ok for empty status")
+	}
+}
+
+func TestPauseAndResumeService(t *testing.T) {
+	home := t.TempDir()
+	runner := func(name string, args ...string) error {
+		return nil
+	}
+	if err := PauseService(home, runner); err != nil {
+		t.Fatalf("PauseService failed: %v", err)
+	}
+	lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
+	if _, err := os.Stat(lockFile); err != nil {
+		t.Fatalf("expected maintenance.lock to exist")
+	}
+	if err := ResumeService(home, runner); err != nil {
+		t.Fatalf("ResumeService failed: %v", err)
+	}
+	if _, err := os.Stat(lockFile); !os.IsNotExist(err) {
+		t.Fatalf("expected maintenance.lock to be removed")
+	}
+}
+

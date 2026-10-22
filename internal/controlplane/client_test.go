@@ -683,6 +683,14 @@ func TestPostRepoStatusAndPingAck(t *testing.T) {
 	}
 }
 
+func TestHostDaemonLoop_Cancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+	c := Client{BaseURL: "http://localhost:9999"}
+	_ = c.HostDaemonLoop(ctx, "host-1", "desktop", 10*time.Millisecond)
+}
+
+
 
 
 

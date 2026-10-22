@@ -1807,6 +1807,25 @@ func TestOnJob_RepoBusyRefusal(t *testing.T) {
 	}
 }
 
+func TestHelpers_DocAndSubmoduleCheck(t *testing.T) {
+	tmp := t.TempDir()
+	if isGitSubmoduleDir(tmp) {
+		t.Fatalf("expected non-git dir to return false")
+	}
+	_ = os.Mkdir(filepath.Join(tmp, ".git"), 0755)
+	if !isGitSubmoduleDir(tmp) {
+		t.Fatalf("expected git dir to return true")
+	}
+	if !isDocOrEphemeralFile("docs/stories/story.md") {
+		t.Fatalf("expected doc file to return true")
+	}
+	if isDocOrEphemeralFile("cmd/main.go") {
+		t.Fatalf("expected go file to return false")
+	}
+}
+
+
+
 
 
 
