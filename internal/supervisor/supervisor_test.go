@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -233,6 +234,45 @@ func TestOSRunnerSmoke(t *testing.T) {
 	missingCode, missingErr := r.Wait(999999)
 	if missingCode != -1 || missingErr == nil {
 		t.Fatalf("expected -1 and error for missing pid, got %d, %v", missingCode, missingErr)
+	}
+}
+
+func TestOSRunner_ConcurrentWait(t *testing.T) {
+	r := NewOSRunner()
+	pid, err := r.Start([]string{"sleep", "0.05"})
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	const numGoroutines = 5
+	var wg sync.WaitGroup
+	codes := make([]int, numGoroutines)
+	errs := make([]error, numGoroutines)
+
+	wg.Add(numGoroutines)
+	for i := 0; i < numGoroutines; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			code, werr := r.Wait(pid)
+			codes[idx] = code
+			errs[idx] = werr
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < numGoroutines; i++ {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d wait failed: %v", i, errs[i])
+		}
+		if codes[i] != 0 {
+			t.Fatalf("goroutine %d exit code: %d", i, codes[i])
+		}
+	}
+
+	// Sequential wait on already completed process must also succeed
+	seqCode, seqErr := r.Wait(pid)
+	if seqErr != nil || seqCode != 0 {
+		t.Fatalf("sequential wait after completion failed: code=%d, err=%v", seqCode, seqErr)
 	}
 }
 

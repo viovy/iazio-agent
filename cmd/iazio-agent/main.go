@@ -149,21 +149,21 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}
 			}
 		}
-		if esURL == "" {
-			esURL = "https://192.168.1.19:9200"
+		var sink *elasticlog.Sink
+		if esURL != "" {
+			sink = elasticlog.New(elasticlog.Config{
+				URL:         esURL,
+				ServiceName: "iazio-agent",
+				Version:     formatVersion(),
+				HostName:    host,
+			})
+			defer func() { _ = sink.Close() }()
+			sink.Info("iazio-agent supervisor starting", map[string]any{
+				"host_kind": string(kind),
+				"api_url":   api,
+				"profile":   profile,
+			})
 		}
-		sink := elasticlog.New(elasticlog.Config{
-			URL:         esURL,
-			ServiceName: "iazio-agent",
-			Version:     formatVersion(),
-			HostName:    host,
-		})
-		defer func() { _ = sink.Close() }()
-		sink.Info("iazio-agent supervisor starting", map[string]any{
-			"host_kind": string(kind),
-			"api_url":   api,
-			"profile":   profile,
-		})
 		if ctx.Err() == nil {
 			runCtx, cancel := context.WithCancel(ctx)
 			defer cancel()
@@ -189,8 +189,27 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				return tools
 			}
 
+			var lastUpdateCheck time.Time
+			var lastUpdateMu sync.Mutex
+
 			doToolUpdate := func(ctx context.Context, targetTools []string, force bool) bool {
-				if !areAllReposCleanAndHarnessIdle(ctx, client, sup, host, api, stdout) {
+				tracer := telemetry.GlobalTracer()
+				_, span := tracer.StartSpan(ctx, "agent.tools.update")
+				defer span.End()
+				span.SetTag("host_id", host)
+				span.SetTag("force", fmt.Sprintf("%t", force))
+				if len(targetTools) > 0 {
+					span.SetTag("target_tools", strings.Join(targetTools, ","))
+				}
+
+				if !areAllReposCleanAndHarnessIdle(ctx, client, sup, host, api, force, stdout) {
+					span.SetTag("result", "deferred")
+					if sink != nil {
+						sink.Info("Tool update check deferred: workstation is busy or worktree dirty", map[string]any{
+							"host":   host,
+							"action": "tool_update_deferred",
+						})
+					}
 					return false
 				}
 				updatingTools.Store(true)
@@ -207,6 +226,15 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 				}()
 
+				if sink != nil {
+					sink.Info(fmt.Sprintf("Tool update check started (force=%t, target=%v)", force, targetTools), map[string]any{
+						"host":   host,
+						"action": "tool_update_started",
+						"force":  force,
+						"tools":  targetTools,
+					})
+				}
+
 				opts := UpdateOptions{
 					Suite:       updateSuite,
 					Profile:     profile,
@@ -214,17 +242,59 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					Force:       force,
 					TargetTools: targetTools,
 				}
-				updated, err := performUpdate(ctx, opts, stdout, stderr, getenv)
+				res, err := performUpdateWithResult(ctx, opts, stdout, stderr, getenv)
 				if err != nil {
+					span.SetTag("result", "error")
+					span.SetError(err)
 					if stderr != nil {
 						fmt.Fprintf(stderr, "[supervisor] update check error: %v\n", err)
 					}
+					if sink != nil {
+						sink.Error("Tool update check error", err, map[string]any{
+							"host":   host,
+							"action": "tool_update_error",
+						})
+					}
 					return false
 				}
-				if updated {
+
+				if len(res.UpdatedTools) > 0 {
+					span.SetTag("result", "updated")
+					span.SetTag("updated_tools", strings.Join(res.UpdatedTools, ","))
+					if sink != nil {
+						sink.Info(fmt.Sprintf("Successfully updated %d tools: %s", len(res.UpdatedTools), strings.Join(res.UpdatedTools, ", ")), map[string]any{
+							"host":          host,
+							"action":        "tool_update_succeeded",
+							"updated_tools": res.UpdatedTools,
+						})
+					}
+					if api != "" {
+						_ = client.PostNotification(ctx, controlplane.NotificationRecord{
+							Title:    "Tool Update Completed",
+							Message:  fmt.Sprintf("Successfully updated %d tools on %s: %s", len(res.UpdatedTools), host, strings.Join(res.UpdatedTools, ", ")),
+							Category: "success",
+							Source:   "iazio-agent",
+							HostID:   host,
+							Metadata: map[string]any{
+								"updated_tools": res.UpdatedTools,
+								"force":         force,
+							},
+						})
+					}
+				} else {
+					span.SetTag("result", "up-to-date")
+					if sink != nil {
+						sink.Info("Tool update check complete: all tools up-to-date", map[string]any{
+							"host":   host,
+							"action": "tool_update_checked",
+						})
+					}
+				}
+
+				if res.AgentUpdated {
 					willRestart = true
 				}
-				return updated
+				return res.AgentUpdated
 			}
 
 			var pendingRemoteMu sync.Mutex
@@ -322,7 +392,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					switch cmd.Type {
 					case "TRIGGER_IDLE_UPDATE":
 						go func() {
-							_ = doToolUpdate(runCtx, nil, false)
+							if doToolUpdate(runCtx, nil, false) {
+								restartOrExecSelf(stdout)
+								cancel()
+							}
 						}()
 					case "PING":
 						if stdout != nil {
@@ -418,8 +491,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					if stdout != nil {
 						fmt.Fprintf(stdout, "[dispatcher] tool update job executing: tools=%v force=%v\n", tools, force)
 					}
-					if !doToolUpdate(ctx, tools, force) {
-						return fmt.Errorf("tool update failed")
+					if doToolUpdate(ctx, tools, force) {
+						restartOrExecSelf(stdout)
+						cancel()
 					}
 					return nil
 				})
@@ -514,6 +588,46 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							}
 							if len(statuses) > 0 {
 								_ = client.PostRepoStatus(runCtx, host, statuses)
+							}
+
+							// Autonomic idle tool update trigger:
+							// When all repos are open / idle and git is clean, trigger tool update check
+							if areAllReposCleanAndHarnessIdle(runCtx, client, sup, host, api, false, nil) {
+								lastUpdateMu.Lock()
+								elapsed := time.Since(lastUpdateCheck)
+								pendingRemoteMu.Lock()
+								isRemote := hasPendingRemote
+								pendingRemoteMu.Unlock()
+								shouldCheck := isRemote || elapsed >= 5*time.Minute
+								if shouldCheck {
+									lastUpdateCheck = time.Now()
+								}
+								lastUpdateMu.Unlock()
+
+								if shouldCheck && !updatingTools.Load() {
+									go func() {
+										pendingRemoteMu.Lock()
+										t := pendingRemoteTools
+										f := pendingRemoteForce
+										rem := hasPendingRemote
+										pendingRemoteMu.Unlock()
+
+										if rem {
+											if doToolUpdate(runCtx, t, f) {
+												pendingRemoteMu.Lock()
+												hasPendingRemote = false
+												pendingRemoteMu.Unlock()
+												restartOrExecSelf(stdout)
+												cancel()
+											}
+										} else {
+											if doToolUpdate(runCtx, nil, false) {
+												restartOrExecSelf(stdout)
+												cancel()
+											}
+										}
+									}()
+								}
 							}
 						}
 					}
@@ -1017,6 +1131,25 @@ type repoAuditResult struct {
 	Submodules      []repoAuditSubmodule `json:"submodules"`
 }
 
+func isDocOrEphemeralFile(f string) bool {
+	clean := filepath.ToSlash(strings.TrimSpace(f))
+	clean = strings.TrimPrefix(clean, "./")
+	return strings.HasPrefix(clean, "docs/reviews/") ||
+		strings.HasPrefix(clean, "docs/stories/") ||
+		strings.HasPrefix(clean, "tmp/") ||
+		strings.HasPrefix(clean, ".system_generated/") ||
+		strings.HasPrefix(clean, ".gemini/") ||
+		strings.HasPrefix(clean, ".agents/") ||
+		strings.HasSuffix(clean, ".log") ||
+		strings.HasSuffix(clean, ".md")
+}
+
+func isGitSubmoduleDir(path string) bool {
+	gitPath := filepath.Join(path, ".git")
+	_, err := os.Stat(gitPath)
+	return err == nil
+}
+
 func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 	// First: verify repoPath is a valid git repository top-level root
 	topCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--show-toplevel")
@@ -1036,38 +1169,90 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 		return false
 	}
 
-	// Verify root worktree is completely clean
-	gitCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain")
-	out, err := gitCmd.CombinedOutput()
-	if err != nil || strings.TrimSpace(string(out)) != "" {
-		return false
+	// Try iazio-harness fleet-status --repo <repoPath> --json first
+	harnessBin := "iazio-harness"
+	if home, err := os.UserHomeDir(); err == nil {
+		p := filepath.Join(home, ".iazio", "bin", "iazio-harness")
+		if _, err := os.Stat(p); err == nil {
+			harnessBin = p
+		}
+	}
+	harnessCmd := exec.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--json")
+	if out, err := harnessCmd.Output(); err == nil && len(out) > 0 {
+		var res struct {
+			WorktreeState   string   `json:"worktree_state"`
+			SubmodulesClean bool     `json:"submodules_clean"`
+			DirtySubmodules []string `json:"dirty_submodules"`
+			ModifiedFiles   []string `json:"modified_files"`
+			UntrackedFiles  []string `json:"untracked_files"`
+		}
+		if json.Unmarshal(out, &res) == nil {
+			if res.WorktreeState == "CLEAN" || res.WorktreeState == "CLEAN_SUBMODULE_DRIFT" {
+				return true
+			}
+			if res.WorktreeState == "DIRTY_UNTRACKED_ONLY" {
+				onlyDocs := true
+				for _, f := range res.UntrackedFiles {
+					if !isDocOrEphemeralFile(f) {
+						onlyDocs = false
+						break
+					}
+				}
+				if onlyDocs && res.SubmodulesClean {
+					return true
+				}
+			}
+			return false
+		}
 	}
 
-	// If autopilot-fleet audit is available, verify submodules
-	cmd := exec.CommandContext(ctx, "autopilot-fleet", "audit", "-json")
-	cmd.Dir = repoPath
-	if auditOut, err := cmd.Output(); err == nil && len(auditOut) > 0 {
-		var audit repoAuditResult
-		if json.Unmarshal(auditOut, &audit) == nil {
-			if audit.DirtyCount > 0 || audit.ErrorCount > 0 {
+	// Fallback git porcelain check:
+	// Allow untracked docs/logs and submodule commit pointer drift (CLEAN_SUBMODULE_DRIFT)
+	gitCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain")
+	out, err := gitCmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(string(out), "\n")
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		if strings.HasPrefix(l, "?? ") {
+			relFile := strings.TrimPrefix(l, "?? ")
+			if !isDocOrEphemeralFile(relFile) {
 				return false
 			}
-			for _, sub := range audit.Submodules {
-				if !sub.IsClean || sub.ModifiedCount > 0 || sub.UntrackedCount > 0 {
-					return false
+			continue
+		}
+		parts := strings.Fields(l)
+		if len(parts) >= 2 {
+			candidateSub := filepath.Join(repoPath, parts[len(parts)-1])
+			if isGitSubmoduleDir(candidateSub) {
+				subCmd := exec.CommandContext(ctx, "git", "-C", candidateSub, "status", "--porcelain")
+				if subOut, sErr := subCmd.CombinedOutput(); sErr == nil && strings.TrimSpace(string(subOut)) == "" {
+					// Clean submodule with commit pointer drift (STORY-GOV-3652 AC-2)
+					continue
 				}
 			}
 		}
+		return false
 	}
+
 	return true
 }
 
-func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Client, sup *supervisor.Sup, host, api string, stdout io.Writer) bool {
+func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Client, sup *supervisor.Sup, host, api string, force bool, stdout io.Writer) bool {
 	if sup != nil && sup.HasRunningHarness() {
 		if stdout != nil {
 			fmt.Fprintln(stdout, "[SIR: IDLE_UPDATE_DEFERRED] reason=\"harness execution is active\"")
 		}
 		return false
+	}
+	if force {
+		// When force is explicitly requested, bypass worktree checks as long as harness is not executing
+		return true
 	}
 	if api != "" {
 		detail, err := client.GetHost(ctx, host)
@@ -1085,11 +1270,33 @@ func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Cli
 			if path == "" {
 				continue
 			}
+			// Verify repo queue is open (not paused or blocked)
+			q := strings.ToUpper(strings.TrimSpace(r.Queue))
+			if q != "" && q != "OPEN" && q != "ACTIVE" {
+				if stdout != nil {
+					fmt.Fprintf(stdout, "[SIR: IDLE_UPDATE_DEFERRED] worktree=\"%s\" queue=\"%s\" reason=\"repo queue is not open\"\n", path, r.Queue)
+				}
+				return false
+			}
+			// Verify repo lock is idle (not running or cooling)
+			lock := strings.ToUpper(strings.TrimSpace(r.Lock))
+			if lock != "" && lock != "IDLE" {
+				if stdout != nil {
+					fmt.Fprintf(stdout, "[SIR: IDLE_UPDATE_DEFERRED] worktree=\"%s\" lock=\"%s\" reason=\"repo lock is not idle\"\n", path, r.Lock)
+				}
+				return false
+			}
+			if r.RunningJobID != "" {
+				if stdout != nil {
+					fmt.Fprintf(stdout, "[SIR: IDLE_UPDATE_DEFERRED] worktree=\"%s\" running_job=\"%s\"\n", path, r.RunningJobID)
+				}
+				return false
+			}
 			if sup != nil {
-				lock := sup.Lock(path)
-				if lock == supervisor.LockRunning || lock == supervisor.LockCooling || lock == supervisor.LockPending {
+				supLock := sup.Lock(path)
+				if supLock == supervisor.LockRunning || supLock == supervisor.LockCooling || supLock == supervisor.LockPending {
 					if stdout != nil {
-						fmt.Fprintf(stdout, "[SIR: IDLE_UPDATE_DEFERRED] worktree=\"%s\" lock=\"%s\"\n", path, lock)
+						fmt.Fprintf(stdout, "[SIR: IDLE_UPDATE_DEFERRED] worktree=\"%s\" lock=\"%s\"\n", path, supLock)
 					}
 					return false
 				}
@@ -1210,7 +1417,7 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 	}
 
 	// Submodules check
-	subCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "status", "--recursive")
+	subCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "status")
 	if subOut, err := subCmd.CombinedOutput(); err == nil {
 		subLines := strings.Split(string(subOut), "\n")
 		st.SubmodulesClean = true

@@ -18,11 +18,17 @@ type waitResult struct {
 	err      error
 }
 
+type processEntry struct {
+	cmd  *exec.Cmd
+	done chan struct{}
+	res  waitResult
+	once sync.Once
+}
+
 // OSRunner executes child processes with their own process group.
 type OSRunner struct {
 	mu      sync.Mutex
-	cmds    map[int]*exec.Cmd
-	results map[int]chan waitResult
+	entries map[int]*processEntry
 	Stdout  io.Writer
 	Stderr  io.Writer
 }
@@ -30,8 +36,7 @@ type OSRunner struct {
 // NewOSRunner returns a new OSRunner.
 func NewOSRunner() *OSRunner {
 	return &OSRunner{
-		cmds:    make(map[int]*exec.Cmd),
-		results: make(map[int]chan waitResult),
+		entries: make(map[int]*processEntry),
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
 	}
@@ -160,10 +165,13 @@ func (r *OSRunner) Start(argv []string) (int, error) {
 	postStartProc(cmd)
 	pid := cmd.Process.Pid
 	r.mu.Lock()
-	if r.cmds == nil {
-		r.cmds = make(map[int]*exec.Cmd)
+	if r.entries == nil {
+		r.entries = make(map[int]*processEntry)
 	}
-	r.cmds[pid] = cmd
+	r.entries[pid] = &processEntry{
+		cmd:  cmd,
+		done: make(chan struct{}),
+	}
 	r.mu.Unlock()
 	return pid, nil
 }
@@ -174,44 +182,33 @@ func (r *OSRunner) Signal(pid int, sig string) error {
 }
 
 // Wait waits for the child process to exit and returns its exit code.
-// Safe for concurrent invocations from multiple observers (e.g. supervisor and watchdog).
+// Safe for concurrent and sequential invocations from multiple observers (e.g. supervisor and watchdog).
 func (r *OSRunner) Wait(pid int) (int, error) {
 	r.mu.Lock()
-	if r.results == nil {
-		r.results = make(map[int]chan waitResult)
-	}
-	ch, exists := r.results[pid]
-	if !exists {
-		cmd := r.cmds[pid]
-		if cmd == nil {
-			r.mu.Unlock()
-			return -1, errors.New("no such process")
-		}
-		ch = make(chan waitResult, 1)
-		r.results[pid] = ch
-		go func() {
-			err := cmd.Wait()
-			var exitCode int
-			var exitErr *exec.ExitError
-			if err != nil {
-				if errors.As(err, &exitErr) {
-					exitCode = exitErr.ExitCode()
-					err = nil
-				} else {
-					exitCode = -1
-				}
-			}
-			res := waitResult{exitCode: exitCode, err: err}
-			ch <- res
-			r.mu.Lock()
-			delete(r.cmds, pid)
-			r.mu.Unlock()
-		}()
-	}
+	entry := r.entries[pid]
 	r.mu.Unlock()
+	if entry == nil {
+		return -1, errors.New("no such process")
+	}
 
-	res := <-ch
-	return res.exitCode, res.err
+	entry.once.Do(func() {
+		err := entry.cmd.Wait()
+		var exitCode int
+		var exitErr *exec.ExitError
+		if err != nil {
+			if errors.As(err, &exitErr) {
+				exitCode = exitErr.ExitCode()
+				err = nil
+			} else {
+				exitCode = -1
+			}
+		}
+		entry.res = waitResult{exitCode: exitCode, err: err}
+		close(entry.done)
+	})
+
+	<-entry.done
+	return entry.res.exitCode, entry.res.err
 }
 
 // DockerConfig holds configuration parameters for launching an ephemeral containerized agent.

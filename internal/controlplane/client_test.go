@@ -667,6 +667,20 @@ func TestPostRepoStatusAndPingAck(t *testing.T) {
 	if len(seenPaths) != 2 || seenPaths[0] != "/v1/hosts/host-1/repos/status" || seenPaths[1] != "/v1/hosts/host-1/ping-ack" {
 		t.Fatalf("unexpected paths: %v", seenPaths)
 	}
+
+	notif := NotificationRecord{
+		Title:    "Test Notification",
+		Message:  "Hello from test",
+		Category: "success",
+		Source:   "iazio-agent",
+		HostID:   "host-1",
+	}
+	if err := c.PostNotification(ctx, notif); err != nil {
+		t.Fatalf("PostNotification failed: %v", err)
+	}
+	if len(seenPaths) != 3 || seenPaths[2] != "/v1/notifications" {
+		t.Fatalf("expected /v1/notifications, got %v", seenPaths)
+	}
 }
 
 

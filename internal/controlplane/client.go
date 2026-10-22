@@ -629,6 +629,27 @@ func (c Client) PostPingAck(ctx context.Context, hostID, pingID, agentVersion st
 	return c.post(ctx, "/v1/hosts/"+hostID+"/ping-ack", payload)
 }
 
+// NotificationRecord captures system events, releases refreshes, and agent tool execution events.
+type NotificationRecord struct {
+	ID        string         `json:"id,omitempty"`
+	Title     string         `json:"title"`
+	Message   string         `json:"message"`
+	Category  string         `json:"category"` // "info", "success", "warning", "error", "userAction"
+	Timestamp time.Time      `json:"timestamp,omitempty"`
+	Source    string         `json:"source,omitempty"`
+	JobID     string         `json:"job_id,omitempty"`
+	HostID    string         `json:"host_id,omitempty"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+}
+
+// PostNotification records a notification event with the control plane.
+func (c Client) PostNotification(ctx context.Context, rec NotificationRecord) error {
+	if rec.Timestamp.IsZero() {
+		rec.Timestamp = time.Now()
+	}
+	return c.post(ctx, "/v1/notifications", rec)
+}
+
 func (c Client) post(ctx context.Context, path string, body any) error {
 	return c.postJSON(ctx, path, body, nil)
 }

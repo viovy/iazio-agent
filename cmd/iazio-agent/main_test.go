@@ -156,7 +156,7 @@ func TestExecuteCommands(t *testing.T) {
 		t.Fatal(err, stdout.String())
 	}
 	stdout.Reset()
-	if err = execute(ctx, []string{"update", "--suite"}, &stdout, &stderr, func(string) string { return "" }); err != nil || !strings.Contains(stdout.String(), "update suite") {
+	if err = execute(ctx, []string{"update", "--suite", "--dry-run"}, &stdout, &stderr, func(string) string { return "" }); err != nil || !strings.Contains(stdout.String(), "update suite") {
 		t.Fatal(err, stdout.String())
 	}
 	stdout.Reset()
@@ -792,7 +792,7 @@ func TestAreAllReposCleanAndHarnessIdle(t *testing.T) {
 	// When sup has running harness, must return false
 	sup := supervisor.New(time.Now)
 	sup.BeginCooling("/repo/busy")
-	if areAllReposCleanAndHarnessIdle(ctx, controlplane.Client{}, sup, "host-1", "", &stdout) {
+	if areAllReposCleanAndHarnessIdle(ctx, controlplane.Client{}, sup, "host-1", "", false, &stdout) {
 		t.Fatal("expected false when harness is running")
 	}
 	if !strings.Contains(stdout.String(), "harness execution is active") {
@@ -808,7 +808,7 @@ func TestAreAllReposCleanAndHarnessIdle(t *testing.T) {
 	idleSup := supervisor.New(time.Now)
 	stdout.Reset()
 	client := controlplane.Client{BaseURL: srv.URL}
-	if areAllReposCleanAndHarnessIdle(ctx, client, idleSup, "host-1", srv.URL, &stdout) {
+	if areAllReposCleanAndHarnessIdle(ctx, client, idleSup, "host-1", srv.URL, false, &stdout) {
 		t.Fatal("expected false when get host fails")
 	}
 
@@ -824,7 +824,7 @@ func TestAreAllReposCleanAndHarnessIdle(t *testing.T) {
 
 	stdout.Reset()
 	clientOk := controlplane.Client{BaseURL: srvOk.URL}
-	if !areAllReposCleanAndHarnessIdle(ctx, clientOk, idleSup, "host-1", srvOk.URL, &stdout) {
+	if !areAllReposCleanAndHarnessIdle(ctx, clientOk, idleSup, "host-1", srvOk.URL, false, &stdout) {
 		t.Fatal("expected true when no repos are registered")
 	}
 
@@ -839,7 +839,7 @@ func TestAreAllReposCleanAndHarnessIdle(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(controlplane.HostDetail{
 			Host: controlplane.HostSummary{ID: "host-1"},
 			Repos: []controlplane.RepoSummary{
-				{Path: dirtyDir},
+				{Path: dirtyDir, Queue: "OPEN", Lock: "IDLE"},
 				{WorktreePath: ""}, // empty path continues
 			},
 		})
@@ -848,11 +848,37 @@ func TestAreAllReposCleanAndHarnessIdle(t *testing.T) {
 
 	clientDirty := controlplane.Client{BaseURL: srvDirty.URL}
 	stdout.Reset()
-	if areAllReposCleanAndHarnessIdle(ctx, clientDirty, nil, "host-1", srvDirty.URL, &stdout) {
+	if areAllReposCleanAndHarnessIdle(ctx, clientDirty, nil, "host-1", srvDirty.URL, false, &stdout) {
 		t.Fatal("expected false when worktree is dirty")
 	}
 	if !strings.Contains(stdout.String(), "is dirty") {
 		t.Fatalf("expected dirty log message, got %s", stdout.String())
+	}
+
+	// Force update bypasses dirty worktree when harness is idle
+	stdout.Reset()
+	if !areAllReposCleanAndHarnessIdle(ctx, clientDirty, nil, "host-1", srvDirty.URL, true, &stdout) {
+		t.Fatal("expected true when force=true and harness is idle")
+	}
+
+	// When repo queue is PAUSED, must return false
+	srvPaused := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(controlplane.HostDetail{
+			Host: controlplane.HostSummary{ID: "host-1"},
+			Repos: []controlplane.RepoSummary{
+				{Path: t.TempDir(), Queue: "PAUSED", Lock: "IDLE"},
+			},
+		})
+	}))
+	defer srvPaused.Close()
+	clientPaused := controlplane.Client{BaseURL: srvPaused.URL}
+	stdout.Reset()
+	if areAllReposCleanAndHarnessIdle(ctx, clientPaused, nil, "host-1", srvPaused.URL, false, &stdout) {
+		t.Fatal("expected false when repo queue is PAUSED")
+	}
+	if !strings.Contains(stdout.String(), "not open") {
+		t.Fatalf("expected queue not open message, got %s", stdout.String())
 	}
 }
 
