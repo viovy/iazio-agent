@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -156,6 +157,7 @@ type ZipkinExporter struct {
 	wg         sync.WaitGroup
 	mu         sync.Mutex
 	closed     bool
+	spoolDir   string
 }
 
 // NewZipkinExporter creates a background-batched Zipkin v2 HTTP exporter.
@@ -174,18 +176,76 @@ func NewZipkinExporter(endpoint string) *ZipkinExporter {
 		clean = clean + "/api/v2/spans"
 	}
 
+	var spoolDir string
+	if env := os.Getenv("ZIPKIN_SPOOL_DIR"); env != "" {
+		if env != "none" {
+			spoolDir = env
+		}
+	} else if home, _ := os.UserHomeDir(); home != "" {
+		spoolDir = filepath.Join(home, ".iazio", "zipkin-spool")
+	}
+
 	ze := &ZipkinExporter{
 		endpoint: clean,
 		httpClient: &http.Client{
 			Timeout: 4 * time.Second,
 		},
-		ch:   make(chan *Span, 1024),
-		done: make(chan struct{}),
+		ch:       make(chan *Span, 1024),
+		done:     make(chan struct{}),
+		spoolDir: spoolDir,
 	}
 
 	ze.wg.Add(1)
 	go ze.batchWorker()
 	return ze
+}
+
+func (ze *ZipkinExporter) spoolSpans(body []byte) {
+	if ze.spoolDir == "" || len(body) == 0 {
+		return
+	}
+	_ = os.MkdirAll(ze.spoolDir, 0o755)
+	filePath := filepath.Join(ze.spoolDir, fmt.Sprintf("spans-%d.json", time.Now().UnixNano()))
+	_ = os.WriteFile(filePath, body, 0o644)
+}
+
+func (ze *ZipkinExporter) drainSpool(ctx context.Context) {
+	if ze.spoolDir == "" {
+		return
+	}
+	entries, err := os.ReadDir(ze.spoolDir)
+	if err != nil || len(entries) == 0 {
+		return
+	}
+	drainCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(ze.spoolDir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			_ = os.Remove(path)
+			continue
+		}
+		req, err := http.NewRequestWithContext(drainCtx, http.MethodPost, ze.endpoint, bytes.NewReader(data))
+		if err != nil {
+			break
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := ze.httpClient.Do(req)
+		if err != nil {
+			break // Still offline, retain remaining spooled spans
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			_ = os.Remove(path)
+		} else {
+			break
+		}
+	}
 }
 
 func (ze *ZipkinExporter) batchWorker() {
@@ -288,17 +348,26 @@ func (ze *ZipkinExporter) sendSpans(ctx context.Context, spans []*Span) error {
 		return err
 	}
 
+	// Drain previously spooled spans first
+	ze.drainSpool(ctx)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ze.endpoint, bytes.NewReader(body))
 	if err != nil {
+		ze.spoolSpans(body)
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := ze.httpClient.Do(req)
 	if err != nil {
+		ze.spoolSpans(body)
 		return err
 	}
 	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		ze.spoolSpans(body)
+		return fmt.Errorf("zipkin status: %s", resp.Status)
+	}
 	return nil
 }
 

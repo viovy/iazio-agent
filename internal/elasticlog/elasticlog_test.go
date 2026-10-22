@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -97,3 +98,83 @@ func TestElasticSink_SendBulk(t *testing.T) {
 		t.Fatalf("unexpected entry fields: %+v", entry)
 	}
 }
+
+func TestElasticSink_OfflineSpoolAndDrain(t *testing.T) {
+	var serverOnline atomic.Bool
+	var receivedCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !serverOnline.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		receivedCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"errors":false,"items":[]}`))
+	}))
+	defer ts.Close()
+
+	spoolDir := t.TempDir()
+
+	sink := New(Config{
+		URL:           ts.URL,
+		Index:         "test-resilient-logs",
+		SpoolDir:      spoolDir,
+		BatchSize:     1,
+		FlushInterval: 10 * time.Millisecond,
+		HTTPClient:    ts.Client(),
+	})
+
+	// Server is down initially
+	serverOnline.Store(false)
+	sink.Info("offline message 1", nil)
+
+	// Wait for worker to attempt flush and fail
+	time.Sleep(50 * time.Millisecond)
+
+	if !sink.IsDown() {
+		t.Fatalf("expected sink to detect Elasticsearch is down")
+	}
+
+	// Verify spooled to disk
+	entries, err := os.ReadDir(spoolDir)
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("expected spool file to be written on failure, got %v (err: %v)", entries, err)
+	}
+
+	// Server recovers online
+	serverOnline.Store(true)
+
+	// Reset failure timer for fast test execution
+	sink.lastFailureTime.Store(0)
+
+	sink.Info("online message 2", nil)
+	time.Sleep(100 * time.Millisecond)
+
+	_ = sink.Close()
+
+	if receivedCount.Load() == 0 {
+		t.Fatalf("expected recovered server to receive drained logs, got 0")
+	}
+}
+
+func TestElasticlog_HelpersAndWarn(t *testing.T) {
+	sink := New(Config{
+		URL:         "http://127.0.0.1:9200",
+		ServiceName: "test",
+		SpoolDir:    t.TempDir(),
+	})
+	defer sink.Close()
+
+	if sink.SpoolDir() == "" {
+		t.Fatalf("expected non-empty spool dir")
+	}
+	if sink.ConsecutiveFailures() != 0 {
+		t.Fatalf("expected 0 consecutive failures initially")
+	}
+	sink.Warn("warning message", errors.New("sample error"), map[string]any{"k": "v"})
+	if sink.DroppedCount() != 0 {
+		t.Fatalf("expected 0 dropped count")
+	}
+}
+

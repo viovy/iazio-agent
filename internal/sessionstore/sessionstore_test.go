@@ -17,6 +17,8 @@ func TestExtractStoryID(t *testing.T) {
 		{"docs/stories/2026-10-09-app-0098-feature.story.md", "STORY-APP-0098"},
 		{"feat/app-0100-dirty-resumption", "STORY-APP-0100"},
 		{"STORY-ENG-3369", "STORY-ENG-3369"},
+		{"id: APP-0098", "STORY-APP-0098"},
+		{"id: STORY-ENG-1234", "STORY-ENG-1234"},
 		{"no-story-here.txt", ""},
 	}
 	for _, tc := range cases {
@@ -187,3 +189,69 @@ func TestGetDirtyFilesParsing(t *testing.T) {
 		t.Errorf("expected ReviewFile docs/reviews/..., got %q", dCtx.ReviewFile)
 	}
 }
+
+func TestResolveForStory_NoPollutionAcrossDifferentStories(t *testing.T) {
+	tmpDir := t.TempDir()
+	worktree := filepath.Join(tmpDir, "my-repo")
+	_ = os.MkdirAll(worktree, 0o755)
+
+	revDir := filepath.Join(worktree, "docs", "reviews")
+	_ = os.MkdirAll(revDir, 0o755)
+
+	// Old historical review for STORY-LEGACY-0098
+	oldConv := "0ddc4208-8d7a-490b-86bb-1dee2e91ae82"
+	revFile := filepath.Join(revDir, "2026-10-09-review-v0-26991d-STORY-LEGACY-0098.md")
+	revContent := "---\nstory_id: STORY-LEGACY-0098\nconversation_id: \"" + oldConv + "\"\n---\n"
+	_ = os.WriteFile(revFile, []byte(revContent), 0o644)
+
+	resolver := &Resolver{
+		BrainDir: t.TempDir(),
+		SpoolDir: t.TempDir(),
+	}
+
+	// Requesting an unrelated story (e.g. STORY-VIGO-0001) MUST NOT receive 0ddc4208...
+	sess, err := resolver.ResolveForStory(worktree, "STORY-VIGO-0001")
+	if err != ErrNoSessionFound {
+		t.Fatalf("expected ErrNoSessionFound for unrelated story, got %v, err=%v", sess, err)
+	}
+	if sess != nil {
+		t.Fatalf("expected nil session, got %+v", sess)
+	}
+}
+
+func TestExtractReviewFrontmatter_TranscriptPath(t *testing.T) {
+	content := "---\nstory_id: STORY-TEST-123\ntranscript_path: \"/tmp/brain/c550f22a-d19d-4c9a-b091-322e573301e6/transcript.jsonl\"\nscheme_iteration: 2\nverdict: PASS\n---\n"
+	tmpFile := filepath.Join(t.TempDir(), "2026-10-22-review-v2-123456-STORY-TEST-123.md")
+	_ = os.WriteFile(tmpFile, []byte(content), 0644)
+
+	info := extractReviewFrontmatter(tmpFile)
+	if info.StoryID != "STORY-TEST-123" {
+		t.Fatalf("expected story ID STORY-TEST-123, got %q", info.StoryID)
+	}
+	if info.ConversationID != "c550f22a-d19d-4c9a-b091-322e573301e6" {
+		t.Fatalf("expected conversation ID c550f22a-d19d-4c9a-b091-322e573301e6, got %q", info.ConversationID)
+	}
+	if info.Iteration != 2 || info.Verdict != "PASS" {
+		t.Fatalf("unexpected info: %+v", info)
+	}
+}
+
+func TestDetectDirtyWorktreeContext_DirtyStoryFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	cmd := exec.Command("git", "init", tmpDir)
+	_ = cmd.Run()
+
+	storyDir := filepath.Join(tmpDir, "docs", "stories")
+	_ = os.MkdirAll(storyDir, 0755)
+	storyFile := filepath.Join(storyDir, "2026-10-22-my-feature.story.md")
+	_ = os.WriteFile(storyFile, []byte("---\nid: STORY-FEAT-9999\n---\n"), 0644)
+
+	dCtx := DefaultResolver().DetectDirtyWorktreeContext(tmpDir)
+	if !dCtx.IsDirty {
+		t.Fatalf("expected dirty context")
+	}
+	if dCtx.StoryID != "STORY-FEAT-9999" {
+		t.Fatalf("expected STORY-FEAT-9999, got %q", dCtx.StoryID)
+	}
+}
+

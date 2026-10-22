@@ -150,11 +150,16 @@ func (c Client) Register(ctx context.Context, hostID, kind string, profile ...st
 
 // Assignment is one leased job returned by the control plane.
 type Assignment struct {
-	ID           string `json:"id"`
-	Kind         string `json:"kind"`
-	WorktreePath string `json:"worktree_path"`
-	DocsHubPath  string `json:"docs_hub_path"`
-	StoryID      string `json:"story_id,omitempty"`
+	ID                   string   `json:"id"`
+	Kind                 string   `json:"kind"`
+	WorktreePath         string   `json:"worktree_path"`
+	DocsHubPath          string   `json:"docs_hub_path"`
+	StoryID              string   `json:"story_id,omitempty"`
+	ScheduleID           string   `json:"schedule_id,omitempty"`
+	Engine               string   `json:"engine,omitempty"`
+	Prompt               string   `json:"prompt,omitempty"`
+	ResumeConversationID string   `json:"resume_conversation_id,omitempty"`
+	ConversationIDs      []string `json:"conversation_ids,omitempty"`
 }
 
 // NextLease asks for the next job for this host. ok is false when the queue is empty.
@@ -622,6 +627,27 @@ func (c Client) PostPingAck(ctx context.Context, hostID, pingID, agentVersion st
 		"acked_at":      time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	return c.post(ctx, "/v1/hosts/"+hostID+"/ping-ack", payload)
+}
+
+// NotificationRecord captures system events, releases refreshes, and agent tool execution events.
+type NotificationRecord struct {
+	ID        string         `json:"id,omitempty"`
+	Title     string         `json:"title"`
+	Message   string         `json:"message"`
+	Category  string         `json:"category"` // "info", "success", "warning", "error", "userAction"
+	Timestamp time.Time      `json:"timestamp,omitempty"`
+	Source    string         `json:"source,omitempty"`
+	JobID     string         `json:"job_id,omitempty"`
+	HostID    string         `json:"host_id,omitempty"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+}
+
+// PostNotification records a notification event with the control plane.
+func (c Client) PostNotification(ctx context.Context, rec NotificationRecord) error {
+	if rec.Timestamp.IsZero() {
+		rec.Timestamp = time.Now()
+	}
+	return c.post(ctx, "/v1/notifications", rec)
 }
 
 func (c Client) post(ctx context.Context, path string, body any) error {

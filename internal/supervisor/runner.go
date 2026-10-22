@@ -13,20 +13,32 @@ import (
 	"sync"
 )
 
+type waitResult struct {
+	exitCode int
+	err      error
+}
+
+type processEntry struct {
+	cmd  *exec.Cmd
+	done chan struct{}
+	res  waitResult
+	once sync.Once
+}
+
 // OSRunner executes child processes with their own process group.
 type OSRunner struct {
-	mu     sync.Mutex
-	cmds   map[int]*exec.Cmd
-	Stdout io.Writer
-	Stderr io.Writer
+	mu      sync.Mutex
+	entries map[int]*processEntry
+	Stdout  io.Writer
+	Stderr  io.Writer
 }
 
 // NewOSRunner returns a new OSRunner.
 func NewOSRunner() *OSRunner {
 	return &OSRunner{
-		cmds:   make(map[int]*exec.Cmd),
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
+		entries: make(map[int]*processEntry),
+		Stdout:  os.Stdout,
+		Stderr:  os.Stderr,
 	}
 }
 
@@ -153,10 +165,13 @@ func (r *OSRunner) Start(argv []string) (int, error) {
 	postStartProc(cmd)
 	pid := cmd.Process.Pid
 	r.mu.Lock()
-	if r.cmds == nil {
-		r.cmds = make(map[int]*exec.Cmd)
+	if r.entries == nil {
+		r.entries = make(map[int]*processEntry)
 	}
-	r.cmds[pid] = cmd
+	r.entries[pid] = &processEntry{
+		cmd:  cmd,
+		done: make(chan struct{}),
+	}
 	r.mu.Unlock()
 	return pid, nil
 }
@@ -167,24 +182,33 @@ func (r *OSRunner) Signal(pid int, sig string) error {
 }
 
 // Wait waits for the child process to exit and returns its exit code.
+// Safe for concurrent and sequential invocations from multiple observers (e.g. supervisor and watchdog).
 func (r *OSRunner) Wait(pid int) (int, error) {
 	r.mu.Lock()
-	cmd := r.cmds[pid]
-	delete(r.cmds, pid)
+	entry := r.entries[pid]
 	r.mu.Unlock()
-
-	if cmd == nil {
+	if entry == nil {
 		return -1, errors.New("no such process")
 	}
-	err := cmd.Wait()
-	if err != nil {
+
+	entry.once.Do(func() {
+		err := entry.cmd.Wait()
+		var exitCode int
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return exitErr.ExitCode(), nil
+		if err != nil {
+			if errors.As(err, &exitErr) {
+				exitCode = exitErr.ExitCode()
+				err = nil
+			} else {
+				exitCode = -1
+			}
 		}
-		return -1, err
-	}
-	return 0, nil
+		entry.res = waitResult{exitCode: exitCode, err: err}
+		close(entry.done)
+	})
+
+	<-entry.done
+	return entry.res.exitCode, entry.res.err
 }
 
 // DockerConfig holds configuration parameters for launching an ephemeral containerized agent.

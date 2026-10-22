@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf16"
 )
 
@@ -1008,3 +1009,416 @@ func TestDarwinPlistHardening(t *testing.T) {
 		t.Errorf("expected SoftResourceLimits in plist, got:\n%s", plist)
 	}
 }
+
+func TestParseSchtasksStatus(t *testing.T) {
+	out := "Folder: \\\nTaskName: \\iazio-agent\nStatus: Running\n"
+	running, status, ok := ParseSchtasksStatus(out)
+	if !ok || !running || status != "Running" {
+		t.Fatalf("unexpected result: ok=%v, running=%v, status=%s", ok, running, status)
+	}
+
+	outReady := "Status: Ready\n"
+	running, status, ok = ParseSchtasksStatus(outReady)
+	if !ok || running || status != "Ready" {
+		t.Fatalf("unexpected ready result: ok=%v, running=%v, status=%s", ok, running, status)
+	}
+
+	outEmpty := "No status here\n"
+	running, status, ok = ParseSchtasksStatus(outEmpty)
+	if ok || running || status != "" {
+		t.Fatalf("expected not ok for empty status")
+	}
+}
+
+func TestPauseAndResumeService(t *testing.T) {
+	home := t.TempDir()
+	runner := func(name string, args ...string) error {
+		return nil
+	}
+	if err := PauseService(home, runner); err != nil {
+		t.Fatalf("PauseService failed: %v", err)
+	}
+	lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
+	if _, err := os.Stat(lockFile); err != nil {
+		t.Fatalf("expected maintenance.lock to exist")
+	}
+	if err := ResumeService(home, runner); err != nil {
+		t.Fatalf("ResumeService failed: %v", err)
+	}
+	if _, err := os.Stat(lockFile); !os.IsNotExist(err) {
+		t.Fatalf("expected maintenance.lock to be removed")
+	}
+}
+
+func TestUserDaemonAt_Helpers(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, ".local", "bin", "iazio-agent")
+	_ = os.MkdirAll(filepath.Dir(bin), 0755)
+	_ = os.WriteFile(bin, []byte("#!/bin/sh\n"), 0755)
+
+	runner := func(name string, args ...string) error {
+		return nil
+	}
+
+	alive, pid := StatusUserDaemonAt(home)
+	if alive || pid != 0 {
+		t.Fatalf("expected inactive daemon")
+	}
+
+	if err := StartUserDaemonAt(home, bin, runner); err != nil {
+		t.Fatalf("StartUserDaemonAt failed: %v", err)
+	}
+
+	pidPath := filepath.Join(home, ".iazio", "agent.pid")
+	_ = os.WriteFile(pidPath, []byte("99999999\n"), 0644)
+	alive, _ = StatusUserDaemonAt(home)
+	if alive {
+		t.Fatalf("expected non-existent pid to be not alive")
+	}
+
+	_ = StopUserDaemonAt(home)
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatalf("expected agent.pid to be removed")
+	}
+
+	if err := UninstallUserDaemonAt(home, runner); err != nil {
+		t.Fatalf("UninstallUserDaemonAt failed: %v", err)
+	}
+}
+
+func TestCopyBinaryAtomic(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.bin")
+	_ = os.WriteFile(src, []byte("atomic-bytes"), 0755)
+
+	if err := copyBinaryAtomic(src, src); err != nil {
+		t.Fatalf("expected no-op: %v", err)
+	}
+
+	dest := filepath.Join(tmp, "dest.bin")
+	if err := copyBinaryAtomic(src, dest); err != nil {
+		t.Fatalf("copyBinaryAtomic failed: %v", err)
+	}
+	data, _ := os.ReadFile(dest)
+	if string(data) != "atomic-bytes" {
+		t.Fatalf("unexpected content: %s", string(data))
+	}
+}
+
+func TestWindowsLogonUser(t *testing.T) {
+	t.Setenv("USERNAME", "winuser")
+	if u := windowsLogonUser(); u != "winuser" {
+		t.Fatalf("expected winuser, got %s", u)
+	}
+	t.Setenv("USERNAME", "")
+	t.Setenv("USER", "unixuser")
+	if u := windowsLogonUser(); u != "unixuser" {
+		t.Fatalf("expected unixuser, got %s", u)
+	}
+}
+
+func TestInstallLinuxResilience(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, "iazio-agent")
+	var calls []string
+	runner := func(name string, args ...string) error {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		return nil
+	}
+	if err := InstallLinuxResilience(home, bin, runner); err != nil {
+		t.Fatalf("InstallLinuxResilience failed: %v", err)
+	}
+	if len(calls) < 3 {
+		t.Fatalf("expected at least 3 systemctl calls, got %v", calls)
+	}
+}
+
+func TestIsSystemdAvailable(t *testing.T) {
+	_ = IsSystemdAvailable()
+}
+
+func TestInstallDarwinResilience(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, "iazio-agent")
+	var calls []string
+	runner := func(name string, args ...string) error {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		return nil
+	}
+	if err := InstallDarwinResilience(home, bin, runner); err != nil {
+		t.Fatalf("InstallDarwinResilience failed: %v", err)
+	}
+	if len(calls) < 4 {
+		t.Fatalf("expected at least 4 launchctl calls, got %v", calls)
+	}
+}
+
+func TestDevInstall_DefaultExecutable(t *testing.T) {
+	home := t.TempDir()
+	runner := func(name string, args ...string) error {
+		return nil
+	}
+	if err := DevInstall("", home, runner); err != nil {
+		t.Fatalf("DevInstall with default executable failed: %v", err)
+	}
+}
+
+func TestReviveCheck_LinuxInactive(t *testing.T) {
+	home := t.TempDir()
+	var runCalls []string
+	runner := func(name string, args ...string) error {
+		runCalls = append(runCalls, name+" "+strings.Join(args, " "))
+		return nil
+	}
+	restore := SetExecCommandForTest(runner, func(name string, args ...string) ([]byte, error) {
+		return nil, errors.New("inactive")
+	})
+	defer restore()
+
+	_ = ReviveCheck(home, runner)
+	_ = ReviveCheck("", runner)
+}
+
+func TestPauseAndResume_EmptyHome(t *testing.T) {
+	runner := func(name string, args ...string) error { return nil }
+	_ = PauseService("", runner)
+	_ = ResumeService("", runner)
+}
+
+func TestSetupUserCrontab_DefaultRunner(t *testing.T) {
+	var applied string
+	restore := SetCrontabCommandForTest(
+		func() ([]byte, error) {
+			return []byte("# existing crontab\n* * * * * echo hi\n"), nil
+		},
+		func(stdin string) error {
+			applied = stdin
+			return nil
+		},
+		nil,
+	)
+	defer restore()
+
+	if err := setupUserCrontab("/usr/local/bin/iazio-runner.sh", nil); err != nil {
+		t.Fatalf("setupUserCrontab failed: %v", err)
+	}
+	if !strings.Contains(applied, "/usr/local/bin/iazio-runner.sh") {
+		t.Fatalf("expected runner in crontab, got:\n%s", applied)
+	}
+
+	restoreErr := SetCrontabCommandForTest(
+		func() ([]byte, error) { return nil, errors.New("no cron") },
+		func(stdin string) error { return errors.New("cannot apply") },
+		nil,
+	)
+	defer restoreErr()
+	if err := setupUserCrontab("/usr/local/bin/iazio-runner.sh", nil); err == nil {
+		t.Fatal("expected error from crontab apply")
+	}
+}
+
+func TestStartUserDaemonAt_DirectExec(t *testing.T) {
+	home := t.TempDir()
+	daemonDir := filepath.Join(home, ".iazio", "daemon")
+	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runnerScript := filepath.Join(daemonDir, "runner.sh")
+	if err := os.WriteFile(runnerScript, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := StartUserDaemonAt(home, "/bin/iazio-agent", nil); err != nil {
+		t.Fatalf("StartUserDaemonAt with nil runner failed: %v", err)
+	}
+}
+
+func TestUninstallUserDaemonAt_DefaultCrontab(t *testing.T) {
+	home := t.TempDir()
+	pidFile := filepath.Join(home, ".iazio", "agent.pid")
+	_ = os.MkdirAll(filepath.Dir(pidFile), 0o755)
+	_ = os.WriteFile(pidFile, []byte("99999999"), 0o644)
+
+	var removed bool
+	var applied string
+	restore := SetCrontabCommandForTest(
+		func() ([]byte, error) {
+			return []byte(BuildInstallCrontab("", "/tmp/runner.sh")), nil
+		},
+		func(stdin string) error {
+			applied = stdin
+			return nil
+		},
+		func() error {
+			removed = true
+			return nil
+		},
+	)
+	defer restore()
+
+	if err := UninstallUserDaemonAt(home); err != nil {
+		t.Fatalf("UninstallUserDaemonAt failed: %v", err)
+	}
+	if !removed {
+		t.Fatal("expected crontab -r to be invoked when crontab becomes empty")
+	}
+
+	restoreNonEmpty := SetCrontabCommandForTest(
+		func() ([]byte, error) {
+			return []byte("# user job\n* * * * * echo hi\n" + BuildInstallCrontab("", "/tmp/runner.sh")), nil
+		},
+		func(stdin string) error {
+			applied = stdin
+			return nil
+		},
+		nil,
+	)
+	defer restoreNonEmpty()
+
+	if err := UninstallUserDaemonAt(home); err != nil {
+		t.Fatalf("UninstallUserDaemonAt with non-empty crontab failed: %v", err)
+	}
+	if !strings.Contains(applied, "echo hi") {
+		t.Fatalf("expected other user jobs preserved in crontab, got:\n%s", applied)
+	}
+}
+
+func TestInstallDarwinResilience_ErrorCases(t *testing.T) {
+	home := t.TempDir()
+	bin := "/usr/local/bin/iazio-agent"
+
+	err1 := InstallDarwinResilience(home, bin, func(name string, args ...string) error {
+		if strings.Contains(strings.Join(args, " "), "bootstrap") && strings.Contains(strings.Join(args, " "), "watcher") {
+			return errors.New("fail bootstrap watcher")
+		}
+		return nil
+	})
+	if err1 == nil || !strings.Contains(err1.Error(), "fail bootstrap watcher") {
+		t.Fatalf("expected bootstrap watcher error, got %v", err1)
+	}
+
+	err2 := InstallDarwinResilience(home, bin, func(name string, args ...string) error {
+		if strings.Contains(strings.Join(args, " "), "enable") && strings.Contains(strings.Join(args, " "), "watcher") {
+			return errors.New("fail enable watcher")
+		}
+		return nil
+	})
+	if err2 == nil || !strings.Contains(err2.Error(), "fail enable watcher") {
+		t.Fatalf("expected enable watcher error, got %v", err2)
+	}
+
+	err3 := InstallDarwinResilience(home, bin, func(name string, args ...string) error {
+		if strings.Contains(strings.Join(args, " "), "bootstrap") && strings.Contains(strings.Join(args, " "), "watchdog") {
+			return errors.New("fail bootstrap watchdog")
+		}
+		return nil
+	})
+	if err3 == nil || !strings.Contains(err3.Error(), "fail bootstrap watchdog") {
+		t.Fatalf("expected bootstrap watchdog error, got %v", err3)
+	}
+
+	err4 := InstallDarwinResilience(home, bin, func(name string, args ...string) error {
+		if strings.Contains(strings.Join(args, " "), "enable") && strings.Contains(strings.Join(args, " "), "watchdog") {
+			return errors.New("fail enable watchdog")
+		}
+		return nil
+	})
+	if err4 == nil || !strings.Contains(err4.Error(), "fail enable watchdog") {
+		t.Fatalf("expected enable watchdog error, got %v", err4)
+	}
+}
+
+func TestInstallLinuxResilience_ErrorCase(t *testing.T) {
+	home := t.TempDir()
+	bin := "/usr/local/bin/iazio-agent"
+
+	err := InstallLinuxResilience(home, bin, func(name string, args ...string) error {
+		if name == "systemctl" && len(args) > 0 && args[len(args)-1] == "daemon-reload" {
+			return errors.New("daemon reload error")
+		}
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "daemon reload error") {
+		t.Fatalf("expected daemon reload error, got %v", err)
+	}
+}
+
+func TestReviveCheck_ExpiredLock(t *testing.T) {
+	home := t.TempDir()
+	lockDir := filepath.Join(home, ".iazio")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lockFile := filepath.Join(lockDir, "maintenance.lock")
+	if err := os.WriteFile(lockFile, []byte("paused"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-3 * time.Hour)
+	_ = os.Chtimes(lockFile, oldTime, oldTime)
+
+	var runCalled bool
+	runner := func(name string, args ...string) error {
+		runCalled = true
+		return nil
+	}
+	_ = runCalled
+	_ = ReviveCheck(home, runner)
+	if _, err := os.Stat(lockFile); !os.IsNotExist(err) {
+		t.Fatal("expected expired maintenance.lock to be removed")
+	}
+}
+
+func TestPauseAndResume_DefaultRunner(t *testing.T) {
+	home := t.TempDir()
+	var runCalls []string
+	restore := SetExecCommandForTest(func(name string, args ...string) error {
+		runCalls = append(runCalls, name+" "+strings.Join(args, " "))
+		return nil
+	})
+	defer restore()
+
+	if err := PauseService(home, nil); err != nil {
+		t.Fatalf("PauseService failed: %v", err)
+	}
+	lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
+	if _, err := os.Stat(lockFile); err != nil {
+		t.Fatalf("expected maintenance.lock to exist: %v", err)
+	}
+
+	if err := ResumeService(home, nil); err != nil {
+		t.Fatalf("ResumeService failed: %v", err)
+	}
+	if _, err := os.Stat(lockFile); !os.IsNotExist(err) {
+		t.Fatalf("expected maintenance.lock to be removed")
+	}
+
+	if IsSystemdAvailable() && len(runCalls) == 0 {
+		t.Fatal("expected default execCommand to be invoked on systemd host")
+	}
+}
+
+func TestWindowsLogonUser_EnvVariants(t *testing.T) {
+	t.Setenv("USERNAME", "alice")
+	if u := windowsLogonUser(); u != "alice" {
+		t.Fatalf("expected alice, got %q", u)
+	}
+	t.Setenv("USERNAME", "")
+	t.Setenv("USER", "bob")
+	if u := windowsLogonUser(); u != "bob" {
+		t.Fatalf("expected bob, got %q", u)
+	}
+	t.Setenv("USERNAME", "")
+	t.Setenv("USER", "")
+	u := windowsLogonUser()
+	if u == "" {
+		t.Fatal("expected non-empty user from current user fallback")
+	}
+}
+
+
+
+
+
+
+
+

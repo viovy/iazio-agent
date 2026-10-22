@@ -667,7 +667,85 @@ func TestPostRepoStatusAndPingAck(t *testing.T) {
 	if len(seenPaths) != 2 || seenPaths[0] != "/v1/hosts/host-1/repos/status" || seenPaths[1] != "/v1/hosts/host-1/ping-ack" {
 		t.Fatalf("unexpected paths: %v", seenPaths)
 	}
+
+	notif := NotificationRecord{
+		Title:    "Test Notification",
+		Message:  "Hello from test",
+		Category: "success",
+		Source:   "iazio-agent",
+		HostID:   "host-1",
+	}
+	if err := c.PostNotification(ctx, notif); err != nil {
+		t.Fatalf("PostNotification failed: %v", err)
+	}
+	if len(seenPaths) != 3 || seenPaths[2] != "/v1/notifications" {
+		t.Fatalf("expected /v1/notifications, got %v", seenPaths)
+	}
 }
+
+func TestHostDaemonLoop_Cancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+	c := Client{BaseURL: "http://localhost:9999"}
+	_ = c.HostDaemonLoop(ctx, "host-1", "desktop", 10*time.Millisecond)
+}
+
+func TestClient_Loop_WithHeartbeatAndCommands(t *testing.T) {
+	toolUpdateCalled := false
+	commandCalled := false
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/hosts/register":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"registered":true}`))
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"ok": true,
+				"pending_tool_update": {"tools":["iazio-harness"],"force":true},
+				"pending_commands": [{"id":"cmd-1","type":"PING"}]
+			}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	c := Client{
+		BaseURL: srv.URL,
+		Tools: func() []Tool {
+			return []Tool{{Name: "iazio-agent", Version: "1.0.0"}}
+		},
+		ActiveJobs: func() []ActiveJob {
+			return []ActiveJob{{JobID: "job-1", PID: 1001}}
+		},
+		OnToolUpdate: func(ctx context.Context, tools []string, force bool) error {
+			toolUpdateCalled = true
+			return nil
+		},
+		OnCommand: func(ctx context.Context, cmd CommandEnvelope) error {
+			commandCalled = true
+			return nil
+		},
+	}
+
+	_ = c.Loop(ctx, "host-1", "desktop", 20*time.Millisecond, nil, "profile-default")
+	time.Sleep(20 * time.Millisecond)
+
+	if !toolUpdateCalled {
+		t.Fatalf("expected OnToolUpdate to be called")
+	}
+	if !commandCalled {
+		t.Fatalf("expected OnCommand to be called")
+	}
+}
+
+
 
 
 

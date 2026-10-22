@@ -174,7 +174,19 @@ type UpdateOptions struct {
 	TargetTools []string
 }
 
+type UpdateResult struct {
+	AgentUpdated bool     `json:"agent_updated"`
+	UpdatedTools []string `json:"updated_tools"`
+	Errors       []error  `json:"errors,omitempty"`
+}
+
 func performUpdate(ctx context.Context, opts UpdateOptions, stdout, stderr io.Writer, getenv func(string) string) (bool, error) {
+	res, err := performUpdateWithResult(ctx, opts, stdout, stderr, getenv)
+	return res.AgentUpdated, err
+}
+
+func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, stderr io.Writer, getenv func(string) string) (UpdateResult, error) {
+	var res UpdateResult
 	if getenv == nil {
 		getenv = os.Getenv
 	}
@@ -189,7 +201,7 @@ func performUpdate(ctx context.Context, opts UpdateOptions, stdout, stderr io.Wr
 	}
 
 	if opts.DryRun {
-		return false, nil
+		return res, nil
 	}
 
 	manifestURL := fmt.Sprintf("%s/v1/fleet/manifest?profile=%s&os=%s&arch=%s",
@@ -197,14 +209,14 @@ func performUpdate(ctx context.Context, opts UpdateOptions, stdout, stderr io.Wr
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
 	if err != nil {
-		return false, fmt.Errorf("create manifest request: %w", err)
+		return res, fmt.Errorf("create manifest request: %w", err)
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		// Control plane might be unreachable in offline or mock test runs
-		return false, nil
+		return res, nil
 	}
 	defer resp.Body.Close()
 
@@ -213,10 +225,10 @@ func performUpdate(ctx context.Context, opts UpdateOptions, stdout, stderr io.Wr
 		// Fallback to baseline default profile if control plane hasn't registered profile yet
 		manifest = defaultBaselineManifest(opts.Profile)
 	} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, fmt.Errorf("fetch manifest returned HTTP %d", resp.StatusCode)
+		return res, fmt.Errorf("fetch manifest returned HTTP %d", resp.StatusCode)
 	} else {
 		if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
-			return false, fmt.Errorf("decode manifest: %w", err)
+			return res, fmt.Errorf("decode manifest: %w", err)
 		}
 	}
 
@@ -277,21 +289,24 @@ func performUpdate(ctx context.Context, opts UpdateOptions, stdout, stderr io.Wr
 		}
 	}
 
-	agentUpdated := false
 	for _, tool := range targets {
 		updated, err := updateSingleTool(ctx, client, tool, binDir, ghToken, opts.Force, stdout, stderr)
 		if err != nil {
+			res.Errors = append(res.Errors, fmt.Errorf("%s: %w", tool.Name, err))
 			if stderr != nil {
 				fmt.Fprintf(stderr, "  [-] %s: %v\n", tool.Name, err)
 			}
 			continue
 		}
-		if updated && tool.Name == "iazio-agent" {
-			agentUpdated = true
+		if updated {
+			res.UpdatedTools = append(res.UpdatedTools, tool.Name)
+			if tool.Name == "iazio-agent" {
+				res.AgentUpdated = true
+			}
 		}
 	}
 
-	return agentUpdated, nil
+	return res, nil
 }
 
 func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {

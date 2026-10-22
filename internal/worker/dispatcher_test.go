@@ -817,3 +817,16 @@ func TestHTTPControlPlaneClient_AllMethods(t *testing.T) {
 		t.Fatal("expected error for fenced heartbeat")
 	}
 }
+
+func TestEnsurePromptID_Helpers(t *testing.T) {
+	raw := json.RawMessage(`{"prompt":"hello"}`)
+	out := EnsurePromptID("job-123", raw)
+	if !strings.Contains(string(out), "prompt_id") {
+		t.Fatalf("expected prompt_id in output: %s", string(out))
+	}
+	outTrace := EnsurePromptIDWithTrace("job-123", "trace-456", raw)
+	if !strings.Contains(string(outTrace), "trace_id") {
+		t.Fatalf("expected trace_id in output: %s", string(outTrace))
+	}
+}
+
