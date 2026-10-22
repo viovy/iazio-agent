@@ -11,6 +11,10 @@ import (
 	"time"
 )
 
+func init() {
+	_ = os.Setenv("ZIPKIN_SPOOL_DIR", "none")
+}
+
 func TestTracerSpanCreationAndPropagation(t *testing.T) {
 	exp := NewZipkinExporter("http://localhost:9411")
 	tracer := NewTracer("test-agent", exp)
@@ -243,4 +247,61 @@ func TestZipkinExporterErrorAndClose(t *testing.T) {
 
 	// Export after close
 	_ = exp.ExportSpan(&Span{})
+}
+
+func TestZipkinExporter_OfflineSpoolAndDrain(t *testing.T) {
+	tempSpool := t.TempDir()
+	exp := NewZipkinExporter("http://127.0.0.1:49999/api/v2/spans")
+	exp.spoolDir = tempSpool
+	defer exp.Close()
+
+	span := &Span{
+		TraceID:     "11112222333344445555666677778888",
+		ID:          "1111222233334444",
+		Name:        "offline.span",
+		ServiceName: "test-agent",
+		StartTime:   time.Now().UTC(),
+		Duration:    10 * time.Millisecond,
+	}
+
+	// 1. Send while server is down -> should spool to disk
+	err := exp.sendSpans(context.Background(), []*Span{span})
+	if err == nil {
+		t.Fatalf("expected error when zipkin is offline")
+	}
+
+	entries, err := os.ReadDir(tempSpool)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected 1 spooled span file in %s, got err=%v count=%d", tempSpool, err, len(entries))
+	}
+
+	// 2. Bring server up
+	received := make(chan []ZipkinSpan, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var spans []ZipkinSpan
+		_ = json.NewDecoder(r.Body).Decode(&spans)
+		received <- spans
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer ts.Close()
+
+	exp.endpoint = ts.URL + "/api/v2/spans"
+
+	// 3. Drain spool
+	exp.drainSpool(context.Background())
+
+	select {
+	case spans := <-received:
+		if len(spans) != 1 || spans[0].Name != "offline.span" {
+			t.Fatalf("unexpected drained span: %+v", spans)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for drained spans to be posted")
+	}
+
+	// Spool directory should now be empty
+	remaining, _ := os.ReadDir(tempSpool)
+	if len(remaining) != 0 {
+		t.Fatalf("expected spool directory to be empty after drain, got %d files", len(remaining))
+	}
 }

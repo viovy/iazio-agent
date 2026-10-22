@@ -13,20 +13,27 @@ import (
 	"sync"
 )
 
+type waitResult struct {
+	exitCode int
+	err      error
+}
+
 // OSRunner executes child processes with their own process group.
 type OSRunner struct {
-	mu     sync.Mutex
-	cmds   map[int]*exec.Cmd
-	Stdout io.Writer
-	Stderr io.Writer
+	mu      sync.Mutex
+	cmds    map[int]*exec.Cmd
+	results map[int]chan waitResult
+	Stdout  io.Writer
+	Stderr  io.Writer
 }
 
 // NewOSRunner returns a new OSRunner.
 func NewOSRunner() *OSRunner {
 	return &OSRunner{
-		cmds:   make(map[int]*exec.Cmd),
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
+		cmds:    make(map[int]*exec.Cmd),
+		results: make(map[int]chan waitResult),
+		Stdout:  os.Stdout,
+		Stderr:  os.Stderr,
 	}
 }
 
@@ -167,24 +174,44 @@ func (r *OSRunner) Signal(pid int, sig string) error {
 }
 
 // Wait waits for the child process to exit and returns its exit code.
+// Safe for concurrent invocations from multiple observers (e.g. supervisor and watchdog).
 func (r *OSRunner) Wait(pid int) (int, error) {
 	r.mu.Lock()
-	cmd := r.cmds[pid]
-	delete(r.cmds, pid)
+	if r.results == nil {
+		r.results = make(map[int]chan waitResult)
+	}
+	ch, exists := r.results[pid]
+	if !exists {
+		cmd := r.cmds[pid]
+		if cmd == nil {
+			r.mu.Unlock()
+			return -1, errors.New("no such process")
+		}
+		ch = make(chan waitResult, 1)
+		r.results[pid] = ch
+		go func() {
+			err := cmd.Wait()
+			var exitCode int
+			var exitErr *exec.ExitError
+			if err != nil {
+				if errors.As(err, &exitErr) {
+					exitCode = exitErr.ExitCode()
+					err = nil
+				} else {
+					exitCode = -1
+				}
+			}
+			res := waitResult{exitCode: exitCode, err: err}
+			ch <- res
+			r.mu.Lock()
+			delete(r.cmds, pid)
+			r.mu.Unlock()
+		}()
+	}
 	r.mu.Unlock()
 
-	if cmd == nil {
-		return -1, errors.New("no such process")
-	}
-	err := cmd.Wait()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return exitErr.ExitCode(), nil
-		}
-		return -1, err
-	}
-	return 0, nil
+	res := <-ch
+	return res.exitCode, res.err
 }
 
 // DockerConfig holds configuration parameters for launching an ephemeral containerized agent.

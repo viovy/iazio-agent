@@ -528,6 +528,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					"--api-url", job.APIURL,
 					"--worktree-path", job.WorktreePath,
 					"--docs-hub-path", job.DocsHubPath,
+					"--kind", "resume",
+				}
+				if job.ConversationID != "" {
+					argv = append(argv, "--resume-conversation", job.ConversationID)
 				}
 				newPID, err := wdRunner.Start(argv)
 				return newPID, err
@@ -583,7 +587,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				if convID == "" && len(a.ConversationIDs) > 0 {
 					convID = a.ConversationIDs[len(a.ConversationIDs)-1]
 				}
-				if convID == "" && lockInfo.ConversationID != "" {
+				if convID == "" && lockInfo.ConversationID != "" && lockInfo.Status != "COMPLETED" && (a.Kind == "resume" || (a.StoryID != "" && lockInfo.StoryID == a.StoryID)) {
 					convID = lockInfo.ConversationID
 				}
 				wd.Track(watchdog.TrackedJob{

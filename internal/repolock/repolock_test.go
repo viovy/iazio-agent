@@ -111,6 +111,104 @@ func TestAcquire_CrashedPID_AdoptsAndPreservesConversation(t *testing.T) {
 	}
 }
 
+func TestAcquire_UnrelatedStoryOrCompleted_DoesNotAdoptConversation(t *testing.T) {
+	// Case 1: Generic prompt without story ID -> MUST NOT adopt
+	t.Run("StoryLessPrompt", func(t *testing.T) {
+		wt := t.TempDir()
+		info1 := LockInfo{
+			JobID:          "job-1",
+			PID:            3001,
+			ConversationID: "conv-leak-prevention",
+			StoryID:        "STORY-FIRST",
+			Status:         "RUNNING",
+		}
+		h1, err := Acquire(wt, info1, func(int) bool { return true })
+		if err != nil {
+			t.Fatalf("Acquire job-1 failed: %v", err)
+		}
+		_ = h1.flockFile.Close()
+		h1.released = true // simulate crash
+
+		infoGeneric := LockInfo{
+			JobID:   "job-generic",
+			PID:     3002,
+			StoryID: "",
+		}
+		handleGen, err := Acquire(wt, infoGeneric, func(int) bool { return false })
+		if err != nil {
+			t.Fatalf("Acquire generic failed: %v", err)
+		}
+		defer handleGen.Release()
+		if handleGen.Info().ConversationID != "" {
+			t.Fatalf("expected empty ConversationID for story-less prompt, got: %q", handleGen.Info().ConversationID)
+		}
+	})
+
+	// Case 2: Different story ID -> MUST NOT adopt
+	t.Run("DifferentStory", func(t *testing.T) {
+		wt := t.TempDir()
+		info1 := LockInfo{
+			JobID:          "job-1",
+			PID:            3001,
+			ConversationID: "conv-leak-prevention",
+			StoryID:        "STORY-FIRST",
+			Status:         "RUNNING",
+		}
+		h1, err := Acquire(wt, info1, func(int) bool { return true })
+		if err != nil {
+			t.Fatalf("Acquire job-1 failed: %v", err)
+		}
+		_ = h1.flockFile.Close()
+		h1.released = true
+
+		infoDiff := LockInfo{
+			JobID:   "job-diff",
+			PID:     3003,
+			StoryID: "STORY-SECOND",
+		}
+		handleDiff, err := Acquire(wt, infoDiff, func(int) bool { return false })
+		if err != nil {
+			t.Fatalf("Acquire different story failed: %v", err)
+		}
+		defer handleDiff.Release()
+		if handleDiff.Info().ConversationID != "" {
+			t.Fatalf("expected empty ConversationID for different story, got: %q", handleDiff.Info().ConversationID)
+		}
+	})
+
+	// Case 3: Prior job was COMPLETED -> MUST NOT adopt even for same story
+	t.Run("CompletedPriorJob", func(t *testing.T) {
+		wt := t.TempDir()
+		infoCompleted := LockInfo{
+			JobID:          "job-done",
+			PID:            3004,
+			ConversationID: "conv-completed",
+			StoryID:        "STORY-DONE",
+			Status:         "COMPLETED",
+		}
+		hDone, err := Acquire(wt, infoCompleted, func(int) bool { return false })
+		if err != nil {
+			t.Fatalf("Acquire completed failed: %v", err)
+		}
+		_ = hDone.flockFile.Close()
+		hDone.released = true
+
+		infoNewSameStory := LockInfo{
+			JobID:   "job-new",
+			PID:     3005,
+			StoryID: "STORY-DONE",
+		}
+		handleNew, err := Acquire(wt, infoNewSameStory, func(int) bool { return false })
+		if err != nil {
+			t.Fatalf("Acquire new failed: %v", err)
+		}
+		defer handleNew.Release()
+		if handleNew.Info().ConversationID != "" {
+			t.Fatalf("expected empty ConversationID from COMPLETED job, got: %q", handleNew.Info().ConversationID)
+		}
+	})
+}
+
 func TestAcquire_ConcurrentFlockContention(t *testing.T) {
 	wt := t.TempDir()
 	info1 := LockInfo{

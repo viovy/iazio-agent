@@ -137,14 +137,13 @@ func Acquire(worktree string, info LockInfo, isAlive func(int) bool) (*LockHandl
 		}
 	}
 
-	// Preserve prior conversation ID / story ID if caller didn't provide them
+	// Only adopt prior conversation ID if explicitly continuing an unfinished run
+	// for the EXACT same non-empty story ID. Never adopt for generic/story-less prompts
+	// or from completed runs (prevents cross-prompt session leak).
 	if info.ConversationID == "" && existing.ConversationID != "" {
-		if info.StoryID == "" || info.StoryID == existing.StoryID {
+		if info.StoryID != "" && info.StoryID == existing.StoryID && existing.Status != "COMPLETED" {
 			info.ConversationID = existing.ConversationID
 		}
-	}
-	if info.StoryID == "" && existing.StoryID != "" {
-		info.StoryID = existing.StoryID
 	}
 	if info.LockedAt.IsZero() {
 		info.LockedAt = time.Now().UTC()
