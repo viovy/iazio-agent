@@ -945,21 +945,33 @@ func BuildUninstallCrontab(existing string) string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
+var crontabListCommand = func() ([]byte, error) {
+	return exec.Command("crontab", "-l").Output()
+}
+
+var crontabApplyCommand = func(stdin string) error {
+	cmd := exec.Command("crontab", "-")
+	cmd.Stdin = strings.NewReader(stdin)
+	return cmd.Run()
+}
+
+var crontabRemoveCommand = func() error {
+	return exec.Command("crontab", "-r").Run()
+}
+
 func setupUserCrontab(runnerPath string, run func(name string, args ...string) error) error {
 	var existing string
 	if run != nil {
 		_ = BuildInstallCrontab(existing, runnerPath)
 		return run("crontab", "-")
 	}
-	out, err := exec.Command("crontab", "-l").Output()
+	out, err := crontabListCommand()
 	if err == nil {
 		existing = string(out)
 	}
 	newCron := BuildInstallCrontab(existing, runnerPath)
 
-	cmd := exec.Command("crontab", "-")
-	cmd.Stdin = strings.NewReader(newCron)
-	if err := cmd.Run(); err != nil {
+	if err := crontabApplyCommand(newCron); err != nil {
 		return fmt.Errorf("update crontab: %w", err)
 	}
 	return nil
@@ -1034,15 +1046,13 @@ func UninstallUserDaemonAt(home string, run ...func(name string, args ...string)
 	if len(run) > 0 && run[0] != nil {
 		_ = run[0]("crontab", "-")
 	} else {
-		out, err := exec.Command("crontab", "-l").Output()
+		out, err := crontabListCommand()
 		if err == nil {
 			newCron := BuildUninstallCrontab(string(out))
 			if newCron == "" {
-				_ = exec.Command("crontab", "-r").Run()
+				_ = crontabRemoveCommand()
 			} else {
-				cmd := exec.Command("crontab", "-")
-				cmd.Stdin = strings.NewReader(newCron)
-				_ = cmd.Run()
+				_ = crontabApplyCommand(newCron)
 			}
 		}
 	}
@@ -1231,5 +1241,26 @@ func SetExecCommandForTest(runner func(name string, args ...string) error, statu
 	return func() {
 		execCommand = origExec
 		statusCheckCommand = origStatus
+	}
+}
+
+// SetCrontabCommandForTest allows mocking crontab subcommands in tests.
+func SetCrontabCommandForTest(list func() ([]byte, error), apply func(string) error, remove func() error) func() {
+	origList := crontabListCommand
+	origApply := crontabApplyCommand
+	origRemove := crontabRemoveCommand
+	if list != nil {
+		crontabListCommand = list
+	}
+	if apply != nil {
+		crontabApplyCommand = apply
+	}
+	if remove != nil {
+		crontabRemoveCommand = remove
+	}
+	return func() {
+		crontabListCommand = origList
+		crontabApplyCommand = origApply
+		crontabRemoveCommand = origRemove
 	}
 }

@@ -674,6 +674,47 @@ func TestReconcileHostCheckouts_AutoHealSuperseded(t *testing.T) {
 	}
 }
 
+func TestReconcileHostCheckouts_AutoHealRealGit(t *testing.T) {
+	tmpDir := t.TempDir()
+	_ = exec.Command("git", "init", "-b", "main", tmpDir).Run()
+	_ = exec.Command("git", "-C", tmpDir, "config", "user.name", "test").Run()
+	_ = exec.Command("git", "-C", tmpDir, "config", "user.email", "test@test.com").Run()
+	_ = exec.Command("git", "-C", tmpDir, "commit", "--allow-empty", "-m", "initial").Run()
+	_ = exec.Command("git", "-C", tmpDir, "checkout", "-b", "feature/my-feat").Run()
+
+	reportsDir := filepath.Join(tmpDir, "tmp", "reports")
+	_ = os.MkdirAll(reportsDir, 0755)
+
+	sirJSON := `{
+  "id": "SIR-1051-REAL",
+  "category": "SUPERSEDED_BRANCH",
+  "auto_healable": true
+}`
+	_ = os.WriteFile(filepath.Join(reportsDir, "intervention-real.json"), []byte(sirJSON), 0644)
+
+	repos := []RepoState{
+		{
+			WorktreePath: tmpDir,
+			Queue:        "PAUSED",
+			Reason:       "HALTED_DIRTY",
+		},
+	}
+
+	resumed := false
+	isLockIdle := func(w string) bool { return true }
+	isClean := func(w string) (bool, error) { return false, nil }
+	resume := func(w string) error {
+		resumed = true
+		return nil
+	}
+	var stdout, stderr bytes.Buffer
+	ReconcileHostCheckouts(repos, isLockIdle, nil, isClean, resume, &stdout, &stderr)
+	if !resumed {
+		t.Fatalf("expected resumed=true after auto-heal, stdout: %s, stderr: %s", stdout.String(), stderr.String())
+	}
+}
+
+
 type mockRunner struct {
 	lastArgv []string
 }

@@ -841,5 +841,120 @@ func TestResolveInstallDir_Extended(t *testing.T) {
 	}
 }
 
+func TestPerformUpdateWithResult_FallbackToSingleAgent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/fleet/manifest") {
+			manifest := ManifestResponse{
+				Profile: "generic",
+				Tools: []ManifestToolItem{
+					{Name: "other-tool", Repository: "viovy/other-tool", BinaryName: "other-tool"},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(manifest)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	opts := UpdateOptions{
+		Suite:   false,
+		API:     srv.URL,
+		Profile: "generic",
+		BinDir:  t.TempDir(),
+	}
+	var stdout, stderr bytes.Buffer
+	_, _ = performUpdateWithResult(ctx, opts, &stdout, &stderr, func(string) string { return "" })
+}
+
+func TestResolveInstallDir_Variants(t *testing.T) {
+	fakeHome := "/home/testuser"
+	getenv := func(k string) string {
+		switch k {
+		case "HOME":
+			return fakeHome
+		case "USERPROFILE":
+			return "C:\\Users\\testuser"
+		default:
+			return ""
+		}
+	}
+
+	// 1. Tilde expansion
+	rootsTilde := ManifestInstallRoots{
+		Unix: ManifestInstallRootPaths{
+			Primary: "~/.local/bin",
+		},
+	}
+	dir := resolveInstallDir(rootsTilde, getenv)
+	if runtime.GOOS != "windows" {
+		expected := filepath.Join(fakeHome, ".local", "bin")
+		if dir != expected {
+			t.Fatalf("expected %s, got %s", expected, dir)
+		}
+	}
+
+	// 2. Absolute path primary
+	rootsAbs := ManifestInstallRoots{
+		Unix: ManifestInstallRootPaths{
+			Primary: "/opt/bin",
+		},
+	}
+	dirAbs := resolveInstallDir(rootsAbs, getenv)
+	if runtime.GOOS != "windows" && dirAbs != "/opt/bin" {
+		t.Fatalf("expected /opt/bin, got %s", dirAbs)
+	}
+
+	// 3. Fallback path
+	rootsFallback := ManifestInstallRoots{
+		Unix: ManifestInstallRootPaths{
+			Fallback: "/opt/fallback/bin",
+		},
+	}
+	dirFallback := resolveInstallDir(rootsFallback, getenv)
+	if runtime.GOOS != "windows" && dirFallback != "/opt/fallback/bin" {
+		t.Fatalf("expected /opt/fallback/bin, got %s", dirFallback)
+	}
+
+	// 4. Default empty fallback
+	rootsEmpty := ManifestInstallRoots{}
+	dirEmpty := resolveInstallDir(rootsEmpty, getenv)
+	if runtime.GOOS != "windows" {
+		expected := filepath.Join(fakeHome, ".local", "bin")
+		if dirEmpty != expected {
+			t.Fatalf("expected %s, got %s", expected, dirEmpty)
+		}
+	}
+}
+
+func TestCleanStaleBackups_ExpiredFiles(t *testing.T) {
+	dir := t.TempDir()
+	staleFile := filepath.Join(dir, "agent.old.12345.exe")
+	if err := os.WriteFile(staleFile, []byte("old binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-10 * time.Minute)
+	_ = os.Chtimes(staleFile, past, past)
+
+	freshFile := filepath.Join(dir, "agent.old.fresh.exe")
+	if err := os.WriteFile(freshFile, []byte("fresh binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanStaleBackups(dir)
+
+	if _, err := os.Stat(staleFile); !os.IsNotExist(err) {
+		t.Fatal("expected stale file to be deleted")
+	}
+	if _, err := os.Stat(freshFile); err != nil {
+		t.Fatal("expected fresh file to remain")
+	}
+}
+
+
 
 

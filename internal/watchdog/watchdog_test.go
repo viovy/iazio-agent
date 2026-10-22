@@ -3,8 +3,10 @@ package watchdog
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -375,6 +377,62 @@ func TestDefaultIsProcessAlive(t *testing.T) {
 		t.Fatalf("expected pid -1 to be dead")
 	}
 }
+
+func TestWatchdog_AdoptsConversationFromExecutionCheckpoint(t *testing.T) {
+	wt := t.TempDir()
+	iazioDir := filepath.Join(wt, ".iazio")
+	_ = os.MkdirAll(iazioDir, 0755)
+	_ = os.WriteFile(filepath.Join(iazioDir, "execution-checkpoint.json"), []byte(`{"conversation_id":"cp-conv-999"}`), 0644)
+
+	stateFile := filepath.Join(t.TempDir(), "watchdog.json")
+	w := New(Options{
+		StateFile: stateFile,
+		IsAlive:   func(pid int) bool { return false },
+		Spawner: func(ctx context.Context, job TrackedJob) (int, error) {
+			if job.ConversationID != "cp-conv-999" {
+				return 0, fmt.Errorf("wrong conversation: %s", job.ConversationID)
+			}
+			return 7777, nil
+		},
+	})
+
+	w.Track(TrackedJob{
+		JobID:        "job-cp-1",
+		WorktreePath: wt,
+		PID:          1001,
+	})
+
+	_ = w.CheckInterrupted(context.Background())
+
+	j, err := w.GetJob("job-cp-1")
+	if err != nil || j.PID != 7777 || j.ConversationID != "cp-conv-999" {
+		t.Fatalf("unexpected resumed job: %+v, err=%v", j, err)
+	}
+}
+
+func TestWatchdog_SpawnerError(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "watchdog-err.json")
+	w := New(Options{
+		StateFile: stateFile,
+		IsAlive:   func(pid int) bool { return false },
+		Spawner: func(ctx context.Context, job TrackedJob) (int, error) {
+			return 0, errors.New("spawn failed")
+		},
+	})
+
+	w.Track(TrackedJob{
+		JobID: "job-err-1",
+		PID:   1001,
+	})
+
+	_ = w.CheckInterrupted(context.Background())
+
+	j, _ := w.GetJob("job-err-1")
+	if !strings.Contains(j.LastError, "spawn failed") {
+		t.Fatalf("expected LastError to contain 'spawn failed', got %q", j.LastError)
+	}
+}
+
 
 
 

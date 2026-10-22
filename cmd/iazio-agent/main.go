@@ -498,47 +498,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return nil
 				})
 				disp.SetWorktreeResolver(func(repoName string) string {
-					clean := strings.TrimSpace(repoName)
-					if detail, err := client.GetHost(runCtx, host); err == nil {
-						if wt := resolveWorktreeFromHostDetail(detail, repoName); wt != "" {
-							return wt
-						}
-					}
-					if envRoot := getenv("IAZIO_FLEET_ROOT"); envRoot != "" {
-						return envRoot
-					}
-					var candidateRoots []string
-					if home, err := os.UserHomeDir(); err == nil && home != "" {
-						workDir := filepath.Join(home, "work")
-						if entries, err := os.ReadDir(workDir); err == nil {
-							for _, e := range entries {
-								if e.IsDir() {
-									candidateRoots = append(candidateRoots, filepath.Join(workDir, e.Name()))
-								}
-							}
-						}
-					}
-					if entries, err := os.ReadDir("/work"); err == nil {
-						for _, e := range entries {
-							if e.IsDir() {
-								candidateRoots = append(candidateRoots, filepath.Join("/work", e.Name()))
-							}
-						}
-					}
-					for _, cand := range candidateRoots {
-						gmPath := filepath.Join(cand, ".gitmodules")
-						if b, err := os.ReadFile(gmPath); err == nil {
-							if clean == "." || clean == "" || clean == "root" || strings.Contains(string(b), clean) {
-								_ = os.Setenv("IAZIO_FLEET_ROOT", cand)
-								return cand
-							}
-							if _, err := os.Stat(filepath.Join(cand, clean)); err == nil {
-								_ = os.Setenv("IAZIO_FLEET_ROOT", cand)
-								return cand
-							}
-						}
-					}
-					return ""
+					return resolveWorktreeForRepo(runCtx, client, host, repoName, getenv)
 				})
 				go func() {
 					pollTicker := time.NewTicker(2 * time.Second)
@@ -964,8 +924,7 @@ var parseSchtasksStatus = service.ParseSchtasksStatus
 func applyWindows(action, _ string, stdout io.Writer) error {
 	switch action {
 	case "status":
-		cmd := exec.Command("schtasks", "/Query", "/TN", "iazio-agent", "/FO", "LIST")
-		out, err := cmd.CombinedOutput()
+		out, err := execCommandOutput("schtasks", "/Query", "/TN", "iazio-agent", "/FO", "LIST")
 		if err != nil {
 			return fmt.Errorf("service not installed: %s", strings.TrimSpace(string(out)))
 		}
@@ -1134,8 +1093,9 @@ type repoAuditResult struct {
 func isDocOrEphemeralFile(f string) bool {
 	clean := filepath.ToSlash(strings.TrimSpace(f))
 	clean = strings.TrimPrefix(clean, "./")
-	return strings.HasPrefix(clean, "docs/reviews/") ||
-		strings.HasPrefix(clean, "docs/stories/") ||
+	return clean == "docs" ||
+		clean == "docs/" ||
+		strings.HasPrefix(clean, "docs/") ||
 		strings.HasPrefix(clean, "tmp/") ||
 		strings.HasPrefix(clean, ".system_generated/") ||
 		strings.HasPrefix(clean, ".gemini/") ||
@@ -1312,6 +1272,8 @@ func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Cli
 	return true
 }
 
+var syscallExec = syscall.Exec
+
 func restartOrExecSelf(stdout io.Writer) {
 	if stdout != nil {
 		fmt.Fprintln(stdout, "[supervisor] iazio-agent self-updated; executing in-PID handoff to updated binary...")
@@ -1325,7 +1287,7 @@ func restartOrExecSelf(stdout io.Writer) {
 		if resolved, err := filepath.EvalSymlinks(selfBin); err == nil {
 			selfBin = resolved
 		}
-		execErr := syscall.Exec(selfBin, os.Args, os.Environ())
+		execErr := syscallExec(selfBin, os.Args, os.Environ())
 		if execErr != nil {
 			fmt.Fprintf(os.Stderr, "[SIR: AUTO_RESTART_FAIL] syscall.Exec(%s) failed: %v; exiting non-zero for systemd recovery\n", selfBin, execErr)
 			os.Exit(1)
@@ -1531,6 +1493,58 @@ func resolveWorktreeFromHostDetail(detail controlplane.HostDetail, repoName stri
 			}
 			if wt != "" {
 				return wt
+			}
+		}
+	}
+	return ""
+}
+
+type hostDetailGetter interface {
+	GetHost(ctx context.Context, hostID string) (controlplane.HostDetail, error)
+}
+
+func resolveWorktreeForRepo(ctx context.Context, getter hostDetailGetter, host, repoName string, getenv func(string) string) string {
+	clean := strings.TrimSpace(repoName)
+	if getter != nil {
+		if detail, err := getter.GetHost(ctx, host); err == nil {
+			if wt := resolveWorktreeFromHostDetail(detail, repoName); wt != "" {
+				return wt
+			}
+		}
+	}
+	if getenv != nil {
+		if envRoot := getenv("IAZIO_FLEET_ROOT"); envRoot != "" {
+			return envRoot
+		}
+	}
+	var candidateRoots []string
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		workDir := filepath.Join(home, "work")
+		if entries, err := os.ReadDir(workDir); err == nil {
+			for _, e := range entries {
+				if e.IsDir() {
+					candidateRoots = append(candidateRoots, filepath.Join(workDir, e.Name()))
+				}
+			}
+		}
+	}
+	if entries, err := os.ReadDir("/work"); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				candidateRoots = append(candidateRoots, filepath.Join("/work", e.Name()))
+			}
+		}
+	}
+	for _, cand := range candidateRoots {
+		gmPath := filepath.Join(cand, ".gitmodules")
+		if b, err := os.ReadFile(gmPath); err == nil {
+			if clean == "." || clean == "" || clean == "root" || strings.Contains(string(b), clean) {
+				_ = os.Setenv("IAZIO_FLEET_ROOT", cand)
+				return cand
+			}
+			if _, err := os.Stat(filepath.Join(cand, clean)); err == nil {
+				_ = os.Setenv("IAZIO_FLEET_ROOT", cand)
+				return cand
 			}
 		}
 	}
