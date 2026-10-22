@@ -28,6 +28,7 @@ import (
 	"github.com/viovy/iazio-agent/internal/service"
 	"github.com/viovy/iazio-agent/internal/supervisor"
 	"github.com/viovy/iazio-agent/internal/telemetry"
+	"github.com/viovy/iazio-agent/internal/watchdog"
 	"github.com/viovy/iazio-agent/internal/worker"
 )
 
@@ -497,6 +498,25 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}()
 			}
 
+			wdRunner := supervisor.NewOSRunner()
+			var wd *watchdog.Watchdog
+			spawner := func(sCtx context.Context, job watchdog.TrackedJob) (int, error) {
+				argv := []string{
+					"iazio-harness", "run",
+					"--job-id", job.JobID,
+					"--api-url", job.APIURL,
+					"--worktree-path", job.WorktreePath,
+					"--docs-hub-path", job.DocsHubPath,
+				}
+				newPID, err := wdRunner.Start(argv)
+				return newPID, err
+			}
+			wd = watchdog.New(watchdog.Options{
+				Runner:  wdRunner,
+				Spawner: spawner,
+			})
+			wd.StartWatchguard(runCtx, 5*time.Second)
+
 			onJob := func(a controlplane.Assignment) error {
 				if a.ID == "" {
 					return nil
@@ -507,8 +527,27 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					telemetry.WithTag("story.id", a.StoryID),
 				)
 				defer span.End()
-				r := &supervisor.OSRunner{}
-				return sup.Spawn(r, a.ID, api, a.WorktreePath, a.DocsHubPath, "")
+				err := sup.Spawn(wdRunner, a.ID, api, a.WorktreePath, a.DocsHubPath, "")
+				if err == nil {
+					pid := sup.PID(a.WorktreePath)
+					convID := a.ResumeConversationID
+					if convID == "" && len(a.ConversationIDs) > 0 {
+						convID = a.ConversationIDs[len(a.ConversationIDs)-1]
+					}
+					wd.Track(watchdog.TrackedJob{
+						JobID:          a.ID,
+						ScheduleID:     a.ScheduleID,
+						WorktreePath:   a.WorktreePath,
+						DocsHubPath:    a.DocsHubPath,
+						APIURL:         api,
+						Engine:         a.Engine,
+						Prompt:         a.Prompt,
+						StoryID:        a.StoryID,
+						ConversationID: convID,
+						PID:            pid,
+					})
+				}
+				return err
 			}
 
 			return client.Loop(runCtx, host, kind, 3*time.Second, onJob, profile)

@@ -135,8 +135,8 @@ func (r *Resolver) ResolveForStory(worktreePath, storyID string) (*Session, erro
 		return &brainSessions[0], nil
 	}
 
-	// 3. Fallback to latest session
-	return r.ResolveLatest(worktreePath)
+	// 3. Never fall back to an arbitrary session from a different story
+	return nil, ErrNoSessionFound
 }
 
 // DetectDirtyWorktreeContext inspects git status and files to diagnose an interrupted story.
@@ -427,6 +427,9 @@ func (r *Resolver) scanBrainSessions(worktree string) []Session {
 		if err != nil {
 			continue
 		}
+		if time.Since(fi.ModTime()) > 24*time.Hour {
+			continue
+		}
 
 		f, err := os.Open(transcriptPath)
 		if err != nil {
@@ -503,6 +506,9 @@ func (r *Resolver) scanBrainSessionsByStory(worktree, storyID string) []Session 
 		if err != nil {
 			continue
 		}
+		if time.Since(fi.ModTime()) > 24*time.Hour {
+			continue
+		}
 
 		f, err := os.Open(transcriptPath)
 		if err != nil {
@@ -576,6 +582,9 @@ func (r *Resolver) scanReviews(worktree string) []Session {
 		}
 
 		isDirty := dirtyFiles[e.Name()] || dirtyFiles[filepath.Join("docs", "reviews", e.Name())]
+		if !isDirty && time.Since(fi.ModTime()) > 12*time.Hour {
+			continue
+		}
 		info := extractReviewFrontmatter(p)
 
 		convID := info.ConversationID

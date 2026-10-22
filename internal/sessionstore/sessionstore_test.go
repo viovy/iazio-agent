@@ -187,3 +187,32 @@ func TestGetDirtyFilesParsing(t *testing.T) {
 		t.Errorf("expected ReviewFile docs/reviews/..., got %q", dCtx.ReviewFile)
 	}
 }
+
+func TestResolveForStory_NoPollutionAcrossDifferentStories(t *testing.T) {
+	tmpDir := t.TempDir()
+	worktree := filepath.Join(tmpDir, "my-repo")
+	_ = os.MkdirAll(worktree, 0o755)
+
+	revDir := filepath.Join(worktree, "docs", "reviews")
+	_ = os.MkdirAll(revDir, 0o755)
+
+	// Old historical review for STORY-IAZIO-0098
+	oldConv := "0ddc4208-8d7a-490b-86bb-1dee2e91ae82"
+	revFile := filepath.Join(revDir, "2026-10-09-review-v0-26991d-STORY-IAZIO-0098.md")
+	revContent := "---\nstory_id: STORY-IAZIO-0098\nconversation_id: \"" + oldConv + "\"\n---\n"
+	_ = os.WriteFile(revFile, []byte(revContent), 0o644)
+
+	resolver := &Resolver{
+		BrainDir: t.TempDir(),
+		SpoolDir: t.TempDir(),
+	}
+
+	// Requesting an unrelated story (e.g. STORY-VIGO-0001) MUST NOT receive 0ddc4208...
+	sess, err := resolver.ResolveForStory(worktree, "STORY-VIGO-0001")
+	if err != ErrNoSessionFound {
+		t.Fatalf("expected ErrNoSessionFound for unrelated story, got %v, err=%v", sess, err)
+	}
+	if sess != nil {
+		t.Fatalf("expected nil session, got %+v", sess)
+	}
+}
