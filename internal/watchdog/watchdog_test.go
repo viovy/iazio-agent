@@ -3,6 +3,7 @@ package watchdog
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -364,5 +365,16 @@ func TestWatchdog_HelperMethods(t *testing.T) {
 	time.Sleep(25 * time.Millisecond)
 	cancel()
 }
+
+func TestDefaultIsProcessAlive(t *testing.T) {
+	w := New(Options{})
+	if !w.isAlive(os.Getpid()) {
+		t.Fatalf("expected current pid to be alive")
+	}
+	if w.isAlive(-1) {
+		t.Fatalf("expected pid -1 to be dead")
+	}
+}
+
 
 

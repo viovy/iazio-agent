@@ -157,3 +157,24 @@ func TestElasticSink_OfflineSpoolAndDrain(t *testing.T) {
 		t.Fatalf("expected recovered server to receive drained logs, got 0")
 	}
 }
+
+func TestElasticlog_HelpersAndWarn(t *testing.T) {
+	sink := New(Config{
+		URL:         "http://127.0.0.1:9200",
+		ServiceName: "test",
+		SpoolDir:    t.TempDir(),
+	})
+	defer sink.Close()
+
+	if sink.SpoolDir() == "" {
+		t.Fatalf("expected non-empty spool dir")
+	}
+	if sink.ConsecutiveFailures() != 0 {
+		t.Fatalf("expected 0 consecutive failures initially")
+	}
+	sink.Warn("warning message", errors.New("sample error"), map[string]any{"k": "v"})
+	if sink.DroppedCount() != 0 {
+		t.Fatalf("expected 0 dropped count")
+	}
+}
+

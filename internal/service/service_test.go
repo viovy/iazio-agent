@@ -1049,3 +1049,40 @@ func TestPauseAndResumeService(t *testing.T) {
 	}
 }
 
+func TestUserDaemonAt_Helpers(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, ".local", "bin", "iazio-agent")
+	_ = os.MkdirAll(filepath.Dir(bin), 0755)
+	_ = os.WriteFile(bin, []byte("#!/bin/sh\n"), 0755)
+
+	runner := func(name string, args ...string) error {
+		return nil
+	}
+
+	alive, pid := StatusUserDaemonAt(home)
+	if alive || pid != 0 {
+		t.Fatalf("expected inactive daemon")
+	}
+
+	if err := StartUserDaemonAt(home, bin, runner); err != nil {
+		t.Fatalf("StartUserDaemonAt failed: %v", err)
+	}
+
+	pidPath := filepath.Join(home, ".iazio", "agent.pid")
+	_ = os.WriteFile(pidPath, []byte("99999999\n"), 0644)
+	alive, _ = StatusUserDaemonAt(home)
+	if alive {
+		t.Fatalf("expected non-existent pid to be not alive")
+	}
+
+	_ = StopUserDaemonAt(home)
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatalf("expected agent.pid to be removed")
+	}
+
+	if err := UninstallUserDaemonAt(home, runner); err != nil {
+		t.Fatalf("UninstallUserDaemonAt failed: %v", err)
+	}
+}
+
+

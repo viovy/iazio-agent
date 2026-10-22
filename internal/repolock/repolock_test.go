@@ -29,6 +29,12 @@ func TestAcquireAndRelease(t *testing.T) {
 	if readInfo.JobID != "job-1" || readInfo.ConversationID != "conv-1" || readInfo.Status != "RUNNING" {
 		t.Fatalf("unexpected read info: %+v", readInfo)
 	}
+	if handle.Worktree() != wt {
+		t.Fatalf("expected wt, got %s", handle.Worktree())
+	}
+	if handle.Info().JobID != "job-1" {
+		t.Fatalf("expected job-1, got %s", handle.Info().JobID)
+	}
 
 	// Update conversation ID
 	info.ConversationID = "conv-updated"

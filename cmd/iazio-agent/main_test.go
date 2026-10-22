@@ -1824,6 +1824,23 @@ func TestHelpers_DocAndSubmoduleCheck(t *testing.T) {
 	}
 }
 
+func TestProbeRepoRuntime_LocalGit(t *testing.T) {
+	tmp := t.TempDir()
+	cmdInit := exec.Command("git", "init", tmp)
+	if err := cmdInit.Run(); err != nil {
+		t.Skip("git init failed")
+	}
+	ctx := context.Background()
+	st := probeRepoRuntime(ctx, tmp, "test-repo")
+	if st.RepoPath != tmp {
+		t.Fatalf("expected RepoPath %q, got %q", tmp, st.RepoPath)
+	}
+	if st.Alias != "test-repo" {
+		t.Fatalf("expected Alias test-repo, got %q", st.Alias)
+	}
+}
+
+
 
 
 

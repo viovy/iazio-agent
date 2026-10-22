@@ -450,5 +450,14 @@ func TestCLIInvoker_FleetRootPropagation(t *testing.T) {
 	}
 }
 
+func TestCLIInvoker_WithWorkDir(t *testing.T) {
+	inv := NewCLIInvoker("iazio-harness", "/tmp/old")
+	inv2 := inv.WithWorkDir("/tmp/new")
+	if inv2 == nil {
+		t.Fatalf("expected non-nil clone")
+	}
+}
+
+
 
 
