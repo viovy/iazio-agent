@@ -1140,6 +1140,7 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 	harnessCmd := exec.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--json")
 	if out, err := harnessCmd.Output(); err == nil && len(out) > 0 {
 		var res struct {
+			IsClean         bool     `json:"is_clean"`
 			WorktreeState   string   `json:"worktree_state"`
 			SubmodulesClean bool     `json:"submodules_clean"`
 			DirtySubmodules []string `json:"dirty_submodules"`
@@ -1161,8 +1162,27 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 				if onlyDocs && res.SubmodulesClean {
 					return true
 				}
+				return false
 			}
-			return false
+			if res.WorktreeState != "" {
+				return false
+			}
+			if res.IsClean && res.SubmodulesClean && len(res.ModifiedFiles) == 0 && len(res.DirtySubmodules) == 0 {
+				onlyDocs := true
+				for _, f := range res.UntrackedFiles {
+					if !isDocOrEphemeralFile(f) {
+						onlyDocs = false
+						break
+					}
+				}
+				if onlyDocs {
+					return true
+				}
+				return false
+			}
+			if len(res.ModifiedFiles) > 0 || len(res.DirtySubmodules) > 0 {
+				return false
+			}
 		}
 	}
 
