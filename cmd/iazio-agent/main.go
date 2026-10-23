@@ -491,10 +491,13 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					if stdout != nil {
 						fmt.Fprintf(stdout, "[dispatcher] tool update job executing: tools=%v force=%v\n", tools, force)
 					}
-					if doToolUpdate(ctx, tools, force) {
-						restartOrExecSelf(stdout)
-						cancel()
+					// Dispatched agent.tools.update jobs treat force=true so paused/healing repo states
+					// do not prevent the runner host from updating tools, provided harness is not executing.
+					if !doToolUpdate(ctx, tools, true) {
+						return fmt.Errorf("tool update deferred: workstation is busy or harness is actively running")
 					}
+					restartOrExecSelf(stdout)
+					cancel()
 					return nil
 				})
 				disp.SetWorktreeResolver(func(repoName string) string {
