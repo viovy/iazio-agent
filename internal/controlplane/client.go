@@ -605,6 +605,7 @@ type RepoRuntimeStatus struct {
 	Porcelain            string    `json:"porcelain,omitempty"`
 	SubmodulesClean      bool      `json:"submodules_clean"`
 	DirtySubmodules      []string  `json:"dirty_submodules,omitempty"`
+	NonMainSubmodules    []string  `json:"non_main_submodules,omitempty"`
 	ASEState             string    `json:"ase_state,omitempty"` // IDLE, RUNNING, SUSPENDED_HITL, FAILED_DIRTY, ORPHANED
 	ActiveStoryID        string    `json:"active_story_id,omitempty"`
 	ActiveTool           string    `json:"active_tool,omitempty"`

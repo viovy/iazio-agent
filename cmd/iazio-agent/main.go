@@ -1342,6 +1342,7 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 			UntrackedFiles       []string `json:"untracked_files"`
 			SubmodulesClean      bool     `json:"submodules_clean"`
 			DirtySubmodules      []string `json:"dirty_submodules"`
+			NonMainSubmodules    []string `json:"non_main_submodules"`
 			ASEState             string   `json:"ase_state"`
 			ActiveStoryID        string   `json:"active_story_id"`
 			AgentTool            string   `json:"agent_tool"`
@@ -1354,6 +1355,7 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 			st.IsClean = res.IsClean
 			st.SubmodulesClean = res.SubmodulesClean
 			st.DirtySubmodules = res.DirtySubmodules
+			st.NonMainSubmodules = res.NonMainSubmodules
 			st.ASEState = res.ASEState
 			st.ActiveStoryID = res.ActiveStoryID
 			st.ActiveTool = res.AgentTool
@@ -1392,7 +1394,8 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 			}
 		}
 		st.Porcelain = strings.Join(porcelainLines, "\n")
-		st.IsClean = len(porcelainLines) == 0
+		isMain := st.Branch == "main" || st.Branch == "master"
+		st.IsClean = len(porcelainLines) == 0 && isMain
 	} else {
 		st.IsClean = false
 		st.Porcelain = err.Error()
@@ -1415,6 +1418,9 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 					st.DirtySubmodules = append(st.DirtySubmodules, parts[1])
 				}
 			}
+		}
+		if !st.SubmodulesClean || len(st.DirtySubmodules) > 0 || len(st.NonMainSubmodules) > 0 {
+			st.IsClean = false
 		}
 	}
 
