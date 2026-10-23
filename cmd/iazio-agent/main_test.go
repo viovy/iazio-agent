@@ -2203,7 +2203,20 @@ echo '{"branch":"feature/test-1","is_clean":false,"ahead":1,"behind":0,"modified
 	if err := os.WriteFile(harnessScript, []byte(scriptContent), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var cleanPathElements []string
+	for _, elem := range filepath.SplitList(os.Getenv("PATH")) {
+		if strings.Contains(elem, ".iazio") {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(elem, "iazio-harness")); err == nil {
+			continue
+		}
+		cleanPathElements = append(cleanPathElements, elem)
+	}
+	cleanPath := strings.Join(cleanPathElements, string(os.PathListSeparator))
+
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+cleanPath)
 
 	st := probeRepoRuntime(ctx, fakeBin, "test-repo")
 	if st.Branch != "feature/test-1" || st.ActiveStoryID != "STORY-999" || st.ActiveTool != "agy" || st.ActiveConversationID != "conv-999" {
@@ -2215,6 +2228,7 @@ echo '{"branch":"feature/test-1","is_clean":false,"ahead":1,"behind":0,"modified
 
 	repoDir := t.TempDir()
 	_ = os.Remove(harnessScript)
+	t.Setenv("PATH", cleanPath)
 
 	cmd := exec.Command("git", "init", repoDir)
 	_ = cmd.Run()
@@ -2241,6 +2255,7 @@ echo '{"branch":"feature/test-1","is_clean":false,"ahead":1,"behind":0,"modified
 
 	_ = os.Remove(filepath.Join(apDir, "lock"))
 	stIdle := probeRepoRuntime(ctx, repoDir, "repo-dir")
+	t.Logf("stIdle: %+v", stIdle)
 	if stIdle.ASEState != "IDLE" {
 		t.Fatalf("expected IDLE, got: %s", stIdle.ASEState)
 	}
