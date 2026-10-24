@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -27,6 +28,7 @@ import (
 	"github.com/viovy/iazio-agent/internal/preflight"
 	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/service"
+	"github.com/viovy/iazio-agent/internal/sessionstore"
 	"github.com/viovy/iazio-agent/internal/supervisor"
 	"github.com/viovy/iazio-agent/internal/telemetry"
 	"github.com/viovy/iazio-agent/internal/watchdog"
@@ -666,7 +668,17 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 				}
 
-				err := sup.Spawn(wdRunner, a.ID, api, a.WorktreePath, a.DocsHubPath, "")
+				convID := ResolveDispatchConversationID(a, lockInfo.ConversationID, lockInfo.StoryID, lockInfo.Status)
+
+				var spawnExtras []string
+				if a.Kind != "" {
+					spawnExtras = append(spawnExtras, "--kind", a.Kind)
+				}
+				if convID != "" {
+					spawnExtras = append(spawnExtras, "--resume-conversation", convID)
+				}
+
+				err := sup.Spawn(wdRunner, a.ID, api, a.WorktreePath, a.DocsHubPath, "", spawnExtras...)
 				if err != nil {
 					if strings.Contains(err.Error(), "busy") {
 						_ = client.AbandonJob(runCtx, a.ID, "REPO_BUSY")
@@ -675,13 +687,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}
 
 				pid := sup.PID(a.WorktreePath)
-				convID := a.ResumeConversationID
-				if convID == "" && len(a.ConversationIDs) > 0 {
-					convID = a.ConversationIDs[len(a.ConversationIDs)-1]
-				}
-				if convID == "" && lockInfo.ConversationID != "" && lockInfo.Status != "COMPLETED" && (a.Kind == "resume" || (a.StoryID != "" && lockInfo.StoryID == a.StoryID)) {
-					convID = lockInfo.ConversationID
-				}
 				wd.Track(watchdog.TrackedJob{
 					JobID:          a.ID,
 					ScheduleID:     a.ScheduleID,
@@ -1593,4 +1598,37 @@ func resolveWorktreeForRepo(ctx context.Context, getter hostDetailGetter, host, 
 		}
 	}
 	return ""
+}
+
+// ResolveDispatchConversationID resolves the conversation ID to resume with strict priority:
+// ActiveConversationID -> ResumeConversationID -> InitialConversationID -> latest from ConversationIDs -> lockInfo.
+// If ResumeMode is "fallback_new_conversation" and ActiveConversationID is empty, it returns ""
+// so that a fresh, unanchored session starts without reusing obsolete initial IDs (Finding C3).
+func ResolveDispatchConversationID(a controlplane.Assignment, lockConvID, lockStoryID, lockStatus string) string {
+	if a.ResumeMode == "fallback_new_conversation" {
+		if a.ActiveConversationID != "" && sessionstore.IsValidConversationID(a.ActiveConversationID) {
+			return a.ActiveConversationID
+		}
+		// CP explicitly instructed a clean fallback conversation: do not reuse initial/historical ID
+		return ""
+	}
+	convID := a.ActiveConversationID
+	if convID == "" {
+		convID = a.ResumeConversationID
+	}
+	if convID == "" {
+		convID = a.InitialConversationID
+	}
+	if convID == "" && len(a.ConversationIDs) > 0 {
+		convID = a.ConversationIDs[0]
+	}
+	isCPResume := (a.ParentJobID != "" || a.RootJobID != "")
+	if convID == "" && !isCPResume && lockConvID != "" && lockStatus != "COMPLETED" && (a.Kind == "resume" || (a.StoryID != "" && lockStoryID == a.StoryID)) {
+		convID = lockConvID
+	}
+	if convID != "" && !sessionstore.IsValidConversationID(convID) {
+		log.Printf("[agent] ignoring invalid conversation id format: %q", convID)
+		convID = ""
+	}
+	return convID
 }

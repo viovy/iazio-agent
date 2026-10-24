@@ -2337,3 +2337,104 @@ func TestResolveHostID_EdgeCases(t *testing.T) {
 		t.Fatalf("expected runner, got %s", idNoWSL)
 	}
 }
+
+func TestResolveDispatchConversationID_Precedence(t *testing.T) {
+	cActive := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	cResume := "1d446877-5bf9-44eb-9db5-e1c007a9fe31"
+	cInitial := "2d446877-5bf9-44eb-9db5-e1c007a9fe32"
+	cSlice := "3d446877-5bf9-44eb-9db5-e1c007a9fe33"
+	cLock := "4d446877-5bf9-44eb-9db5-e1c007a9fe34"
+
+	// 1. Active takes top precedence over Resume, Initial, ConversationIDs, and Lock
+	a1 := controlplane.Assignment{
+		ActiveConversationID:  cActive,
+		ResumeConversationID:  cResume,
+		InitialConversationID: cInitial,
+		ConversationIDs:       []string{cSlice},
+	}
+	if got := ResolveDispatchConversationID(a1, cLock, "STORY-1", "RUNNING"); got != cActive {
+		t.Fatalf("expected active %s, got %s", cActive, got)
+	}
+
+	// 2. Resume takes precedence when Active is empty
+	a2 := controlplane.Assignment{
+		ResumeConversationID:  cResume,
+		InitialConversationID: cInitial,
+		ConversationIDs:       []string{cSlice},
+	}
+	if got := ResolveDispatchConversationID(a2, cLock, "STORY-1", "RUNNING"); got != cResume {
+		t.Fatalf("expected resume %s, got %s", cResume, got)
+	}
+
+	// 3. Initial takes precedence when Active and Resume are empty
+	a3 := controlplane.Assignment{
+		InitialConversationID: cInitial,
+		ConversationIDs:       []string{cSlice},
+	}
+	if got := ResolveDispatchConversationID(a3, cLock, "STORY-1", "RUNNING"); got != cInitial {
+		t.Fatalf("expected initial %s, got %s", cInitial, got)
+	}
+
+	// 4. ConversationIDs slice fallback
+	a4 := controlplane.Assignment{
+		ConversationIDs: []string{cSlice},
+	}
+	if got := ResolveDispatchConversationID(a4, cLock, "STORY-1", "RUNNING"); got != cSlice {
+		t.Fatalf("expected slice %s, got %s", cSlice, got)
+	}
+
+	// 5. Lock fallback for resume kind
+	a5 := controlplane.Assignment{
+		Kind: "resume",
+	}
+	if got := ResolveDispatchConversationID(a5, cLock, "STORY-1", "RUNNING"); got != cLock {
+		t.Fatalf("expected lock %s, got %s", cLock, got)
+	}
+
+	// 6. Invalid format rejected (path traversal / bad chars)
+	a6 := controlplane.Assignment{
+		ActiveConversationID: "../../etc/passwd",
+	}
+	if got := ResolveDispatchConversationID(a6, "", "", ""); got != "" {
+		t.Fatalf("expected empty for invalid ID, got %s", got)
+	}
+
+	// 7. ResumeMode == fallback_new_conversation with empty ActiveConversationID starts fresh (Finding C3)
+	a7 := controlplane.Assignment{
+		ResumeMode:            "fallback_new_conversation",
+		InitialConversationID: cInitial,
+		ResumeConversationID:  cResume,
+		ConversationIDs:       []string{cSlice},
+	}
+	if got := ResolveDispatchConversationID(a7, cLock, "STORY-1", "RUNNING"); got != "" {
+		t.Fatalf("expected empty conversation for fallback_new_conversation without active ID, got %s", got)
+	}
+
+	// 8. ResumeMode == fallback_new_conversation with ActiveConversationID already pinned reuses active
+	a8 := controlplane.Assignment{
+		ResumeMode:            "fallback_new_conversation",
+		ActiveConversationID:  cActive,
+		InitialConversationID: cInitial,
+	}
+	if got := ResolveDispatchConversationID(a8, cLock, "STORY-1", "RUNNING"); got != cActive {
+		t.Fatalf("expected active %s for pinned fallback conversation, got %s", cActive, got)
+	}
+
+	// 9. Control plane resume (ParentJobID set) with empty registered conversations must NOT adopt lock conversation (Finding M2)
+	a9 := controlplane.Assignment{
+		Kind:        "resume",
+		ParentJobID: "job-parent-001",
+	}
+	if got := ResolveDispatchConversationID(a9, cLock, "STORY-1", "RUNNING"); got != "" {
+		t.Fatalf("CP resume with empty parent conversation must NOT adopt lock %s, got %s", cLock, got)
+	}
+
+	// 10. Control plane resume (RootJobID set) with empty registered conversations must NOT adopt lock conversation (Finding M2)
+	a10 := controlplane.Assignment{
+		Kind:      "resume",
+		RootJobID: "job-root-001",
+	}
+	if got := ResolveDispatchConversationID(a10, cLock, "STORY-1", "RUNNING"); got != "" {
+		t.Fatalf("CP resume with RootJobID set must NOT adopt lock %s, got %s", cLock, got)
+	}
+}
