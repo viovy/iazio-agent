@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -17,6 +18,11 @@ type UpdateResult struct {
 	AgentUpdated bool     `json:"agent_updated"`
 }
 
+var (
+	// ErrUpdateInProgress is returned when an update is already executing and a forced or targeted request is queued (G4).
+	ErrUpdateInProgress = errors.New("tool update already in progress")
+)
+
 // EagerToolUpdater handles safe atomic binary updates guarded by harness idle and fleet git clean states.
 type EagerToolUpdater struct {
 	mu              sync.Mutex
@@ -28,6 +34,9 @@ type EagerToolUpdater struct {
 	postNotif       func(ctx context.Context, rec controlplane.NotificationRecord) error
 	lastDeferredKey string
 	updating        bool
+	pendingTools    []string
+	pendingForce    bool
+	hasPending      bool
 }
 
 // NewEagerToolUpdater constructs an EagerToolUpdater.
@@ -57,10 +66,47 @@ func (u *EagerToolUpdater) IsUpdating() bool {
 // EvaluateAndTrigger checks preconditions and performs an eager update if eligible.
 func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools []string, force bool) (agentUpdated bool, deferred bool, err error) {
 	if !u.updateMutex.TryLock() {
-		// Coalesce concurrent triggers: an update check or swap is already running (F8)
+		// Coalesce or queue: if caller requested forced or targeted tools, record pending request (G4)
+		if force || len(targetTools) > 0 {
+			u.mu.Lock()
+			u.pendingForce = u.pendingForce || force
+			for _, t := range targetTools {
+				found := false
+				for _, pt := range u.pendingTools {
+					if pt == t {
+						found = true
+						break
+					}
+				}
+				if !found {
+					u.pendingTools = append(u.pendingTools, t)
+				}
+			}
+			u.hasPending = true
+			u.mu.Unlock()
+			return false, true, ErrUpdateInProgress
+		}
 		return false, true, nil
 	}
 	defer u.updateMutex.Unlock()
+
+	defer func() {
+		// Check if a pending forced or targeted request arrived while executing (G4)
+		u.mu.Lock()
+		hasP := u.hasPending
+		pForce := u.pendingForce
+		pTools := u.pendingTools
+		u.hasPending = false
+		u.pendingForce = false
+		u.pendingTools = nil
+		u.mu.Unlock()
+
+		if hasP {
+			go func() {
+				_, _, _ = u.EvaluateAndTrigger(context.Background(), pTools, pForce)
+			}()
+		}
+	}()
 
 	u.mu.Lock()
 	if u.updating {
@@ -138,6 +184,28 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 	u.lastDeferredKey = ""
 	u.mu.Unlock()
 
+	// Emit update_started prior to executing update operations (G5)
+	if u.postNotif != nil {
+		targetsDesc := "all outdated tools"
+		if len(targetTools) > 0 {
+			targetsDesc = strings.Join(targetTools, ", ")
+		}
+		if err := u.postNotif(ctx, controlplane.NotificationRecord{
+			Title:    "Tool Update Started",
+			Message:  fmt.Sprintf("Eager tool update started on host %s (target: %s)", u.hostID, targetsDesc),
+			Category: "info",
+			Source:   "tool-updater",
+			HostID:   u.hostID,
+			Metadata: map[string]any{
+				"event":        "agent.tool.update_started",
+				"target_tools": targetTools,
+				"force":        force,
+			},
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "[eagerupdater] postNotif error (update_started): %v\n", err)
+		}
+	}
+
 	start := time.Now()
 	res, updateErr := u.doUpdate(ctx, targetTools, force)
 	durationMs := time.Since(start).Milliseconds()
@@ -163,20 +231,6 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 	}
 
 	if len(res.UpdatedTools) > 0 && u.postNotif != nil {
-		// Emit update_started for audit trail of the executed update (R4)
-		_ = u.postNotif(ctx, controlplane.NotificationRecord{
-			Title:    "Tool Update Started",
-			Message:  fmt.Sprintf("Eager tool update started on host %s (updating: %s)", u.hostID, strings.Join(res.UpdatedTools, ", ")),
-			Category: "info",
-			Source:   "tool-updater",
-			HostID:   u.hostID,
-			Metadata: map[string]any{
-				"event":        "agent.tool.update_started",
-				"target_tools": res.UpdatedTools,
-				"force":        force,
-			},
-		})
-
 		if err := u.postNotif(ctx, controlplane.NotificationRecord{
 			Title:    "Tool Update Succeeded",
 			Message:  fmt.Sprintf("Successfully updated tools on %s: %s (took %dms)", u.hostID, strings.Join(res.UpdatedTools, ", "), durationMs),

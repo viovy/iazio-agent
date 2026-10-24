@@ -41,9 +41,9 @@ func TestVerifyChecksum(t *testing.T) {
 		t.Fatal("expected checksum mismatch error")
 	}
 
-	// 3. File not in checksums text fails silently (returns nil)
-	if err := verifyChecksum(data, "non-existent-file", checksumsText); err != nil {
-		t.Fatalf("expected nil when file not found in checksums, got: %v", err)
+	// 3. File not in checksums text fails closed (returns error, G2)
+	if err := verifyChecksum(data, "non-existent-file", checksumsText); err == nil {
+		t.Fatal("expected error when file not found in checksums (fail-closed)")
 	}
 }
 
@@ -1033,5 +1033,82 @@ func TestUpdateTool_ChecksumMismatchRejection(t *testing.T) {
 	}
 	if _, statErr := os.Stat(binPath); !os.IsNotExist(statErr) {
 		t.Fatalf("expected binary not to be installed after checksum failure, but found: %s", binPath)
+	}
+}
+
+func TestUpdateSingleTool_MissingChecksumsAssetFailsClosed(t *testing.T) {
+	tempDir := t.TempDir()
+	binDir := filepath.Join(tempDir, "bin")
+	_ = os.MkdirAll(binDir, 0755)
+
+	tarData := createTarGz(t, "my-tool", []byte("#!/bin/sh\necho hello\n"))
+
+	// Mock release has only the binary tarball, NO checksums asset
+	client := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if strings.Contains(req.URL.Path, "/releases/latest") {
+				rel := gitHubRelease{
+					TagName: "0.2.0",
+					Assets: []gitHubAsset{
+						{
+							Name:               "my-tool-linux-amd64.tar.gz",
+							BrowserDownloadURL: "https://github.com/viovy/my-tool/releases/download/0.2.0/my-tool-linux-amd64.tar.gz",
+						},
+					},
+				}
+				data, _ := json.Marshal(rel)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(bytes.NewReader(data)),
+					Header:     make(http.Header),
+				}, nil
+			}
+			if strings.HasSuffix(req.URL.Path, ".tar.gz") {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(bytes.NewReader(tarData)),
+					Header:     make(http.Header),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Status:     "404 Not Found",
+				Body:       io.NopCloser(strings.NewReader("404")),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+
+	tool := ManifestToolItem{
+		Name:          "my-tool",
+		Repository:    "viovy/my-tool",
+		BinaryName:    "my-tool",
+		Tier:          "baseline",
+		TargetVersion: "latest",
+	}
+
+	// 1. Unattended mode: fails closed when checksums asset missing (G2)
+	t.Setenv("IAZIO_ALLOW_UNVERIFIED_UPDATES", "")
+	var stdout, stderr bytes.Buffer
+	updated, err := updateSingleTool(context.Background(), client, tool, binDir, "", true, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("expected error when checksums asset is missing in unattended mode, got updated=%v", updated)
+	}
+	if !strings.Contains(err.Error(), "no checksums asset found") {
+		t.Fatalf("expected error to mention 'no checksums asset found', got: %v", err)
+	}
+
+	// 2. Explicit operator override allows installation (G2)
+	t.Setenv("IAZIO_ALLOW_UNVERIFIED_UPDATES", "1")
+	stdout.Reset()
+	stderr.Reset()
+	updated, err = updateSingleTool(context.Background(), client, tool, binDir, "", true, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("expected update to succeed with IAZIO_ALLOW_UNVERIFIED_UPDATES=1 override, got: %v", err)
+	}
+	if !updated {
+		t.Fatalf("expected tool to be updated with override")
 	}
 }

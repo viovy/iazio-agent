@@ -50,7 +50,24 @@ func main() {
 var initialUpdateDelay = 5 * time.Second
 var isTesting = false
 
+type safeWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *safeWriter) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
 func execute(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
+	if stdout != nil {
+		stdout = &safeWriter{w: stdout}
+	}
+	if stderr != nil {
+		stderr = &safeWriter{w: stderr}
+	}
 	if getenv == nil {
 		getenv = os.Getenv
 	}

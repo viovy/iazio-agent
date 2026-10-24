@@ -435,7 +435,10 @@ func updateSingleTool(
 			return false, fmt.Errorf("integrity verification failed for %s: %w", asset.Name, vErr)
 		}
 	} else {
-		fmt.Fprintf(stdout, "  [!] %s: no checksums file found in release %s, skipping hash verification\n", tool.Name, latestVer)
+		if os.Getenv("IAZIO_ALLOW_UNVERIFIED_UPDATES") != "1" {
+			return false, fmt.Errorf("integrity verification failed: no checksums asset found in release %s for %s (fail-closed, set IAZIO_ALLOW_UNVERIFIED_UPDATES=1 to override)", latestVer, tool.Name)
+		}
+		fmt.Fprintf(stdout, "  [!] %s: no checksums file found in release %s, skipping hash verification due to IAZIO_ALLOW_UNVERIFIED_UPDATES=1\n", tool.Name, latestVer)
 	}
 
 	binBytes, err := extractBinary(data, asset.Name, tool.BinaryName, runtime.GOOS)
@@ -693,7 +696,7 @@ func verifyChecksum(data []byte, filename, checksumsText string) error {
 			}
 		}
 	}
-	return nil
+	return fmt.Errorf("no checksum entry found for %s in checksums file", filename)
 }
 
 func extractBinary(archiveData []byte, archiveName, binaryName, targetOS string) ([]byte, error) {

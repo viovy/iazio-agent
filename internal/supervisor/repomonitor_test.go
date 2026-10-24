@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -334,5 +335,65 @@ func TestEagerToolUpdater_ForceTakesHostExecutionLock(t *testing.T) {
 	}
 	if sup.IsToolUpdating() {
 		t.Fatalf("expected sup.IsToolUpdating()=false after update finished")
+	}
+}
+
+func TestEagerToolUpdater_OverlappingCallsQueuePendingForce(t *testing.T) {
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	// Set initial fleet state clean
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	var executionCount int
+	var executedForces []bool
+	var mu sync.Mutex
+
+	inProgressCh := make(chan struct{})
+	continueCh := make(chan struct{})
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
+		mu.Lock()
+		executionCount++
+		executedForces = append(executedForces, force)
+		count := executionCount
+		mu.Unlock()
+
+		if count == 1 {
+			close(inProgressCh)
+			<-continueCh
+		}
+		return UpdateResult{UpdatedTools: []string{"tool-a"}}, nil
+	}, nil)
+
+	// Call 1: unforced
+	call1Done := make(chan struct{})
+	go func() {
+		_, _, _ = updater.EvaluateAndTrigger(context.Background(), nil, false)
+		close(call1Done)
+	}()
+
+	// Wait until call 1 is actively inside doUpdate
+	<-inProgressCh
+
+	// Call 2: concurrent forced call must return ErrUpdateInProgress and queue pending execution (G4)
+	_, deferred, err := updater.EvaluateAndTrigger(context.Background(), []string{"tool-b"}, true)
+	if !deferred || err != ErrUpdateInProgress {
+		t.Fatalf("expected call 2 to return deferred=true with ErrUpdateInProgress, got: deferred=%v, err=%v", deferred, err)
+	}
+
+	// Release call 1
+	close(continueCh)
+	<-call1Done
+
+	// Give background queue a moment to execute
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if executionCount < 2 {
+		t.Fatalf("expected at least 2 executions (initial + queued pending force), got %d", executionCount)
+	}
+	if len(executedForces) >= 2 && !executedForces[1] {
+		t.Fatalf("expected second queued execution to have force=true")
 	}
 }
