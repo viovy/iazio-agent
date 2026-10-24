@@ -210,6 +210,16 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			if raw := getenv("IAZIO_AGENT_REPO_POLL_INTERVAL"); raw != "" {
 				if d, err := time.ParseDuration(raw); err == nil {
 					repoPollInterval = d
+				} else {
+					fmt.Fprintf(stderr, "[RepoMonitor] WARN: invalid IAZIO_AGENT_REPO_POLL_INTERVAL %q: %v. Defaulting to 2m\n", raw, err)
+				}
+			}
+			if repoPollInterval < 1*time.Minute || repoPollInterval > 5*time.Minute {
+				fmt.Fprintf(stderr, "[RepoMonitor] WARN: IAZIO_AGENT_REPO_POLL_INTERVAL %v outside permitted range [1m..5m]; clamping\n", repoPollInterval)
+				if repoPollInterval < 1*time.Minute {
+					repoPollInterval = 1 * time.Minute
+				} else {
+					repoPollInterval = 5 * time.Minute
 				}
 			}
 
@@ -268,7 +278,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 				},
 			)
-			repoMonitor.Start(runCtx)
 
 			eagerUpdater = supervisor.NewEagerToolUpdater(
 				sup,
@@ -306,6 +315,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return client.PostNotification(c, nr)
 				},
 			)
+
+			// Start repoMonitor AFTER eagerUpdater is fully constructed to eliminate initialization race
+			repoMonitor.Start(runCtx)
 
 			var lastUpdateCheck time.Time
 			var lastUpdateMu sync.Mutex

@@ -80,17 +80,22 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 		return false, true, nil
 	}
 
-	// 3. Acquire exclusive host execution lock from supervisor
+	// 3. Acquire exclusive host execution lock from supervisor (always, even on force)
 	var releaseHostLock func()
-	if u.sup != nil && !force {
+	if u.sup != nil {
 		var ok bool
 		releaseHostLock, ok = u.sup.TryAcquireToolUpdate()
 		if !ok {
-			reason := "BlockedByActiveHarness"
-			u.emitDeferredOnce(ctx, targetTools, reason, "Tool update deferred: harness execution active on host")
-			return false, true, nil
+			if !force {
+				reason := "BlockedByActiveHarness"
+				u.emitDeferredOnce(ctx, targetTools, reason, "Tool update deferred: harness execution active on host")
+				return false, true, nil
+			}
+			releaseHostLock = u.sup.AcquireToolUpdateForce()
 		}
-		defer releaseHostLock()
+		if releaseHostLock != nil {
+			defer releaseHostLock()
+		}
 	}
 
 	u.mu.Lock()

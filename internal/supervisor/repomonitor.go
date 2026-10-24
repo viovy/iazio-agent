@@ -86,8 +86,10 @@ func InspectRepoGitState(ctx context.Context, repoPath, alias string) RepoGitSta
 		}
 	}
 
-	// 2. Non-locking git status --porcelain=v2 --branch
-	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain=v2", "--branch")
+	// 2. Non-locking git status --porcelain=v2 --branch with per-repo 15s timeout
+	repoCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(repoCtx, "git", "-C", repoPath, "status", "--porcelain=v2", "--branch")
 	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -184,12 +186,14 @@ func (m *RepoStateMonitor) LastSnapshot() FleetStateSnapshot {
 
 // InspectFleet performs one full inspection pass across registered repos.
 func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	lastSnap := m.lastSnapshot
+	hostID := m.hostID
+	m.mu.RUnlock()
 
 	now := time.Now().UTC()
 	snap := FleetStateSnapshot{
-		HostID:    m.hostID,
+		HostID:    hostID,
 		CheckedAt: now,
 		Repos:     make(map[string]RepoGitState),
 	}
@@ -198,10 +202,12 @@ func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot 
 	if m.sup != nil && m.sup.HasRunningHarness() {
 		snap.HarnessActive = true
 		snap.FleetGitClean = false
-		if len(m.lastSnapshot.Repos) > 0 {
-			snap.Repos = m.lastSnapshot.Repos
+		if len(lastSnap.Repos) > 0 {
+			snap.Repos = lastSnap.Repos
 		}
+		m.mu.Lock()
 		m.lastSnapshot = snap
+		m.mu.Unlock()
 		return snap
 	}
 
@@ -213,14 +219,18 @@ func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot 
 			// Fail-closed when repo inventory is unavailable
 			snap.FleetGitClean = false
 			snap.DirtyRepoPaths = []string{"repo_inventory_unavailable"}
+			m.mu.Lock()
 			m.lastSnapshot = snap
+			m.mu.Unlock()
 			return snap
 		}
 	}
 
 	if len(repos) == 0 {
 		snap.FleetGitClean = true
+		m.mu.Lock()
 		m.lastSnapshot = snap
+		m.mu.Unlock()
 		return snap
 	}
 
@@ -258,7 +268,7 @@ func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot 
 			dirtyList = append(dirtyList, r.path)
 		}
 		// Transition check
-		if prev, ok := m.lastSnapshot.Repos[r.path]; ok {
+		if prev, ok := lastSnap.Repos[r.path]; ok {
 			if prev.IsClean != r.state.IsClean && m.postNotif != nil {
 				category := "warning"
 				statusStr := "Dirty"
@@ -301,8 +311,10 @@ func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot 
 	snap.FleetGitClean = allClean
 	snap.DirtyRepoPaths = dirtyList
 
+	m.mu.Lock()
 	wasClean := m.lastSnapshot.FleetGitClean
 	m.lastSnapshot = snap
+	m.mu.Unlock()
 
 	// Report to backend
 	if m.reportStatuses != nil && len(statuses) > 0 {

@@ -297,6 +297,22 @@ func (s *Sup) TryAcquireToolUpdate() (release func(), ok bool) {
 	}, true
 }
 
+// AcquireToolUpdateForce sets toolUpdating = true unconditionally, returning a release callback.
+// Used when an update is forced, ensuring TrySpawn still refuses new child executions during the swap.
+func (s *Sup) AcquireToolUpdateForce() func() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.toolUpdating = true
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			s.toolUpdating = false
+			s.mu.Unlock()
+		})
+	}
+}
+
 // IsToolUpdating reports whether an exclusive tool update lock is currently held.
 func (s *Sup) IsToolUpdating() bool {
 	s.mu.Lock()

@@ -308,3 +308,31 @@ func TestSupervisor_ToolUpdateHostExecutionLock(t *testing.T) {
 		t.Fatalf("expected TrySpawn to succeed after release, got %v", err)
 	}
 }
+
+func TestEagerToolUpdater_ForceTakesHostExecutionLock(t *testing.T) {
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+
+	var hostLockedDuringUpdate bool
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
+		hostLockedDuringUpdate = sup.IsToolUpdating()
+		// While update is running, TrySpawn must be blocked even when update was forced
+		err := sup.TrySpawn("/tmp/test-worktree")
+		if err == nil || !strings.Contains(err.Error(), "tool update in progress") {
+			t.Errorf("expected TrySpawn to fail with 'tool update in progress', got: %v", err)
+		}
+		return UpdateResult{UpdatedTools: []string{"autopilot"}}, nil
+	}, nil)
+
+	// Trigger forced update
+	_, deferred, err := updater.EvaluateAndTrigger(context.Background(), []string{"autopilot"}, true)
+	if err != nil || deferred {
+		t.Fatalf("expected forced update to execute, got deferred=%v, err=%v", deferred, err)
+	}
+	if !hostLockedDuringUpdate {
+		t.Fatalf("expected sup.IsToolUpdating()=true during forced update swap")
+	}
+	if sup.IsToolUpdating() {
+		t.Fatalf("expected sup.IsToolUpdating()=false after update finished")
+	}
+}
