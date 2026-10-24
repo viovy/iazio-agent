@@ -668,12 +668,12 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 				}
 
-				convID := a.InitialConversationID
+				convID := a.ActiveConversationID
 				if convID == "" {
 					convID = a.ResumeConversationID
 				}
-				if convID == "" && a.ActiveConversationID != "" {
-					convID = a.ActiveConversationID
+				if convID == "" {
+					convID = a.InitialConversationID
 				}
 				if convID == "" && len(a.ConversationIDs) > 0 {
 					convID = a.ConversationIDs[len(a.ConversationIDs)-1]
