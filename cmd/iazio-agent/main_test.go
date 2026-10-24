@@ -2419,4 +2419,22 @@ func TestResolveDispatchConversationID_Precedence(t *testing.T) {
 	if got := ResolveDispatchConversationID(a8, cLock, "STORY-1", "RUNNING"); got != cActive {
 		t.Fatalf("expected active %s for pinned fallback conversation, got %s", cActive, got)
 	}
+
+	// 9. Control plane resume (ParentJobID set) with empty registered conversations must NOT adopt lock conversation (Finding M2)
+	a9 := controlplane.Assignment{
+		Kind:        "resume",
+		ParentJobID: "job-parent-001",
+	}
+	if got := ResolveDispatchConversationID(a9, cLock, "STORY-1", "RUNNING"); got != "" {
+		t.Fatalf("CP resume with empty parent conversation must NOT adopt lock %s, got %s", cLock, got)
+	}
+
+	// 10. Control plane resume (RootJobID set) with empty registered conversations must NOT adopt lock conversation (Finding M2)
+	a10 := controlplane.Assignment{
+		Kind:      "resume",
+		RootJobID: "job-root-001",
+	}
+	if got := ResolveDispatchConversationID(a10, cLock, "STORY-1", "RUNNING"); got != "" {
+		t.Fatalf("CP resume with RootJobID set must NOT adopt lock %s, got %s", cLock, got)
+	}
 }

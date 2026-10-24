@@ -1622,7 +1622,8 @@ func ResolveDispatchConversationID(a controlplane.Assignment, lockConvID, lockSt
 	if convID == "" && len(a.ConversationIDs) > 0 {
 		convID = a.ConversationIDs[0]
 	}
-	if convID == "" && lockConvID != "" && lockStatus != "COMPLETED" && (a.Kind == "resume" || (a.StoryID != "" && lockStoryID == a.StoryID)) {
+	isCPResume := (a.ParentJobID != "" || a.RootJobID != "")
+	if convID == "" && !isCPResume && lockConvID != "" && lockStatus != "COMPLETED" && (a.Kind == "resume" || (a.StoryID != "" && lockStoryID == a.StoryID)) {
 		convID = lockConvID
 	}
 	if convID != "" && !sessionstore.IsValidConversationID(convID) {
