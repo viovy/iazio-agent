@@ -24,6 +24,11 @@ const (
 	JobTypeToolsUpdate   = "agent.tools.update"
 )
 
+var (
+	// ErrJobDeferred is returned by ToolUpdater when an update is queued or deferred without failure (N3).
+	ErrJobDeferred = errors.New("tool update queued/deferred")
+)
+
 // DefaultJobExecutionTimeout is the maximum duration an individual job can run before being terminated.
 const DefaultJobExecutionTimeout = 30 * time.Minute
 
@@ -364,6 +369,13 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		_ = json.Unmarshal(job.Payload, &p)
 		if d.toolUpdater != nil {
 			if err := d.toolUpdater(execCtx, p.Tools, p.Force, p.TargetVersion); err != nil {
+				if errors.Is(err, ErrJobDeferred) {
+					compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{
+						FencingToken: job.FencingToken,
+						Result:       json.RawMessage(`{"status":"queued","deferred":true,"message":"tool update queued for execution when harness is idle"}`),
+					})
+					return true, compErr
+				}
 				_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: err.Error()})
 				return true, err
 			}

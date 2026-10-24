@@ -377,11 +377,22 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						// Return non-nil error to fail-open (F3)
 						return false, err
 					}
+					// Exclude tools currently within their backoff window on unforced checks (N1)
+					activeTools := make([]supervisor.ManifestTool, 0, len(manifest.Tools))
+					for _, t := range manifest.Tools {
+						if eagerUpdater != nil && (eagerUpdater.IsToolInBackoff(t.Name) || eagerUpdater.IsToolInBackoff(t.BinaryName)) {
+							continue
+						}
+						activeTools = append(activeTools, t)
+					}
+					activeManifest := *manifest
+					activeManifest.Tools = activeTools
+
 					binDir := resolveInstallDir(ManifestInstallRoots{
 						Unix:    ManifestInstallRootPaths{Primary: manifest.InstallRoots.Unix.Primary, Fallback: manifest.InstallRoots.Unix.Fallback},
 						Windows: ManifestInstallRootPaths{Primary: manifest.InstallRoots.Windows.Primary, Fallback: manifest.InstallRoots.Windows.Fallback},
 					}, getenv)
-					return supervisor.EvaluateDrift(manifest, inventory.InspectInstalledVersion, binDir, targetTools, runtime.GOOS)
+					return supervisor.EvaluateDrift(&activeManifest, inventory.InspectInstalledVersion, binDir, targetTools, runtime.GOOS)
 				}
 			}
 
@@ -391,25 +402,36 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			var lastUpdateCheck time.Time
 			var lastUpdateMu sync.Mutex
 
+			var doToolUpdateWithOpts func(ctx context.Context, opts supervisor.TriggerOptions) (supervisor.UpdateResult, bool, error)
+
 			doToolUpdateDetailed := func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (supervisor.UpdateResult, bool, error) {
 				var tv string
 				if len(targetVersion) > 0 && targetVersion[0] != "" {
 					tv = targetVersion[0]
 				}
+				return doToolUpdateWithOpts(ctx, supervisor.TriggerOptions{
+					TargetTools:   targetTools,
+					Force:         force,
+					TargetVersion: tv,
+					BypassDirty:   false,
+				})
+			}
+
+			doToolUpdateWithOpts = func(ctx context.Context, opts supervisor.TriggerOptions) (supervisor.UpdateResult, bool, error) {
 				tracer := telemetry.GlobalTracer()
 				_, span := tracer.StartSpan(ctx, "agent.tools.update")
 				defer span.End()
 				span.SetTag("host_id", host)
-				span.SetTag("force", fmt.Sprintf("%t", force))
-				if len(targetTools) > 0 {
-					span.SetTag("target_tools", strings.Join(targetTools, ","))
+				span.SetTag("force", fmt.Sprintf("%t", opts.Force))
+				if len(opts.TargetTools) > 0 {
+					span.SetTag("target_tools", strings.Join(opts.TargetTools, ","))
 				}
-				if tv != "" {
-					span.SetTag("target_version", tv)
+				if opts.TargetVersion != "" {
+					span.SetTag("target_version", opts.TargetVersion)
 				}
 
 				if eagerUpdater != nil {
-					res, deferred, err := eagerUpdater.EvaluateAndTriggerDetailed(ctx, targetTools, force, targetVersion...)
+					res, deferred, err := eagerUpdater.EvaluateAndTriggerWithOpts(ctx, opts)
 					if err != nil {
 						if errors.Is(err, supervisor.ErrUpdateInProgress) {
 							span.SetTag("result", "queued")
@@ -431,7 +453,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return res, false, nil
 				}
 
-				if !areAllReposCleanAndHarnessIdle(ctx, client, sup, host, api, force, stdout) {
+				if !opts.BypassDirty && !areAllReposCleanAndHarnessIdle(ctx, client, sup, host, api, opts.Force, stdout) {
 					span.SetTag("result", "deferred")
 					if sink != nil {
 						sink.Info("Tool update check deferred: workstation is busy or worktree dirty", map[string]any{
@@ -456,15 +478,15 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 				}()
 
-				opts := UpdateOptions{
+				updateOpts := UpdateOptions{
 					Suite:         updateSuite,
 					Profile:       profile,
 					API:           api,
-					Force:         force,
-					TargetTools:   targetTools,
-					TargetVersion: tv,
+					Force:         opts.Force,
+					TargetTools:   opts.TargetTools,
+					TargetVersion: opts.TargetVersion,
 				}
-				upRes, err := performUpdateWithResult(ctx, opts, stdout, stderr, getenv)
+				upRes, err := performUpdateWithResult(ctx, updateOpts, stdout, stderr, getenv)
 				res := supervisor.UpdateResult{
 					UpdatedTools: upRes.UpdatedTools,
 					AgentUpdated: upRes.AgentUpdated,
@@ -710,14 +732,29 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					if stdout != nil {
 						fmt.Fprintf(stdout, "[dispatcher] tool update job executing: tools=%v force=%v target_version=%s\n", tools, force, tv)
 					}
-					// Dispatched agent.tools.update jobs treat force=true so paused/healing repo states
-					// do not prevent the runner host from updating tools, provided harness is not executing.
-					res, deferred, err := doToolUpdateDetailed(ctx, tools, true, tv)
+					// Dispatched agent.tools.update jobs:
+					// 1. Pass the actual caller force flag (unforced updates do not force-reinstall, N2).
+					// 2. Bypass dirty worktree check so paused/healing repos do not block runner host updates.
+					res, deferred, err := doToolUpdateWithOpts(ctx, supervisor.TriggerOptions{
+						TargetTools:   tools,
+						Force:         force,
+						TargetVersion: tv,
+						BypassDirty:   true,
+					})
 					if err != nil {
+						if errors.Is(err, supervisor.ErrUpdateInProgress) {
+							if stdout != nil {
+								fmt.Fprintf(stdout, "[dispatcher] tool update already in progress; request queued (N3)\n")
+							}
+							return worker.ErrJobDeferred
+						}
 						return fmt.Errorf("tool update failed: %w", err)
 					}
 					if deferred {
-						return fmt.Errorf("tool update deferred: workstation is busy or harness is actively running")
+						if stdout != nil {
+							fmt.Fprintf(stdout, "[dispatcher] tool update deferred; request queued for execution when harness is idle (N3)\n")
+						}
+						return worker.ErrJobDeferred
 					}
 					if res.AgentUpdated {
 						restartOrExecSelf(stdout)

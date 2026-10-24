@@ -818,3 +818,94 @@ func TestEagerToolUpdater_DeferralRetentionAndUnmergedDraining(t *testing.T) {
 		t.Fatalf("expected deferred request for tool-a to be executed on clean tick, got executions: %v", executions)
 	}
 }
+
+func TestEagerToolUpdater_SuitePartialFailureBackoffAndNotificationDedupe(t *testing.T) {
+	// N1: Test that partial failures on unforced suite path engage backoff and deduplicate notifications
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	var callCount int
+	var mu sync.Mutex
+
+	var emittedNotifications []controlplane.NotificationRecord
+	var notifMu sync.Mutex
+
+	postNotif := func(ctx context.Context, rec controlplane.NotificationRecord) error {
+		notifMu.Lock()
+		emittedNotifications = append(emittedNotifications, rec)
+		notifMu.Unlock()
+		return nil
+	}
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", nil, postNotif)
+	updater.SetDetailedUpdateFunc(func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error) {
+		mu.Lock()
+		callCount++
+		mu.Unlock()
+		return UpdateResult{
+			FailedTools: []string{"bad-tool"},
+		}, nil
+	})
+
+	ctx := context.Background()
+
+	// Pass 1: unforced suite update (targetTools == nil)
+	res1, def1, err1 := updater.EvaluateAndTriggerDetailed(ctx, nil, false)
+	if err1 != nil || def1 {
+		t.Fatalf("expected pass 1 to complete without deferral, err=%v, def=%v", err1, def1)
+	}
+	if len(res1.FailedTools) != 1 || res1.FailedTools[0] != "bad-tool" {
+		t.Fatalf("expected failed tool 'bad-tool', got %v", res1.FailedTools)
+	}
+
+	mu.Lock()
+	if callCount != 1 {
+		t.Fatalf("expected 1 call to doUpdateDetailed, got %d", callCount)
+	}
+	mu.Unlock()
+
+	notifMu.Lock()
+	partialNotifCount := 0
+	for _, n := range emittedNotifications {
+		if n.Metadata["event"] == "agent.tool.update_partial_failure" {
+			partialNotifCount++
+		}
+	}
+	if partialNotifCount != 1 {
+		t.Fatalf("expected 1 partial failure notification on pass 1, got %d", partialNotifCount)
+	}
+	notifMu.Unlock()
+
+	// Verify tool and suite backoff state
+	if !updater.IsToolInBackoff("bad-tool") {
+		t.Fatalf("expected IsToolInBackoff('bad-tool')=true after failure")
+	}
+
+	// Pass 2: immediate second unforced suite pass (within backoff window)
+	res2, def2, err2 := updater.EvaluateAndTriggerDetailed(ctx, nil, false)
+	if err2 != nil || def2 {
+		t.Fatalf("expected pass 2 to complete without deferral, err=%v, def=%v", err2, def2)
+	}
+	if len(res2.FailedTools) != 0 || len(res2.UpdatedTools) != 0 {
+		t.Fatalf("expected empty result on backed off pass 2, got %+v", res2)
+	}
+
+	mu.Lock()
+	if callCount != 1 {
+		t.Fatalf("expected doUpdateDetailed to NOT be called on pass 2 due to backoff (N1), callCount=%d", callCount)
+	}
+	mu.Unlock()
+
+	notifMu.Lock()
+	partialNotifCountPass2 := 0
+	for _, n := range emittedNotifications {
+		if n.Metadata["event"] == "agent.tool.update_partial_failure" {
+			partialNotifCountPass2++
+		}
+	}
+	if partialNotifCountPass2 != 1 {
+		t.Fatalf("expected no new partial failure notifications on pass 2 (deduped, N1), got %d", partialNotifCountPass2)
+	}
+	notifMu.Unlock()
+}

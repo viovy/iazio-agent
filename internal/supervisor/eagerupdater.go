@@ -26,30 +26,42 @@ var (
 	ErrUpdateInProgress = errors.New("tool update already in progress")
 )
 
-// PendingToolRequest models a discrete queued tool update request (R4, R5).
+// PendingToolRequest models a discrete queued tool update request (R4, R5, N2, N5).
 type PendingToolRequest struct {
 	Tool          string
 	Force         bool
 	TargetVersion string
+	BypassDirty   bool
 }
+
+// TriggerOptions configures an eager update pass (F-3, F1, R4, R5, N2, N3).
+type TriggerOptions struct {
+	TargetTools   []string
+	Force         bool
+	TargetVersion string
+	BypassDirty   bool
+}
+
+const maxPendingRequests = 32
 
 // EagerToolUpdater handles safe atomic binary updates guarded by harness idle and fleet git clean states.
 type EagerToolUpdater struct {
-	mu               sync.Mutex
-	updateMutex      sync.Mutex // host-level execution and update mutex
-	sup              *Sup
-	monitor          *RepoStateMonitor
-	hostID           string
-	doUpdate         func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error)
-	doUpdateDetailed func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error)
-	postNotif        func(ctx context.Context, rec controlplane.NotificationRecord) error
-	CheckDrift       func(ctx context.Context, targetTools []string) (bool, error)
-	lastDeferredKey  string
-	updating         bool
-	pendingRequests  []PendingToolRequest // discrete requests preserved per tool (R4, R5)
-	hasPending       bool
+	mu                    sync.Mutex
+	updateMutex           sync.Mutex // host-level execution and update mutex
+	sup                   *Sup
+	monitor               *RepoStateMonitor
+	hostID                string
+	doUpdate              func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error)
+	doUpdateDetailed      func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error)
+	postNotif             func(ctx context.Context, rec controlplane.NotificationRecord) error
+	CheckDrift            func(ctx context.Context, targetTools []string) (bool, error)
+	lastDeferredKey       string
+	lastPartialFailureKey string
+	updating              bool
+	pendingRequests       []PendingToolRequest // discrete requests preserved per tool (R4, R5, N5)
+	hasPending            bool
 
-	// Per-tool failure backoff tracking to prevent retry storms on un-installable tools (F5, R1, R7)
+	// Per-tool failure backoff tracking to prevent retry storms on un-installable tools (F5, R1, R7, N1)
 	failedAttempts   map[string]int
 	failedLastTime   map[string]time.Time
 	suiteFailCount   int
@@ -83,6 +95,22 @@ func (u *EagerToolUpdater) SetDetailedUpdateFunc(fn func(ctx context.Context, ta
 	u.doUpdateDetailed = fn
 }
 
+// IsToolInBackoff reports whether the specified tool is currently within its backoff window (N1).
+func (u *EagerToolUpdater) IsToolInBackoff(tool string) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	toolKey := strings.ToLower(strings.TrimSpace(tool))
+	if toolKey == "" {
+		return false
+	}
+	count := u.failedAttempts[toolKey]
+	if count <= 0 {
+		return false
+	}
+	backoff := calculateBackoff(count)
+	return time.Since(u.failedLastTime[toolKey]) < backoff
+}
+
 func (u *EagerToolUpdater) shouldBackoff(targetTools []string, force bool) bool {
 	if force {
 		return false
@@ -104,6 +132,23 @@ func (u *EagerToolUpdater) shouldBackoff(targetTools []string, force bool) bool 
 		return false
 	}
 
+	// Targeted multi-tool check: if all requested tools are currently backing off, back off the whole pass (N1)
+	if len(targetTools) > 1 {
+		allBackedOff := true
+		for _, t := range targetTools {
+			tool := strings.ToLower(strings.TrimSpace(t))
+			count := u.failedAttempts[tool]
+			if count == 0 || now.Sub(u.failedLastTime[tool]) >= calculateBackoff(count) {
+				allBackedOff = false
+				break
+			}
+		}
+		if allBackedOff {
+			return true
+		}
+		return false
+	}
+
 	// Full suite / unconstrained check
 	if len(targetTools) == 0 {
 		if u.suiteFailCount > 0 {
@@ -114,6 +159,53 @@ func (u *EagerToolUpdater) shouldBackoff(targetTools []string, force bool) bool 
 		}
 	}
 	return false
+}
+
+func (u *EagerToolUpdater) appendPendingRequestLocked(req PendingToolRequest) bool {
+	normTool := strings.ToLower(strings.TrimSpace(req.Tool))
+	req.Tool = normTool
+	for _, p := range u.pendingRequests {
+		if strings.ToLower(strings.TrimSpace(p.Tool)) == normTool &&
+			p.Force == req.Force &&
+			p.TargetVersion == req.TargetVersion &&
+			p.BypassDirty == req.BypassDirty {
+			return false // deduplicate identical request (N5)
+		}
+	}
+	if len(u.pendingRequests) >= maxPendingRequests {
+		return false // cap queue limit (N5)
+	}
+	u.pendingRequests = append(u.pendingRequests, req)
+	return true
+}
+
+func (u *EagerToolUpdater) prependPendingRequestsLocked(reqs []PendingToolRequest) {
+	var toAdd []PendingToolRequest
+	for _, req := range reqs {
+		normTool := strings.ToLower(strings.TrimSpace(req.Tool))
+		req.Tool = normTool
+		dup := false
+		for _, p := range u.pendingRequests {
+			if strings.ToLower(strings.TrimSpace(p.Tool)) == normTool &&
+				p.Force == req.Force &&
+				p.TargetVersion == req.TargetVersion &&
+				p.BypassDirty == req.BypassDirty {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			toAdd = append(toAdd, req)
+		}
+	}
+	if len(toAdd) == 0 {
+		return
+	}
+	combined := append(toAdd, u.pendingRequests...)
+	if len(combined) > maxPendingRequests {
+		combined = combined[:maxPendingRequests]
+	}
+	u.pendingRequests = combined
 }
 
 func calculateBackoff(attempts int) time.Duration {
@@ -189,27 +281,38 @@ func (u *EagerToolUpdater) EvaluateAndTriggerDetailed(ctx context.Context, targe
 	if len(targetVersion) > 0 {
 		requestedVersion = targetVersion[0]
 	}
+	return u.EvaluateAndTriggerWithOpts(ctx, TriggerOptions{
+		TargetTools:   targetTools,
+		Force:         force,
+		TargetVersion: requestedVersion,
+		BypassDirty:   false,
+	})
+}
 
+// EvaluateAndTriggerWithOpts performs the eager update using TriggerOptions (N2, N3, N5).
+func (u *EagerToolUpdater) EvaluateAndTriggerWithOpts(ctx context.Context, opts TriggerOptions) (res UpdateResult, deferred bool, err error) {
 	if !u.updateMutex.TryLock() {
-		// Coalesce or queue: record individual tool requests without merging (R4, R5)
-		if force || len(targetTools) > 0 {
+		// Coalesce or queue: record individual tool requests without merging (R4, R5, N5)
+		if opts.Force || len(opts.TargetTools) > 0 || opts.BypassDirty || opts.TargetVersion != "" {
 			u.mu.Lock()
-			if len(targetTools) > 0 {
-				for _, t := range targetTools {
-					u.pendingRequests = append(u.pendingRequests, PendingToolRequest{
+			if len(opts.TargetTools) > 0 {
+				for _, t := range opts.TargetTools {
+					u.appendPendingRequestLocked(PendingToolRequest{
 						Tool:          t,
-						Force:         force,
-						TargetVersion: requestedVersion,
+						Force:         opts.Force,
+						TargetVersion: opts.TargetVersion,
+						BypassDirty:   opts.BypassDirty,
 					})
 				}
 			} else {
-				u.pendingRequests = append(u.pendingRequests, PendingToolRequest{
+				u.appendPendingRequestLocked(PendingToolRequest{
 					Tool:          "",
-					Force:         force,
-					TargetVersion: requestedVersion,
+					Force:         opts.Force,
+					TargetVersion: opts.TargetVersion,
+					BypassDirty:   opts.BypassDirty,
 				})
 			}
-			u.hasPending = true
+			u.hasPending = len(u.pendingRequests) > 0
 			u.mu.Unlock()
 			return UpdateResult{}, true, ErrUpdateInProgress
 		}
@@ -220,12 +323,13 @@ func (u *EagerToolUpdater) EvaluateAndTriggerDetailed(ctx context.Context, targe
 	var aggregateRes UpdateResult
 	var lastErr error
 
-	curTools := targetTools
-	curForce := force
-	curVersion := requestedVersion
+	curTools := opts.TargetTools
+	curForce := opts.Force
+	curVersion := opts.TargetVersion
+	curBypassDirty := opts.BypassDirty
 
 	for {
-		passRes, passDeferred, passErr := u.runSinglePass(ctx, curTools, curForce, curVersion)
+		passRes, passDeferred, passErr := u.runSinglePass(ctx, curTools, curForce, curBypassDirty, curVersion)
 		if passRes.AgentUpdated {
 			aggregateRes.AgentUpdated = true
 		}
@@ -260,25 +364,29 @@ func (u *EagerToolUpdater) EvaluateAndTriggerDetailed(ctx context.Context, targe
 			lastErr = passErr
 		}
 
-		if passDeferred && (curForce || curVersion != "") {
-			// R4: Re-queue deferred forced/targeted requests so they are not dropped when harness is active
+		if passDeferred && (curForce || curVersion != "" || curBypassDirty) {
+			// R4, N5: Re-queue deferred forced/targeted/dispatched requests so they are not dropped when harness is active
 			u.mu.Lock()
+			var reqs []PendingToolRequest
 			if len(curTools) > 0 {
 				for _, t := range curTools {
-					u.pendingRequests = append([]PendingToolRequest{{
+					reqs = append(reqs, PendingToolRequest{
 						Tool:          t,
 						Force:         curForce,
 						TargetVersion: curVersion,
-					}}, u.pendingRequests...)
+						BypassDirty:   curBypassDirty,
+					})
 				}
 			} else {
-				u.pendingRequests = append([]PendingToolRequest{{
+				reqs = append(reqs, PendingToolRequest{
 					Tool:          "",
 					Force:         curForce,
 					TargetVersion: curVersion,
-				}}, u.pendingRequests...)
+					BypassDirty:   curBypassDirty,
+				})
 			}
-			u.hasPending = true
+			u.prependPendingRequestsLocked(reqs)
+			u.hasPending = len(u.pendingRequests) > 0
 			u.mu.Unlock()
 			return aggregateRes, true, lastErr
 		}
@@ -287,7 +395,7 @@ func (u *EagerToolUpdater) EvaluateAndTriggerDetailed(ctx context.Context, targe
 		if len(u.pendingRequests) == 0 {
 			u.hasPending = false
 			u.mu.Unlock()
-			if passDeferred && !curForce {
+			if passDeferred && !curForce && !curBypassDirty {
 				return aggregateRes, true, lastErr
 			}
 			break
@@ -305,12 +413,13 @@ func (u *EagerToolUpdater) EvaluateAndTriggerDetailed(ctx context.Context, targe
 		}
 		curForce = nextReq.Force
 		curVersion = nextReq.TargetVersion
+		curBypassDirty = nextReq.BypassDirty
 	}
 
 	return aggregateRes, false, lastErr
 }
 
-func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (res UpdateResult, deferred bool, err error) {
+func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []string, force, bypassDirty bool, targetVersion ...string) (res UpdateResult, deferred bool, err error) {
 	u.mu.Lock()
 	if u.updating {
 		u.mu.Unlock()
@@ -318,7 +427,7 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 	}
 	u.mu.Unlock()
 
-	// Guard against failure retry storm via backoff (F5)
+	// Guard against failure retry storm via backoff (F5, N1)
 	if u.shouldBackoff(targetTools, force) {
 		return UpdateResult{}, false, nil
 	}
@@ -330,7 +439,7 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 		return UpdateResult{}, true, nil
 	}
 
-	// 2. Fleet Git Clean check
+	// 2. Fleet Git Clean check (bypassed if force or bypassDirty)
 	snap := u.monitor.LastSnapshot()
 	if snap.HarnessActive {
 		// If supervisor reports no active harness, snapshot is stale; refresh inspection (M1)
@@ -343,7 +452,7 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 			return UpdateResult{}, true, nil
 		}
 	}
-	if !snap.FleetGitClean && !force {
+	if !snap.FleetGitClean && !force && !bypassDirty {
 		// If dirty repo paths is empty, run a fresh inspection instead of deferring on stale guard (R3)
 		if len(snap.DirtyRepoPaths) == 0 {
 			snap = u.monitor.InspectFleet(ctx)
@@ -382,8 +491,8 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 		u.mu.Unlock()
 	}()
 
-	// Re-verify inside lock if not forced
-	if !force {
+	// Re-verify inside lock if not forced and not bypassing dirty guard
+	if !force && !bypassDirty {
 		snap2 := u.monitor.InspectFleet(ctx)
 		if !snap2.FleetGitClean {
 			pathsCopy := append([]string(nil), snap2.DirtyRepoPaths...)
@@ -454,6 +563,9 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 		for _, ft := range res.FailedTools {
 			u.recordToolFailure(ft)
 		}
+		if len(res.FailedTools) > 0 {
+			u.recordSuiteFailure()
+		}
 		if u.postNotif != nil {
 			if err := u.postNotif(ctx, controlplane.NotificationRecord{
 				Title:    "Tool Update Failed",
@@ -480,24 +592,20 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 	for _, ut := range res.UpdatedTools {
 		u.recordToolSuccess(ut)
 	}
+	if len(res.FailedTools) > 0 {
+		u.recordSuiteFailure() // N1: record suite failure on partial failure so suite path backs off
+	}
 	if len(targetTools) == 0 && len(res.FailedTools) == 0 {
 		u.recordSuiteSuccess()
 	}
 
 	if u.postNotif != nil {
 		if len(res.FailedTools) > 0 {
-			_ = u.postNotif(ctx, controlplane.NotificationRecord{
-				Title:    "Tool Update Partial Failure",
-				Message:  fmt.Sprintf("Some tools failed to update on %s: %s", u.hostID, strings.Join(res.FailedTools, ", ")),
-				Category: "warning",
-				Source:   "tool-updater",
-				HostID:   u.hostID,
-				Metadata: map[string]any{
-					"event":        "agent.tool.update_partial_failure",
-					"failed_tools": res.FailedTools,
-					"duration_ms":  durationMs,
-				},
-			})
+			u.emitPartialFailureOnce(ctx, res.FailedTools, durationMs) // N1: deduped notification
+		} else {
+			u.mu.Lock()
+			u.lastPartialFailureKey = "" // reset dedupe on clean run
+			u.mu.Unlock()
 		}
 		if len(res.UpdatedTools) > 0 {
 			if err := u.postNotif(ctx, controlplane.NotificationRecord{
@@ -532,6 +640,36 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 	}
 
 	return res, false, nil
+}
+
+func (u *EagerToolUpdater) emitPartialFailureOnce(ctx context.Context, failedTools []string, durationMs int64) {
+	if len(failedTools) == 0 || u.postNotif == nil {
+		return
+	}
+	sortedFailed := append([]string(nil), failedTools...)
+	sort.Strings(sortedFailed)
+	key := strings.Join(sortedFailed, ",")
+
+	u.mu.Lock()
+	if u.lastPartialFailureKey == key {
+		u.mu.Unlock()
+		return
+	}
+	u.lastPartialFailureKey = key
+	u.mu.Unlock()
+
+	_ = u.postNotif(ctx, controlplane.NotificationRecord{
+		Title:    "Tool Update Partial Failure",
+		Message:  fmt.Sprintf("Some tools failed to update on %s: %s", u.hostID, strings.Join(sortedFailed, ", ")),
+		Category: "warning",
+		Source:   "tool-updater",
+		HostID:   u.hostID,
+		Metadata: map[string]any{
+			"event":        "agent.tool.update_partial_failure",
+			"failed_tools": sortedFailed,
+			"duration_ms":  durationMs,
+		},
+	})
 }
 
 func (u *EagerToolUpdater) emitDeferredOnce(ctx context.Context, targetTools []string, reason, msg string) {

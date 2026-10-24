@@ -24,6 +24,7 @@ import (
 	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/service"
 	"github.com/viovy/iazio-agent/internal/supervisor"
+	"github.com/viovy/iazio-agent/internal/worker"
 )
 
 func init() {
@@ -2491,24 +2492,24 @@ func TestDispatcher_ToolUpdaterResultMapping(t *testing.T) {
 		t.Fatalf("expected nil error when tools are already up to date, got: %v", err)
 	}
 
-	// Test that deferred actually returns the deferred error
+	// Test that deferred returns worker.ErrJobDeferred so dispatcher can ack without failure (N3)
 	doToolUpdateDeferred := func(ctx context.Context, tools []string, force bool) (supervisor.UpdateResult, bool, error) {
 		return supervisor.UpdateResult{}, true, nil
 	}
 	handlerDeferred := func(ctx context.Context, tools []string, force bool) error {
-		res, deferred, err := doToolUpdateDeferred(ctx, tools, true)
+		res, deferred, err := doToolUpdateDeferred(ctx, tools, force)
 		if err != nil {
 			return fmt.Errorf("tool update failed: %w", err)
 		}
 		if deferred {
-			return fmt.Errorf("tool update deferred: workstation is busy or harness is actively running")
+			return worker.ErrJobDeferred
 		}
 		if res.AgentUpdated {
 			// would restart
 		}
 		return nil
 	}
-	if err := handlerDeferred(context.Background(), []string{"autopilot"}, true); err == nil || !strings.Contains(err.Error(), "tool update deferred") {
-		t.Fatalf("expected deferred error, got: %v", err)
+	if err := handlerDeferred(context.Background(), []string{"autopilot"}, false); !errors.Is(err, worker.ErrJobDeferred) {
+		t.Fatalf("expected ErrJobDeferred for deferred update, got: %v", err)
 	}
 }
