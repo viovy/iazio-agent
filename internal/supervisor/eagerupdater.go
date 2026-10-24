@@ -32,6 +32,7 @@ type EagerToolUpdater struct {
 	hostID          string
 	doUpdate        func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error)
 	postNotif       func(ctx context.Context, rec controlplane.NotificationRecord) error
+	CheckDrift      func(ctx context.Context, targetTools []string) (bool, error)
 	lastDeferredKey string
 	updating        bool
 	pendingTools    []string
@@ -64,9 +65,11 @@ func (u *EagerToolUpdater) IsUpdating() bool {
 }
 
 // EvaluateAndTrigger checks preconditions and performs an eager update if eligible.
+// If a concurrent update is running, forced or targeted requests are queued and executed
+// sequentially inside the update lock, and any agent binary upgrade triggers a restart (E3).
 func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools []string, force bool) (agentUpdated bool, deferred bool, err error) {
 	if !u.updateMutex.TryLock() {
-		// Coalesce or queue: if caller requested forced or targeted tools, record pending request (G4)
+		// Coalesce or queue: if caller requested forced or targeted tools, record pending request (G4, E3)
 		if force || len(targetTools) > 0 {
 			u.mu.Lock()
 			u.pendingForce = u.pendingForce || force
@@ -90,24 +93,41 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 	}
 	defer u.updateMutex.Unlock()
 
-	defer func() {
-		// Check if a pending forced or targeted request arrived while executing (G4)
+	var anyAgentUpdated bool
+	var lastErr error
+
+	curTools := targetTools
+	curForce := force
+
+	for {
+		passUpdated, passDeferred, passErr := u.runSinglePass(ctx, curTools, curForce)
+		if passUpdated {
+			anyAgentUpdated = true
+		}
+		if passErr != nil {
+			lastErr = passErr
+		}
+		if passDeferred && !curForce {
+			return anyAgentUpdated, true, lastErr
+		}
+
 		u.mu.Lock()
-		hasP := u.hasPending
-		pForce := u.pendingForce
-		pTools := u.pendingTools
+		if !u.hasPending {
+			u.mu.Unlock()
+			break
+		}
+		curTools = u.pendingTools
+		curForce = u.pendingForce
 		u.hasPending = false
 		u.pendingForce = false
 		u.pendingTools = nil
 		u.mu.Unlock()
+	}
 
-		if hasP {
-			go func() {
-				_, _, _ = u.EvaluateAndTrigger(context.Background(), pTools, pForce)
-			}()
-		}
-	}()
+	return anyAgentUpdated, false, lastErr
+}
 
+func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []string, force bool) (agentUpdated bool, deferred bool, err error) {
 	u.mu.Lock()
 	if u.updating {
 		u.mu.Unlock()
@@ -179,6 +199,14 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 		}
 	}
 
+	// Check drift before emitting update_started to eliminate noise on unforced no-op ticks (E4)
+	if !force && u.CheckDrift != nil {
+		hasDrift, driftErr := u.CheckDrift(ctx, targetTools)
+		if driftErr == nil && !hasDrift {
+			return false, false, nil
+		}
+	}
+
 	// Reset deferred key on successful entry
 	u.mu.Lock()
 	u.lastDeferredKey = ""
@@ -230,21 +258,36 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 		return false, false, updateErr
 	}
 
-	if len(res.UpdatedTools) > 0 && u.postNotif != nil {
-		if err := u.postNotif(ctx, controlplane.NotificationRecord{
-			Title:    "Tool Update Succeeded",
-			Message:  fmt.Sprintf("Successfully updated tools on %s: %s (took %dms)", u.hostID, strings.Join(res.UpdatedTools, ", "), durationMs),
-			Category: "success",
-			Source:   "tool-updater",
-			HostID:   u.hostID,
-			Metadata: map[string]any{
-				"event":         "agent.tool.update_succeeded",
-				"updated_tools": res.UpdatedTools,
-				"duration_ms":   durationMs,
-				"agent_updated": res.AgentUpdated,
-			},
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "[eagerupdater] postNotif error (update_succeeded): %v\n", err)
+	if u.postNotif != nil {
+		if len(res.UpdatedTools) > 0 {
+			if err := u.postNotif(ctx, controlplane.NotificationRecord{
+				Title:    "Tool Update Succeeded",
+				Message:  fmt.Sprintf("Successfully updated tools on %s: %s (took %dms)", u.hostID, strings.Join(res.UpdatedTools, ", "), durationMs),
+				Category: "success",
+				Source:   "tool-updater",
+				HostID:   u.hostID,
+				Metadata: map[string]any{
+					"event":         "agent.tool.update_succeeded",
+					"updated_tools": res.UpdatedTools,
+					"duration_ms":   durationMs,
+					"agent_updated": res.AgentUpdated,
+				},
+			}); err != nil {
+				fmt.Fprintf(os.Stderr, "[eagerupdater] postNotif error (update_succeeded): %v\n", err)
+			}
+		} else if !force {
+			// Terminal noop notification to pair with started (E4)
+			_ = u.postNotif(ctx, controlplane.NotificationRecord{
+				Title:    "Tools Up To Date",
+				Message:  fmt.Sprintf("Tool update check completed on %s: all tools already up to date", u.hostID),
+				Category: "info",
+				Source:   "tool-updater",
+				HostID:   u.hostID,
+				Metadata: map[string]any{
+					"event":       "agent.tool.update_noop",
+					"duration_ms": durationMs,
+				},
+			})
 		}
 	}
 

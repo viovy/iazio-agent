@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -354,6 +355,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				if eagerUpdater != nil {
 					agentUpdated, deferred, err := eagerUpdater.EvaluateAndTrigger(ctx, targetTools, force)
 					if err != nil {
+						if errors.Is(err, supervisor.ErrUpdateInProgress) {
+							span.SetTag("result", "queued")
+							return false
+						}
 						span.SetTag("result", "error")
 						span.SetError(err)
 						return false
@@ -483,16 +488,15 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						t := pendingRemoteTools
 						f := pendingRemoteForce
 						isRemote := hasPendingRemote
+						if isRemote {
+							hasPendingRemote = false
+							pendingRemoteTools = nil
+							pendingRemoteForce = false
+						}
 						pendingRemoteMu.Unlock()
 
 						if isRemote {
-							if doToolUpdate(runCtx, t, f) {
-								pendingRemoteMu.Lock()
-								hasPendingRemote = false
-								pendingRemoteMu.Unlock()
-								return true
-							}
-							return false
+							return doToolUpdate(runCtx, t, f)
 						}
 						return doToolUpdate(runCtx, nil, false)
 					}
@@ -543,13 +547,12 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						pendingRemoteMu.Lock()
 						t := pendingRemoteTools
 						f := pendingRemoteForce
+						pendingRemoteTools = nil
+						pendingRemoteForce = false
+						hasPendingRemote = false
 						pendingRemoteMu.Unlock()
 
 						if doToolUpdate(runCtx, t, f) {
-							pendingRemoteMu.Lock()
-							hasPendingRemote = false
-							pendingRemoteMu.Unlock()
-
 							restartOrExecSelf(stdout)
 							cancel()
 						}

@@ -361,21 +361,24 @@ func TestEagerToolUpdater_OverlappingCallsQueuePendingForce(t *testing.T) {
 		if count == 1 {
 			close(inProgressCh)
 			<-continueCh
+			return UpdateResult{UpdatedTools: []string{"tool-a"}}, nil
 		}
-		return UpdateResult{UpdatedTools: []string{"tool-a"}}, nil
+		return UpdateResult{UpdatedTools: []string{"tool-b"}, AgentUpdated: true}, nil
 	}, nil)
 
 	// Call 1: unforced
+	var call1AgentUpdated bool
 	call1Done := make(chan struct{})
 	go func() {
-		_, _, _ = updater.EvaluateAndTrigger(context.Background(), nil, false)
+		updated, _, _ := updater.EvaluateAndTrigger(context.Background(), nil, false)
+		call1AgentUpdated = updated
 		close(call1Done)
 	}()
 
 	// Wait until call 1 is actively inside doUpdate
 	<-inProgressCh
 
-	// Call 2: concurrent forced call must return ErrUpdateInProgress and queue pending execution (G4)
+	// Call 2: concurrent forced call must return ErrUpdateInProgress and queue pending execution (G4, E3)
 	_, deferred, err := updater.EvaluateAndTrigger(context.Background(), []string{"tool-b"}, true)
 	if !deferred || err != ErrUpdateInProgress {
 		t.Fatalf("expected call 2 to return deferred=true with ErrUpdateInProgress, got: deferred=%v, err=%v", deferred, err)
@@ -383,17 +386,59 @@ func TestEagerToolUpdater_OverlappingCallsQueuePendingForce(t *testing.T) {
 
 	// Release call 1
 	close(continueCh)
+	// Channel synchronization guarantees loop finishes both passes before call1Done closes (E3)
 	<-call1Done
 
-	// Give background queue a moment to execute
-	time.Sleep(100 * time.Millisecond)
+	if !call1AgentUpdated {
+		t.Fatalf("expected queued agent update in pass 2 to return agentUpdated=true to caller (E3)")
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	if executionCount < 2 {
-		t.Fatalf("expected at least 2 executions (initial + queued pending force), got %d", executionCount)
+	if executionCount != 2 {
+		t.Fatalf("expected exactly 2 executions (initial + queued pending force), got %d", executionCount)
 	}
-	if len(executedForces) >= 2 && !executedForces[1] {
-		t.Fatalf("expected second queued execution to have force=true")
+	if len(executedForces) != 2 || executedForces[0] != false || executedForces[1] != true {
+		t.Fatalf("expected executions [false, true], got %v", executedForces)
+	}
+}
+
+func TestEagerToolUpdater_NoUpdateStartedWhenNoDrift(t *testing.T) {
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	var emittedEvents []string
+	var mu sync.Mutex
+	notifFn := func(ctx context.Context, rec controlplane.NotificationRecord) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if evt, ok := rec.Metadata["event"].(string); ok {
+			emittedEvents = append(emittedEvents, evt)
+		}
+		return nil
+	}
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
+		return UpdateResult{}, nil
+	}, notifFn)
+
+	// Configure CheckDrift to report no drift (all tools up-to-date)
+	updater.CheckDrift = func(ctx context.Context, targetTools []string) (bool, error) {
+		return false, nil
+	}
+
+	// Unforced check should suppress noise (no update_started emitted) (E4)
+	agentUpdated, deferred, err := updater.EvaluateAndTrigger(context.Background(), nil, false)
+	if err != nil || deferred || agentUpdated {
+		t.Fatalf("expected clean up-to-date return, got updated=%v deferred=%v err=%v", agentUpdated, deferred, err)
+	}
+
+	mu.Lock()
+	eventsCount := len(emittedEvents)
+	mu.Unlock()
+
+	if eventsCount != 0 {
+		t.Fatalf("expected 0 notifications when CheckDrift returns false, got %v (E4)", emittedEvents)
 	}
 }
