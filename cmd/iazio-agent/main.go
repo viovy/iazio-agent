@@ -215,13 +215,16 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 
 			var eagerUpdater *supervisor.EagerToolUpdater
 
-			getRepos := func() []supervisor.RepoConfigItem {
+			getRepos := func() ([]supervisor.RepoConfigItem, error) {
 				if api == "" {
-					return nil
+					return nil, nil
 				}
 				detail, err := client.GetHost(runCtx, host)
-				if err != nil || len(detail.Repos) == 0 {
-					return nil
+				if err != nil {
+					return nil, fmt.Errorf("failed to fetch host repos: %w", err)
+				}
+				if len(detail.Repos) == 0 {
+					return nil, nil
 				}
 				var items []supervisor.RepoConfigItem
 				for _, r := range detail.Repos {
@@ -236,7 +239,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						})
 					}
 				}
-				return items
+				return items, nil
 			}
 
 			repoMonitor := supervisor.NewRepoStateMonitor(

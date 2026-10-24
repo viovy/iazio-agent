@@ -55,6 +55,9 @@ func (u *EagerToolUpdater) IsUpdating() bool {
 
 // EvaluateAndTrigger checks preconditions and performs an eager update if eligible.
 func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools []string, force bool) (agentUpdated bool, deferred bool, err error) {
+	u.updateMutex.Lock()
+	defer u.updateMutex.Unlock()
+
 	u.mu.Lock()
 	if u.updating {
 		u.mu.Unlock()
@@ -77,9 +80,18 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 		return false, true, nil
 	}
 
-	// 3. Acquire exclusive update lock
-	u.updateMutex.Lock()
-	defer u.updateMutex.Unlock()
+	// 3. Acquire exclusive host execution lock from supervisor
+	var releaseHostLock func()
+	if u.sup != nil && !force {
+		var ok bool
+		releaseHostLock, ok = u.sup.TryAcquireToolUpdate()
+		if !ok {
+			reason := "BlockedByActiveHarness"
+			u.emitDeferredOnce(ctx, targetTools, reason, "Tool update deferred: harness execution active on host")
+			return false, true, nil
+		}
+		defer releaseHostLock()
+	}
 
 	u.mu.Lock()
 	u.updating = true
@@ -93,9 +105,6 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 
 	// Re-verify inside lock if not forced
 	if !force {
-		if u.sup != nil && u.sup.HasRunningHarness() {
-			return false, true, nil
-		}
 		snap2 := u.monitor.InspectFleet(ctx)
 		if !snap2.FleetGitClean {
 			reason := fmt.Sprintf("BlockedByDirtyRepos: %v", snap2.DirtyRepoPaths)

@@ -2,9 +2,11 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,8 +102,8 @@ func TestRepoStateMonitor_ExecutionGuardAndFleetClean(t *testing.T) {
 		sup,
 		"test-host",
 		2*time.Minute,
-		func() []RepoConfigItem {
-			return []RepoConfigItem{{Path: tempDir, Alias: "test-repo"}}
+		func() ([]RepoConfigItem, error) {
+			return []RepoConfigItem{{Path: tempDir, Alias: "test-repo"}}, nil
 		},
 		func(ctx context.Context, hostID string, statuses []controlplane.RepoRuntimeStatus) error {
 			reportedStatuses = statuses
@@ -164,8 +166,8 @@ func TestEagerToolUpdater_PreconditionsAndDeduplicatedNotifications(t *testing.T
 		sup,
 		"test-host",
 		2*time.Minute,
-		func() []RepoConfigItem {
-			return []RepoConfigItem{{Path: tempDir, Alias: "test-repo"}}
+		func() ([]RepoConfigItem, error) {
+			return []RepoConfigItem{{Path: tempDir, Alias: "test-repo"}}, nil
 		},
 		nil,
 		postNotif,
@@ -241,5 +243,68 @@ func TestEagerToolUpdater_PreconditionsAndDeduplicatedNotifications(t *testing.T
 	}
 	if !foundStarted || !foundSucceeded {
 		t.Fatalf("expected update_started and update_succeeded notifications, got: %v", notifications)
+	}
+}
+
+func TestRepoStateMonitor_InventoryFailureFailClosed(t *testing.T) {
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(
+		sup,
+		"test-host",
+		2*time.Minute,
+		func() ([]RepoConfigItem, error) {
+			return nil, errors.New("simulated control-plane 503 outage")
+		},
+		nil,
+		nil,
+		nil,
+	)
+
+	snap := monitor.InspectFleet(context.Background())
+	if snap.FleetGitClean {
+		t.Fatalf("expected FleetGitClean=false on inventory lookup failure (fail-closed)")
+	}
+	if len(snap.DirtyRepoPaths) == 0 || snap.DirtyRepoPaths[0] != "repo_inventory_unavailable" {
+		t.Fatalf("expected DirtyRepoPaths to include repo_inventory_unavailable, got %v", snap.DirtyRepoPaths)
+	}
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
+		t.Fatalf("doUpdate must NOT be called when inventory failed")
+		return UpdateResult{}, nil
+	}, nil)
+
+	_, deferred, _ := updater.EvaluateAndTrigger(context.Background(), nil, false)
+	if !deferred {
+		t.Fatalf("expected update to be deferred when repo inventory is unavailable")
+	}
+}
+
+func TestSupervisor_ToolUpdateHostExecutionLock(t *testing.T) {
+	sup := New(time.Now)
+
+	// Acquire tool update host lock
+	release, ok := sup.TryAcquireToolUpdate()
+	if !ok || release == nil {
+		t.Fatalf("expected TryAcquireToolUpdate to succeed")
+	}
+	if !sup.IsToolUpdating() {
+		t.Fatalf("expected IsToolUpdating=true")
+	}
+
+	// While tool update is in progress, harness Spawn / TrySpawn must be refused
+	err := sup.TrySpawn("/tmp/test-repo")
+	if err == nil || !strings.Contains(err.Error(), "tool update in progress") {
+		t.Fatalf("expected TrySpawn to be blocked while tool update in progress, got %v", err)
+	}
+
+	// Release lock
+	release()
+	if sup.IsToolUpdating() {
+		t.Fatalf("expected IsToolUpdating=false after release")
+	}
+
+	// Now TrySpawn succeeds
+	if err := sup.TrySpawn("/tmp/test-repo"); err != nil {
+		t.Fatalf("expected TrySpawn to succeed after release, got %v", err)
 	}
 }

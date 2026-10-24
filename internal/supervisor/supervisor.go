@@ -69,6 +69,7 @@ type Sup struct {
 	fetches      []string
 	halted       bool
 	loopDetector *LoopDetector
+	toolUpdating bool
 }
 
 // New returns a supervisor. now injects the clock.
@@ -154,6 +155,9 @@ func (s *Sup) TrySpawn(path string) error {
 	defer gate.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.toolUpdating {
+		return errors.New("host locked: tool update in progress")
+	}
 	if s.locks[path] == LockRunning {
 		return errors.New("checkout busy")
 	}
@@ -258,16 +262,46 @@ func (s *Sup) ActiveJobs() map[string]int {
 	return res
 }
 
-// HasRunningHarness reports whether any worktree is actively running, cooling, or pending correlation.
-func (s *Sup) HasRunningHarness() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Sup) hasRunningHarnessLocked() bool {
 	for _, state := range s.locks {
 		if state == LockRunning || state == LockCooling || state == LockPending {
 			return true
 		}
 	}
 	return false
+}
+
+// HasRunningHarness reports whether any worktree is actively running, cooling, or pending correlation.
+func (s *Sup) HasRunningHarness() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hasRunningHarnessLocked()
+}
+
+// TryAcquireToolUpdate locks the host exclusively for tool update swapping.
+// If any harness is running or cooling, or if an update is already running, it returns (nil, false).
+func (s *Sup) TryAcquireToolUpdate() (release func(), ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.toolUpdating || s.hasRunningHarnessLocked() {
+		return nil, false
+	}
+	s.toolUpdating = true
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			s.toolUpdating = false
+			s.mu.Unlock()
+		})
+	}, true
+}
+
+// IsToolUpdating reports whether an exclusive tool update lock is currently held.
+func (s *Sup) IsToolUpdating() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.toolUpdating
 }
 
 // RunningJob describes an active harness job.

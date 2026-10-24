@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,10 +68,14 @@ func InspectRepoGitState(ctx context.Context, repoPath, alias string) RepoGitSta
 
 	lockSentinels := []string{
 		filepath.Join(gitDir, "index.lock"),
+		filepath.Join(gitDir, "HEAD.lock"),
+		filepath.Join(gitDir, "shallow.lock"),
 		filepath.Join(gitDir, "MERGE_HEAD"),
 		filepath.Join(gitDir, "rebase-merge"),
 		filepath.Join(gitDir, "rebase-apply"),
 		filepath.Join(gitDir, "CHERRY_PICK_HEAD"),
+		filepath.Join(gitDir, "REVERT_HEAD"),
+		filepath.Join(gitDir, "BISECT_LOG"),
 	}
 	for _, sentinel := range lockSentinels {
 		if _, err := os.Stat(sentinel); err == nil {
@@ -133,7 +138,7 @@ type RepoStateMonitor struct {
 	mu             sync.RWMutex
 	sup            *Sup
 	hostID         string
-	getRepos       func() []RepoConfigItem
+	getRepos       func() ([]RepoConfigItem, error)
 	reportStatuses func(ctx context.Context, hostID string, statuses []controlplane.RepoRuntimeStatus) error
 	postNotif      func(ctx context.Context, rec controlplane.NotificationRecord) error
 	onFleetClean   func(snap FleetStateSnapshot)
@@ -146,12 +151,13 @@ func NewRepoStateMonitor(
 	sup *Sup,
 	hostID string,
 	interval time.Duration,
-	getRepos func() []RepoConfigItem,
+	getRepos func() ([]RepoConfigItem, error),
 	reportStatuses func(ctx context.Context, hostID string, statuses []controlplane.RepoRuntimeStatus) error,
 	postNotif func(ctx context.Context, rec controlplane.NotificationRecord) error,
 	onFleetClean func(snap FleetStateSnapshot),
 ) *RepoStateMonitor {
 	if interval < 1*time.Minute || interval > 5*time.Minute {
+		fmt.Fprintf(os.Stderr, "[repomonitor] configured interval %v outside permitted range [1m..5m]; defaulting to 2m\n", interval)
 		interval = 2 * time.Minute
 	}
 	return &RepoStateMonitor{
@@ -192,13 +198,24 @@ func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot 
 	if m.sup != nil && m.sup.HasRunningHarness() {
 		snap.HarnessActive = true
 		snap.FleetGitClean = false
+		if len(m.lastSnapshot.Repos) > 0 {
+			snap.Repos = m.lastSnapshot.Repos
+		}
 		m.lastSnapshot = snap
 		return snap
 	}
 
 	var repos []RepoConfigItem
 	if m.getRepos != nil {
-		repos = m.getRepos()
+		var err error
+		repos, err = m.getRepos()
+		if err != nil {
+			// Fail-closed when repo inventory is unavailable
+			snap.FleetGitClean = false
+			snap.DirtyRepoPaths = []string{"repo_inventory_unavailable"}
+			m.lastSnapshot = snap
+			return snap
+		}
 	}
 
 	if len(repos) == 0 {
@@ -283,22 +300,26 @@ func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot 
 
 	snap.FleetGitClean = allClean
 	snap.DirtyRepoPaths = dirtyList
+
+	wasClean := m.lastSnapshot.FleetGitClean
 	m.lastSnapshot = snap
 
 	// Report to backend
 	if m.reportStatuses != nil && len(statuses) > 0 {
-		_ = m.reportStatuses(ctx, m.hostID, statuses)
+		if rErr := m.reportStatuses(ctx, m.hostID, statuses); rErr != nil {
+			fmt.Fprintf(os.Stderr, "[repomonitor] reportStatuses error: %v\n", rErr)
+		}
 	}
 
-	// Trigger onFleetClean if clean
-	if allClean && m.onFleetClean != nil {
+	// Trigger onFleetClean only on transition to clean
+	if allClean && !wasClean && m.onFleetClean != nil {
 		m.onFleetClean(snap)
 	}
 
 	return snap
 }
 
-// Start begins periodic background inspection.
+// Start begins periodic background inspection with jitter.
 func (m *RepoStateMonitor) Start(ctx context.Context) {
 	go func() {
 		// Run initial check after 3 seconds
@@ -309,13 +330,18 @@ func (m *RepoStateMonitor) Start(ctx context.Context) {
 			m.InspectFleet(ctx)
 		}
 
-		ticker := time.NewTicker(m.interval)
-		defer ticker.Stop()
 		for {
+			// Apply ±15s jitter to avoid synchronized fleet requests
+			jitter := time.Duration(rand.Intn(30)-15) * time.Second
+			waitDur := m.interval + jitter
+			if waitDur < 45*time.Second {
+				waitDur = 45 * time.Second
+			}
+
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case <-time.After(waitDur):
 				m.InspectFleet(ctx)
 			}
 		}
