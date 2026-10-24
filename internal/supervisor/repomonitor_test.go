@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -646,4 +647,570 @@ func TestEagerToolUpdater_DedupeMultipleDirtyReposOrderAgnostic(t *testing.T) {
 		t.Fatalf("expected still 1 deferred notif after permutation pass (deduped), got %d (F-1)", deferredNotifs)
 	}
 	mu.Unlock()
+}
+
+func TestRepoStateMonitor_LevelTriggeredCleanPasses(t *testing.T) {
+	tempDir := t.TempDir()
+	initTestGitRepo(t, tempDir)
+
+	sup := New(time.Now)
+	var onFleetCleanCalls int
+	monitor := NewRepoStateMonitor(
+		sup,
+		"test-host",
+		2*time.Minute,
+		func() ([]RepoConfigItem, error) {
+			return []RepoConfigItem{
+				{Path: tempDir, Alias: "test-repo"},
+			}, nil
+		},
+		nil,
+		nil,
+		func(snap FleetStateSnapshot) {
+			onFleetCleanCalls++
+		},
+	)
+
+	ctx := context.Background()
+
+	// Pass 1: Repo is clean -> onFleetClean must fire
+	snap1 := monitor.InspectFleet(ctx)
+	if !snap1.FleetGitClean {
+		t.Fatalf("expected clean fleet on pass 1, got dirty: %v", snap1.DirtyRepoPaths)
+	}
+	if onFleetCleanCalls != 1 {
+		t.Fatalf("expected onFleetClean to be called once on pass 1, got %d", onFleetCleanCalls)
+	}
+
+	// Pass 2: Repo remains clean -> level trigger must fire AGAIN (consecutive clean pass, F7)
+	snap2 := monitor.InspectFleet(ctx)
+	if !snap2.FleetGitClean {
+		t.Fatalf("expected clean fleet on pass 2, got dirty: %v", snap2.DirtyRepoPaths)
+	}
+	if onFleetCleanCalls != 2 {
+		t.Fatalf("expected onFleetClean to be called twice across consecutive clean passes (level-triggered), got %d", onFleetCleanCalls)
+	}
+}
+
+func TestEagerToolUpdater_Backoff(t *testing.T) {
+	// R6, R7: Test calculateBackoff capping and shouldBackoff / recordFailure
+	if b := calculateBackoff(0); b != 0 {
+		t.Errorf("expected 0 for 0 attempts, got %v", b)
+	}
+	if b := calculateBackoff(1); b != 30*time.Second {
+		t.Errorf("expected 30s for 1 attempt, got %v", b)
+	}
+	if b := calculateBackoff(2); b != 60*time.Second {
+		t.Errorf("expected 60s for 2 attempts, got %v", b)
+	}
+	// Cap at 1h (R7)
+	if b := calculateBackoff(20); b != 1*time.Hour {
+		t.Errorf("expected 1h cap for 20 attempts, got %v", b)
+	}
+
+	updater := NewEagerToolUpdater(nil, nil, "test-host", nil, nil)
+	// Initial state: no backoff
+	if updater.shouldBackoff([]string{"my-tool"}, false) {
+		t.Fatalf("expected no backoff initially")
+	}
+
+	// Record failure: should backoff immediately
+	updater.recordToolFailure("my-tool")
+	if !updater.shouldBackoff([]string{"my-tool"}, false) {
+		t.Fatalf("expected shouldBackoff=true after failure")
+	}
+	// Force bypasses backoff
+	if updater.shouldBackoff([]string{"my-tool"}, true) {
+		t.Fatalf("expected force=true to bypass backoff")
+	}
+
+	// Record success: backoff cleared
+	updater.recordToolSuccess("my-tool")
+	if updater.shouldBackoff([]string{"my-tool"}, false) {
+		t.Fatalf("expected shouldBackoff=false after success")
+	}
+}
+
+func TestEagerToolUpdater_DeferralRetentionAndUnmergedDraining(t *testing.T) {
+	// R4, R5, R6: Deferred forced/pinned requests must be retained across active harness runs
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	var executions []struct {
+		tools   []string
+		force   bool
+		version string
+	}
+	var mu sync.Mutex
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", nil, nil)
+	updater.SetDetailedUpdateFunc(func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error) {
+		mu.Lock()
+		var tv string
+		if len(targetVersion) > 0 {
+			tv = targetVersion[0]
+		}
+		executions = append(executions, struct {
+			tools   []string
+			force   bool
+			version string
+		}{
+			tools:   append([]string(nil), targetTools...),
+			force:   force,
+			version: tv,
+		})
+		mu.Unlock()
+		return UpdateResult{UpdatedTools: targetTools}, nil
+	})
+
+	ctx := context.Background()
+
+	// 1. Simulate active harness blocking tool update
+	tempDir := t.TempDir()
+	if err := sup.TrySpawn(tempDir); err != nil {
+		t.Fatalf("setup TrySpawn failed: %v", err)
+	}
+
+	// Request forced update for tool-a @ 0.1.0 while harness is running
+	_, deferred, err := updater.EvaluateAndTriggerDetailed(ctx, []string{"tool-a"}, true, "0.1.0")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !deferred {
+		t.Fatalf("expected request to be deferred while harness is active")
+	}
+
+	// Verify nothing was executed yet
+	mu.Lock()
+	if len(executions) != 0 {
+		t.Fatalf("expected 0 executions while deferred, got %d", len(executions))
+	}
+	mu.Unlock()
+
+	// 2. Harness finishes execution
+	sup.MarkIdle(tempDir)
+
+	// 3. Next periodic clean tick runs with targetTools=nil, force=false
+	_, _, err = updater.EvaluateAndTrigger(ctx, nil, false)
+	if err != nil {
+		t.Fatalf("unexpected error on clean tick: %v", err)
+	}
+
+	// 4. Assert deferred request was retained and executed with original version and force flag (R4, R5)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(executions) < 1 {
+		t.Fatalf("expected deferred request to be executed on clean tick, got %d executions", len(executions))
+	}
+	var found bool
+	for _, ex := range executions {
+		if len(ex.tools) == 1 && ex.tools[0] == "tool-a" {
+			found = true
+			if !ex.force {
+				t.Errorf("expected force=true retained for deferred request, got false")
+			}
+			if ex.version != "0.1.0" {
+				t.Errorf("expected version 0.1.0 retained for deferred request, got %q", ex.version)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected deferred request for tool-a to be executed on clean tick, got executions: %v", executions)
+	}
+}
+
+func TestEagerToolUpdater_SuitePartialFailureBackoffAndNotificationDedupe(t *testing.T) {
+	// N1: Test that partial failures on unforced suite path engage backoff and deduplicate notifications
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	var callCount int
+	var mu sync.Mutex
+
+	var emittedNotifications []controlplane.NotificationRecord
+	var notifMu sync.Mutex
+
+	postNotif := func(ctx context.Context, rec controlplane.NotificationRecord) error {
+		notifMu.Lock()
+		emittedNotifications = append(emittedNotifications, rec)
+		notifMu.Unlock()
+		return nil
+	}
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", nil, postNotif)
+	updater.ListSuiteTools = func(ctx context.Context) ([]string, error) {
+		return []string{"bad-tool"}, nil
+	}
+	updater.SetDetailedUpdateFunc(func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error) {
+		mu.Lock()
+		callCount++
+		mu.Unlock()
+		return UpdateResult{
+			FailedTools: []string{"bad-tool"},
+		}, nil
+	})
+
+	ctx := context.Background()
+
+	// Pass 1: unforced suite update (targetTools == nil)
+	res1, def1, err1 := updater.EvaluateAndTriggerDetailed(ctx, nil, false)
+	if err1 != nil || def1 {
+		t.Fatalf("expected pass 1 to complete without deferral, err=%v, def=%v", err1, def1)
+	}
+	if len(res1.FailedTools) != 1 || res1.FailedTools[0] != "bad-tool" {
+		t.Fatalf("expected failed tool 'bad-tool', got %v", res1.FailedTools)
+	}
+
+	mu.Lock()
+	if callCount != 1 {
+		t.Fatalf("expected 1 call to doUpdateDetailed, got %d", callCount)
+	}
+	mu.Unlock()
+
+	notifMu.Lock()
+	partialNotifCount := 0
+	for _, n := range emittedNotifications {
+		if n.Metadata["event"] == "agent.tool.update_partial_failure" {
+			partialNotifCount++
+		}
+	}
+	if partialNotifCount != 1 {
+		t.Fatalf("expected 1 partial failure notification on pass 1, got %d", partialNotifCount)
+	}
+	notifMu.Unlock()
+
+	// Verify tool and suite backoff state
+	if !updater.IsToolInBackoff("bad-tool") {
+		t.Fatalf("expected IsToolInBackoff('bad-tool')=true after failure")
+	}
+
+	// Pass 2: immediate second unforced suite pass (within backoff window)
+	res2, def2, err2 := updater.EvaluateAndTriggerDetailed(ctx, nil, false)
+	if err2 != nil || def2 {
+		t.Fatalf("expected pass 2 to complete without deferral, err=%v, def=%v", err2, def2)
+	}
+	if len(res2.FailedTools) != 0 || len(res2.UpdatedTools) != 0 {
+		t.Fatalf("expected empty result on backed off pass 2, got %+v", res2)
+	}
+
+	mu.Lock()
+	if callCount != 1 {
+		t.Fatalf("expected doUpdateDetailed to NOT be called on pass 2 due to backoff (N1), callCount=%d", callCount)
+	}
+	mu.Unlock()
+
+	notifMu.Lock()
+	partialNotifCountPass2 := 0
+	for _, n := range emittedNotifications {
+		if n.Metadata["event"] == "agent.tool.update_partial_failure" {
+			partialNotifCountPass2++
+		}
+	}
+	if partialNotifCountPass2 != 1 {
+		t.Fatalf("expected no new partial failure notifications on pass 2 (deduped, N1), got %d", partialNotifCountPass2)
+	}
+	notifMu.Unlock()
+}
+
+func TestEagerToolUpdater_HealthyToolUpdatesWhileAnotherBackedOff(t *testing.T) {
+	// N1-R: When tool-broken is backed off and tool-healthy is drifting,
+	// unforced suite update should update tool-healthy and NOT attempt tool-broken.
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	var attemptedTools []string
+	var mu sync.Mutex
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", nil, nil)
+	updater.ListSuiteTools = func(ctx context.Context) ([]string, error) {
+		return []string{"tool-broken", "tool-healthy"}, nil
+	}
+	updater.SetDetailedUpdateFunc(func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error) {
+		mu.Lock()
+		attemptedTools = append([]string(nil), targetTools...)
+		mu.Unlock()
+		return UpdateResult{
+			UpdatedTools: []string{"tool-healthy"},
+		}, nil
+	})
+
+	// Pre-record failure for tool-broken so it is within backoff window
+	updater.recordToolFailure("tool-broken")
+	if !updater.IsToolInBackoff("tool-broken") {
+		t.Fatalf("expected tool-broken to be in backoff")
+	}
+
+	res, def, err := updater.EvaluateAndTriggerDetailed(context.Background(), nil, false)
+	if err != nil || def {
+		t.Fatalf("expected update to succeed, err=%v def=%v", err, def)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(attemptedTools) != 1 || attemptedTools[0] != "tool-healthy" {
+		t.Fatalf("expected only tool-healthy to be attempted (N1-R), got: %v", attemptedTools)
+	}
+	if len(res.UpdatedTools) != 1 || res.UpdatedTools[0] != "tool-healthy" {
+		t.Fatalf("expected tool-healthy in updated tools, got: %v", res.UpdatedTools)
+	}
+}
+
+func TestEagerToolUpdater_QueueCapAndDedupe(t *testing.T) {
+	// N5-R: Verify dedupe of identical pending requests and ErrQueueFull on overflow
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	blockCh := make(chan struct{})
+	doneCh := make(chan struct{})
+	var once sync.Once
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", nil, nil)
+	updater.SetDetailedUpdateFunc(func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error) {
+		once.Do(func() { close(doneCh) })
+		<-blockCh
+		return UpdateResult{UpdatedTools: targetTools}, nil
+	})
+
+	ctx := context.Background()
+
+	bgDone := make(chan struct{})
+	// Launch background update that holds the lock
+	go func() {
+		defer close(bgDone)
+		_, _, _ = updater.EvaluateAndTriggerDetailed(ctx, []string{"running-tool"}, true)
+	}()
+
+	<-doneCh // ensure lock is held
+
+	// 1. Deduplication: queue identical request multiple times
+	for i := 0; i < 5; i++ {
+		_, def, err := updater.EvaluateAndTriggerWithOpts(ctx, TriggerOptions{
+			TargetTools: []string{"dedupe-tool"},
+			Force:       true,
+		})
+		if !def || !errors.Is(err, ErrUpdateInProgress) {
+			t.Fatalf("expected ErrUpdateInProgress, got err=%v def=%v", err, def)
+		}
+	}
+
+	updater.mu.Lock()
+	pendingCount := len(updater.pendingRequests)
+	updater.mu.Unlock()
+	if pendingCount != 1 {
+		t.Fatalf("expected deduplication to keep exactly 1 request in queue (N5), got %d", pendingCount)
+	}
+
+	// 2. Queue capacity: fill up to maxPendingRequests (32)
+	for i := pendingCount; i < maxPendingRequests; i++ {
+		toolName := fmt.Sprintf("fill-tool-%d", i)
+		_, _, err := updater.EvaluateAndTriggerWithOpts(ctx, TriggerOptions{
+			TargetTools: []string{toolName},
+			Force:       true,
+		})
+		if !errors.Is(err, ErrUpdateInProgress) {
+			t.Fatalf("expected ErrUpdateInProgress while under cap, got %v", err)
+		}
+	}
+
+	// 3. Overflow beyond cap must return ErrQueueFull (N5-R)
+	_, _, overflowErr := updater.EvaluateAndTriggerWithOpts(ctx, TriggerOptions{
+		TargetTools: []string{"overflow-tool"},
+		Force:       true,
+	})
+	if !errors.Is(overflowErr, ErrQueueFull) {
+		t.Fatalf("expected ErrQueueFull on queue overflow (N5-R), got %v", overflowErr)
+	}
+
+	// Unblock background update and wait for completion (R5: no goroutine leak)
+	close(blockCh)
+	select {
+	case <-bgDone:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for background update to complete")
+	}
+}
+
+func TestEagerToolUpdater_BypassDirtySkipsBackoff(t *testing.T) {
+	// R2, B-1: Operator-dispatched update (BypassDirty: true) must run even when tools are in backoff
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	var attempted []string
+	var mu sync.Mutex
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", nil, nil)
+	updater.SetDetailedUpdateFunc(func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error) {
+		mu.Lock()
+		attempted = append([]string(nil), targetTools...)
+		mu.Unlock()
+		return UpdateResult{UpdatedTools: targetTools}, nil
+	})
+
+	// Pre-record failure for tool-backed-off
+	updater.recordToolFailure("tool-backed-off")
+	if !updater.IsToolInBackoff("tool-backed-off") {
+		t.Fatalf("expected tool-backed-off to be in backoff")
+	}
+
+	// 1. Unforced background run without BypassDirty: tool is skipped
+	res1, def1, err1 := updater.EvaluateAndTriggerWithOpts(context.Background(), TriggerOptions{
+		TargetTools: []string{"tool-backed-off"},
+		Force:       false,
+		BypassDirty: false,
+	})
+	if err1 != nil || def1 || len(res1.UpdatedTools) != 0 {
+		t.Fatalf("expected background run to skip backed off tool, got res=%v def=%v err=%v", res1, def1, err1)
+	}
+
+	// 2. Unforced operator run WITH BypassDirty: tool is NOT skipped (B-1, R2)
+	res2, def2, err2 := updater.EvaluateAndTriggerWithOpts(context.Background(), TriggerOptions{
+		TargetTools: []string{"tool-backed-off"},
+		Force:       false,
+		BypassDirty: true,
+	})
+	if err2 != nil || def2 {
+		t.Fatalf("expected BypassDirty run to succeed, err=%v def=%v", err2, def2)
+	}
+	mu.Lock()
+	if len(attempted) != 1 || attempted[0] != "tool-backed-off" {
+		t.Fatalf("expected tool-backed-off to be attempted via BypassDirty (R2), got: %v", attempted)
+	}
+	mu.Unlock()
+	if len(res2.UpdatedTools) != 1 || res2.UpdatedTools[0] != "tool-backed-off" {
+		t.Fatalf("expected tool-backed-off to be updated, got: %v", res2.UpdatedTools)
+	}
+}
+
+func TestEagerToolUpdater_PrependTruncation(t *testing.T) {
+	// R3: Prepend truncation caps queue at maxPendingRequests
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", nil, nil)
+
+	var reqs []PendingToolRequest
+	for i := 0; i < maxPendingRequests+10; i++ {
+		reqs = append(reqs, PendingToolRequest{
+			Tool: fmt.Sprintf("tool-%d", i),
+		})
+	}
+
+	updater.mu.Lock()
+	updater.prependPendingRequestsLocked(reqs)
+	count := len(updater.pendingRequests)
+	updater.mu.Unlock()
+
+	if count != maxPendingRequests {
+		t.Fatalf("expected prepend to truncate to %d, got %d", maxPendingRequests, count)
+	}
+}
+
+func TestEagerToolUpdater_SuiteDisabledOnlyAgent(t *testing.T) {
+	// R1: When updateSuite is false, ListSuiteTools returns only iazio-agent,
+	// and backed-off tools do not trigger updates of the rest of the manifest.
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	var attempted []string
+	var mu sync.Mutex
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", nil, nil)
+	updater.ListSuiteTools = func(ctx context.Context) ([]string, error) {
+		// When updateSuite is false, only iazio-agent is returned (R1)
+		return []string{"iazio-agent"}, nil
+	}
+	updater.SetDetailedUpdateFunc(func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error) {
+		mu.Lock()
+		attempted = append([]string(nil), targetTools...)
+		mu.Unlock()
+		return UpdateResult{AgentUpdated: true}, nil
+	})
+
+	// Put another tool into backoff
+	updater.recordToolFailure("some-other-tool")
+
+	res, def, err := updater.EvaluateAndTriggerDetailed(context.Background(), nil, false)
+	if err != nil || def {
+		t.Fatalf("expected update to succeed, err=%v def=%v", err, def)
+	}
+	if !res.AgentUpdated {
+		t.Fatalf("expected AgentUpdated to be true")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Must not have expanded to any other manifest tools
+	for _, tool := range attempted {
+		if tool != "iazio-agent" && tool != "" {
+			t.Fatalf("expected only iazio-agent to be attempted when suite update is disabled (R1), got: %v", attempted)
+		}
+	}
+}
+
+func TestEagerToolUpdater_BackedOffToolOnlyDriftingDoesNotTriggerUpdate(t *testing.T) {
+	// S1: When tool-broken is backed off and is the only drifting tool,
+	// CheckDrift must be evaluated against effectiveTargets (healthy tools),
+	// preventing update_started notification and doUpdateDetailed execution.
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	var updateCalled bool
+	var notifStartedCalled bool
+	var mu sync.Mutex
+
+	postNotif := func(ctx context.Context, rec controlplane.NotificationRecord) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if rec.Metadata != nil && rec.Metadata["event"] == "agent.tool.update_started" {
+			notifStartedCalled = true
+		}
+		return nil
+	}
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", nil, postNotif)
+	updater.ListSuiteTools = func(ctx context.Context) ([]string, error) {
+		return []string{"tool-broken", "tool-healthy"}, nil
+	}
+	updater.CheckDrift = func(ctx context.Context, targetTools []string) (bool, error) {
+		// If targetTools includes tool-broken, drift would be true.
+		// If effectiveTargets was correctly passed, targetTools only contains tool-healthy (which has no drift).
+		for _, t := range targetTools {
+			if t == "tool-broken" {
+				return true, nil // broken tool is out of date
+			}
+		}
+		return false, nil // healthy tool is already up-to-date
+	}
+	updater.SetDetailedUpdateFunc(func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error) {
+		mu.Lock()
+		updateCalled = true
+		mu.Unlock()
+		return UpdateResult{}, nil
+	})
+
+	// Put tool-broken into backoff
+	updater.recordToolFailure("tool-broken")
+
+	res, def, err := updater.EvaluateAndTriggerDetailed(context.Background(), nil, false)
+	if err != nil || def {
+		t.Fatalf("unexpected err=%v def=%v", err, def)
+	}
+	if len(res.UpdatedTools) != 0 {
+		t.Fatalf("expected 0 updated tools, got: %v", res.UpdatedTools)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if notifStartedCalled {
+		t.Fatalf("expected agent.tool.update_started NOT to be emitted when only backed-off tool drifts (S1)")
+	}
+	if updateCalled {
+		t.Fatalf("expected doUpdateDetailed NOT to be called when only backed-off tool drifts (S1)")
+	}
 }

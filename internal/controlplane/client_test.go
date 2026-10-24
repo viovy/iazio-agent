@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -691,8 +693,10 @@ func TestHostDaemonLoop_Cancellation(t *testing.T) {
 }
 
 func TestClient_Loop_WithHeartbeatAndCommands(t *testing.T) {
-	toolUpdateCalled := false
-	commandCalled := false
+	var toolUpdateCalled atomic.Bool
+	var commandCalled atomic.Bool
+	var receivedTargetVersion string
+	var versionMu sync.Mutex
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -704,7 +708,7 @@ func TestClient_Loop_WithHeartbeatAndCommands(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{
 				"ok": true,
-				"pending_tool_update": {"tools":["iazio-harness"],"force":true},
+				"pending_tool_update": {"tools":["iazio-harness"],"force":true,"target_version":"0.0.492"},
 				"pending_commands": [{"id":"cmd-1","type":"PING"}]
 			}`))
 		default:
@@ -724,12 +728,17 @@ func TestClient_Loop_WithHeartbeatAndCommands(t *testing.T) {
 		ActiveJobs: func() []ActiveJob {
 			return []ActiveJob{{JobID: "job-1", PID: 1001}}
 		},
-		OnToolUpdate: func(ctx context.Context, tools []string, force bool) error {
-			toolUpdateCalled = true
+		OnToolUpdate: func(ctx context.Context, tools []string, force bool, targetVersion ...string) error {
+			toolUpdateCalled.Store(true)
+			versionMu.Lock()
+			if len(targetVersion) > 0 {
+				receivedTargetVersion = targetVersion[0]
+			}
+			versionMu.Unlock()
 			return nil
 		},
 		OnCommand: func(ctx context.Context, cmd CommandEnvelope) error {
-			commandCalled = true
+			commandCalled.Store(true)
 			return nil
 		},
 	}
@@ -737,10 +746,16 @@ func TestClient_Loop_WithHeartbeatAndCommands(t *testing.T) {
 	_ = c.Loop(ctx, "host-1", "desktop", 20*time.Millisecond, nil, "profile-default")
 	time.Sleep(20 * time.Millisecond)
 
-	if !toolUpdateCalled {
+	if !toolUpdateCalled.Load() {
 		t.Fatalf("expected OnToolUpdate to be called")
 	}
-	if !commandCalled {
+	versionMu.Lock()
+	tv := receivedTargetVersion
+	versionMu.Unlock()
+	if tv != "0.0.492" {
+		t.Fatalf("expected targetVersion 0.0.492 to propagate (F7), got %q", tv)
+	}
+	if !commandCalled.Load() {
 		t.Fatalf("expected OnCommand to be called")
 	}
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/service"
 	"github.com/viovy/iazio-agent/internal/supervisor"
+	"github.com/viovy/iazio-agent/internal/worker"
 )
 
 func init() {
@@ -2491,24 +2492,133 @@ func TestDispatcher_ToolUpdaterResultMapping(t *testing.T) {
 		t.Fatalf("expected nil error when tools are already up to date, got: %v", err)
 	}
 
-	// Test that deferred actually returns the deferred error
+	// Test that deferred returns worker.ErrJobDeferred so dispatcher can ack without failure (N3)
 	doToolUpdateDeferred := func(ctx context.Context, tools []string, force bool) (supervisor.UpdateResult, bool, error) {
 		return supervisor.UpdateResult{}, true, nil
 	}
 	handlerDeferred := func(ctx context.Context, tools []string, force bool) error {
-		res, deferred, err := doToolUpdateDeferred(ctx, tools, true)
+		res, deferred, err := doToolUpdateDeferred(ctx, tools, force)
 		if err != nil {
 			return fmt.Errorf("tool update failed: %w", err)
 		}
 		if deferred {
-			return fmt.Errorf("tool update deferred: workstation is busy or harness is actively running")
+			return worker.ErrJobDeferred
 		}
 		if res.AgentUpdated {
 			// would restart
 		}
 		return nil
 	}
-	if err := handlerDeferred(context.Background(), []string{"autopilot"}, true); err == nil || !strings.Contains(err.Error(), "tool update deferred") {
-		t.Fatalf("expected deferred error, got: %v", err)
+	if err := handlerDeferred(context.Background(), []string{"autopilot"}, false); !errors.Is(err, worker.ErrJobDeferred) {
+		t.Fatalf("expected ErrJobDeferred for deferred update, got: %v", err)
+	}
+}
+
+type testManifestFetcher struct {
+	manifest *supervisor.FleetManifest
+	err      error
+}
+
+func (m *testManifestFetcher) FetchManifest(ctx context.Context) (*supervisor.FleetManifest, error) {
+	return m.manifest, m.err
+}
+
+func TestBuildEagerHooks_SuiteOptOutAndBackoff(t *testing.T) {
+	// S2: Verify buildEagerHooks when updateSuite is false vs true
+	manifest := &supervisor.FleetManifest{
+		Tools: []supervisor.ManifestTool{
+			{Name: "iazio-agent", BinaryName: "iazio-agent", TargetVersion: "1.0.0"},
+			{Name: "tool-b", BinaryName: "tool-b", TargetVersion: "2.0.0"},
+			{Name: "tool-c", BinaryName: "tool-c", TargetVersion: "3.0.0"},
+		},
+	}
+	fetcher := &testManifestFetcher{manifest: manifest}
+
+	tempDir := t.TempDir()
+
+	// 1. Suite update disabled: listSuiteTools returns ONLY ["iazio-agent"]
+	checkDriftFalse, listSuiteFalse := buildEagerHooks(
+		false,
+		fetcher,
+		func(tool string) bool { return tool == "tool-b" },
+		func(_ *supervisor.FleetManifest) string { return tempDir },
+		runtime.GOOS,
+	)
+
+	suiteTools, err := listSuiteFalse(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(suiteTools) != 1 || suiteTools[0] != "iazio-agent" {
+		t.Fatalf("expected only iazio-agent when suite opt-out, got: %v", suiteTools)
+	}
+
+	// 2. Suite update enabled: listSuiteTools returns all tools in manifest
+	checkDriftTrue, listSuiteTrue := buildEagerHooks(
+		true,
+		fetcher,
+		func(tool string) bool { return tool == "tool-b" },
+		func(_ *supervisor.FleetManifest) string { return tempDir },
+		runtime.GOOS,
+	)
+
+	allTools, err := listSuiteTrue(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(allTools) != 3 {
+		t.Fatalf("expected all 3 tools when suite enabled, got: %v", allTools)
+	}
+
+	// 3. Seed binaries: iazio-agent at 1.0.0 (up to date), tool-c at 3.0.0 (up to date).
+	// tool-b is missing/drifting.
+	if runtime.GOOS != "windows" {
+		agentScript := filepath.Join(tempDir, "iazio-agent")
+		if err := os.WriteFile(agentScript, []byte("#!/bin/sh\necho 'iazio-agent 1.0.0'\n"), 0755); err != nil {
+			t.Fatalf("failed to write agentScript: %v", err)
+		}
+		toolCScript := filepath.Join(tempDir, "tool-c")
+		if err := os.WriteFile(toolCScript, []byte("#!/bin/sh\necho 'tool-c 3.0.0'\n"), 0755); err != nil {
+			t.Fatalf("failed to write toolCScript: %v", err)
+		}
+
+		// checkDriftFalse only checks iazio-agent -> no drift
+		driftFalse, err := checkDriftFalse(context.Background(), nil)
+		if err != nil || driftFalse {
+			t.Fatalf("expected false drift for opt-out when iazio-agent is current, got %v err=%v", driftFalse, err)
+		}
+
+		// checkDriftTrue checks manifest but excludes backed-off tool-b -> no drift
+		driftTrue, err := checkDriftTrue(context.Background(), nil)
+		if err != nil || driftTrue {
+			t.Fatalf("expected false drift when only backed-off tool drifts, got %v err=%v", driftTrue, err)
+		}
+
+		// Positive control 1 (H4): when tool-b is NOT in backoff, suite drift check detects missing tool-b -> true
+		checkDriftNoBackoff, _ := buildEagerHooks(
+			true,
+			fetcher,
+			func(tool string) bool { return false }, // no tools backed off
+			func(_ *supervisor.FleetManifest) string { return tempDir },
+			runtime.GOOS,
+		)
+		driftNoBackoff, err := checkDriftNoBackoff(context.Background(), nil)
+		if err != nil || !driftNoBackoff {
+			t.Fatalf("expected true drift when missing tool-b is not backed off, got %v err=%v", driftNoBackoff, err)
+		}
+
+		// Positive control 2 (H4): with tool-b still missing and NOT in backoff, suite opt-out still returns false
+		// proving opt-out strictly narrows check to iazio-agent and ignores suite drift
+		checkDriftOptOutNoBackoff, _ := buildEagerHooks(
+			false,
+			fetcher,
+			func(tool string) bool { return false }, // no tools backed off
+			func(_ *supervisor.FleetManifest) string { return tempDir },
+			runtime.GOOS,
+		)
+		driftOptOut, err := checkDriftOptOutNoBackoff(context.Background(), nil)
+		if err != nil || driftOptOut {
+			t.Fatalf("expected false drift for suite opt-out even when suite tools drift, got %v err=%v", driftOptOut, err)
+		}
 	}
 }

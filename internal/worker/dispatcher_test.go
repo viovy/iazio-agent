@@ -656,7 +656,7 @@ func TestDispatcher_ToolsUpdate_Success(t *testing.T) {
 		return &Job{
 			ID:           "job-tu-1",
 			Type:         JobTypeToolsUpdate,
-			Payload:      json.RawMessage(`{"tools":["autopilot"],"force":true}`),
+			Payload:      json.RawMessage(`{"tools":["autopilot"],"force":true,"target_version":"0.0.492"}`),
 			FencingToken: 42,
 		}, nil
 	}
@@ -664,10 +664,13 @@ func TestDispatcher_ToolsUpdate_Success(t *testing.T) {
 	toolUpdateCalled := false
 	inv := &mockInvoker{}
 	d := NewDispatcher(cp, inv, "host-1")
-	d.SetToolUpdater(func(ctx context.Context, tools []string, force bool) error {
+	d.SetToolUpdater(func(ctx context.Context, tools []string, force bool, targetVersion ...string) error {
 		toolUpdateCalled = true
 		if len(tools) != 1 || tools[0] != "autopilot" || !force {
 			t.Errorf("unexpected tool update params: tools=%v force=%v", tools, force)
+		}
+		if len(targetVersion) == 0 || targetVersion[0] != "0.0.492" {
+			t.Errorf("expected targetVersion 0.0.492 to propagate (F7), got %v", targetVersion)
 		}
 		return nil
 	})
@@ -689,6 +692,83 @@ func TestDispatcher_ToolsUpdate_Success(t *testing.T) {
 	}
 	if comp.FencingToken != 42 {
 		t.Fatalf("expected fencing token 42, got %d", comp.FencingToken)
+	}
+}
+
+func TestDispatcher_ToolsUpdate_Unforced(t *testing.T) {
+	// N2: Verify that an unforced job payload passes force=false to ToolUpdater
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:           "job-tu-unforced",
+			Type:         JobTypeToolsUpdate,
+			Payload:      json.RawMessage(`{"tools":["autopilot"],"force":false}`),
+			FencingToken: 43,
+		}, nil
+	}
+
+	toolUpdateCalled := false
+	inv := &mockInvoker{}
+	d := NewDispatcher(cp, inv, "host-1")
+	d.SetToolUpdater(func(ctx context.Context, tools []string, force bool, targetVersion ...string) error {
+		toolUpdateCalled = true
+		if len(tools) != 1 || tools[0] != "autopilot" {
+			t.Errorf("unexpected tools: %v", tools)
+		}
+		if force {
+			t.Errorf("expected force=false for unforced job (N2), got force=true")
+		}
+		return nil
+	})
+
+	processed, err := d.PollAndProcess(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !processed || !toolUpdateCalled {
+		t.Fatal("expected unforced job to be processed and tool updater called")
+	}
+}
+
+func TestDispatcher_ToolsUpdate_DeferredReportsNonTerminalSuccess(t *testing.T) {
+	// N3: Verify that ErrJobDeferred reports non-terminal success with status=queued
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:           "job-tu-deferred",
+			Type:         JobTypeToolsUpdate,
+			Payload:      json.RawMessage(`{"tools":["autopilot"],"force":false}`),
+			FencingToken: 44,
+		}, nil
+	}
+
+	inv := &mockInvoker{}
+	d := NewDispatcher(cp, inv, "host-1")
+	d.SetToolUpdater(func(ctx context.Context, tools []string, force bool, targetVersion ...string) error {
+		return ErrJobDeferred
+	})
+
+	processed, err := d.PollAndProcess(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error on deferred job processing (N3), got: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected job to be processed")
+	}
+
+	comp, ok := cp.completedJobs["job-tu-deferred"]
+	if !ok {
+		t.Fatal("expected completion report for job-tu-deferred")
+	}
+	if comp.Error != "" {
+		t.Fatalf("expected empty error on deferred completion (N3), got error: %s", comp.Error)
+	}
+	var resMap map[string]any
+	if err := json.Unmarshal(comp.Result, &resMap); err != nil {
+		t.Fatalf("failed to unmarshal completion result: %v", err)
+	}
+	if resMap["status"] != "queued" || resMap["deferred"] != true {
+		t.Fatalf("expected status=queued deferred=true in result (N3), got: %v", resMap)
 	}
 }
 

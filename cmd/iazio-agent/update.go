@@ -163,20 +163,22 @@ func defaultBaselineManifest(profile string) ManifestResponse {
 }
 
 type UpdateOptions struct {
-	Suite       bool
-	DryRun      bool
-	Force       bool
-	Profile     string
-	API         string
-	BinDir      string
-	OnTimeout   string
-	Expired     bool
-	TargetTools []string
+	Suite         bool
+	DryRun        bool
+	Force         bool
+	Profile       string
+	API           string
+	BinDir        string
+	OnTimeout     string
+	Expired       bool
+	TargetTools   []string
+	TargetVersion string
 }
 
 type UpdateResult struct {
 	AgentUpdated bool     `json:"agent_updated"`
 	UpdatedTools []string `json:"updated_tools"`
+	FailedTools  []string `json:"failed_tools,omitempty"`
 	Errors       []error  `json:"errors,omitempty"`
 }
 
@@ -187,6 +189,17 @@ func performUpdate(ctx context.Context, opts UpdateOptions, stdout, stderr io.Wr
 
 func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, stderr io.Writer, getenv func(string) string) (UpdateResult, error) {
 	var res UpdateResult
+
+	// Single-tool guard (F2, F7): TargetVersion can only be applied when exactly one tool is targeted
+	if opts.TargetVersion != "" {
+		if opts.Suite {
+			return res, fmt.Errorf("target_version %q can only be specified when exactly one tool is targeted, got suite with multiple targets", opts.TargetVersion)
+		}
+		if len(opts.TargetTools) > 1 {
+			return res, fmt.Errorf("target_version %q can only be specified when exactly one tool is targeted, got %d targets", opts.TargetVersion, len(opts.TargetTools))
+		}
+	}
+
 	if getenv == nil {
 		getenv = os.Getenv
 	}
@@ -212,23 +225,23 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 		return res, fmt.Errorf("create manifest request: %w", err)
 	}
 
+	var manifest ManifestResponse
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		// Control plane might be unreachable in offline or mock test runs
-		return res, nil
-	}
-	defer resp.Body.Close()
-
-	var manifest ManifestResponse
-	if resp.StatusCode == http.StatusNotFound {
-		// Fallback to baseline default profile if control plane hasn't registered profile yet
+		// Control plane might be unreachable in offline or mock test runs; fallback to baseline
 		manifest = defaultBaselineManifest(opts.Profile)
-	} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return res, fmt.Errorf("fetch manifest returned HTTP %d", resp.StatusCode)
 	} else {
-		if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
-			return res, fmt.Errorf("decode manifest: %w", err)
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			// Fallback to baseline default profile if control plane hasn't registered profile yet
+			manifest = defaultBaselineManifest(opts.Profile)
+		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return res, fmt.Errorf("fetch manifest returned HTTP %d", resp.StatusCode)
+		} else {
+			if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
+				return res, fmt.Errorf("decode manifest: %w", err)
+			}
 		}
 	}
 
@@ -289,10 +302,19 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 		}
 	}
 
+	// Single-tool guard (F2): TargetVersion can only be applied when exactly one tool is targeted
+	if opts.TargetVersion != "" && len(targets) != 1 {
+		return res, fmt.Errorf("target_version %q can only be specified when exactly one tool is targeted, got %d targets", opts.TargetVersion, len(targets))
+	}
+
 	for _, tool := range targets {
+		if opts.TargetVersion != "" {
+			tool.TargetVersion = opts.TargetVersion
+		}
 		updated, err := updateSingleTool(ctx, client, tool, binDir, ghToken, opts.Force, stdout, stderr, getenv)
 		if err != nil {
 			res.Errors = append(res.Errors, fmt.Errorf("%s: %w", tool.Name, err))
+			res.FailedTools = append(res.FailedTools, tool.Name)
 			if stderr != nil {
 				fmt.Fprintf(stderr, "  [-] %s: %v\n", tool.Name, err)
 			}
@@ -306,10 +328,14 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 		}
 	}
 
+	if len(res.Errors) > 0 && opts.Force {
+		return res, fmt.Errorf("forced tool update failed: %w", res.Errors[0])
+	}
+
 	return res, nil
 }
 
-func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
+func parseUpdateFlags(args []string) (UpdateOptions, error) {
 	var opts UpdateOptions
 	opts.OnTimeout = "reject"
 
@@ -343,14 +369,27 @@ func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer, get
 			opts.TargetTools = append(opts.TargetTools, args[i])
 		case strings.HasPrefix(args[i], "--tool="):
 			opts.TargetTools = append(opts.TargetTools, strings.TrimPrefix(args[i], "--tool="))
+		case args[i] == "--version" && i+1 < len(args):
+			i++
+			opts.TargetVersion = args[i]
+		case strings.HasPrefix(args[i], "--version="):
+			opts.TargetVersion = strings.TrimPrefix(args[i], "--version=")
 		case args[i] == "--bin-dir" && i+1 < len(args):
 			i++
 			opts.BinDir = args[i]
 		case strings.HasPrefix(args[i], "--bin-dir="):
 			opts.BinDir = strings.TrimPrefix(args[i], "--bin-dir=")
 		default:
-			return fmt.Errorf("unknown update flag %s", args[i])
+			return opts, fmt.Errorf("unknown update flag %s", args[i])
 		}
+	}
+	return opts, nil
+}
+
+func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
+	opts, err := parseUpdateFlags(args)
+	if err != nil {
+		return err
 	}
 
 	if opts.Suite {

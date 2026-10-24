@@ -1112,3 +1112,49 @@ func TestUpdateSingleTool_MissingChecksumsAssetFailsClosed(t *testing.T) {
 		t.Fatalf("expected tool to be updated with override")
 	}
 }
+
+func TestUpdate_SingleToolGuard(t *testing.T) {
+	// F2, F7: TargetVersion can only be applied when exactly one tool is targeted
+	optsSuite := UpdateOptions{
+		Suite:         true,
+		TargetVersion: "0.0.492",
+	}
+	res, err := performUpdateWithResult(context.Background(), optsSuite, nil, nil, nil)
+	if err == nil {
+		t.Fatalf("expected error when TargetVersion is used with Suite=true (multiple targets), got res=%+v", res)
+	}
+	if !strings.Contains(err.Error(), "can only be specified when exactly one tool is targeted") {
+		t.Fatalf("expected single-tool guard error message, got %v", err)
+	}
+
+	optsMulti := UpdateOptions{
+		TargetTools:   []string{"autopilot", "iazio-agent"},
+		TargetVersion: "0.0.492",
+	}
+	res2, err2 := performUpdateWithResult(context.Background(), optsMulti, nil, nil, nil)
+	if err2 == nil {
+		t.Fatalf("expected error when TargetVersion is used with multiple TargetTools, got res=%+v", res2)
+	}
+	if !strings.Contains(err2.Error(), "can only be specified when exactly one tool is targeted") {
+		t.Fatalf("expected single-tool guard error message, got %v", err2)
+	}
+}
+
+func TestUpdate_CLIFlagParsing_Version(t *testing.T) {
+	// R6: Test real CLI flag parsing for --version and --version= using parseUpdateFlags
+	opts1, err1 := parseUpdateFlags([]string{"--version", "0.0.492", "--tool", "autopilot"})
+	if err1 != nil {
+		t.Fatalf("unexpected parse error: %v", err1)
+	}
+	if opts1.TargetVersion != "0.0.492" || len(opts1.TargetTools) != 1 || opts1.TargetTools[0] != "autopilot" {
+		t.Fatalf("unexpected parsed opts: %+v", opts1)
+	}
+
+	opts2, err2 := parseUpdateFlags([]string{"--version=0.0.493"})
+	if err2 != nil {
+		t.Fatalf("unexpected parse error: %v", err2)
+	}
+	if opts2.TargetVersion != "0.0.493" {
+		t.Fatalf("expected TargetVersion 0.0.493, got %s", opts2.TargetVersion)
+	}
+}
