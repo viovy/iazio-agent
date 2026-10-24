@@ -117,5 +117,3 @@ func TestComputeWorkingTreeHash(t *testing.T) {
 		t.Error("expected identical diff hashes")
 	}
 }
-
-

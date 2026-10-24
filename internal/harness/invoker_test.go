@@ -457,7 +457,3 @@ func TestCLIInvoker_WithWorkDir(t *testing.T) {
 		t.Fatalf("expected non-nil clone")
 	}
 }
-
-
-
-

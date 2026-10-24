@@ -379,5 +379,3 @@ func TestCodebaseSyncer_ErrorsAndValidation(t *testing.T) {
 		t.Fatalf("expected handshake error, got: %v", err)
 	}
 }
-
-

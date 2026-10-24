@@ -369,6 +369,13 @@ func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer, get
 
 	if agentUpdated {
 		fmt.Fprintln(stdout, "iazio-agent updated: service reload required")
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			binPath := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+			if runtime.GOOS == "windows" {
+				binPath += ".exe"
+			}
+			_ = service.ReconcileServiceConfiguration(home, binPath, nil)
+		}
 	}
 
 	return nil

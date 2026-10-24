@@ -288,6 +288,3 @@ func TestHarnessSyncClient_NegativeConfigAndSuccessStatusCodes(t *testing.T) {
 		t.Fatal("expected false for regular error")
 	}
 }
-
-
-

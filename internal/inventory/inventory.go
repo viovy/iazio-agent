@@ -108,11 +108,92 @@ func BaselineNames() []string {
 
 // Tool is one discovered executable.
 type Tool struct {
-	Name       string
-	Path       string
-	Version    string
-	Status     string
-	Executable bool
+	Name             string   `json:"name"`
+	Path             string   `json:"path"`
+	Version          string   `json:"version"`
+	Status           string   `json:"status"`
+	Executable       bool     `json:"executable"`
+	ServiceInstalled bool     `json:"service_installed,omitempty"`
+	ServiceType      string   `json:"service_type,omitempty"`
+	ServiceStatus    string   `json:"service_status,omitempty"`
+	Capabilities     []string `json:"capabilities,omitempty"`
+}
+
+// InspectToolService probes whether a tool is installed as an OS service (e.g. systemd user service),
+// its installation type, runtime status, and supported capabilities.
+func InspectToolService(toolName, goos string) (installed bool, svcType string, svcStatus string, caps []string) {
+	home, _ := os.UserHomeDir()
+	switch goos {
+	case "linux":
+		if home != "" {
+			unitPath := filepath.Join(home, ".config", "systemd", "user", toolName+".service")
+			if data, err := os.ReadFile(unitPath); err == nil {
+				installed = true
+				svcType = "user_service"
+				content := string(data)
+
+				// Determine capabilities from unit file & platform
+				if strings.Contains(content, "WatchdogSec=") {
+					caps = append(caps, "watchdog")
+				}
+				if strings.Contains(content, "Restart=") {
+					caps = append(caps, "auto_restart")
+				}
+				watcherPath := filepath.Join(home, ".config", "systemd", "user", toolName+"-watcher.path")
+				if _, err := os.Stat(watcherPath); err == nil {
+					caps = append(caps, "path_watcher")
+				}
+				if toolName == "iazio-agent" || toolName == "iazio-harvester" {
+					caps = append(caps, "self_update", "dev_install")
+				}
+
+				// Check runtime status via systemctl
+				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, "systemctl", "--user", "is-active", toolName+".service")
+				out, _ := cmd.Output()
+				s := strings.TrimSpace(string(out))
+				if s != "" {
+					svcStatus = s
+				} else {
+					svcStatus = "inactive"
+				}
+				return
+			}
+		}
+		// Check system-level service
+		systemUnit := filepath.Join("/etc/systemd/system", toolName+".service")
+		if _, err := os.Stat(systemUnit); err == nil {
+			installed = true
+			svcType = "system_service"
+			svcStatus = "installed"
+			caps = append(caps, "auto_restart")
+			return
+		}
+	case "darwin":
+		if home != "" {
+			plistPath := filepath.Join(home, "Library", "LaunchAgents", "io.iazio."+toolName+".plist")
+			if _, err := os.Stat(plistPath); err == nil {
+				installed = true
+				svcType = "launchd_agent"
+				svcStatus = "installed"
+				caps = append(caps, "auto_restart", "path_watcher", "self_update", "dev_install")
+				return
+			}
+		}
+	case "windows":
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "schtasks", "/Query", "/TN", toolName)
+		if out, err := cmd.Output(); err == nil && len(out) > 0 {
+			installed = true
+			svcType = "task_scheduler"
+			svcStatus = "installed"
+			caps = append(caps, "auto_restart", "self_update", "dev_install")
+			return
+		}
+	}
+	return false, "none", "not_installed", nil
 }
 
 // DefaultDirs is the scan order: PATH, ~/.iazio/bin, ~/.local/bin, and on windows the user bin.
@@ -180,6 +261,13 @@ func scan(dirs []string, goos string) []Tool {
 		go func(idx int) {
 			defer wg.Done()
 			out[idx].Version = InspectInstalledVersion(out[idx].Path)
+			if out[idx].Name == "iazio-agent" || out[idx].Name == "iazio-harvester" || strings.HasPrefix(out[idx].Name, "iazio-") {
+				installed, sType, sStatus, caps := InspectToolService(out[idx].Name, goos)
+				out[idx].ServiceInstalled = installed
+				out[idx].ServiceType = sType
+				out[idx].ServiceStatus = sStatus
+				out[idx].Capabilities = caps
+			}
 		}(i)
 	}
 	wg.Wait()
@@ -231,7 +319,12 @@ func Classify(found []Tool, expected map[string]string) (tools []Tool, schedulab
 	for _, name := range BaselineNames() {
 		tool, ok := byName[name]
 		if !ok {
-			tools = append(tools, Tool{Name: name, Status: "MISSING"})
+			tools = append(tools, Tool{
+				Name:          name,
+				Status:        "MISSING",
+				ServiceType:   "none",
+				ServiceStatus: "not_installed",
+			})
 			schedulable = false
 			continue
 		}

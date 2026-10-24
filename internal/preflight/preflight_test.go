@@ -33,7 +33,12 @@ func TestDecideMatrix(t *testing.T) {
 		{name: "resume detached", edit: func(r *Report) { r.Kind = KindResume; r.HeadAttached = false }, code: ReasonDetached, pause: true},
 		{name: "resume dirty worktree", edit: func(r *Report) { r.Kind = KindResume; r.WorkPorcelain = " M a\n?? b" }},
 		{name: "resume dirty hub and work", edit: func(r *Report) { r.Kind = KindResume; r.HubPorcelain = " M x"; r.WorkPorcelain = " M a" }},
-		{name: "resume feature without upstream", edit: func(r *Report) { r.Kind = KindResume; r.Branch = "topic"; r.HasUpstream = false; r.WorkPorcelain = " M a" }},
+		{name: "resume feature without upstream", edit: func(r *Report) {
+			r.Kind = KindResume
+			r.Branch = "topic"
+			r.HasUpstream = false
+			r.WorkPorcelain = " M a"
+		}},
 		{name: "refinement ignores work porcelain", edit: func(r *Report) { r.Kind = KindRefinement; r.WorkPorcelain = " M a" }},
 		{name: "refinement hub porcelain", edit: func(r *Report) { r.Kind = KindRefinement; r.HubPorcelain = " M a" }, code: ReasonDirty, pause: true},
 		{name: "refinement ignores detached", edit: func(r *Report) {

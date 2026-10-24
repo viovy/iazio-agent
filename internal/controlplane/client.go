@@ -93,10 +93,14 @@ type ActiveJob struct {
 
 // Tool is one binary on a heartbeat.
 type Tool struct {
-	Name    string `json:"name"`
-	Path    string `json:"path"`
-	Version string `json:"version"`
-	Status  string `json:"status"`
+	Name             string   `json:"name"`
+	Path             string   `json:"path"`
+	Version          string   `json:"version"`
+	Status           string   `json:"status"`
+	ServiceInstalled bool     `json:"service_installed,omitempty"`
+	ServiceType      string   `json:"service_type,omitempty"`
+	ServiceStatus    string   `json:"service_status,omitempty"`
+	Capabilities     []string `json:"capabilities,omitempty"`
 }
 
 // PendingToolUpdate describes a remote tool update command for the agent.
@@ -594,7 +598,6 @@ func (c Client) RemediateRepo(ctx context.Context, hostID, worktree string) erro
 		"worktree_path": worktree,
 	})
 }
-
 
 // RepoRuntimeStatus contains near real-time git and ASE telemetry for a repository.
 type RepoRuntimeStatus struct {

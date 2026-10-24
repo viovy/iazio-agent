@@ -54,18 +54,18 @@ type Runner interface {
 
 // Sup is the in-process repo lock table.
 type Sup struct {
-	mu       sync.Mutex
-	gates    map[string]*sync.Mutex
-	locks    map[string]string
-	until    map[string]time.Time
-	deadline map[string]time.Time
-	pids     map[string]int
-	jobIDs   map[string]string
-	reasons  map[string]string
-	now      func() time.Time
-	sleep    func(time.Duration)
-	signal   func(pid int, sig string) error
-	alive    func(pid int) bool
+	mu           sync.Mutex
+	gates        map[string]*sync.Mutex
+	locks        map[string]string
+	until        map[string]time.Time
+	deadline     map[string]time.Time
+	pids         map[string]int
+	jobIDs       map[string]string
+	reasons      map[string]string
+	now          func() time.Time
+	sleep        func(time.Duration)
+	signal       func(pid int, sig string) error
+	alive        func(pid int) bool
 	fetches      []string
 	halted       bool
 	loopDetector *LoopDetector
@@ -142,7 +142,6 @@ func (s *Sup) JobID(path string) string {
 	defer s.mu.Unlock()
 	return s.jobIDs[path]
 }
-
 
 // TrySpawn records RUNNING_HARNESS. A second call for the same path is refused.
 func (s *Sup) TrySpawn(path string) error {

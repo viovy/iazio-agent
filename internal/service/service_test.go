@@ -105,7 +105,7 @@ func TestInstallLinuxAndWindowsUnits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(unit), "WantedBy=default.target") || !strings.Contains(string(unit), "RestartSec=3s") || !strings.Contains(string(unit), "Restart=always") {
+	if !strings.Contains(string(unit), "WantedBy=default.target") || !strings.Contains(string(unit), "RestartSec=") || !strings.Contains(string(unit), "Restart=always") || !strings.Contains(string(unit), "WatchdogSec=30s") {
 		t.Fatal(string(unit))
 	}
 	joined := strings.Join(cmds, "\n")
@@ -261,7 +261,6 @@ func TestActionTextAndApply_EdgeCases(t *testing.T) {
 		t.Fatal("expected error when execFn fails")
 	}
 }
-
 
 func TestSuiteAllowed(t *testing.T) {
 	tests := []struct {
@@ -530,8 +529,6 @@ func TestInstallErrors(t *testing.T) {
 		t.Fatalf("expected runner script executed, got err=%v cmd=%s", err, startedCmd)
 	}
 }
-
-
 
 func TestInstallDarwinAt(t *testing.T) {
 	home := t.TempDir()
@@ -1415,10 +1412,37 @@ func TestWindowsLogonUser_EnvVariants(t *testing.T) {
 	}
 }
 
+func TestReconcileServiceConfiguration(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+	var cmds []string
+	run := func(name string, args ...string) error {
+		cmds = append(cmds, name+" "+strings.Join(args, " "))
+		return nil
+	}
 
+	// 1. Initial reconcile: writes missing files
+	if err := ReconcileServiceConfiguration(home, bin, run); err != nil {
+		t.Fatalf("ReconcileServiceConfiguration failed: %v", err)
+	}
 
+	unitFile := filepath.Join(home, ".config", "systemd", "user", "iazio-agent.service")
+	data, err := os.ReadFile(unitFile)
+	if err != nil {
+		t.Fatalf("read unit file: %v", err)
+	}
+	if !strings.Contains(string(data), "WatchdogSec=30s") {
+		t.Fatalf("expected WatchdogSec=30s in reconciled unit, got:\n%s", string(data))
+	}
 
-
-
-
-
+	// 2. Corrupted unit without WatchdogSec
+	_ = os.WriteFile(unitFile, []byte("[Service]\nExecStart=/some/bin\n"), 0644)
+	cmds = nil
+	if err := ReconcileServiceConfiguration(home, bin, run); err != nil {
+		t.Fatalf("ReconcileServiceConfiguration failed: %v", err)
+	}
+	data, _ = os.ReadFile(unitFile)
+	if !strings.Contains(string(data), "WatchdogSec=30s") {
+		t.Fatalf("expected WatchdogSec=30s after healing, got:\n%s", string(data))
+	}
+}

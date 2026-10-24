@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -420,4 +422,54 @@ func (w *Watchdog) IsTracked(jobID string) bool {
 	defer w.mu.Unlock()
 	j, ok := w.jobs[jobID]
 	return ok && j != nil && j.Status != StatusCompleted && j.Status != StatusFailed
+}
+
+// NotifyWatchdog sends a WATCHDOG=1 heartbeat notification to systemd via $NOTIFY_SOCKET.
+func NotifyWatchdog() error {
+	socket := os.Getenv("NOTIFY_SOCKET")
+	if socket == "" {
+		return nil
+	}
+	addr := &net.UnixAddr{
+		Name: socket,
+		Net:  "unixgram",
+	}
+	conn, err := net.DialUnix("unixgram", nil, addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_, err = conn.Write([]byte("WATCHDOG=1\n"))
+	return err
+}
+
+// StartSystemdWatchdog starts a background goroutine that periodically sends WATCHDOG=1
+// heartbeats to systemd as long as the context remains active.
+func StartSystemdWatchdog(ctx context.Context) {
+	socket := os.Getenv("NOTIFY_SOCKET")
+	if socket == "" {
+		return
+	}
+	interval := 10 * time.Second
+	if usecStr := os.Getenv("WATCHDOG_USEC"); usecStr != "" {
+		if usec, err := strconv.ParseInt(usecStr, 10, 64); err == nil && usec > 0 {
+			interval = time.Duration(usec/2) * time.Microsecond
+			if interval < 1*time.Second {
+				interval = 1 * time.Second
+			}
+		}
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		_ = NotifyWatchdog()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = NotifyWatchdog()
+			}
+		}
+	}()
 }

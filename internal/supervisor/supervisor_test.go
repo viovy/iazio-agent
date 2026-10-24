@@ -73,7 +73,7 @@ func (r *recordingRunner) Start(argv []string) (int, error) {
 }
 
 func (r *recordingRunner) Signal(int, string) error { return nil }
-func (r *recordingRunner) Wait(int) (int, error)     { return 0, nil }
+func (r *recordingRunner) Wait(int) (int, error)    { return 0, nil }
 
 func TestSpawnArgvOmitsToken(t *testing.T) {
 	start := time.Unix(1_700_000_000, 0)
@@ -467,7 +467,6 @@ func TestReconcileHostCheckouts_Errors(t *testing.T) {
 	}
 }
 
-
 func TestReconcileStrandedCheckouts(t *testing.T) {
 	repos := []RepoState{
 		{
@@ -714,7 +713,6 @@ func TestReconcileHostCheckouts_AutoHealRealGit(t *testing.T) {
 	}
 }
 
-
 type mockRunner struct {
 	lastArgv []string
 }
@@ -877,9 +875,3 @@ func TestResolveBinaryAndRunnerSignal(t *testing.T) {
 		_ = cmd.Wait()
 	}
 }
-
-
-
-
-
-
