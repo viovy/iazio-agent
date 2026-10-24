@@ -67,9 +67,10 @@ type Sup struct {
 	signal       func(pid int, sig string) error
 	alive        func(pid int) bool
 	fetches      []string
-	halted       bool
-	loopDetector *LoopDetector
-	toolUpdating bool
+	halted              bool
+	loopDetector        *LoopDetector
+	toolUpdating        bool
+	toolUpdatingHolders int
 }
 
 // New returns a supervisor. now injects the clock.
@@ -286,12 +287,17 @@ func (s *Sup) TryAcquireToolUpdate() (release func(), ok bool) {
 	if s.toolUpdating || s.hasRunningHarnessLocked() {
 		return nil, false
 	}
+	s.toolUpdatingHolders++
 	s.toolUpdating = true
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			s.mu.Lock()
-			s.toolUpdating = false
+			s.toolUpdatingHolders--
+			if s.toolUpdatingHolders <= 0 {
+				s.toolUpdatingHolders = 0
+				s.toolUpdating = false
+			}
 			s.mu.Unlock()
 		})
 	}, true
@@ -302,12 +308,17 @@ func (s *Sup) TryAcquireToolUpdate() (release func(), ok bool) {
 func (s *Sup) AcquireToolUpdateForce() func() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.toolUpdatingHolders++
 	s.toolUpdating = true
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			s.mu.Lock()
-			s.toolUpdating = false
+			s.toolUpdatingHolders--
+			if s.toolUpdatingHolders <= 0 {
+				s.toolUpdatingHolders = 0
+				s.toolUpdating = false
+			}
 			s.mu.Unlock()
 		})
 	}

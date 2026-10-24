@@ -56,7 +56,10 @@ func (u *EagerToolUpdater) IsUpdating() bool {
 
 // EvaluateAndTrigger checks preconditions and performs an eager update if eligible.
 func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools []string, force bool) (agentUpdated bool, deferred bool, err error) {
-	u.updateMutex.Lock()
+	if !u.updateMutex.TryLock() {
+		// Coalesce concurrent triggers: an update check or swap is already running (F8)
+		return false, true, nil
+	}
 	defer u.updateMutex.Unlock()
 
 	u.mu.Lock()

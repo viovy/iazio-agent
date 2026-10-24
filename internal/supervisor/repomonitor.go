@@ -138,6 +138,7 @@ type RepoConfigItem struct {
 // RepoStateMonitor periodically inspects host repositories when no harness is executing.
 type RepoStateMonitor struct {
 	mu             sync.RWMutex
+	inspectMu      sync.Mutex // serializes InspectFleet across callers (F8)
 	sup            *Sup
 	hostID         string
 	getRepos       func() ([]RepoConfigItem, error)
@@ -186,6 +187,9 @@ func (m *RepoStateMonitor) LastSnapshot() FleetStateSnapshot {
 
 // InspectFleet performs one full inspection pass across registered repos.
 func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot {
+	m.inspectMu.Lock()
+	defer m.inspectMu.Unlock()
+
 	m.mu.RLock()
 	lastSnap := m.lastSnapshot
 	hostID := m.hostID
