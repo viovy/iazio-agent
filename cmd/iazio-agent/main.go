@@ -666,7 +666,29 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 				}
 
-				err := sup.Spawn(wdRunner, a.ID, api, a.WorktreePath, a.DocsHubPath, "")
+				convID := a.InitialConversationID
+				if convID == "" {
+					convID = a.ResumeConversationID
+				}
+				if convID == "" && a.ActiveConversationID != "" {
+					convID = a.ActiveConversationID
+				}
+				if convID == "" && len(a.ConversationIDs) > 0 {
+					convID = a.ConversationIDs[len(a.ConversationIDs)-1]
+				}
+				if convID == "" && lockInfo.ConversationID != "" && lockInfo.Status != "COMPLETED" && (a.Kind == "resume" || (a.StoryID != "" && lockInfo.StoryID == a.StoryID)) {
+					convID = lockInfo.ConversationID
+				}
+
+				var spawnExtras []string
+				if a.Kind != "" {
+					spawnExtras = append(spawnExtras, "--kind", a.Kind)
+				}
+				if convID != "" {
+					spawnExtras = append(spawnExtras, "--resume-conversation", convID)
+				}
+
+				err := sup.Spawn(wdRunner, a.ID, api, a.WorktreePath, a.DocsHubPath, "", spawnExtras...)
 				if err != nil {
 					if strings.Contains(err.Error(), "busy") {
 						_ = client.AbandonJob(runCtx, a.ID, "REPO_BUSY")
@@ -675,13 +697,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}
 
 				pid := sup.PID(a.WorktreePath)
-				convID := a.ResumeConversationID
-				if convID == "" && len(a.ConversationIDs) > 0 {
-					convID = a.ConversationIDs[len(a.ConversationIDs)-1]
-				}
-				if convID == "" && lockInfo.ConversationID != "" && lockInfo.Status != "COMPLETED" && (a.Kind == "resume" || (a.StoryID != "" && lockInfo.StoryID == a.StoryID)) {
-					convID = lockInfo.ConversationID
-				}
 				wd.Track(watchdog.TrackedJob{
 					JobID:          a.ID,
 					ScheduleID:     a.ScheduleID,

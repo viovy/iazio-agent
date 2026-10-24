@@ -154,16 +154,23 @@ func (c Client) Register(ctx context.Context, hostID, kind string, profile ...st
 
 // Assignment is one leased job returned by the control plane.
 type Assignment struct {
-	ID                   string   `json:"id"`
-	Kind                 string   `json:"kind"`
-	WorktreePath         string   `json:"worktree_path"`
-	DocsHubPath          string   `json:"docs_hub_path"`
-	StoryID              string   `json:"story_id,omitempty"`
-	ScheduleID           string   `json:"schedule_id,omitempty"`
-	Engine               string   `json:"engine,omitempty"`
-	Prompt               string   `json:"prompt,omitempty"`
-	ResumeConversationID string   `json:"resume_conversation_id,omitempty"`
-	ConversationIDs      []string `json:"conversation_ids,omitempty"`
+	ID                    string         `json:"id"`
+	Kind                  string         `json:"kind"`
+	WorktreePath          string         `json:"worktree_path"`
+	DocsHubPath           string         `json:"docs_hub_path"`
+	StoryID               string         `json:"story_id,omitempty"`
+	ScheduleID            string         `json:"schedule_id,omitempty"`
+	Engine                string         `json:"engine,omitempty"`
+	Prompt                string         `json:"prompt,omitempty"`
+	ResumeConversationID  string         `json:"resume_conversation_id,omitempty"`
+	ConversationIDs       []string       `json:"conversation_ids,omitempty"`
+	ParentJobID           string         `json:"parent_job_id,omitempty"`
+	RootJobID             string         `json:"root_job_id,omitempty"`
+	InitialConversationID string         `json:"initial_conversation_id,omitempty"`
+	ActiveConversationID  string         `json:"active_conversation_id,omitempty"`
+	ResumeMode            string         `json:"resume_mode,omitempty"`
+	ResumeFallbackReason  string         `json:"resume_fallback_reason,omitempty"`
+	InterruptedASEState   map[string]any `json:"interrupted_ase_state,omitempty"`
 }
 
 // NextLease asks for the next job for this host. ok is false when the queue is empty.

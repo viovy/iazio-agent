@@ -91,23 +91,27 @@ func New(now func() time.Time) *Sup {
 }
 
 // SpawnArgs is the only argv the agent passes. It does not include a token.
-func SpawnArgs(jobID, apiURL, worktree, docsHub string) []string {
-	return []string{
+func SpawnArgs(jobID, apiURL, worktree, docsHub string, extraArgs ...string) []string {
+	argv := []string{
 		"iazio-harness", "run",
 		"--job-id", jobID,
 		"--api-url", apiURL,
 		"--worktree-path", worktree,
 		"--docs-hub-path", docsHub,
 	}
+	if len(extraArgs) > 0 {
+		argv = append(argv, extraArgs...)
+	}
+	return argv
 }
 
 // Spawn starts a harness when the worktree lock is free.
 // token is accepted and ignored so it cannot be forwarded.
-func (s *Sup) Spawn(r Runner, jobID, apiURL, worktree, docsHub, token string) error {
+func (s *Sup) Spawn(r Runner, jobID, apiURL, worktree, docsHub, token string, extraArgs ...string) error {
 	if err := s.TrySpawn(worktree); err != nil {
 		return err
 	}
-	argv := SpawnArgs(jobID, apiURL, worktree, docsHub)
+	argv := SpawnArgs(jobID, apiURL, worktree, docsHub, extraArgs...)
 	_ = token
 	pid := 0
 	if r != nil {
