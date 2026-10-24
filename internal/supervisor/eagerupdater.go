@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -125,7 +126,7 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 
 	// Emit agent.tool.update_started
 	if u.postNotif != nil {
-		_ = u.postNotif(ctx, controlplane.NotificationRecord{
+		if err := u.postNotif(ctx, controlplane.NotificationRecord{
 			Title:    "Tool Update Started",
 			Message:  fmt.Sprintf("Eager tool update started on host %s (targets: %v, force: %t)", u.hostID, targetTools, force),
 			Category: "info",
@@ -136,7 +137,9 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 				"target_tools": targetTools,
 				"force":        force,
 			},
-		})
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "[eagerupdater] postNotif error (update_started): %v\n", err)
+		}
 	}
 
 	start := time.Now()
@@ -145,7 +148,7 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 
 	if updateErr != nil {
 		if u.postNotif != nil {
-			_ = u.postNotif(ctx, controlplane.NotificationRecord{
+			if err := u.postNotif(ctx, controlplane.NotificationRecord{
 				Title:    "Tool Update Failed",
 				Message:  fmt.Sprintf("Tool update failed on %s: %v", u.hostID, updateErr),
 				Category: "error",
@@ -156,13 +159,15 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 					"error":       updateErr.Error(),
 					"duration_ms": durationMs,
 				},
-			})
+			}); err != nil {
+				fmt.Fprintf(os.Stderr, "[eagerupdater] postNotif error (update_failed): %v\n", err)
+			}
 		}
 		return false, false, updateErr
 	}
 
 	if len(res.UpdatedTools) > 0 && u.postNotif != nil {
-		_ = u.postNotif(ctx, controlplane.NotificationRecord{
+		if err := u.postNotif(ctx, controlplane.NotificationRecord{
 			Title:    "Tool Update Succeeded",
 			Message:  fmt.Sprintf("Successfully updated tools on %s: %s (took %dms)", u.hostID, strings.Join(res.UpdatedTools, ", "), durationMs),
 			Category: "success",
@@ -174,7 +179,9 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 				"duration_ms":   durationMs,
 				"agent_updated": res.AgentUpdated,
 			},
-		})
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "[eagerupdater] postNotif error (update_succeeded): %v\n", err)
+		}
 	}
 
 	return res.AgentUpdated, false, nil
@@ -191,7 +198,7 @@ func (u *EagerToolUpdater) emitDeferredOnce(ctx context.Context, targetTools []s
 	u.mu.Unlock()
 
 	if u.postNotif != nil {
-		_ = u.postNotif(ctx, controlplane.NotificationRecord{
+		if err := u.postNotif(ctx, controlplane.NotificationRecord{
 			Title:    "Tool Update Deferred",
 			Message:  msg,
 			Category: "info",
@@ -202,6 +209,8 @@ func (u *EagerToolUpdater) emitDeferredOnce(ctx context.Context, targetTools []s
 				"reason":       reason,
 				"target_tools": targetTools,
 			},
-		})
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "[eagerupdater] postNotif error (update_deferred): %v\n", err)
+		}
 	}
 }

@@ -229,7 +229,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				if api == "" {
 					return nil, nil
 				}
-				detail, err := client.GetHost(runCtx, host)
+				fetchCtx, fetchCancel := context.WithTimeout(runCtx, 10*time.Second)
+				defer fetchCancel()
+				detail, err := client.GetHost(fetchCtx, host)
 				if err != nil {
 					return nil, fmt.Errorf("failed to fetch host repos: %w", err)
 				}

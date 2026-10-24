@@ -276,7 +276,7 @@ func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot 
 					category = "info"
 					statusStr = "Clean"
 				}
-				_ = m.postNotif(ctx, controlplane.NotificationRecord{
+				if err := m.postNotif(ctx, controlplane.NotificationRecord{
 					Title:    fmt.Sprintf("Repo Transitioned to %s", statusStr),
 					Message:  fmt.Sprintf("Repository %s (%s) is now %s.", r.path, r.state.Branch, statusStr),
 					Category: category,
@@ -289,7 +289,9 @@ func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot 
 						"is_clean":    r.state.IsClean,
 						"dirty_files": r.state.DirtyFilesCount,
 					},
-				})
+				}); err != nil {
+					fmt.Fprintf(os.Stderr, "[repomonitor] postNotif error: %v\n", err)
+				}
 			}
 		}
 
