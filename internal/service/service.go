@@ -664,7 +664,7 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 		}
 	}
 
-	if runtime.GOOS == "linux" && IsSystemdAvailable() {
+	if runtime.GOOS == "linux" {
 		unitDir := filepath.Join(home, ".config", "systemd", "user")
 		if err := os.MkdirAll(unitDir, 0o755); err != nil {
 			return err
