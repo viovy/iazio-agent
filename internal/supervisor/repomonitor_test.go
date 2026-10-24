@@ -502,19 +502,98 @@ func TestEagerToolUpdater_AgentUpdatedPreservedWhenPass2Defers(t *testing.T) {
 		mu.Unlock()
 
 		if currentPass == 1 {
-			// Pass 1 updates the agent
+			// Inside pass 1, simulate repos becoming dirty so pass 2 defers
+			monitor.mu.Lock()
+			monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: false, DirtyRepoPaths: []string{"/work/dirty"}}
+			monitor.mu.Unlock()
 			return UpdateResult{AgentUpdated: true, UpdatedTools: []string{"iazio-agent"}}, nil
 		}
 		return UpdateResult{}, nil
 	}, nil)
 
-	// Pre-queue pass 2 targeted
+	// Pre-queue pass 2 targeted but UNFORCED so it defers on the dirty repos (N2)
 	updater.updateMutex.Lock()
-	_, _, _ = updater.EvaluateAndTrigger(context.Background(), []string{"tool-queued"}, true)
+	_, _, _ = updater.EvaluateAndTrigger(context.Background(), []string{"tool-queued"}, false)
 	updater.updateMutex.Unlock()
 
-	agentUpdated, _, _ := updater.EvaluateAndTrigger(context.Background(), nil, false)
+	agentUpdated, deferred, _ := updater.EvaluateAndTrigger(context.Background(), nil, false)
 	if !agentUpdated {
-		t.Fatalf("expected agentUpdated=true to be sticky and preserved for caller restart (H2)")
+		t.Fatalf("expected agentUpdated=true to be sticky and preserved for caller restart even when pass 2 defers (H2, N2)")
 	}
+	if !deferred {
+		t.Fatalf("expected deferred=true because pass 2 deferred on dirty repos (N2)")
+	}
+}
+
+func TestEagerToolUpdater_StaleHarnessSnapshotRefreshes(t *testing.T) {
+	sup := New(time.Now)
+	// No running harness in supervisor (idle)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	// Stale snapshot claims harness is active
+	monitor.lastSnapshot = FleetStateSnapshot{HarnessActive: true, FleetGitClean: false}
+
+	var updatedCalled bool
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
+		updatedCalled = true
+		return UpdateResult{UpdatedTools: []string{"tool-a"}}, nil
+	}, nil)
+
+	_, deferred, err := updater.EvaluateAndTrigger(context.Background(), nil, false)
+	if err != nil || deferred {
+		t.Fatalf("expected stale snapshot to be refreshed and proceed, got deferred=%v err=%v (N6)", deferred, err)
+	}
+	if !updatedCalled {
+		t.Fatalf("expected doUpdate to be called after refreshing stale harness snapshot (N6)")
+	}
+}
+
+func TestEagerToolUpdater_DedupeKeyResetOnCleanPass(t *testing.T) {
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	// Start dirty
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: false, DirtyRepoPaths: []string{"/work/dirty"}}
+
+	var deferredNotifs int
+	var mu sync.Mutex
+	notifFn := func(ctx context.Context, rec controlplane.NotificationRecord) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if evt, ok := rec.Metadata["event"].(string); ok && evt == "agent.tool.update_deferred" {
+			deferredNotifs++
+		}
+		return nil
+	}
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
+		return UpdateResult{}, nil
+	}, notifFn)
+	updater.CheckDrift = func(ctx context.Context, targetTools []string) (bool, error) {
+		return false, nil // no drift on clean passes
+	}
+
+	// Pass 1: dirty fleet -> emits deferred notification #1
+	_, _, _ = updater.EvaluateAndTrigger(context.Background(), nil, false)
+	mu.Lock()
+	if deferredNotifs != 1 {
+		t.Fatalf("expected 1 deferred notif, got %d", deferredNotifs)
+	}
+	mu.Unlock()
+
+	// Pass 2: fleet becomes clean -> passes guards -> resets lastDeferredKey (L6)
+	monitor.mu.Lock()
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+	monitor.mu.Unlock()
+	_, _, _ = updater.EvaluateAndTrigger(context.Background(), nil, false)
+
+	// Pass 3: fleet becomes dirty again with same repo -> MUST emit deferred notification #2 (L6)
+	monitor.mu.Lock()
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: false, DirtyRepoPaths: []string{"/work/dirty"}}
+	monitor.mu.Unlock()
+	_, _, _ = updater.EvaluateAndTrigger(context.Background(), nil, false)
+
+	mu.Lock()
+	if deferredNotifs != 2 {
+		t.Fatalf("expected 2 deferred notifs (key was reset after clean pass), got %d (L6, N6)", deferredNotifs)
+	}
+	mu.Unlock()
 }
