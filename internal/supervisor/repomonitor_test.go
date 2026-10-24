@@ -1151,3 +1151,66 @@ func TestEagerToolUpdater_SuiteDisabledOnlyAgent(t *testing.T) {
 		}
 	}
 }
+
+func TestEagerToolUpdater_BackedOffToolOnlyDriftingDoesNotTriggerUpdate(t *testing.T) {
+	// S1: When tool-broken is backed off and is the only drifting tool,
+	// CheckDrift must be evaluated against effectiveTargets (healthy tools),
+	// preventing update_started notification and doUpdateDetailed execution.
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	var updateCalled bool
+	var notifStartedCalled bool
+	var mu sync.Mutex
+
+	postNotif := func(ctx context.Context, rec controlplane.NotificationRecord) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if rec.Metadata != nil && rec.Metadata["event"] == "agent.tool.update_started" {
+			notifStartedCalled = true
+		}
+		return nil
+	}
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", nil, postNotif)
+	updater.ListSuiteTools = func(ctx context.Context) ([]string, error) {
+		return []string{"tool-broken", "tool-healthy"}, nil
+	}
+	updater.CheckDrift = func(ctx context.Context, targetTools []string) (bool, error) {
+		// If targetTools includes tool-broken, drift would be true.
+		// If effectiveTargets was correctly passed, targetTools only contains tool-healthy (which has no drift).
+		for _, t := range targetTools {
+			if t == "tool-broken" {
+				return true, nil // broken tool is out of date
+			}
+		}
+		return false, nil // healthy tool is already up-to-date
+	}
+	updater.SetDetailedUpdateFunc(func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error) {
+		mu.Lock()
+		updateCalled = true
+		mu.Unlock()
+		return UpdateResult{}, nil
+	})
+
+	// Put tool-broken into backoff
+	updater.recordToolFailure("tool-broken")
+
+	res, def, err := updater.EvaluateAndTriggerDetailed(context.Background(), nil, false)
+	if err != nil || def {
+		t.Fatalf("unexpected err=%v def=%v", err, def)
+	}
+	if len(res.UpdatedTools) != 0 {
+		t.Fatalf("expected 0 updated tools, got: %v", res.UpdatedTools)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if notifStartedCalled {
+		t.Fatalf("expected agent.tool.update_started NOT to be emitted when only backed-off tool drifts (S1)")
+	}
+	if updateCalled {
+		t.Fatalf("expected doUpdateDetailed NOT to be called when only backed-off tool drifts (S1)")
+	}
+}

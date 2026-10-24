@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -50,10 +51,23 @@ type HTTPDriftFetcher struct {
 	Profile string
 	OS      string
 	Arch    string
+
+	mu        sync.Mutex
+	cached    *FleetManifest
+	expiresAt time.Time
 }
 
 // FetchManifest retrieves the latest manifest from the API endpoint.
+// It caches results for 10 seconds to avoid redundant round-trips within the same pass (S5).
 func (h *HTTPDriftFetcher) FetchManifest(ctx context.Context) (*FleetManifest, error) {
+	h.mu.Lock()
+	if h.cached != nil && time.Now().Before(h.expiresAt) {
+		m := h.cached
+		h.mu.Unlock()
+		return m, nil
+	}
+	h.mu.Unlock()
+
 	if h.API == "" {
 		return nil, fmt.Errorf("control plane API URL is empty")
 	}
@@ -94,6 +108,12 @@ func (h *HTTPDriftFetcher) FetchManifest(ctx context.Context) (*FleetManifest, e
 	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
 		return nil, fmt.Errorf("decode manifest JSON: %w", err)
 	}
+
+	h.mu.Lock()
+	h.cached = &m
+	h.expiresAt = time.Now().Add(10 * time.Second)
+	h.mu.Unlock()
+
 	return &m, nil
 }
 

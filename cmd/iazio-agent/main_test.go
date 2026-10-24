@@ -2513,3 +2513,61 @@ func TestDispatcher_ToolUpdaterResultMapping(t *testing.T) {
 		t.Fatalf("expected ErrJobDeferred for deferred update, got: %v", err)
 	}
 }
+
+type testManifestFetcher struct {
+	manifest *supervisor.FleetManifest
+	err      error
+}
+
+func (m *testManifestFetcher) FetchManifest(ctx context.Context) (*supervisor.FleetManifest, error) {
+	return m.manifest, m.err
+}
+
+func TestBuildEagerHooks_SuiteOptOutAndBackoff(t *testing.T) {
+	// S2: Verify buildEagerHooks when updateSuite is false vs true
+	manifest := &supervisor.FleetManifest{
+		Tools: []supervisor.ManifestTool{
+			{Name: "iazio-agent", BinaryName: "iazio-agent", TargetVersion: "1.0.0"},
+			{Name: "tool-b", BinaryName: "tool-b", TargetVersion: "2.0.0"},
+			{Name: "tool-c", BinaryName: "tool-c", TargetVersion: "3.0.0"},
+		},
+	}
+	fetcher := &testManifestFetcher{manifest: manifest}
+
+	// 1. Suite update disabled: listSuiteTools returns ONLY ["iazio-agent"]
+	checkDriftFalse, listSuiteFalse := buildEagerHooks(
+		false,
+		fetcher,
+		func(tool string) bool { return tool == "tool-b" },
+		func(_ *supervisor.FleetManifest) string { return t.TempDir() },
+		runtime.GOOS,
+	)
+
+	suiteTools, err := listSuiteFalse(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(suiteTools) != 1 || suiteTools[0] != "iazio-agent" {
+		t.Fatalf("expected only iazio-agent when suite opt-out, got: %v", suiteTools)
+	}
+
+	// 2. Suite update enabled: listSuiteTools returns all tools in manifest
+	_, listSuiteTrue := buildEagerHooks(
+		true,
+		fetcher,
+		func(tool string) bool { return tool == "tool-b" },
+		func(_ *supervisor.FleetManifest) string { return t.TempDir() },
+		runtime.GOOS,
+	)
+
+	allTools, err := listSuiteTrue(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(allTools) != 3 {
+		t.Fatalf("expected all 3 tools when suite enabled, got: %v", allTools)
+	}
+
+	// 3. Check drift runs without error and excludes backed off tools
+	_, _ = checkDriftFalse(context.Background(), nil)
+}

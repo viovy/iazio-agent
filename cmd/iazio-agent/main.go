@@ -371,50 +371,22 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					OS:      runtime.GOOS,
 					Arch:    runtime.GOARCH,
 				}
-				eagerUpdater.CheckDrift = func(ctx context.Context, targetTools []string) (bool, error) {
-					manifest, err := driftFetcher.FetchManifest(ctx)
-					if err != nil {
-						// Return non-nil error to fail-open (F3)
-						return false, err
-					}
-					// Exclude tools currently within their backoff window on unforced checks (N1)
-					activeTools := make([]supervisor.ManifestTool, 0, len(manifest.Tools))
-					for _, t := range manifest.Tools {
-						if eagerUpdater != nil && (eagerUpdater.IsToolInBackoff(t.Name) || eagerUpdater.IsToolInBackoff(t.BinaryName)) {
-							continue
-						}
-						activeTools = append(activeTools, t)
-					}
-					activeManifest := *manifest
-					activeManifest.Tools = activeTools
-
-					binDir := resolveInstallDir(ManifestInstallRoots{
+				isToolInBackoff := func(tool string) bool {
+					return eagerUpdater != nil && (eagerUpdater.IsToolInBackoff(tool))
+				}
+				getInstallRoots := func(manifest *supervisor.FleetManifest) string {
+					return resolveInstallDir(ManifestInstallRoots{
 						Unix:    ManifestInstallRootPaths{Primary: manifest.InstallRoots.Unix.Primary, Fallback: manifest.InstallRoots.Unix.Fallback},
 						Windows: ManifestInstallRootPaths{Primary: manifest.InstallRoots.Windows.Primary, Fallback: manifest.InstallRoots.Windows.Fallback},
 					}, getenv)
-					checkTools := targetTools
-					if len(checkTools) == 0 && !updateSuite {
-						checkTools = []string{"iazio-agent"}
-					}
-					return supervisor.EvaluateDrift(&activeManifest, inventory.InspectInstalledVersion, binDir, checkTools, runtime.GOOS)
 				}
-				if updateSuite {
-					eagerUpdater.ListSuiteTools = func(ctx context.Context) ([]string, error) {
-						manifest, err := driftFetcher.FetchManifest(ctx)
-						if err != nil {
-							return nil, err
-						}
-						var names []string
-						for _, t := range manifest.Tools {
-							names = append(names, t.Name)
-						}
-						return names, nil
-					}
-				} else {
-					eagerUpdater.ListSuiteTools = func(ctx context.Context) ([]string, error) {
-						return []string{"iazio-agent"}, nil
-					}
-				}
+				eagerUpdater.CheckDrift, eagerUpdater.ListSuiteTools = buildEagerHooks(
+					updateSuite,
+					driftFetcher,
+					isToolInBackoff,
+					getInstallRoots,
+					runtime.GOOS,
+				)
 			}
 
 			// Start repoMonitor AFTER eagerUpdater is fully constructed to eliminate initialization race
@@ -1904,4 +1876,59 @@ func ResolveDispatchConversationID(a controlplane.Assignment, lockConvID, lockSt
 		convID = ""
 	}
 	return convID
+}
+
+// buildEagerHooks constructs the CheckDrift and ListSuiteTools hooks for eager updater (R1, S2).
+func buildEagerHooks(
+	updateSuite bool,
+	driftFetcher supervisor.DriftFetcher,
+	isToolInBackoff func(string) bool,
+	getInstallRoots func(*supervisor.FleetManifest) string,
+	targetOS string,
+) (checkDrift func(context.Context, []string) (bool, error), listSuiteTools func(context.Context) ([]string, error)) {
+	checkDrift = func(ctx context.Context, targetTools []string) (bool, error) {
+		manifest, err := driftFetcher.FetchManifest(ctx)
+		if err != nil {
+			return false, err
+		}
+		activeTools := make([]supervisor.ManifestTool, 0, len(manifest.Tools))
+		for _, t := range manifest.Tools {
+			if isToolInBackoff != nil && (isToolInBackoff(t.Name) || isToolInBackoff(t.BinaryName)) {
+				continue
+			}
+			activeTools = append(activeTools, t)
+		}
+		activeManifest := *manifest
+		activeManifest.Tools = activeTools
+
+		var binDir string
+		if getInstallRoots != nil {
+			binDir = getInstallRoots(manifest)
+		}
+		checkTools := targetTools
+		if len(checkTools) == 0 && !updateSuite {
+			checkTools = []string{"iazio-agent"}
+		}
+		return supervisor.EvaluateDrift(&activeManifest, inventory.InspectInstalledVersion, binDir, checkTools, targetOS)
+	}
+
+	if updateSuite {
+		listSuiteTools = func(ctx context.Context) ([]string, error) {
+			manifest, err := driftFetcher.FetchManifest(ctx)
+			if err != nil {
+				return nil, err
+			}
+			var names []string
+			for _, t := range manifest.Tools {
+				names = append(names, t.Name)
+			}
+			return names, nil
+		}
+	} else {
+		listSuiteTools = func(ctx context.Context) ([]string, error) {
+			return []string{"iazio-agent"}, nil
+		}
+	}
+
+	return checkDrift, listSuiteTools
 }

@@ -187,24 +187,6 @@ func (u *EagerToolUpdater) shouldBackoff(targetTools []string, force bool) bool 
 	return false
 }
 
-func (u *EagerToolUpdater) appendPendingRequestLocked(req PendingToolRequest) (added bool, full bool) {
-	normTool := strings.ToLower(strings.TrimSpace(req.Tool))
-	req.Tool = normTool
-	for _, p := range u.pendingRequests {
-		if strings.ToLower(strings.TrimSpace(p.Tool)) == normTool &&
-			p.Force == req.Force &&
-			p.TargetVersion == req.TargetVersion &&
-			p.BypassDirty == req.BypassDirty {
-			return false, false // deduplicate identical request (N5)
-		}
-	}
-	if len(u.pendingRequests) >= maxPendingRequests {
-		return false, true // cap queue limit (N5-R)
-	}
-	u.pendingRequests = append(u.pendingRequests, req)
-	return true, false
-}
-
 func (u *EagerToolUpdater) prependPendingRequestsLocked(reqs []PendingToolRequest) {
 	var toAdd []PendingToolRequest
 	for _, req := range reqs {
@@ -342,7 +324,13 @@ func (u *EagerToolUpdater) EvaluateAndTriggerWithOpts(ctx context.Context, opts 
 			}
 
 			var toAppend []PendingToolRequest
+			seenInBatch := make(map[string]bool)
 			for _, c := range candidates {
+				key := fmt.Sprintf("%s:%t:%s:%t", c.Tool, c.Force, c.TargetVersion, c.BypassDirty)
+				if seenInBatch[key] {
+					continue
+				}
+				seenInBatch[key] = true
 				dup := false
 				for _, p := range u.pendingRequests {
 					if p.Tool == c.Tool && p.Force == c.Force && p.TargetVersion == c.TargetVersion && p.BypassDirty == c.BypassDirty {
@@ -582,9 +570,9 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 	u.lastDeferredKey = ""
 	u.mu.Unlock()
 
-	// Check drift before emitting update_started to eliminate noise on unforced no-op ticks (E4)
+	// Check drift before emitting update_started to eliminate noise on unforced no-op ticks (E4, S1)
 	if !force && u.CheckDrift != nil {
-		hasDrift, driftErr := u.CheckDrift(ctx, targetTools)
+		hasDrift, driftErr := u.CheckDrift(ctx, effectiveTargets)
 		if driftErr != nil {
 			// Fail open on drift inspection error (F3): log and proceed with update
 			fmt.Fprintf(os.Stderr, "[eagerupdater] CheckDrift error, proceeding with update (fail-open): %v\n", driftErr)
@@ -596,8 +584,8 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 	// Emit update_started prior to executing update operations (G5)
 	if u.postNotif != nil {
 		targetsDesc := "all outdated tools"
-		if len(targetTools) > 0 {
-			targetsDesc = strings.Join(targetTools, ", ")
+		if len(effectiveTargets) > 0 {
+			targetsDesc = strings.Join(effectiveTargets, ", ")
 		}
 		if err := u.postNotif(ctx, controlplane.NotificationRecord{
 			Title:    "Tool Update Started",
@@ -607,7 +595,7 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 			HostID:   u.hostID,
 			Metadata: map[string]any{
 				"event":        "agent.tool.update_started",
-				"target_tools": targetTools,
+				"target_tools": effectiveTargets,
 				"force":        force,
 			},
 		}); err != nil {
