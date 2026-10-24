@@ -2570,12 +2570,17 @@ func TestBuildEagerHooks_SuiteOptOutAndBackoff(t *testing.T) {
 		t.Fatalf("expected all 3 tools when suite enabled, got: %v", allTools)
 	}
 
-	// 3. Seed binaries: iazio-agent at 1.0.0 (up to date), tool-c at 3.0.0 (up to date). tool-b is missing/drifting but in backoff.
+	// 3. Seed binaries: iazio-agent at 1.0.0 (up to date), tool-c at 3.0.0 (up to date).
+	// tool-b is missing/drifting.
 	if runtime.GOOS != "windows" {
 		agentScript := filepath.Join(tempDir, "iazio-agent")
-		_ = os.WriteFile(agentScript, []byte("#!/bin/sh\necho 'iazio-agent 1.0.0'\n"), 0755)
+		if err := os.WriteFile(agentScript, []byte("#!/bin/sh\necho 'iazio-agent 1.0.0'\n"), 0755); err != nil {
+			t.Fatalf("failed to write agentScript: %v", err)
+		}
 		toolCScript := filepath.Join(tempDir, "tool-c")
-		_ = os.WriteFile(toolCScript, []byte("#!/bin/sh\necho 'tool-c 3.0.0'\n"), 0755)
+		if err := os.WriteFile(toolCScript, []byte("#!/bin/sh\necho 'tool-c 3.0.0'\n"), 0755); err != nil {
+			t.Fatalf("failed to write toolCScript: %v", err)
+		}
 
 		// checkDriftFalse only checks iazio-agent -> no drift
 		driftFalse, err := checkDriftFalse(context.Background(), nil)
@@ -2587,6 +2592,33 @@ func TestBuildEagerHooks_SuiteOptOutAndBackoff(t *testing.T) {
 		driftTrue, err := checkDriftTrue(context.Background(), nil)
 		if err != nil || driftTrue {
 			t.Fatalf("expected false drift when only backed-off tool drifts, got %v err=%v", driftTrue, err)
+		}
+
+		// Positive control 1 (H4): when tool-b is NOT in backoff, suite drift check detects missing tool-b -> true
+		checkDriftNoBackoff, _ := buildEagerHooks(
+			true,
+			fetcher,
+			func(tool string) bool { return false }, // no tools backed off
+			func(_ *supervisor.FleetManifest) string { return tempDir },
+			runtime.GOOS,
+		)
+		driftNoBackoff, err := checkDriftNoBackoff(context.Background(), nil)
+		if err != nil || !driftNoBackoff {
+			t.Fatalf("expected true drift when missing tool-b is not backed off, got %v err=%v", driftNoBackoff, err)
+		}
+
+		// Positive control 2 (H4): with tool-b still missing and NOT in backoff, suite opt-out still returns false
+		// proving opt-out strictly narrows check to iazio-agent and ignores suite drift
+		checkDriftOptOutNoBackoff, _ := buildEagerHooks(
+			false,
+			fetcher,
+			func(tool string) bool { return false }, // no tools backed off
+			func(_ *supervisor.FleetManifest) string { return tempDir },
+			runtime.GOOS,
+		)
+		driftOptOut, err := checkDriftOptOutNoBackoff(context.Background(), nil)
+		if err != nil || driftOptOut {
+			t.Fatalf("expected false drift for suite opt-out even when suite tools drift, got %v err=%v", driftOptOut, err)
 		}
 	}
 }
