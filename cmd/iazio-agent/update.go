@@ -427,9 +427,15 @@ func updateSingleTool(
 	}
 
 	if csAsset := findChecksumsAsset(rel); csAsset != nil {
-		if csData, err := downloadAsset(ctx, client, csAsset, ghToken); err == nil {
-			_ = verifyChecksum(data, asset.Name, string(csData))
+		csData, csErr := downloadAsset(ctx, client, csAsset, ghToken)
+		if csErr != nil {
+			return false, fmt.Errorf("download checksums (%s): %w", csAsset.Name, csErr)
 		}
+		if vErr := verifyChecksum(data, asset.Name, string(csData)); vErr != nil {
+			return false, fmt.Errorf("integrity verification failed for %s: %w", asset.Name, vErr)
+		}
+	} else {
+		fmt.Fprintf(stdout, "  [!] %s: no checksums file found in release %s, skipping hash verification\n", tool.Name, latestVer)
 	}
 
 	binBytes, err := extractBinary(data, asset.Name, tool.BinaryName, runtime.GOOS)

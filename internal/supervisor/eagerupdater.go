@@ -75,10 +75,21 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 
 	// 2. Fleet Git Clean check
 	snap := u.monitor.LastSnapshot()
-	if !snap.FleetGitClean && !force {
-		reason := fmt.Sprintf("BlockedByDirtyRepos: %v", snap.DirtyRepoPaths)
-		u.emitDeferredOnce(ctx, targetTools, reason, fmt.Sprintf("Tool update deferred: registered repos are dirty (%s)", strings.Join(snap.DirtyRepoPaths, ", ")))
+	if snap.HarnessActive && !force {
+		reason := "BlockedByActiveHarness"
+		u.emitDeferredOnce(ctx, targetTools, reason, "Tool update deferred: harness execution active on host")
 		return false, true, nil
+	}
+	if !snap.FleetGitClean && !force {
+		// If dirty repo paths is empty, run a fresh inspection instead of deferring on stale guard (R3)
+		if len(snap.DirtyRepoPaths) == 0 {
+			snap = u.monitor.InspectFleet(ctx)
+		}
+		if !snap.FleetGitClean {
+			reason := fmt.Sprintf("BlockedByDirtyRepos: %v", snap.DirtyRepoPaths)
+			u.emitDeferredOnce(ctx, targetTools, reason, fmt.Sprintf("Tool update deferred: registered repos are dirty (%s)", strings.Join(snap.DirtyRepoPaths, ", ")))
+			return false, true, nil
+		}
 	}
 
 	// 3. Acquire exclusive host execution lock from supervisor (always, even on force)
@@ -124,24 +135,6 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 	u.lastDeferredKey = ""
 	u.mu.Unlock()
 
-	// Emit agent.tool.update_started
-	if u.postNotif != nil {
-		if err := u.postNotif(ctx, controlplane.NotificationRecord{
-			Title:    "Tool Update Started",
-			Message:  fmt.Sprintf("Eager tool update started on host %s (targets: %v, force: %t)", u.hostID, targetTools, force),
-			Category: "info",
-			Source:   "tool-updater",
-			HostID:   u.hostID,
-			Metadata: map[string]any{
-				"event":        "agent.tool.update_started",
-				"target_tools": targetTools,
-				"force":        force,
-			},
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "[eagerupdater] postNotif error (update_started): %v\n", err)
-		}
-	}
-
 	start := time.Now()
 	res, updateErr := u.doUpdate(ctx, targetTools, force)
 	durationMs := time.Since(start).Milliseconds()
@@ -167,6 +160,20 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 	}
 
 	if len(res.UpdatedTools) > 0 && u.postNotif != nil {
+		// Emit update_started for audit trail of the executed update (R4)
+		_ = u.postNotif(ctx, controlplane.NotificationRecord{
+			Title:    "Tool Update Started",
+			Message:  fmt.Sprintf("Eager tool update started on host %s (updating: %s)", u.hostID, strings.Join(res.UpdatedTools, ", ")),
+			Category: "info",
+			Source:   "tool-updater",
+			HostID:   u.hostID,
+			Metadata: map[string]any{
+				"event":        "agent.tool.update_started",
+				"target_tools": res.UpdatedTools,
+				"force":        force,
+			},
+		})
+
 		if err := u.postNotif(ctx, controlplane.NotificationRecord{
 			Title:    "Tool Update Succeeded",
 			Message:  fmt.Sprintf("Successfully updated tools on %s: %s (took %dms)", u.hostID, strings.Join(res.UpdatedTools, ", "), durationMs),

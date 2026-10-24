@@ -633,6 +633,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					// If harness finished and idle, trigger eager update check if fleet clean
 					if len(reaped) > 0 && eagerUpdater != nil && !updatingTools.Load() {
 						go func() {
+							repoMonitor.InspectFleet(runCtx)
 							agentUpdated, deferred, err := eagerUpdater.EvaluateAndTrigger(runCtx, nil, false)
 							if err == nil && !deferred && agentUpdated {
 								restartOrExecSelf(stdout)

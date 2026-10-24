@@ -953,3 +953,85 @@ func TestCleanStaleBackups_ExpiredFiles(t *testing.T) {
 		t.Fatal("expected fresh file to remain")
 	}
 }
+
+func TestUpdateTool_ChecksumMismatchRejection(t *testing.T) {
+	tmpDir := t.TempDir()
+	binDir := filepath.Join(tmpDir, "bin")
+	_ = os.MkdirAll(binDir, 0o755)
+
+	archiveData := createTarGz(t, "my-tool", []byte("#!/bin/sh\necho ok\n"))
+	archiveName := fmt.Sprintf("my-tool-%s-%s.tar.gz", runtime.GOOS, runtime.GOARCH)
+
+	// Checksums file with an intentionally wrong hash
+	badChecksums := fmt.Sprintf("0000000000000000000000000000000000000000000000000000000000000000  %s\n", archiveName)
+
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			path := r.URL.Path
+			switch {
+			case strings.HasSuffix(path, "/releases/latest"):
+				rel := gitHubRelease{
+					TagName: "1.0.0",
+					Assets: []gitHubAsset{
+						{Name: archiveName, BrowserDownloadURL: "https://example.com/download/" + archiveName},
+						{Name: "checksums.txt", BrowserDownloadURL: "https://example.com/download/checksums.txt"},
+					},
+				}
+				b, _ := json.Marshal(rel)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(bytes.NewReader(b)),
+					Header:     make(http.Header),
+				}, nil
+			case strings.HasSuffix(path, archiveName):
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(bytes.NewReader(archiveData)),
+					Header:     make(http.Header),
+				}, nil
+			case strings.HasSuffix(path, "checksums.txt"):
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(strings.NewReader(badChecksums)),
+					Header:     make(http.Header),
+				}, nil
+			default:
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Status:     "404 Not Found",
+					Body:       io.NopCloser(strings.NewReader("not found")),
+					Header:     make(http.Header),
+				}, nil
+			}
+		}),
+	}
+
+	tool := ManifestToolItem{
+		Name:          "my-tool",
+		Repository:    "viovy/my-tool",
+		BinaryName:    "my-tool",
+		Tier:          "baseline",
+		TargetVersion: "latest",
+	}
+
+	var stdout, stderr bytes.Buffer
+	updated, err := updateSingleTool(context.Background(), client, tool, binDir, "", true, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("expected error on checksum mismatch, got updated=%v", updated)
+	}
+	if !strings.Contains(err.Error(), "integrity verification failed") {
+		t.Fatalf("expected integrity verification error, got: %v", err)
+	}
+
+	// Verify the binary was NOT installed
+	binPath := filepath.Join(binDir, "my-tool")
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+	if _, statErr := os.Stat(binPath); !os.IsNotExist(statErr) {
+		t.Fatalf("expected binary not to be installed after checksum failure, but found: %s", binPath)
+	}
+}
