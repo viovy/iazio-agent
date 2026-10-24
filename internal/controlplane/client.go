@@ -64,7 +64,7 @@ type Client struct {
 	Tools          func() []Tool
 	ActiveJobs     func() []ActiveJob
 	OnTick         func(ctx context.Context, hostID string) error
-	OnToolUpdate   func(ctx context.Context, tools []string, force bool) error
+	OnToolUpdate   func(ctx context.Context, tools []string, force bool, targetVersion ...string) error
 	OnCommand      func(ctx context.Context, cmd CommandEnvelope) error
 	MaxRetries     int
 	InitialBackoff time.Duration
@@ -105,8 +105,9 @@ type Tool struct {
 
 // PendingToolUpdate describes a remote tool update command for the agent.
 type PendingToolUpdate struct {
-	Tools []string `json:"tools,omitempty"`
-	Force bool     `json:"force,omitempty"`
+	Tools         []string `json:"tools,omitempty"`
+	Force         bool     `json:"force,omitempty"`
+	TargetVersion string   `json:"target_version,omitempty"`
 }
 
 // HeartbeatResponse is the payload returned by the control plane upon heartbeat.
@@ -296,7 +297,11 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 		} else if hbRes != nil {
 			if hbRes.PendingToolUpdate != nil && c.OnToolUpdate != nil {
 				go func(up PendingToolUpdate) {
-					_ = c.OnToolUpdate(ctx, up.Tools, up.Force)
+					if up.TargetVersion != "" {
+						_ = c.OnToolUpdate(ctx, up.Tools, up.Force, up.TargetVersion)
+					} else {
+						_ = c.OnToolUpdate(ctx, up.Tools, up.Force)
+					}
 				}(*hbRes.PendingToolUpdate)
 			}
 			if len(hbRes.PendingCommands) > 0 && c.OnCommand != nil {

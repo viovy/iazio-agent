@@ -664,7 +664,7 @@ func TestDispatcher_ToolsUpdate_Success(t *testing.T) {
 	toolUpdateCalled := false
 	inv := &mockInvoker{}
 	d := NewDispatcher(cp, inv, "host-1")
-	d.SetToolUpdater(func(ctx context.Context, tools []string, force bool) error {
+	d.SetToolUpdater(func(ctx context.Context, tools []string, force bool, targetVersion ...string) error {
 		toolUpdateCalled = true
 		if len(tools) != 1 || tools[0] != "autopilot" || !force {
 			t.Errorf("unexpected tool update params: tools=%v force=%v", tools, force)

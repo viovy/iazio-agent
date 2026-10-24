@@ -195,7 +195,7 @@ type RepoSyncer interface {
 type WorktreeResolver func(repo string) string
 
 // ToolUpdater defines the callback to execute tool suite updates.
-type ToolUpdater func(ctx context.Context, tools []string, force bool) error
+type ToolUpdater func(ctx context.Context, tools []string, force bool, targetVersion ...string) error
 
 // Dispatcher coordinates claiming jobs from the control plane and routing them to iazio-harness.
 type Dispatcher struct {
@@ -357,12 +357,13 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 
 	case JobTypeToolsUpdate:
 		var p struct {
-			Tools []string `json:"tools"`
-			Force bool     `json:"force"`
+			Tools         []string `json:"tools"`
+			Force         bool     `json:"force"`
+			TargetVersion string   `json:"target_version,omitempty"`
 		}
 		_ = json.Unmarshal(job.Payload, &p)
 		if d.toolUpdater != nil {
-			if err := d.toolUpdater(execCtx, p.Tools, p.Force); err != nil {
+			if err := d.toolUpdater(execCtx, p.Tools, p.Force, p.TargetVersion); err != nil {
 				_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: err.Error()})
 				return true, err
 			}

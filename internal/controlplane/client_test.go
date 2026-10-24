@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -691,8 +692,8 @@ func TestHostDaemonLoop_Cancellation(t *testing.T) {
 }
 
 func TestClient_Loop_WithHeartbeatAndCommands(t *testing.T) {
-	toolUpdateCalled := false
-	commandCalled := false
+	var toolUpdateCalled atomic.Bool
+	var commandCalled atomic.Bool
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -724,12 +725,12 @@ func TestClient_Loop_WithHeartbeatAndCommands(t *testing.T) {
 		ActiveJobs: func() []ActiveJob {
 			return []ActiveJob{{JobID: "job-1", PID: 1001}}
 		},
-		OnToolUpdate: func(ctx context.Context, tools []string, force bool) error {
-			toolUpdateCalled = true
+		OnToolUpdate: func(ctx context.Context, tools []string, force bool, targetVersion ...string) error {
+			toolUpdateCalled.Store(true)
 			return nil
 		},
 		OnCommand: func(ctx context.Context, cmd CommandEnvelope) error {
-			commandCalled = true
+			commandCalled.Store(true)
 			return nil
 		},
 	}
@@ -737,10 +738,10 @@ func TestClient_Loop_WithHeartbeatAndCommands(t *testing.T) {
 	_ = c.Loop(ctx, "host-1", "desktop", 20*time.Millisecond, nil, "profile-default")
 	time.Sleep(20 * time.Millisecond)
 
-	if !toolUpdateCalled {
+	if !toolUpdateCalled.Load() {
 		t.Fatalf("expected OnToolUpdate to be called")
 	}
-	if !commandCalled {
+	if !commandCalled.Load() {
 		t.Fatalf("expected OnCommand to be called")
 	}
 }

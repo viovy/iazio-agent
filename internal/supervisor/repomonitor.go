@@ -320,7 +320,6 @@ func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot 
 	snap.DirtyRepoPaths = dirtyList
 
 	m.mu.Lock()
-	wasClean := m.lastSnapshot.FleetGitClean
 	m.lastSnapshot = snap
 	m.mu.Unlock()
 
@@ -331,8 +330,8 @@ func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot 
 		}
 	}
 
-	// Trigger onFleetClean only on transition to clean
-	if allClean && !wasClean && m.onFleetClean != nil {
+	// Level-triggered: evaluate onFleetClean on every inspection pass when all registered repos are clean
+	if allClean && m.onFleetClean != nil {
 		m.onFleetClean(snap)
 	}
 

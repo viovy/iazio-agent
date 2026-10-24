@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -300,6 +301,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			)
 
 			var willRestart atomic.Bool
+			var requestedTargetVersion string
+			var requestedTargetMu sync.Mutex
 
 			eagerUpdater = supervisor.NewEagerToolUpdater(
 				sup,
@@ -319,12 +322,18 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						}
 					}()
 
+					requestedTargetMu.Lock()
+					tv := requestedTargetVersion
+					requestedTargetVersion = ""
+					requestedTargetMu.Unlock()
+
 					opts := UpdateOptions{
-						Suite:       updateSuite,
-						Profile:     profile,
-						API:         api,
-						Force:       force,
-						TargetTools: targetTools,
+						Suite:         updateSuite,
+						Profile:       profile,
+						API:           api,
+						Force:         force,
+						TargetTools:   targetTools,
+						TargetVersion: tv,
 					}
 					res, err := performUpdateWithResult(c, opts, stdout, stderr, getenv)
 					if res.AgentUpdated {
@@ -343,13 +352,78 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				},
 			)
 
+			eagerUpdater.CheckDrift = func(ctx context.Context, targetTools []string) (bool, error) {
+				if api == "" {
+					return false, nil
+				}
+				manifestURL := fmt.Sprintf("%s/v1/fleet/manifest?profile=%s&os=%s&arch=%s",
+					strings.TrimRight(api, "/"), profile, runtime.GOOS, runtime.GOARCH)
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
+				if err != nil {
+					return false, err
+				}
+				client := &http.Client{Timeout: 10 * time.Second}
+				resp, err := client.Do(req)
+				if err != nil {
+					return false, nil
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					return false, nil
+				}
+				var manifest ManifestResponse
+				if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
+					return false, nil
+				}
+				binDir := resolveInstallDir(manifest.InstallRoots, getenv)
+
+				targetMap := make(map[string]bool)
+				for _, name := range targetTools {
+					targetMap[strings.ToLower(strings.TrimSpace(name))] = true
+				}
+
+				for _, tool := range manifest.Tools {
+					if len(targetMap) > 0 && !targetMap[strings.ToLower(tool.Name)] && !targetMap[strings.ToLower(tool.BinaryName)] {
+						continue
+					}
+					binName := tool.BinaryName
+					if binName == "" {
+						binName = tool.Name
+					}
+					if runtime.GOOS == "windows" && !strings.HasSuffix(binName, ".exe") {
+						binName += ".exe"
+					}
+					destPath := filepath.Join(binDir, binName)
+					curVer := inventory.InspectInstalledVersion(destPath)
+					if curVer == "" {
+						return true, nil
+					}
+					targetVer := strings.TrimPrefix(strings.TrimSpace(tool.TargetVersion), "v")
+					if targetVer == "" || targetVer == "latest" {
+						continue
+					}
+					cleanCurVer := strings.TrimPrefix(strings.TrimSpace(curVer), "v")
+					if cleanCurVer != targetVer && !strings.Contains(cleanCurVer, targetVer) {
+						return true, nil
+					}
+				}
+				return false, nil
+			}
+
 			// Start repoMonitor AFTER eagerUpdater is fully constructed to eliminate initialization race
 			repoMonitor.Start(runCtx)
 
 			var lastUpdateCheck time.Time
 			var lastUpdateMu sync.Mutex
 
-			doToolUpdateDetailed := func(ctx context.Context, targetTools []string, force bool) (supervisor.UpdateResult, bool, error) {
+			doToolUpdateDetailed := func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (supervisor.UpdateResult, bool, error) {
+				var tv string
+				if len(targetVersion) > 0 && targetVersion[0] != "" {
+					tv = targetVersion[0]
+					requestedTargetMu.Lock()
+					requestedTargetVersion = tv
+					requestedTargetMu.Unlock()
+				}
 				tracer := telemetry.GlobalTracer()
 				_, span := tracer.StartSpan(ctx, "agent.tools.update")
 				defer span.End()
@@ -357,6 +431,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				span.SetTag("force", fmt.Sprintf("%t", force))
 				if len(targetTools) > 0 {
 					span.SetTag("target_tools", strings.Join(targetTools, ","))
+				}
+				if tv != "" {
+					span.SetTag("target_version", tv)
 				}
 
 				if eagerUpdater != nil {
@@ -408,11 +485,12 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}()
 
 				opts := UpdateOptions{
-					Suite:       updateSuite,
-					Profile:     profile,
-					API:         api,
-					Force:       force,
-					TargetTools: targetTools,
+					Suite:         updateSuite,
+					Profile:       profile,
+					API:           api,
+					Force:         force,
+					TargetTools:   targetTools,
+					TargetVersion: tv,
 				}
 				upRes, err := performUpdateWithResult(ctx, opts, stdout, stderr, getenv)
 				res := supervisor.UpdateResult{
@@ -435,8 +513,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				return res, false, nil
 			}
 
-			doToolUpdate := func(ctx context.Context, targetTools []string, force bool) bool {
-				res, deferred, err := doToolUpdateDetailed(ctx, targetTools, force)
+			doToolUpdate := func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) bool {
+				res, deferred, err := doToolUpdateDetailed(ctx, targetTools, force, targetVersion...)
 				if err != nil || deferred {
 					return false
 				}
@@ -446,6 +524,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			var pendingRemoteMu sync.Mutex
 			var pendingRemoteTools []string
 			var pendingRemoteForce bool
+			var pendingRemoteTargetVersion string
 			var hasPendingRemote bool
 
 			if updateInterval > 0 {
@@ -460,16 +539,18 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						pendingRemoteMu.Lock()
 						t := pendingRemoteTools
 						f := pendingRemoteForce
+						v := pendingRemoteTargetVersion
 						isRemote := hasPendingRemote
 						if isRemote {
 							hasPendingRemote = false
 							pendingRemoteTools = nil
 							pendingRemoteForce = false
+							pendingRemoteTargetVersion = ""
 						}
 						pendingRemoteMu.Unlock()
 
 						if isRemote {
-							return doToolUpdate(runCtx, t, f)
+							return doToolUpdate(runCtx, t, f, v)
 						}
 						return doToolUpdate(runCtx, nil, false)
 					}
@@ -506,13 +587,18 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return "ONLINE"
 				},
 				Tools: getTools,
-				OnToolUpdate: func(ctx context.Context, tools []string, force bool) error {
+				OnToolUpdate: func(ctx context.Context, tools []string, force bool, targetVersion ...string) error {
+					var tv string
+					if len(targetVersion) > 0 {
+						tv = targetVersion[0]
+					}
 					if stdout != nil {
-						fmt.Fprintf(stdout, "[supervisor] remote tool update requested: tools=%v force=%v\n", tools, force)
+						fmt.Fprintf(stdout, "[supervisor] remote tool update requested: tools=%v force=%v target_version=%s\n", tools, force, tv)
 					}
 					pendingRemoteMu.Lock()
 					pendingRemoteTools = tools
 					pendingRemoteForce = force
+					pendingRemoteTargetVersion = tv
 					hasPendingRemote = true
 					pendingRemoteMu.Unlock()
 
@@ -520,12 +606,14 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						pendingRemoteMu.Lock()
 						t := pendingRemoteTools
 						f := pendingRemoteForce
+						v := pendingRemoteTargetVersion
 						pendingRemoteTools = nil
 						pendingRemoteForce = false
+						pendingRemoteTargetVersion = ""
 						hasPendingRemote = false
 						pendingRemoteMu.Unlock()
 
-						if doToolUpdate(runCtx, t, f) {
+						if doToolUpdate(runCtx, t, f, v) {
 							restartOrExecSelf(stdout)
 							cancel()
 						}
@@ -642,13 +730,17 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				cpClient := worker.NewHTTPControlPlaneClient(api, "", nil)
 				cliInvoker := harness.NewCLIInvoker("", "")
 				disp := worker.NewDispatcher(cpClient, cliInvoker, host)
-				disp.SetToolUpdater(func(ctx context.Context, tools []string, force bool) error {
+				disp.SetToolUpdater(func(ctx context.Context, tools []string, force bool, targetVersion ...string) error {
+					var tv string
+					if len(targetVersion) > 0 {
+						tv = targetVersion[0]
+					}
 					if stdout != nil {
-						fmt.Fprintf(stdout, "[dispatcher] tool update job executing: tools=%v force=%v\n", tools, force)
+						fmt.Fprintf(stdout, "[dispatcher] tool update job executing: tools=%v force=%v target_version=%s\n", tools, force, tv)
 					}
 					// Dispatched agent.tools.update jobs treat force=true so paused/healing repo states
 					// do not prevent the runner host from updating tools, provided harness is not executing.
-					res, deferred, err := doToolUpdateDetailed(ctx, tools, true)
+					res, deferred, err := doToolUpdateDetailed(ctx, tools, true, tv)
 					if err != nil {
 						return fmt.Errorf("tool update failed: %w", err)
 					}
@@ -733,13 +825,17 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 										pendingRemoteMu.Lock()
 										t := pendingRemoteTools
 										f := pendingRemoteForce
+										v := pendingRemoteTargetVersion
 										rem := hasPendingRemote
 										pendingRemoteMu.Unlock()
 
 										if rem {
-											if doToolUpdate(runCtx, t, f) {
+											if doToolUpdate(runCtx, t, f, v) {
 												pendingRemoteMu.Lock()
 												hasPendingRemote = false
+												pendingRemoteTools = nil
+												pendingRemoteForce = false
+												pendingRemoteTargetVersion = ""
 												pendingRemoteMu.Unlock()
 												restartOrExecSelf(stdout)
 												cancel()

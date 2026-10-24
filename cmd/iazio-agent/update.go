@@ -163,15 +163,16 @@ func defaultBaselineManifest(profile string) ManifestResponse {
 }
 
 type UpdateOptions struct {
-	Suite       bool
-	DryRun      bool
-	Force       bool
-	Profile     string
-	API         string
-	BinDir      string
-	OnTimeout   string
-	Expired     bool
-	TargetTools []string
+	Suite         bool
+	DryRun        bool
+	Force         bool
+	Profile       string
+	API           string
+	BinDir        string
+	OnTimeout     string
+	Expired       bool
+	TargetTools   []string
+	TargetVersion string
 }
 
 type UpdateResult struct {
@@ -290,6 +291,9 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 	}
 
 	for _, tool := range targets {
+		if opts.TargetVersion != "" {
+			tool.TargetVersion = opts.TargetVersion
+		}
 		updated, err := updateSingleTool(ctx, client, tool, binDir, ghToken, opts.Force, stdout, stderr, getenv)
 		if err != nil {
 			res.Errors = append(res.Errors, fmt.Errorf("%s: %w", tool.Name, err))
@@ -343,6 +347,11 @@ func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer, get
 			opts.TargetTools = append(opts.TargetTools, args[i])
 		case strings.HasPrefix(args[i], "--tool="):
 			opts.TargetTools = append(opts.TargetTools, strings.TrimPrefix(args[i], "--tool="))
+		case args[i] == "--version" && i+1 < len(args):
+			i++
+			opts.TargetVersion = args[i]
+		case strings.HasPrefix(args[i], "--version="):
+			opts.TargetVersion = strings.TrimPrefix(args[i], "--version=")
 		case args[i] == "--bin-dir" && i+1 < len(args):
 			i++
 			opts.BinDir = args[i]
