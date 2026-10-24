@@ -668,23 +668,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 				}
 
-				convID := a.ActiveConversationID
-				if convID == "" {
-					convID = a.ResumeConversationID
-				}
-				if convID == "" {
-					convID = a.InitialConversationID
-				}
-				if convID == "" && len(a.ConversationIDs) > 0 {
-					convID = a.ConversationIDs[len(a.ConversationIDs)-1]
-				}
-				if convID == "" && lockInfo.ConversationID != "" && lockInfo.Status != "COMPLETED" && (a.Kind == "resume" || (a.StoryID != "" && lockInfo.StoryID == a.StoryID)) {
-					convID = lockInfo.ConversationID
-				}
-				if convID != "" && !sessionstore.IsValidConversationID(convID) {
-					log.Printf("[agent] ignoring invalid conversation id format: %q", convID)
-					convID = ""
-				}
+				convID := ResolveDispatchConversationID(a, lockInfo.ConversationID, lockInfo.StoryID, lockInfo.Status)
 
 				var spawnExtras []string
 				if a.Kind != "" {
@@ -1614,4 +1598,27 @@ func resolveWorktreeForRepo(ctx context.Context, getter hostDetailGetter, host, 
 		}
 	}
 	return ""
+}
+
+// ResolveDispatchConversationID resolves the conversation ID to resume with strict priority:
+// ActiveConversationID -> ResumeConversationID -> InitialConversationID -> latest from ConversationIDs -> lockInfo
+func ResolveDispatchConversationID(a controlplane.Assignment, lockConvID, lockStoryID, lockStatus string) string {
+	convID := a.ActiveConversationID
+	if convID == "" {
+		convID = a.ResumeConversationID
+	}
+	if convID == "" {
+		convID = a.InitialConversationID
+	}
+	if convID == "" && len(a.ConversationIDs) > 0 {
+		convID = a.ConversationIDs[len(a.ConversationIDs)-1]
+	}
+	if convID == "" && lockConvID != "" && lockStatus != "COMPLETED" && (a.Kind == "resume" || (a.StoryID != "" && lockStoryID == a.StoryID)) {
+		convID = lockConvID
+	}
+	if convID != "" && !sessionstore.IsValidConversationID(convID) {
+		log.Printf("[agent] ignoring invalid conversation id format: %q", convID)
+		convID = ""
+	}
+	return convID
 }
