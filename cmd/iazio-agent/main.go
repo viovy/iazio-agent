@@ -333,10 +333,18 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				if res.AgentUpdated {
 					willRestart.Store(true)
 				}
+				var aggregateErr error
+				if err != nil {
+					aggregateErr = err
+				} else if force && len(res.Errors) > 0 {
+					aggregateErr = res.Errors[0]
+				}
 				return supervisor.UpdateResult{
 					UpdatedTools: res.UpdatedTools,
+					FailedTools:  res.FailedTools,
+					Errors:       res.Errors,
 					AgentUpdated: res.AgentUpdated,
-				}, err
+				}, aggregateErr
 			}
 
 			eagerUpdater = supervisor.NewEagerToolUpdater(

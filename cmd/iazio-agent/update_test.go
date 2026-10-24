@@ -1141,32 +1141,18 @@ func TestUpdate_SingleToolGuard(t *testing.T) {
 }
 
 func TestUpdate_CLIFlagParsing_Version(t *testing.T) {
-	// F7: Test CLI flag parsing for --version and --version=
-	var opts1 UpdateOptions
-	args1 := []string{"--version", "0.0.492", "--tool", "autopilot"}
-	for i := 0; i < len(args1); i++ {
-		switch {
-		case args1[i] == "--version" && i+1 < len(args1):
-			i++
-			opts1.TargetVersion = args1[i]
-		case strings.HasPrefix(args1[i], "--version="):
-			opts1.TargetVersion = strings.TrimPrefix(args1[i], "--version=")
-		case args1[i] == "--tool" && i+1 < len(args1):
-			i++
-			opts1.TargetTools = append(opts1.TargetTools, args1[i])
-		}
+	// R6: Test real CLI flag parsing for --version and --version= using parseUpdateFlags
+	opts1, err1 := parseUpdateFlags([]string{"--version", "0.0.492", "--tool", "autopilot"})
+	if err1 != nil {
+		t.Fatalf("unexpected parse error: %v", err1)
 	}
 	if opts1.TargetVersion != "0.0.492" || len(opts1.TargetTools) != 1 || opts1.TargetTools[0] != "autopilot" {
 		t.Fatalf("unexpected parsed opts: %+v", opts1)
 	}
 
-	var opts2 UpdateOptions
-	args2 := []string{"--version=0.0.493"}
-	for i := 0; i < len(args2); i++ {
-		switch {
-		case strings.HasPrefix(args2[i], "--version="):
-			opts2.TargetVersion = strings.TrimPrefix(args2[i], "--version=")
-		}
+	opts2, err2 := parseUpdateFlags([]string{"--version=0.0.493"})
+	if err2 != nil {
+		t.Fatalf("unexpected parse error: %v", err2)
 	}
 	if opts2.TargetVersion != "0.0.493" {
 		t.Fatalf("expected TargetVersion 0.0.493, got %s", opts2.TargetVersion)

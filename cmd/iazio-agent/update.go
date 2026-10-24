@@ -178,6 +178,7 @@ type UpdateOptions struct {
 type UpdateResult struct {
 	AgentUpdated bool     `json:"agent_updated"`
 	UpdatedTools []string `json:"updated_tools"`
+	FailedTools  []string `json:"failed_tools,omitempty"`
 	Errors       []error  `json:"errors,omitempty"`
 }
 
@@ -302,6 +303,7 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 		updated, err := updateSingleTool(ctx, client, tool, binDir, ghToken, opts.Force, stdout, stderr, getenv)
 		if err != nil {
 			res.Errors = append(res.Errors, fmt.Errorf("%s: %w", tool.Name, err))
+			res.FailedTools = append(res.FailedTools, tool.Name)
 			if stderr != nil {
 				fmt.Fprintf(stderr, "  [-] %s: %v\n", tool.Name, err)
 			}
@@ -315,10 +317,14 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 		}
 	}
 
+	if len(res.Errors) > 0 && opts.Force {
+		return res, fmt.Errorf("forced tool update failed: %w", res.Errors[0])
+	}
+
 	return res, nil
 }
 
-func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
+func parseUpdateFlags(args []string) (UpdateOptions, error) {
 	var opts UpdateOptions
 	opts.OnTimeout = "reject"
 
@@ -363,8 +369,16 @@ func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer, get
 		case strings.HasPrefix(args[i], "--bin-dir="):
 			opts.BinDir = strings.TrimPrefix(args[i], "--bin-dir=")
 		default:
-			return fmt.Errorf("unknown update flag %s", args[i])
+			return opts, fmt.Errorf("unknown update flag %s", args[i])
 		}
+	}
+	return opts, nil
+}
+
+func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
+	opts, err := parseUpdateFlags(args)
+	if err != nil {
+		return err
 	}
 
 	if opts.Suite {

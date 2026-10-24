@@ -690,3 +690,131 @@ func TestRepoStateMonitor_LevelTriggeredCleanPasses(t *testing.T) {
 		t.Fatalf("expected onFleetClean to be called twice across consecutive clean passes (level-triggered), got %d", onFleetCleanCalls)
 	}
 }
+
+func TestEagerToolUpdater_Backoff(t *testing.T) {
+	// R6, R7: Test calculateBackoff capping and shouldBackoff / recordFailure
+	if b := calculateBackoff(0); b != 0 {
+		t.Errorf("expected 0 for 0 attempts, got %v", b)
+	}
+	if b := calculateBackoff(1); b != 30*time.Second {
+		t.Errorf("expected 30s for 1 attempt, got %v", b)
+	}
+	if b := calculateBackoff(2); b != 60*time.Second {
+		t.Errorf("expected 60s for 2 attempts, got %v", b)
+	}
+	// Cap at 1h (R7)
+	if b := calculateBackoff(20); b != 1*time.Hour {
+		t.Errorf("expected 1h cap for 20 attempts, got %v", b)
+	}
+
+	updater := NewEagerToolUpdater(nil, nil, "test-host", nil, nil)
+	// Initial state: no backoff
+	if updater.shouldBackoff([]string{"my-tool"}, false) {
+		t.Fatalf("expected no backoff initially")
+	}
+
+	// Record failure: should backoff immediately
+	updater.recordToolFailure("my-tool")
+	if !updater.shouldBackoff([]string{"my-tool"}, false) {
+		t.Fatalf("expected shouldBackoff=true after failure")
+	}
+	// Force bypasses backoff
+	if updater.shouldBackoff([]string{"my-tool"}, true) {
+		t.Fatalf("expected force=true to bypass backoff")
+	}
+
+	// Record success: backoff cleared
+	updater.recordToolSuccess("my-tool")
+	if updater.shouldBackoff([]string{"my-tool"}, false) {
+		t.Fatalf("expected shouldBackoff=false after success")
+	}
+}
+
+func TestEagerToolUpdater_DeferralRetentionAndUnmergedDraining(t *testing.T) {
+	// R4, R5, R6: Deferred forced/pinned requests must be retained across active harness runs
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	var executions []struct {
+		tools   []string
+		force   bool
+		version string
+	}
+	var mu sync.Mutex
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", nil, nil)
+	updater.SetDetailedUpdateFunc(func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error) {
+		mu.Lock()
+		var tv string
+		if len(targetVersion) > 0 {
+			tv = targetVersion[0]
+		}
+		executions = append(executions, struct {
+			tools   []string
+			force   bool
+			version string
+		}{
+			tools:   append([]string(nil), targetTools...),
+			force:   force,
+			version: tv,
+		})
+		mu.Unlock()
+		return UpdateResult{UpdatedTools: targetTools}, nil
+	})
+
+	ctx := context.Background()
+
+	// 1. Simulate active harness blocking tool update
+	tempDir := t.TempDir()
+	if err := sup.TrySpawn(tempDir); err != nil {
+		t.Fatalf("setup TrySpawn failed: %v", err)
+	}
+
+	// Request forced update for tool-a @ 0.1.0 while harness is running
+	_, deferred, err := updater.EvaluateAndTriggerDetailed(ctx, []string{"tool-a"}, true, "0.1.0")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !deferred {
+		t.Fatalf("expected request to be deferred while harness is active")
+	}
+
+	// Verify nothing was executed yet
+	mu.Lock()
+	if len(executions) != 0 {
+		t.Fatalf("expected 0 executions while deferred, got %d", len(executions))
+	}
+	mu.Unlock()
+
+	// 2. Harness finishes execution
+	sup.MarkIdle(tempDir)
+
+	// 3. Next periodic clean tick runs with targetTools=nil, force=false
+	_, _, err = updater.EvaluateAndTrigger(ctx, nil, false)
+	if err != nil {
+		t.Fatalf("unexpected error on clean tick: %v", err)
+	}
+
+	// 4. Assert deferred request was retained and executed with original version and force flag (R4, R5)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(executions) < 1 {
+		t.Fatalf("expected deferred request to be executed on clean tick, got %d executions", len(executions))
+	}
+	var found bool
+	for _, ex := range executions {
+		if len(ex.tools) == 1 && ex.tools[0] == "tool-a" {
+			found = true
+			if !ex.force {
+				t.Errorf("expected force=true retained for deferred request, got false")
+			}
+			if ex.version != "0.1.0" {
+				t.Errorf("expected version 0.1.0 retained for deferred request, got %q", ex.version)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected deferred request for tool-a to be executed on clean tick, got executions: %v", executions)
+	}
+}
