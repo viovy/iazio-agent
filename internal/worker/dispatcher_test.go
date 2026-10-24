@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"time"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/viovy/iazio-agent/internal/harness"
 )
@@ -604,9 +604,6 @@ func TestDispatcher_PromptExecute_AutoInjectsPromptID(t *testing.T) {
 	}
 }
 
-
-
-
 func TestDispatcher_JobExecutionTimeout(t *testing.T) {
 	ctx := context.Background()
 	cp := newMockControlPlane()
@@ -829,4 +826,3 @@ func TestEnsurePromptID_Helpers(t *testing.T) {
 		t.Fatalf("expected trace_id in output: %s", string(outTrace))
 	}
 }
-

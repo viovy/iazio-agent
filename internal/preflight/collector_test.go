@@ -190,4 +190,3 @@ func TestCleanPorcelain(t *testing.T) {
 		t.Errorf("expected empty string for scratch only, got %q", CleanPorcelain(scratchOnly))
 	}
 }
-

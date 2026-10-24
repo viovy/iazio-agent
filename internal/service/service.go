@@ -2,6 +2,7 @@
 package service
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -463,13 +464,14 @@ func linuxUnit(bin string) string {
 	return fmt.Sprintf(`[Unit]
 Description=iazio-agent user supervisor
 After=network.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=%s run
 Restart=always
-RestartSec=3s
-StartLimitIntervalSec=0
+RestartSec=5s
+WatchdogSec=30s
 OOMScoreAdjust=-500
 Environment=IAZIO_AGENT_NONINTERACTIVE=1
 %s%s
@@ -604,6 +606,134 @@ func copyBinaryAtomic(src, dest string) error {
 	return os.Rename(tmp, dest)
 }
 
+func validateCandidateBinary(src string, info os.FileInfo) error {
+	if info.Size() == 0 {
+		return errors.New("candidate binary is empty")
+	}
+	f, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open candidate binary: %w", err)
+	}
+	defer f.Close()
+
+	header := make([]byte, 512)
+	n, err := f.Read(header)
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("read candidate header: %w", err)
+	}
+	if n < 4 {
+		return errors.New("candidate file too small to be an executable")
+	}
+
+	// Reject empty scripts (e.g. #!/bin/sh with no executable command lines)
+	if bytes.HasPrefix(header, []byte("#!")) {
+		content, _ := os.ReadFile(src)
+		lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+		hasCommand := false
+		for _, l := range lines {
+			l = strings.TrimSpace(l)
+			if l != "" && !strings.HasPrefix(l, "#") {
+				hasCommand = true
+				break
+			}
+		}
+		if !hasCommand {
+			return errors.New("candidate binary is an empty script without executable commands")
+		}
+	}
+	return nil
+}
+
+// ReconcileServiceConfiguration inspects user service units and corrects missing,
+// outdated, or drifted configuration (e.g. missing WatchdogSec, wrong ExecStart path).
+func ReconcileServiceConfiguration(home, bin string, run func(name string, args ...string) error) error {
+	if home == "" {
+		h, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		home = h
+	}
+	if run == nil {
+		run = execCommand
+	}
+	if bin == "" {
+		bin = filepath.Join(home, ".iazio", "bin", "iazio-agent")
+		if runtime.GOOS == "windows" {
+			bin += ".exe"
+		}
+	}
+
+	if runtime.GOOS == "linux" && IsSystemdAvailable() {
+		unitDir := filepath.Join(home, ".config", "systemd", "user")
+		if err := os.MkdirAll(unitDir, 0o755); err != nil {
+			return err
+		}
+
+		serviceFile := filepath.Join(unitDir, "iazio-agent.service")
+		needsReload := false
+
+		// Check and reconcile primary service unit
+		expectedService := linuxUnit(bin)
+		data, err := os.ReadFile(serviceFile)
+		if err != nil || !strings.Contains(string(data), "WatchdogSec=") || !strings.Contains(string(data), bin) || !strings.Contains(string(data), "IAZIO_AGENT_NONINTERACTIVE=1") {
+			if err := os.WriteFile(serviceFile, []byte(expectedService), 0o644); err != nil {
+				return fmt.Errorf("write iazio-agent.service: %w", err)
+			}
+			needsReload = true
+		}
+
+		// Check and reconcile watcher .path and .service
+		pathFile := filepath.Join(unitDir, "iazio-agent-watcher.path")
+		expectedPath := LinuxWatcherPath(bin)
+		if pData, err := os.ReadFile(pathFile); err != nil || !strings.Contains(string(pData), bin) {
+			if err := os.WriteFile(pathFile, []byte(expectedPath), 0o644); err != nil {
+				return fmt.Errorf("write iazio-agent-watcher.path: %w", err)
+			}
+			needsReload = true
+		}
+
+		watcherSvcFile := filepath.Join(unitDir, "iazio-agent-watcher.service")
+		if _, err := os.Stat(watcherSvcFile); err != nil {
+			if err := os.WriteFile(watcherSvcFile, []byte(LinuxWatcherService()), 0o644); err != nil {
+				return fmt.Errorf("write iazio-agent-watcher.service: %w", err)
+			}
+			needsReload = true
+		}
+
+		// Check and reconcile watchdog .timer and .service
+		timerFile := filepath.Join(unitDir, "iazio-agent-watchdog.timer")
+		if _, err := os.Stat(timerFile); err != nil {
+			if err := os.WriteFile(timerFile, []byte(LinuxWatchdogTimer()), 0o644); err != nil {
+				return fmt.Errorf("write iazio-agent-watchdog.timer: %w", err)
+			}
+			needsReload = true
+		}
+
+		watchdogSvcFile := filepath.Join(unitDir, "iazio-agent-watchdog.service")
+		expectedWatchdogSvc := LinuxWatchdogService(bin)
+		if wData, err := os.ReadFile(watchdogSvcFile); err != nil || !strings.Contains(string(wData), bin) {
+			if err := os.WriteFile(watchdogSvcFile, []byte(expectedWatchdogSvc), 0o644); err != nil {
+				return fmt.Errorf("write iazio-agent-watchdog.service: %w", err)
+			}
+			needsReload = true
+		}
+
+		if needsReload {
+			_ = run("systemctl", "--user", "daemon-reload")
+			_ = run("systemctl", "--user", "enable", "--now", "iazio-agent-watcher.path")
+			_ = run("systemctl", "--user", "enable", "--now", "iazio-agent-watchdog.timer")
+		}
+		_ = run("loginctl", "enable-linger")
+		return nil
+	} else if runtime.GOOS == "darwin" {
+		return InstallDarwinResilience(home, bin, run)
+	} else if runtime.GOOS == "windows" {
+		return InstallWindowsAt(home, bin, windowsLogonUser(), run)
+	}
+	return nil
+}
+
 // DevInstall safely hot-swaps the active binary with srcBinary and ensures the service is running.
 func DevInstall(srcBinary, home string, run func(name string, args ...string) error) error {
 	if home == "" {
@@ -638,6 +768,9 @@ func DevInstall(srcBinary, home string, run func(name string, args ...string) er
 	if info.IsDir() {
 		return fmt.Errorf("source binary is a directory: %s", srcBinary)
 	}
+	if err := validateCandidateBinary(srcBinary, info); err != nil {
+		return fmt.Errorf("invalid candidate binary: %w", err)
+	}
 
 	destDir := filepath.Join(home, ".iazio", "bin")
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
@@ -658,20 +791,21 @@ func DevInstall(srcBinary, home string, run func(name string, args ...string) er
 	// Remove maintenance lock if present
 	_ = os.Remove(filepath.Join(home, ".iazio", "maintenance.lock"))
 
-	// Ensure resilience units are active
+	// Ensure resilience units and configuration are active and reconciled
 	if runtime.GOOS == "linux" && IsSystemdAvailable() {
-		_ = InstallLinuxResilience(home, dest, run)
+		_ = ReconcileServiceConfiguration(home, dest, run)
 		if err := run("systemctl", "--user", "restart", "iazio-agent.service"); err != nil {
 			return fmt.Errorf("restart service: %w", err)
 		}
 	} else if runtime.GOOS == "darwin" {
-		if err := InstallDarwinResilience(home, dest, run); err != nil {
+		if err := ReconcileServiceConfiguration(home, dest, run); err != nil {
 			return fmt.Errorf("install darwin resilience: %w", err)
 		}
 		if err := run("launchctl", "kickstart", "-k", fmt.Sprintf("gui/%d/%s", os.Getuid(), agentLabel)); err != nil {
 			return fmt.Errorf("kickstart service: %w", err)
 		}
 	} else if runtime.GOOS == "windows" {
+		_ = ReconcileServiceConfiguration(home, dest, run)
 		_ = run("schtasks", "/Run", "/TN", "iazio-agent")
 	}
 	return nil

@@ -49,7 +49,7 @@ type ioCounters struct {
 }
 
 type jobObjectExtendedLimitInformation struct {
-	BasicLimitInformation jobObjectBasicLimitInformation
+	BasicLimitInformation  jobObjectBasicLimitInformation
 	IoInfo                 ioCounters
 	ProcessMemoryLimit     uintptr
 	JobMemoryLimit         uintptr

@@ -254,4 +254,3 @@ func TestDetectDirtyWorktreeContext_DirtyStoryFile(t *testing.T) {
 		t.Fatalf("expected STORY-FEAT-9999, got %q", dCtx.StoryID)
 	}
 }
-

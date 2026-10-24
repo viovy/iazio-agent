@@ -153,3 +153,49 @@ func writeExe(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 }
+
+func TestInspectToolService(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// 1. Not installed
+	installed, svcType, svcStatus, caps := InspectToolService("iazio-agent", "linux")
+	if installed || svcType != "none" || svcStatus != "not_installed" {
+		t.Fatalf("expected not installed, got: %v, %s, %s", installed, svcType, svcStatus)
+	}
+
+	// 2. Installed with systemd user unit
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	_ = os.MkdirAll(unitDir, 0755)
+	unitContent := `[Unit]
+Description=iazio-agent user supervisor
+[Service]
+ExecStart=/path/to/iazio-agent run
+Restart=always
+WatchdogSec=30s
+`
+	_ = os.WriteFile(filepath.Join(unitDir, "iazio-agent.service"), []byte(unitContent), 0644)
+	_ = os.WriteFile(filepath.Join(unitDir, "iazio-agent-watcher.path"), []byte("[Path]\n"), 0644)
+
+	installed, svcType, _, caps = InspectToolService("iazio-agent", "linux")
+	if !installed || svcType != "user_service" {
+		t.Fatalf("expected user_service installed, got: %v, %s", installed, svcType)
+	}
+	hasWatchdog := false
+	hasRestart := false
+	hasWatcher := false
+	for _, c := range caps {
+		if c == "watchdog" {
+			hasWatchdog = true
+		}
+		if c == "auto_restart" {
+			hasRestart = true
+		}
+		if c == "path_watcher" {
+			hasWatcher = true
+		}
+	}
+	if !hasWatchdog || !hasRestart || !hasWatcher {
+		t.Fatalf("missing expected capabilities: %+v", caps)
+	}
+}

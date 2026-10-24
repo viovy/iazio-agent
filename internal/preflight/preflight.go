@@ -51,15 +51,15 @@ const (
 
 // Report is the checkout snapshot taken before spawn.
 type Report struct {
-	Kind          string
-	FreeBytes     uint64
-	WorkPorcelain string
-	HubPorcelain  string
-	HeadAttached  bool
-	Branch        string
-	DefaultBranch string
-	HasUpstream   bool
-	DocsHubOK     bool
+	Kind                   string
+	FreeBytes              uint64
+	WorkPorcelain          string
+	HubPorcelain           string
+	HeadAttached           bool
+	Branch                 string
+	DefaultBranch          string
+	HasUpstream            bool
+	DocsHubOK              bool
 	GitAuthOK              bool
 	GitWorkTree            bool
 	DirtyStoryID           string `json:"DirtyStoryID,omitempty"`

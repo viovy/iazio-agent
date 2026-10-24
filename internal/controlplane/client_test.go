@@ -744,12 +744,3 @@ func TestClient_Loop_WithHeartbeatAndCommands(t *testing.T) {
 		t.Fatalf("expected OnCommand to be called")
 	}
 }
-
-
-
-
-
-
-
-
-

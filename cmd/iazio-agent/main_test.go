@@ -26,7 +26,6 @@ import (
 	"github.com/viovy/iazio-agent/internal/supervisor"
 )
 
-
 func init() {
 	isTesting = true
 }
@@ -372,10 +371,10 @@ func TestRunUpdate_ManifestIntegration(t *testing.T) {
 				},
 				Tools: []ManifestToolItem{
 					{
-						Name:        "iazio-agent",
-						Repository:  "viovy/iazio-agent",
-						BinaryName:  "iazio-agent",
-						Tier:        "baseline",
+						Name:       "iazio-agent",
+						Repository: "viovy/iazio-agent",
+						BinaryName: "iazio-agent",
+						Tier:       "baseline",
 					},
 				},
 			})
@@ -1422,7 +1421,6 @@ func TestRunService_NonDryRunLifecycle(t *testing.T) {
 	_ = runService([]string{"uninstall"}, &stdout, linuxGetenv)
 }
 
-
 func TestExecuteRun_CLIArgsParsing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately so Loop exits
@@ -1981,6 +1979,11 @@ func TestExecute_Run_WithElasticsearchSink(t *testing.T) {
 }
 
 func TestExecute_Service_PauseResumeReviveDevInstall(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("USERPROFILE", fakeHome)
+	t.Setenv("IAZIO_DISABLE_SYSTEMD", "1")
+
 	origExec := execCommand
 	defer func() { execCommand = origExec }()
 	execCommand = func(name string, args ...string) error {
@@ -1996,8 +1999,26 @@ func TestExecute_Service_PauseResumeReviveDevInstall(t *testing.T) {
 
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "src-bin")
-	_ = os.WriteFile(bin, []byte("#!/bin/sh\n"), 0755)
+	_ = os.WriteFile(bin, []byte("#!/bin/sh\necho 'valid dev binary'\nexit 0\n"), 0755)
 	_ = execute(ctx, []string{"service", "dev-install", bin}, &stdout, &stderr, nil)
+}
+
+func TestExecute_Service_DevInstall_RejectsEmptyBinary(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("USERPROFILE", fakeHome)
+	t.Setenv("IAZIO_DISABLE_SYSTEMD", "1")
+
+	ctx := context.Background()
+	var stdout, stderr bytes.Buffer
+
+	tmp := t.TempDir()
+	emptyBin := filepath.Join(tmp, "empty-bin")
+	_ = os.WriteFile(emptyBin, []byte("#!/bin/sh\n"), 0755)
+	err := execute(ctx, []string{"service", "dev-install", emptyBin}, &stdout, &stderr, nil)
+	if err == nil {
+		t.Fatal("expected error when installing empty script")
+	}
 }
 
 func TestProbeRepoRuntime_StateFiles(t *testing.T) {
@@ -2316,24 +2337,3 @@ func TestResolveHostID_EdgeCases(t *testing.T) {
 		t.Fatalf("expected runner, got %s", idNoWSL)
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

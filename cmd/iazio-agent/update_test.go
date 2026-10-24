@@ -703,7 +703,7 @@ func TestUpdateSingleTool_ErrorsAndRepoPrefix(t *testing.T) {
 	toolNoSlash := ManifestToolItem{
 		Name:       "custom-tool",
 		Repository: "custom-tool-repo", // no slash
-		BinaryName: "",                // empty binary name falls back to tool.Name
+		BinaryName: "",                 // empty binary name falls back to tool.Name
 	}
 	updated, err := updateSingleTool(ctx, client404, toolNoSlash, binDir, "", false, &stdout, &stderr)
 	if err == nil || updated {
@@ -738,7 +738,6 @@ func TestUpdateSingleTool_ErrorsAndRepoPrefix(t *testing.T) {
 		t.Fatalf("expected error when no asset matches, got err=%v updated=%v", err, updated)
 	}
 }
-
 
 func TestResolveLocalAPI_Extended(t *testing.T) {
 	// 1. Env override
@@ -954,7 +953,3 @@ func TestCleanStaleBackups_ExpiredFiles(t *testing.T) {
 		t.Fatal("expected fresh file to remain")
 	}
 }
-
-
-
-

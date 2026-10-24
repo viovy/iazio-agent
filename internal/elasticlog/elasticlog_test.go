@@ -177,4 +177,3 @@ func TestElasticlog_HelpersAndWarn(t *testing.T) {
 		t.Fatalf("expected 0 dropped count")
 	}
 }
-

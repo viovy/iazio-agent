@@ -271,4 +271,3 @@ func (d *DockerRunner) Signal(pid int, sig string) error {
 func (d *DockerRunner) Wait(pid int) (int, error) {
 	return d.host.Wait(pid)
 }
-

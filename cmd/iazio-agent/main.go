@@ -20,8 +20,8 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/auth"
-	"github.com/viovy/iazio-agent/internal/elasticlog"
 	"github.com/viovy/iazio-agent/internal/controlplane"
+	"github.com/viovy/iazio-agent/internal/elasticlog"
 	"github.com/viovy/iazio-agent/internal/harness"
 	"github.com/viovy/iazio-agent/internal/inventory"
 	"github.com/viovy/iazio-agent/internal/preflight"
@@ -168,6 +168,17 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			runCtx, cancel := context.WithCancel(ctx)
 			defer cancel()
 
+			watchdog.StartSystemdWatchdog(runCtx)
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				binPath := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+				if runtime.GOOS == "windows" {
+					binPath += ".exe"
+				}
+				go func() {
+					_ = service.ReconcileServiceConfiguration(home, binPath, nil)
+				}()
+			}
+
 			sup := supervisor.New(time.Now)
 			var client controlplane.Client
 
@@ -180,10 +191,14 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				var tools []controlplane.Tool
 				for _, t := range classified {
 					tools = append(tools, controlplane.Tool{
-						Name:    t.Name,
-						Path:    t.Path,
-						Version: t.Version,
-						Status:  t.Status,
+						Name:             t.Name,
+						Path:             t.Path,
+						Version:          t.Version,
+						Status:           t.Status,
+						ServiceInstalled: t.ServiceInstalled,
+						ServiceType:      t.ServiceType,
+						ServiceStatus:    t.ServiceStatus,
+						Capabilities:     t.Capabilities,
 					})
 				}
 				return tools

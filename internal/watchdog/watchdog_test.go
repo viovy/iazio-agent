@@ -432,7 +432,3 @@ func TestWatchdog_SpawnerError(t *testing.T) {
 		t.Fatalf("expected LastError to contain 'spawn failed', got %q", j.LastError)
 	}
 }
-
-
-
-
