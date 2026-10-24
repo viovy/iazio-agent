@@ -299,6 +299,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				},
 			)
 
+			var willRestart atomic.Bool
+
 			eagerUpdater = supervisor.NewEagerToolUpdater(
 				sup,
 				repoMonitor,
@@ -309,9 +311,11 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						_ = client.Heartbeat(c, host, getTools(), false)
 					}
 					defer func() {
-						updatingTools.Store(false)
-						if api != "" {
-							_ = client.Heartbeat(c, host, getTools(), false)
+						if !willRestart.Load() {
+							updatingTools.Store(false)
+							if api != "" {
+								_ = client.Heartbeat(c, host, getTools(), false)
+							}
 						}
 					}()
 
@@ -323,6 +327,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						TargetTools: targetTools,
 					}
 					res, err := performUpdateWithResult(c, opts, stdout, stderr, getenv)
+					if res.AgentUpdated {
+						willRestart.Store(true)
+					}
 					return supervisor.UpdateResult{
 						UpdatedTools: res.UpdatedTools,
 						AgentUpdated: res.AgentUpdated,
@@ -342,7 +349,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			var lastUpdateCheck time.Time
 			var lastUpdateMu sync.Mutex
 
-			doToolUpdate := func(ctx context.Context, targetTools []string, force bool) bool {
+			doToolUpdateDetailed := func(ctx context.Context, targetTools []string, force bool) (supervisor.UpdateResult, bool, error) {
 				tracer := telemetry.GlobalTracer()
 				_, span := tracer.StartSpan(ctx, "agent.tools.update")
 				defer span.End()
@@ -353,26 +360,26 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}
 
 				if eagerUpdater != nil {
-					agentUpdated, deferred, err := eagerUpdater.EvaluateAndTrigger(ctx, targetTools, force)
-					if agentUpdated {
-						span.SetTag("result", "updated")
-						return true
-					}
+					res, deferred, err := eagerUpdater.EvaluateAndTriggerDetailed(ctx, targetTools, force)
 					if err != nil {
 						if errors.Is(err, supervisor.ErrUpdateInProgress) {
 							span.SetTag("result", "queued")
-							return false
+							return res, true, err
 						}
 						span.SetTag("result", "error")
 						span.SetError(err)
-						return false
+						return res, false, err
 					}
 					if deferred {
 						span.SetTag("result", "deferred")
-						return false
+						return res, true, nil
 					}
-					span.SetTag("result", "up-to-date")
-					return false
+					if len(res.UpdatedTools) > 0 || res.AgentUpdated {
+						span.SetTag("result", "updated")
+					} else {
+						span.SetTag("result", "up-to-date")
+					}
+					return res, false, nil
 				}
 
 				if !areAllReposCleanAndHarnessIdle(ctx, client, sup, host, api, force, stdout) {
@@ -383,30 +390,22 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							"action": "tool_update_deferred",
 						})
 					}
-					return false
+					return supervisor.UpdateResult{}, true, nil
 				}
+
 				updatingTools.Store(true)
 				if api != "" {
 					_ = client.Heartbeat(ctx, host, getTools(), false)
 				}
-				var willRestart bool
+				var willRestartFallback bool
 				defer func() {
-					if !willRestart {
+					if !willRestartFallback {
 						updatingTools.Store(false)
 						if api != "" {
 							_ = client.Heartbeat(ctx, host, getTools(), false)
 						}
 					}
 				}()
-
-				if sink != nil {
-					sink.Info(fmt.Sprintf("Tool update check started (force=%t, target=%v)", force, targetTools), map[string]any{
-						"host":   host,
-						"action": "tool_update_started",
-						"force":  force,
-						"tools":  targetTools,
-					})
-				}
 
 				opts := UpdateOptions{
 					Suite:       updateSuite,
@@ -415,57 +414,31 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					Force:       force,
 					TargetTools: targetTools,
 				}
-				res, err := performUpdateWithResult(ctx, opts, stdout, stderr, getenv)
+				upRes, err := performUpdateWithResult(ctx, opts, stdout, stderr, getenv)
+				res := supervisor.UpdateResult{
+					UpdatedTools: upRes.UpdatedTools,
+					AgentUpdated: upRes.AgentUpdated,
+				}
 				if err != nil {
 					span.SetTag("result", "error")
 					span.SetError(err)
-					if stderr != nil {
-						fmt.Fprintf(stderr, "[supervisor] update check error: %v\n", err)
-					}
-					if sink != nil {
-						sink.Error("Tool update check error", err, map[string]any{
-							"host":   host,
-							"action": "tool_update_error",
-						})
-					}
-					return false
+					return res, false, err
 				}
-
-				if len(res.UpdatedTools) > 0 {
+				if upRes.AgentUpdated {
+					willRestartFallback = true
+				}
+				if len(res.UpdatedTools) > 0 || res.AgentUpdated {
 					span.SetTag("result", "updated")
-					span.SetTag("updated_tools", strings.Join(res.UpdatedTools, ","))
-					if sink != nil {
-						sink.Info(fmt.Sprintf("Successfully updated %d tools: %s", len(res.UpdatedTools), strings.Join(res.UpdatedTools, ", ")), map[string]any{
-							"host":          host,
-							"action":        "tool_update_succeeded",
-							"updated_tools": res.UpdatedTools,
-						})
-					}
-					if api != "" {
-						_ = client.PostNotification(ctx, controlplane.NotificationRecord{
-							Title:    "Tool Update Completed",
-							Message:  fmt.Sprintf("Successfully updated %d tools on %s: %s", len(res.UpdatedTools), host, strings.Join(res.UpdatedTools, ", ")),
-							Category: "success",
-							Source:   "iazio-agent",
-							HostID:   host,
-							Metadata: map[string]any{
-								"updated_tools": res.UpdatedTools,
-								"force":         force,
-							},
-						})
-					}
 				} else {
 					span.SetTag("result", "up-to-date")
-					if sink != nil {
-						sink.Info("Tool update check complete: all tools up-to-date", map[string]any{
-							"host":   host,
-							"action": "tool_update_checked",
-						})
-					}
 				}
+				return res, false, nil
+			}
 
-				if res.AgentUpdated {
-					willRestart = true
+			doToolUpdate := func(ctx context.Context, targetTools []string, force bool) bool {
+				res, deferred, err := doToolUpdateDetailed(ctx, targetTools, force)
+				if err != nil || deferred {
+					return false
 				}
 				return res.AgentUpdated
 			}
@@ -675,11 +648,17 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 					// Dispatched agent.tools.update jobs treat force=true so paused/healing repo states
 					// do not prevent the runner host from updating tools, provided harness is not executing.
-					if !doToolUpdate(ctx, tools, true) {
+					res, deferred, err := doToolUpdateDetailed(ctx, tools, true)
+					if err != nil {
+						return fmt.Errorf("tool update failed: %w", err)
+					}
+					if deferred {
 						return fmt.Errorf("tool update deferred: workstation is busy or harness is actively running")
 					}
-					restartOrExecSelf(stdout)
-					cancel()
+					if res.AgentUpdated {
+						restartOrExecSelf(stdout)
+						cancel()
+					}
 					return nil
 				})
 				disp.SetWorktreeResolver(func(repoName string) string {

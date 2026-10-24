@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -68,6 +69,12 @@ func (u *EagerToolUpdater) IsUpdating() bool {
 // If a concurrent update is running, forced or targeted requests are queued and executed
 // sequentially inside the update lock, and any agent binary upgrade triggers a restart (E3).
 func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools []string, force bool) (agentUpdated bool, deferred bool, err error) {
+	res, def, err := u.EvaluateAndTriggerDetailed(ctx, targetTools, force)
+	return res.AgentUpdated, def, err
+}
+
+// EvaluateAndTriggerDetailed performs the eager update returning the full UpdateResult (F-3).
+func (u *EagerToolUpdater) EvaluateAndTriggerDetailed(ctx context.Context, targetTools []string, force bool) (res UpdateResult, deferred bool, err error) {
 	if !u.updateMutex.TryLock() {
 		// Coalesce or queue: if caller requested forced or targeted tools, record pending request (G4, E3)
 		if force || len(targetTools) > 0 {
@@ -87,22 +94,36 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 			}
 			u.hasPending = true
 			u.mu.Unlock()
-			return false, true, ErrUpdateInProgress
+			return UpdateResult{}, true, ErrUpdateInProgress
 		}
-		return false, true, nil
+		return UpdateResult{}, true, nil
 	}
 	defer u.updateMutex.Unlock()
 
-	var anyAgentUpdated bool
+	var aggregateRes UpdateResult
 	var lastErr error
 
 	curTools := targetTools
 	curForce := force
 
 	for {
-		passUpdated, passDeferred, passErr := u.runSinglePass(ctx, curTools, curForce)
-		if passUpdated {
-			anyAgentUpdated = true
+		passRes, passDeferred, passErr := u.runSinglePass(ctx, curTools, curForce)
+		if passRes.AgentUpdated {
+			aggregateRes.AgentUpdated = true
+		}
+		if len(passRes.UpdatedTools) > 0 {
+			for _, ut := range passRes.UpdatedTools {
+				found := false
+				for _, existing := range aggregateRes.UpdatedTools {
+					if existing == ut {
+						found = true
+						break
+					}
+				}
+				if !found {
+					aggregateRes.UpdatedTools = append(aggregateRes.UpdatedTools, ut)
+				}
+			}
 		}
 		if passErr != nil {
 			lastErr = passErr
@@ -112,7 +133,7 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 		if !u.hasPending {
 			u.mu.Unlock()
 			if passDeferred && !curForce {
-				return anyAgentUpdated, true, lastErr
+				return aggregateRes, true, lastErr
 			}
 			break
 		}
@@ -124,27 +145,27 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 		u.mu.Unlock()
 	}
 
-	return anyAgentUpdated, false, lastErr
+	return aggregateRes, false, lastErr
 }
 
-func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []string, force bool) (agentUpdated bool, deferred bool, err error) {
+func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []string, force bool) (res UpdateResult, deferred bool, err error) {
 	u.mu.Lock()
 	if u.updating {
 		u.mu.Unlock()
-		return false, true, nil
+		return UpdateResult{}, true, nil
 	}
 	u.mu.Unlock()
 
-	// 1. Guard check: Is harness executing?
-	if u.sup != nil && u.sup.HasRunningHarness() && !force {
+	// 1. Guard check: Is harness executing? Protects all updates including forced (F-3)
+	if u.sup != nil && u.sup.HasRunningHarness() {
 		reason := "BlockedByActiveHarness"
 		u.emitDeferredOnce(ctx, targetTools, reason, "Tool update deferred: harness execution active on host")
-		return false, true, nil
+		return UpdateResult{}, true, nil
 	}
 
 	// 2. Fleet Git Clean check
 	snap := u.monitor.LastSnapshot()
-	if snap.HarnessActive && !force {
+	if snap.HarnessActive {
 		// If supervisor reports no active harness, snapshot is stale; refresh inspection (M1)
 		if u.sup != nil && !u.sup.HasRunningHarness() {
 			snap = u.monitor.InspectFleet(ctx)
@@ -152,7 +173,7 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 		if snap.HarnessActive {
 			reason := "BlockedByActiveHarness"
 			u.emitDeferredOnce(ctx, targetTools, reason, "Tool update deferred: harness execution active on host")
-			return false, true, nil
+			return UpdateResult{}, true, nil
 		}
 	}
 	if !snap.FleetGitClean && !force {
@@ -161,9 +182,11 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 			snap = u.monitor.InspectFleet(ctx)
 		}
 		if !snap.FleetGitClean {
-			reason := fmt.Sprintf("BlockedByDirtyRepos: %v", snap.DirtyRepoPaths)
-			u.emitDeferredOnce(ctx, targetTools, reason, fmt.Sprintf("Tool update deferred: registered repos are dirty (%s)", strings.Join(snap.DirtyRepoPaths, ", ")))
-			return false, true, nil
+			pathsCopy := append([]string(nil), snap.DirtyRepoPaths...)
+			sort.Strings(pathsCopy)
+			reason := fmt.Sprintf("BlockedByDirtyRepos: %v", pathsCopy)
+			u.emitDeferredOnce(ctx, targetTools, reason, fmt.Sprintf("Tool update deferred: registered repos are dirty (%s)", strings.Join(pathsCopy, ", ")))
+			return UpdateResult{}, true, nil
 		}
 	}
 
@@ -173,12 +196,9 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 		var ok bool
 		releaseHostLock, ok = u.sup.TryAcquireToolUpdate()
 		if !ok {
-			if !force {
-				reason := "BlockedByActiveHarness"
-				u.emitDeferredOnce(ctx, targetTools, reason, "Tool update deferred: harness execution active on host")
-				return false, true, nil
-			}
-			releaseHostLock = u.sup.AcquireToolUpdateForce()
+			reason := "BlockedByActiveHarness"
+			u.emitDeferredOnce(ctx, targetTools, reason, "Tool update deferred: harness execution active on host")
+			return UpdateResult{}, true, nil
 		}
 		if releaseHostLock != nil {
 			defer releaseHostLock()
@@ -199,9 +219,11 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 	if !force {
 		snap2 := u.monitor.InspectFleet(ctx)
 		if !snap2.FleetGitClean {
-			reason := fmt.Sprintf("BlockedByDirtyRepos: %v", snap2.DirtyRepoPaths)
-			u.emitDeferredOnce(ctx, targetTools, reason, fmt.Sprintf("Tool update deferred: registered repos are dirty (%s)", strings.Join(snap2.DirtyRepoPaths, ", ")))
-			return false, true, nil
+			pathsCopy := append([]string(nil), snap2.DirtyRepoPaths...)
+			sort.Strings(pathsCopy)
+			reason := fmt.Sprintf("BlockedByDirtyRepos: %v", pathsCopy)
+			u.emitDeferredOnce(ctx, targetTools, reason, fmt.Sprintf("Tool update deferred: registered repos are dirty (%s)", strings.Join(pathsCopy, ", ")))
+			return UpdateResult{}, true, nil
 		}
 	}
 
@@ -214,7 +236,7 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 	if !force && u.CheckDrift != nil {
 		hasDrift, driftErr := u.CheckDrift(ctx, targetTools)
 		if driftErr == nil && !hasDrift {
-			return false, false, nil
+			return UpdateResult{}, false, nil
 		}
 	}
 
@@ -261,7 +283,7 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 				fmt.Fprintf(os.Stderr, "[eagerupdater] postNotif error (update_failed): %v\n", err)
 			}
 		}
-		return false, false, updateErr
+		return UpdateResult{}, false, updateErr
 	}
 
 	if u.postNotif != nil {
@@ -297,7 +319,7 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 		}
 	}
 
-	return res.AgentUpdated, false, nil
+	return res, false, nil
 }
 
 func (u *EagerToolUpdater) emitDeferredOnce(ctx context.Context, targetTools []string, reason, msg string) {

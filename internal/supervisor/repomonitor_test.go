@@ -597,3 +597,53 @@ func TestEagerToolUpdater_DedupeKeyResetOnCleanPass(t *testing.T) {
 	}
 	mu.Unlock()
 }
+
+func TestEagerToolUpdater_DedupeMultipleDirtyReposOrderAgnostic(t *testing.T) {
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+
+	var deferredNotifs int
+	var mu sync.Mutex
+	notifFn := func(ctx context.Context, rec controlplane.NotificationRecord) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if evt, ok := rec.Metadata["event"].(string); ok && evt == "agent.tool.update_deferred" {
+			deferredNotifs++
+		}
+		return nil
+	}
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
+		return UpdateResult{}, nil
+	}, notifFn)
+
+	// Pass 1: multiple dirty repos in order B, A
+	monitor.mu.Lock()
+	monitor.lastSnapshot = FleetStateSnapshot{
+		FleetGitClean:  false,
+		DirtyRepoPaths: []string{"/work/repo-b", "/work/repo-a"},
+	}
+	monitor.mu.Unlock()
+	_, _, _ = updater.EvaluateAndTrigger(context.Background(), nil, false)
+
+	mu.Lock()
+	if deferredNotifs != 1 {
+		t.Fatalf("expected 1 deferred notif after pass 1, got %d", deferredNotifs)
+	}
+	mu.Unlock()
+
+	// Pass 2: same dirty repos but reported in reversed order A, B
+	monitor.mu.Lock()
+	monitor.lastSnapshot = FleetStateSnapshot{
+		FleetGitClean:  false,
+		DirtyRepoPaths: []string{"/work/repo-a", "/work/repo-b"},
+	}
+	monitor.mu.Unlock()
+	_, _, _ = updater.EvaluateAndTrigger(context.Background(), nil, false)
+
+	mu.Lock()
+	if deferredNotifs != 1 {
+		t.Fatalf("expected still 1 deferred notif after permutation pass (deduped), got %d (F-1)", deferredNotifs)
+	}
+	mu.Unlock()
+}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -314,6 +315,7 @@ func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot 
 		})
 	}
 
+	sort.Strings(dirtyList)
 	snap.FleetGitClean = allClean
 	snap.DirtyRepoPaths = dirtyList
 
