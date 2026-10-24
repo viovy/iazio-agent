@@ -26,19 +26,27 @@ var (
 
 // EagerToolUpdater handles safe atomic binary updates guarded by harness idle and fleet git clean states.
 type EagerToolUpdater struct {
-	mu              sync.Mutex
-	updateMutex     sync.Mutex // host-level execution and update mutex
-	sup             *Sup
-	monitor         *RepoStateMonitor
-	hostID          string
-	doUpdate        func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error)
-	postNotif       func(ctx context.Context, rec controlplane.NotificationRecord) error
-	CheckDrift      func(ctx context.Context, targetTools []string) (bool, error)
-	lastDeferredKey string
-	updating        bool
-	pendingTools    []string
-	pendingForce    bool
-	hasPending      bool
+	mu               sync.Mutex
+	updateMutex      sync.Mutex // host-level execution and update mutex
+	sup              *Sup
+	monitor          *RepoStateMonitor
+	hostID           string
+	doUpdate         func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error)
+	doUpdateDetailed func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error)
+	postNotif        func(ctx context.Context, rec controlplane.NotificationRecord) error
+	CheckDrift       func(ctx context.Context, targetTools []string) (bool, error)
+	lastDeferredKey  string
+	updating         bool
+	pendingTools     []string
+	pendingForce     bool
+	pendingVersions  map[string]string // tool -> targetVersion (F1)
+	hasPending       bool
+
+	// Per-tool failure backoff tracking to prevent retry storms on un-installable tools (F5)
+	failedAttempts   map[string]int
+	failedLastTime   map[string]time.Time
+	suiteFailCount   int
+	suiteLastFailure time.Time
 }
 
 // NewEagerToolUpdater constructs an EagerToolUpdater.
@@ -50,12 +58,104 @@ func NewEagerToolUpdater(
 	postNotif func(ctx context.Context, rec controlplane.NotificationRecord) error,
 ) *EagerToolUpdater {
 	return &EagerToolUpdater{
-		sup:       sup,
-		monitor:   monitor,
-		hostID:    hostID,
-		doUpdate:  doUpdate,
-		postNotif: postNotif,
+		sup:             sup,
+		monitor:         monitor,
+		hostID:          hostID,
+		doUpdate:        doUpdate,
+		postNotif:       postNotif,
+		pendingVersions: make(map[string]string),
+		failedAttempts:  make(map[string]int),
+		failedLastTime:  make(map[string]time.Time),
 	}
+}
+
+// SetDetailedUpdateFunc configures an update callback that supports explicit TargetVersion (F1).
+func (u *EagerToolUpdater) SetDetailedUpdateFunc(fn func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error)) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.doUpdateDetailed = fn
+}
+
+func (u *EagerToolUpdater) shouldBackoff(targetTools []string, force bool) bool {
+	if force {
+		return false
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	now := time.Now()
+	// Single-tool targeted check
+	if len(targetTools) == 1 {
+		tool := targetTools[0]
+		count := u.failedAttempts[tool]
+		if count > 0 {
+			backoff := calculateBackoff(count)
+			if now.Sub(u.failedLastTime[tool]) < backoff {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Full suite / unconstrained check
+	if len(targetTools) == 0 {
+		if u.suiteFailCount > 0 {
+			backoff := calculateBackoff(u.suiteFailCount)
+			if now.Sub(u.suiteLastFailure) < backoff {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func calculateBackoff(attempts int) time.Duration {
+	if attempts <= 0 {
+		return 0
+	}
+	b := 30 * time.Second * (1 << (attempts - 1))
+	if b > 5*time.Minute || b <= 0 {
+		b = 5 * time.Minute
+	}
+	return b
+}
+
+func (u *EagerToolUpdater) recordFailure(targetTools []string, force bool) {
+	if force {
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	now := time.Now()
+	if len(targetTools) == 1 {
+		tool := targetTools[0]
+		if u.failedAttempts == nil {
+			u.failedAttempts = make(map[string]int)
+			u.failedLastTime = make(map[string]time.Time)
+		}
+		u.failedAttempts[tool]++
+		u.failedLastTime[tool] = now
+		return
+	}
+	if len(targetTools) == 0 {
+		u.suiteFailCount++
+		u.suiteLastFailure = now
+	}
+}
+
+func (u *EagerToolUpdater) recordSuccess(targetTools []string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if len(targetTools) == 1 {
+		tool := targetTools[0]
+		delete(u.failedAttempts, tool)
+		delete(u.failedLastTime, tool)
+		return
+	}
+	u.suiteFailCount = 0
+	u.suiteLastFailure = time.Time{}
+	u.failedAttempts = make(map[string]int)
+	u.failedLastTime = make(map[string]time.Time)
 }
 
 // IsUpdating reports whether a tool update is currently in-flight.
@@ -73,13 +173,21 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 	return res.AgentUpdated, def, err
 }
 
-// EvaluateAndTriggerDetailed performs the eager update returning the full UpdateResult (F-3).
-func (u *EagerToolUpdater) EvaluateAndTriggerDetailed(ctx context.Context, targetTools []string, force bool) (res UpdateResult, deferred bool, err error) {
+// EvaluateAndTriggerDetailed performs the eager update returning the full UpdateResult (F-3, F1).
+func (u *EagerToolUpdater) EvaluateAndTriggerDetailed(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (res UpdateResult, deferred bool, err error) {
+	var requestedVersion string
+	if len(targetVersion) > 0 {
+		requestedVersion = targetVersion[0]
+	}
+
 	if !u.updateMutex.TryLock() {
-		// Coalesce or queue: if caller requested forced or targeted tools, record pending request (G4, E3)
+		// Coalesce or queue: if caller requested forced or targeted tools, record pending request (G4, E3, F1)
 		if force || len(targetTools) > 0 {
 			u.mu.Lock()
 			u.pendingForce = u.pendingForce || force
+			if u.pendingVersions == nil {
+				u.pendingVersions = make(map[string]string)
+			}
 			for _, t := range targetTools {
 				found := false
 				for _, pt := range u.pendingTools {
@@ -90,6 +198,9 @@ func (u *EagerToolUpdater) EvaluateAndTriggerDetailed(ctx context.Context, targe
 				}
 				if !found {
 					u.pendingTools = append(u.pendingTools, t)
+				}
+				if requestedVersion != "" && len(targetTools) == 1 {
+					u.pendingVersions[t] = requestedVersion
 				}
 			}
 			u.hasPending = true
@@ -105,9 +216,10 @@ func (u *EagerToolUpdater) EvaluateAndTriggerDetailed(ctx context.Context, targe
 
 	curTools := targetTools
 	curForce := force
+	curVersion := requestedVersion
 
 	for {
-		passRes, passDeferred, passErr := u.runSinglePass(ctx, curTools, curForce)
+		passRes, passDeferred, passErr := u.runSinglePass(ctx, curTools, curForce, curVersion)
 		if passRes.AgentUpdated {
 			aggregateRes.AgentUpdated = true
 		}
@@ -139,22 +251,32 @@ func (u *EagerToolUpdater) EvaluateAndTriggerDetailed(ctx context.Context, targe
 		}
 		curTools = u.pendingTools
 		curForce = u.pendingForce
+		curVersion = ""
+		if len(curTools) == 1 && u.pendingVersions != nil {
+			curVersion = u.pendingVersions[curTools[0]]
+		}
 		u.hasPending = false
 		u.pendingForce = false
 		u.pendingTools = nil
+		u.pendingVersions = nil
 		u.mu.Unlock()
 	}
 
 	return aggregateRes, false, lastErr
 }
 
-func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []string, force bool) (res UpdateResult, deferred bool, err error) {
+func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (res UpdateResult, deferred bool, err error) {
 	u.mu.Lock()
 	if u.updating {
 		u.mu.Unlock()
 		return UpdateResult{}, true, nil
 	}
 	u.mu.Unlock()
+
+	// Guard against failure retry storm via backoff (F5)
+	if u.shouldBackoff(targetTools, force) {
+		return UpdateResult{}, false, nil
+	}
 
 	// 1. Guard check: Is harness executing? Protects all updates including forced (F-3)
 	if u.sup != nil && u.sup.HasRunningHarness() {
@@ -235,7 +357,10 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 	// Check drift before emitting update_started to eliminate noise on unforced no-op ticks (E4)
 	if !force && u.CheckDrift != nil {
 		hasDrift, driftErr := u.CheckDrift(ctx, targetTools)
-		if driftErr == nil && !hasDrift {
+		if driftErr != nil {
+			// Fail open on drift inspection error (F3): log and proceed with update
+			fmt.Fprintf(os.Stderr, "[eagerupdater] CheckDrift error, proceeding with update (fail-open): %v\n", driftErr)
+		} else if !hasDrift {
 			return UpdateResult{}, false, nil
 		}
 	}
@@ -263,10 +388,20 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 	}
 
 	start := time.Now()
-	res, updateErr := u.doUpdate(ctx, targetTools, force)
+	var updateErr error
+	var tv string
+	if len(targetVersion) > 0 {
+		tv = targetVersion[0]
+	}
+	if u.doUpdateDetailed != nil {
+		res, updateErr = u.doUpdateDetailed(ctx, targetTools, force, tv)
+	} else if u.doUpdate != nil {
+		res, updateErr = u.doUpdate(ctx, targetTools, force)
+	}
 	durationMs := time.Since(start).Milliseconds()
 
 	if updateErr != nil {
+		u.recordFailure(targetTools, force)
 		if u.postNotif != nil {
 			if err := u.postNotif(ctx, controlplane.NotificationRecord{
 				Title:    "Tool Update Failed",
@@ -285,6 +420,8 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 		}
 		return UpdateResult{}, false, updateErr
 	}
+
+	u.recordSuccess(targetTools)
 
 	if u.postNotif != nil {
 		if len(res.UpdatedTools) > 0 {

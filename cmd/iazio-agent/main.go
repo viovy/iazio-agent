@@ -301,48 +301,50 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			)
 
 			var willRestart atomic.Bool
-			var requestedTargetVersion string
-			var requestedTargetMu sync.Mutex
+
+			performUpdateFn := func(c context.Context, targetTools []string, force bool, targetVersion ...string) (supervisor.UpdateResult, error) {
+				updatingTools.Store(true)
+				if api != "" {
+					_ = client.Heartbeat(c, host, getTools(), false)
+				}
+				defer func() {
+					if !willRestart.Load() {
+						updatingTools.Store(false)
+						if api != "" {
+							_ = client.Heartbeat(c, host, getTools(), false)
+						}
+					}
+				}()
+
+				var tv string
+				if len(targetVersion) > 0 {
+					tv = targetVersion[0]
+				}
+
+				opts := UpdateOptions{
+					Suite:         updateSuite,
+					Profile:       profile,
+					API:           api,
+					Force:         force,
+					TargetTools:   targetTools,
+					TargetVersion: tv,
+				}
+				res, err := performUpdateWithResult(c, opts, stdout, stderr, getenv)
+				if res.AgentUpdated {
+					willRestart.Store(true)
+				}
+				return supervisor.UpdateResult{
+					UpdatedTools: res.UpdatedTools,
+					AgentUpdated: res.AgentUpdated,
+				}, err
+			}
 
 			eagerUpdater = supervisor.NewEagerToolUpdater(
 				sup,
 				repoMonitor,
 				host,
 				func(c context.Context, targetTools []string, force bool) (supervisor.UpdateResult, error) {
-					updatingTools.Store(true)
-					if api != "" {
-						_ = client.Heartbeat(c, host, getTools(), false)
-					}
-					defer func() {
-						if !willRestart.Load() {
-							updatingTools.Store(false)
-							if api != "" {
-								_ = client.Heartbeat(c, host, getTools(), false)
-							}
-						}
-					}()
-
-					requestedTargetMu.Lock()
-					tv := requestedTargetVersion
-					requestedTargetVersion = ""
-					requestedTargetMu.Unlock()
-
-					opts := UpdateOptions{
-						Suite:         updateSuite,
-						Profile:       profile,
-						API:           api,
-						Force:         force,
-						TargetTools:   targetTools,
-						TargetVersion: tv,
-					}
-					res, err := performUpdateWithResult(c, opts, stdout, stderr, getenv)
-					if res.AgentUpdated {
-						willRestart.Store(true)
-					}
-					return supervisor.UpdateResult{
-						UpdatedTools: res.UpdatedTools,
-						AgentUpdated: res.AgentUpdated,
-					}, err
+					return performUpdateFn(c, targetTools, force)
 				},
 				func(c context.Context, nr controlplane.NotificationRecord) error {
 					if api == "" {
@@ -351,63 +353,28 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return client.PostNotification(c, nr)
 				},
 			)
+			eagerUpdater.SetDetailedUpdateFunc(performUpdateFn)
 
-			eagerUpdater.CheckDrift = func(ctx context.Context, targetTools []string) (bool, error) {
-				if api == "" {
-					return false, nil
+			if api != "" {
+				driftFetcher := &supervisor.HTTPDriftFetcher{
+					Client:  &http.Client{Timeout: 10 * time.Second},
+					API:     api,
+					Profile: profile,
+					OS:      runtime.GOOS,
+					Arch:    runtime.GOARCH,
 				}
-				manifestURL := fmt.Sprintf("%s/v1/fleet/manifest?profile=%s&os=%s&arch=%s",
-					strings.TrimRight(api, "/"), profile, runtime.GOOS, runtime.GOARCH)
-				req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
-				if err != nil {
-					return false, err
-				}
-				client := &http.Client{Timeout: 10 * time.Second}
-				resp, err := client.Do(req)
-				if err != nil {
-					return false, nil
-				}
-				defer resp.Body.Close()
-				if resp.StatusCode != http.StatusOK {
-					return false, nil
-				}
-				var manifest ManifestResponse
-				if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
-					return false, nil
-				}
-				binDir := resolveInstallDir(manifest.InstallRoots, getenv)
-
-				targetMap := make(map[string]bool)
-				for _, name := range targetTools {
-					targetMap[strings.ToLower(strings.TrimSpace(name))] = true
-				}
-
-				for _, tool := range manifest.Tools {
-					if len(targetMap) > 0 && !targetMap[strings.ToLower(tool.Name)] && !targetMap[strings.ToLower(tool.BinaryName)] {
-						continue
+				eagerUpdater.CheckDrift = func(ctx context.Context, targetTools []string) (bool, error) {
+					manifest, err := driftFetcher.FetchManifest(ctx)
+					if err != nil {
+						// Return non-nil error to fail-open (F3)
+						return false, err
 					}
-					binName := tool.BinaryName
-					if binName == "" {
-						binName = tool.Name
-					}
-					if runtime.GOOS == "windows" && !strings.HasSuffix(binName, ".exe") {
-						binName += ".exe"
-					}
-					destPath := filepath.Join(binDir, binName)
-					curVer := inventory.InspectInstalledVersion(destPath)
-					if curVer == "" {
-						return true, nil
-					}
-					targetVer := strings.TrimPrefix(strings.TrimSpace(tool.TargetVersion), "v")
-					if targetVer == "" || targetVer == "latest" {
-						continue
-					}
-					cleanCurVer := strings.TrimPrefix(strings.TrimSpace(curVer), "v")
-					if cleanCurVer != targetVer && !strings.Contains(cleanCurVer, targetVer) {
-						return true, nil
-					}
+					binDir := resolveInstallDir(ManifestInstallRoots{
+						Unix:    ManifestInstallRootPaths{Primary: manifest.InstallRoots.Unix.Primary, Fallback: manifest.InstallRoots.Unix.Fallback},
+						Windows: ManifestInstallRootPaths{Primary: manifest.InstallRoots.Windows.Primary, Fallback: manifest.InstallRoots.Windows.Fallback},
+					}, getenv)
+					return supervisor.EvaluateDrift(manifest, inventory.InspectInstalledVersion, binDir, targetTools, runtime.GOOS)
 				}
-				return false, nil
 			}
 
 			// Start repoMonitor AFTER eagerUpdater is fully constructed to eliminate initialization race
@@ -420,9 +387,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				var tv string
 				if len(targetVersion) > 0 && targetVersion[0] != "" {
 					tv = targetVersion[0]
-					requestedTargetMu.Lock()
-					requestedTargetVersion = tv
-					requestedTargetMu.Unlock()
 				}
 				tracer := telemetry.GlobalTracer()
 				_, span := tracer.StartSpan(ctx, "agent.tools.update")
@@ -437,7 +401,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}
 
 				if eagerUpdater != nil {
-					res, deferred, err := eagerUpdater.EvaluateAndTriggerDetailed(ctx, targetTools, force)
+					res, deferred, err := eagerUpdater.EvaluateAndTriggerDetailed(ctx, targetTools, force, targetVersion...)
 					if err != nil {
 						if errors.Is(err, supervisor.ErrUpdateInProgress) {
 							span.SetTag("result", "queued")

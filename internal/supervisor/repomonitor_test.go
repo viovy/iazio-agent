@@ -647,3 +647,46 @@ func TestEagerToolUpdater_DedupeMultipleDirtyReposOrderAgnostic(t *testing.T) {
 	}
 	mu.Unlock()
 }
+
+func TestRepoStateMonitor_LevelTriggeredCleanPasses(t *testing.T) {
+	tempDir := t.TempDir()
+	initTestGitRepo(t, tempDir)
+
+	sup := New(time.Now)
+	var onFleetCleanCalls int
+	monitor := NewRepoStateMonitor(
+		sup,
+		"test-host",
+		2*time.Minute,
+		func() ([]RepoConfigItem, error) {
+			return []RepoConfigItem{
+				{Path: tempDir, Alias: "test-repo"},
+			}, nil
+		},
+		nil,
+		nil,
+		func(snap FleetStateSnapshot) {
+			onFleetCleanCalls++
+		},
+	)
+
+	ctx := context.Background()
+
+	// Pass 1: Repo is clean -> onFleetClean must fire
+	snap1 := monitor.InspectFleet(ctx)
+	if !snap1.FleetGitClean {
+		t.Fatalf("expected clean fleet on pass 1, got dirty: %v", snap1.DirtyRepoPaths)
+	}
+	if onFleetCleanCalls != 1 {
+		t.Fatalf("expected onFleetClean to be called once on pass 1, got %d", onFleetCleanCalls)
+	}
+
+	// Pass 2: Repo remains clean -> level trigger must fire AGAIN (consecutive clean pass, F7)
+	snap2 := monitor.InspectFleet(ctx)
+	if !snap2.FleetGitClean {
+		t.Fatalf("expected clean fleet on pass 2, got dirty: %v", snap2.DirtyRepoPaths)
+	}
+	if onFleetCleanCalls != 2 {
+		t.Fatalf("expected onFleetClean to be called twice across consecutive clean passes (level-triggered), got %d", onFleetCleanCalls)
+	}
+}

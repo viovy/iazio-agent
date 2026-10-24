@@ -1112,3 +1112,63 @@ func TestUpdateSingleTool_MissingChecksumsAssetFailsClosed(t *testing.T) {
 		t.Fatalf("expected tool to be updated with override")
 	}
 }
+
+func TestUpdate_SingleToolGuard(t *testing.T) {
+	// F2, F7: TargetVersion can only be applied when exactly one tool is targeted
+	optsSuite := UpdateOptions{
+		Suite:         true,
+		TargetVersion: "0.0.492",
+	}
+	res, err := performUpdateWithResult(context.Background(), optsSuite, nil, nil, nil)
+	if err == nil {
+		t.Fatalf("expected error when TargetVersion is used with Suite=true (multiple targets), got res=%+v", res)
+	}
+	if !strings.Contains(err.Error(), "can only be specified when exactly one tool is targeted") {
+		t.Fatalf("expected single-tool guard error message, got %v", err)
+	}
+
+	optsMulti := UpdateOptions{
+		TargetTools:   []string{"autopilot", "iazio-agent"},
+		TargetVersion: "0.0.492",
+	}
+	res2, err2 := performUpdateWithResult(context.Background(), optsMulti, nil, nil, nil)
+	if err2 == nil {
+		t.Fatalf("expected error when TargetVersion is used with multiple TargetTools, got res=%+v", res2)
+	}
+	if !strings.Contains(err2.Error(), "can only be specified when exactly one tool is targeted") {
+		t.Fatalf("expected single-tool guard error message, got %v", err2)
+	}
+}
+
+func TestUpdate_CLIFlagParsing_Version(t *testing.T) {
+	// F7: Test CLI flag parsing for --version and --version=
+	var opts1 UpdateOptions
+	args1 := []string{"--version", "0.0.492", "--tool", "autopilot"}
+	for i := 0; i < len(args1); i++ {
+		switch {
+		case args1[i] == "--version" && i+1 < len(args1):
+			i++
+			opts1.TargetVersion = args1[i]
+		case strings.HasPrefix(args1[i], "--version="):
+			opts1.TargetVersion = strings.TrimPrefix(args1[i], "--version=")
+		case args1[i] == "--tool" && i+1 < len(args1):
+			i++
+			opts1.TargetTools = append(opts1.TargetTools, args1[i])
+		}
+	}
+	if opts1.TargetVersion != "0.0.492" || len(opts1.TargetTools) != 1 || opts1.TargetTools[0] != "autopilot" {
+		t.Fatalf("unexpected parsed opts: %+v", opts1)
+	}
+
+	var opts2 UpdateOptions
+	args2 := []string{"--version=0.0.493"}
+	for i := 0; i < len(args2); i++ {
+		switch {
+		case strings.HasPrefix(args2[i], "--version="):
+			opts2.TargetVersion = strings.TrimPrefix(args2[i], "--version=")
+		}
+	}
+	if opts2.TargetVersion != "0.0.493" {
+		t.Fatalf("expected TargetVersion 0.0.493, got %s", opts2.TargetVersion)
+	}
+}

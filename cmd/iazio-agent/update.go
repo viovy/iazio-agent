@@ -290,6 +290,11 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 		}
 	}
 
+	// Single-tool guard (F2): TargetVersion can only be applied when exactly one tool is targeted
+	if opts.TargetVersion != "" && len(targets) != 1 {
+		return res, fmt.Errorf("target_version %q can only be specified when exactly one tool is targeted, got %d targets", opts.TargetVersion, len(targets))
+	}
+
 	for _, tool := range targets {
 		if opts.TargetVersion != "" {
 			tool.TargetVersion = opts.TargetVersion

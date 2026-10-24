@@ -656,7 +656,7 @@ func TestDispatcher_ToolsUpdate_Success(t *testing.T) {
 		return &Job{
 			ID:           "job-tu-1",
 			Type:         JobTypeToolsUpdate,
-			Payload:      json.RawMessage(`{"tools":["autopilot"],"force":true}`),
+			Payload:      json.RawMessage(`{"tools":["autopilot"],"force":true,"target_version":"0.0.492"}`),
 			FencingToken: 42,
 		}, nil
 	}
@@ -668,6 +668,9 @@ func TestDispatcher_ToolsUpdate_Success(t *testing.T) {
 		toolUpdateCalled = true
 		if len(tools) != 1 || tools[0] != "autopilot" || !force {
 			t.Errorf("unexpected tool update params: tools=%v force=%v", tools, force)
+		}
+		if len(targetVersion) == 0 || targetVersion[0] != "0.0.492" {
+			t.Errorf("expected targetVersion 0.0.492 to propagate (F7), got %v", targetVersion)
 		}
 		return nil
 	})
