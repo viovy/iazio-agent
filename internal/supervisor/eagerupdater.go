@@ -319,38 +319,51 @@ func (u *EagerToolUpdater) EvaluateAndTriggerDetailed(ctx context.Context, targe
 // EvaluateAndTriggerWithOpts performs the eager update using TriggerOptions (N2, N3, N5).
 func (u *EagerToolUpdater) EvaluateAndTriggerWithOpts(ctx context.Context, opts TriggerOptions) (res UpdateResult, deferred bool, err error) {
 	if !u.updateMutex.TryLock() {
-		// Coalesce or queue: record individual tool requests without merging (R4, R5, N5)
+		// Coalesce or queue: record individual tool requests without merging (R4, R5, N5, R3)
 		if opts.Force || len(opts.TargetTools) > 0 || opts.BypassDirty || opts.TargetVersion != "" {
 			u.mu.Lock()
-			var queueFull bool
+			var candidates []PendingToolRequest
 			if len(opts.TargetTools) > 0 {
 				for _, t := range opts.TargetTools {
-					_, full := u.appendPendingRequestLocked(PendingToolRequest{
-						Tool:          t,
+					candidates = append(candidates, PendingToolRequest{
+						Tool:          strings.ToLower(strings.TrimSpace(t)),
 						Force:         opts.Force,
 						TargetVersion: opts.TargetVersion,
 						BypassDirty:   opts.BypassDirty,
 					})
-					if full {
-						queueFull = true
-					}
 				}
 			} else {
-				_, full := u.appendPendingRequestLocked(PendingToolRequest{
+				candidates = append(candidates, PendingToolRequest{
 					Tool:          "",
 					Force:         opts.Force,
 					TargetVersion: opts.TargetVersion,
 					BypassDirty:   opts.BypassDirty,
 				})
-				if full {
-					queueFull = true
+			}
+
+			var toAppend []PendingToolRequest
+			for _, c := range candidates {
+				dup := false
+				for _, p := range u.pendingRequests {
+					if p.Tool == c.Tool && p.Force == c.Force && p.TargetVersion == c.TargetVersion && p.BypassDirty == c.BypassDirty {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					toAppend = append(toAppend, c)
 				}
 			}
-			u.hasPending = len(u.pendingRequests) > 0
-			u.mu.Unlock()
-			if queueFull {
+
+			// Atomic all-or-nothing capacity check (R3)
+			if len(u.pendingRequests)+len(toAppend) > maxPendingRequests {
+				u.mu.Unlock()
 				return UpdateResult{}, false, ErrQueueFull
 			}
+
+			u.pendingRequests = append(u.pendingRequests, toAppend...)
+			u.hasPending = len(u.pendingRequests) > 0
+			u.mu.Unlock()
 			return UpdateResult{}, true, ErrUpdateInProgress
 		}
 		return UpdateResult{}, true, nil
@@ -470,17 +483,15 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 		return UpdateResult{}, false, nil
 	}
 
-	// Filter out backed-off tools on unforced runs so healthy tools can update (N1-R):
+	// Filter out backed-off tools on unforced background runs so healthy tools can update (N1-R, R2):
 	effectiveTargets := targetTools
-	if !force {
+	if !force && !bypassDirty {
 		if len(targetTools) > 0 {
 			filtered := u.FilterActiveTools(targetTools)
-			if len(filtered) == 0 && !bypassDirty {
+			if len(filtered) == 0 {
 				return UpdateResult{}, false, nil
 			}
-			if len(filtered) > 0 {
-				effectiveTargets = filtered
-			}
+			effectiveTargets = filtered
 		} else if u.ListSuiteTools != nil {
 			allSuite, err := u.ListSuiteTools(ctx)
 			if err == nil && len(allSuite) > 0 {

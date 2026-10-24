@@ -392,18 +392,28 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						Unix:    ManifestInstallRootPaths{Primary: manifest.InstallRoots.Unix.Primary, Fallback: manifest.InstallRoots.Unix.Fallback},
 						Windows: ManifestInstallRootPaths{Primary: manifest.InstallRoots.Windows.Primary, Fallback: manifest.InstallRoots.Windows.Fallback},
 					}, getenv)
-					return supervisor.EvaluateDrift(&activeManifest, inventory.InspectInstalledVersion, binDir, targetTools, runtime.GOOS)
+					checkTools := targetTools
+					if len(checkTools) == 0 && !updateSuite {
+						checkTools = []string{"iazio-agent"}
+					}
+					return supervisor.EvaluateDrift(&activeManifest, inventory.InspectInstalledVersion, binDir, checkTools, runtime.GOOS)
 				}
-				eagerUpdater.ListSuiteTools = func(ctx context.Context) ([]string, error) {
-					manifest, err := driftFetcher.FetchManifest(ctx)
-					if err != nil {
-						return nil, err
+				if updateSuite {
+					eagerUpdater.ListSuiteTools = func(ctx context.Context) ([]string, error) {
+						manifest, err := driftFetcher.FetchManifest(ctx)
+						if err != nil {
+							return nil, err
+						}
+						var names []string
+						for _, t := range manifest.Tools {
+							names = append(names, t.Name)
+						}
+						return names, nil
 					}
-					var names []string
-					for _, t := range manifest.Tools {
-						names = append(names, t.Name)
+				} else {
+					eagerUpdater.ListSuiteTools = func(ctx context.Context) ([]string, error) {
+						return []string{"iazio-agent"}, nil
 					}
-					return names, nil
 				}
 			}
 
