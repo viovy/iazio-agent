@@ -394,6 +394,17 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}, getenv)
 					return supervisor.EvaluateDrift(&activeManifest, inventory.InspectInstalledVersion, binDir, targetTools, runtime.GOOS)
 				}
+				eagerUpdater.ListSuiteTools = func(ctx context.Context) ([]string, error) {
+					manifest, err := driftFetcher.FetchManifest(ctx)
+					if err != nil {
+						return nil, err
+					}
+					var names []string
+					for _, t := range manifest.Tools {
+						names = append(names, t.Name)
+					}
+					return names, nil
+				}
 			}
 
 			// Start repoMonitor AFTER eagerUpdater is fully constructed to eliminate initialization race
@@ -742,6 +753,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						BypassDirty:   true,
 					})
 					if err != nil {
+						if errors.Is(err, supervisor.ErrQueueFull) {
+							return fmt.Errorf("tool update request rejected: %w", err)
+						}
 						if errors.Is(err, supervisor.ErrUpdateInProgress) {
 							if stdout != nil {
 								fmt.Fprintf(stdout, "[dispatcher] tool update already in progress; request queued (N3)\n")

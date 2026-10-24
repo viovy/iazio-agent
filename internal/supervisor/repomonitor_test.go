@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -839,6 +840,9 @@ func TestEagerToolUpdater_SuitePartialFailureBackoffAndNotificationDedupe(t *tes
 	}
 
 	updater := NewEagerToolUpdater(sup, monitor, "test-host", nil, postNotif)
+	updater.ListSuiteTools = func(ctx context.Context) ([]string, error) {
+		return []string{"bad-tool"}, nil
+	}
 	updater.SetDetailedUpdateFunc(func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error) {
 		mu.Lock()
 		callCount++
@@ -908,4 +912,117 @@ func TestEagerToolUpdater_SuitePartialFailureBackoffAndNotificationDedupe(t *tes
 		t.Fatalf("expected no new partial failure notifications on pass 2 (deduped, N1), got %d", partialNotifCountPass2)
 	}
 	notifMu.Unlock()
+}
+
+func TestEagerToolUpdater_HealthyToolUpdatesWhileAnotherBackedOff(t *testing.T) {
+	// N1-R: When tool-broken is backed off and tool-healthy is drifting,
+	// unforced suite update should update tool-healthy and NOT attempt tool-broken.
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	var attemptedTools []string
+	var mu sync.Mutex
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", nil, nil)
+	updater.ListSuiteTools = func(ctx context.Context) ([]string, error) {
+		return []string{"tool-broken", "tool-healthy"}, nil
+	}
+	updater.SetDetailedUpdateFunc(func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error) {
+		mu.Lock()
+		attemptedTools = append([]string(nil), targetTools...)
+		mu.Unlock()
+		return UpdateResult{
+			UpdatedTools: []string{"tool-healthy"},
+		}, nil
+	})
+
+	// Pre-record failure for tool-broken so it is within backoff window
+	updater.recordToolFailure("tool-broken")
+	if !updater.IsToolInBackoff("tool-broken") {
+		t.Fatalf("expected tool-broken to be in backoff")
+	}
+
+	res, def, err := updater.EvaluateAndTriggerDetailed(context.Background(), nil, false)
+	if err != nil || def {
+		t.Fatalf("expected update to succeed, err=%v def=%v", err, def)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(attemptedTools) != 1 || attemptedTools[0] != "tool-healthy" {
+		t.Fatalf("expected only tool-healthy to be attempted (N1-R), got: %v", attemptedTools)
+	}
+	if len(res.UpdatedTools) != 1 || res.UpdatedTools[0] != "tool-healthy" {
+		t.Fatalf("expected tool-healthy in updated tools, got: %v", res.UpdatedTools)
+	}
+}
+
+func TestEagerToolUpdater_QueueCapAndDedupe(t *testing.T) {
+	// N5-R: Verify dedupe of identical pending requests and ErrQueueFull on overflow
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	blockCh := make(chan struct{})
+	doneCh := make(chan struct{})
+	var once sync.Once
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", nil, nil)
+	updater.SetDetailedUpdateFunc(func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error) {
+		once.Do(func() { close(doneCh) })
+		<-blockCh
+		return UpdateResult{UpdatedTools: targetTools}, nil
+	})
+
+	ctx := context.Background()
+
+	// Launch background update that holds the lock
+	go func() {
+		_, _, _ = updater.EvaluateAndTriggerDetailed(ctx, []string{"running-tool"}, true)
+	}()
+
+	<-doneCh // ensure lock is held
+
+	// 1. Deduplication: queue identical request multiple times
+	for i := 0; i < 5; i++ {
+		_, def, err := updater.EvaluateAndTriggerWithOpts(ctx, TriggerOptions{
+			TargetTools: []string{"dedupe-tool"},
+			Force:       true,
+		})
+		if !def || !errors.Is(err, ErrUpdateInProgress) {
+			t.Fatalf("expected ErrUpdateInProgress, got err=%v def=%v", err, def)
+		}
+	}
+
+	updater.mu.Lock()
+	pendingCount := len(updater.pendingRequests)
+	updater.mu.Unlock()
+	if pendingCount != 1 {
+		t.Fatalf("expected deduplication to keep exactly 1 request in queue (N5), got %d", pendingCount)
+	}
+
+	// 2. Queue capacity: fill up to maxPendingRequests (32)
+	for i := pendingCount; i < maxPendingRequests; i++ {
+		toolName := fmt.Sprintf("fill-tool-%d", i)
+		_, _, err := updater.EvaluateAndTriggerWithOpts(ctx, TriggerOptions{
+			TargetTools: []string{toolName},
+			Force:       true,
+		})
+		if !errors.Is(err, ErrUpdateInProgress) {
+			t.Fatalf("expected ErrUpdateInProgress while under cap, got %v", err)
+		}
+	}
+
+	// 3. Overflow beyond cap must return ErrQueueFull (N5-R)
+	_, _, overflowErr := updater.EvaluateAndTriggerWithOpts(ctx, TriggerOptions{
+		TargetTools: []string{"overflow-tool"},
+		Force:       true,
+	})
+	if !errors.Is(overflowErr, ErrQueueFull) {
+		t.Fatalf("expected ErrQueueFull on queue overflow (N5-R), got %v", overflowErr)
+	}
+
+	// Unblock background update
+	close(blockCh)
 }
