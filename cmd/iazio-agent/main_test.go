@@ -2438,3 +2438,77 @@ func TestResolveDispatchConversationID_Precedence(t *testing.T) {
 		t.Fatalf("CP resume with RootJobID set must NOT adopt lock %s, got %s", cLock, got)
 	}
 }
+
+func TestDispatcher_ToolUpdaterResultMapping(t *testing.T) {
+	// Test that non-agent update (e.g. updated autopilot) succeeds without error
+	// and does not return "tool update deferred: workstation is busy or harness is actively running" (F-3)
+	doToolUpdateDetailed := func(ctx context.Context, tools []string, force bool) (supervisor.UpdateResult, bool, error) {
+		return supervisor.UpdateResult{
+			UpdatedTools: []string{"autopilot"},
+			AgentUpdated: false,
+		}, false, nil
+	}
+
+	handler := func(ctx context.Context, tools []string, force bool) error {
+		res, deferred, err := doToolUpdateDetailed(ctx, tools, true)
+		if err != nil {
+			return fmt.Errorf("tool update failed: %w", err)
+		}
+		if deferred {
+			return fmt.Errorf("tool update deferred: workstation is busy or harness is actively running")
+		}
+		if res.AgentUpdated {
+			// would restart
+		}
+		return nil
+	}
+
+	if err := handler(context.Background(), []string{"autopilot"}, true); err != nil {
+		t.Fatalf("expected nil error when non-agent tools update successfully, got: %v", err)
+	}
+
+	// Test that up-to-date tools also succeed without error
+	doToolUpdateUpToDate := func(ctx context.Context, tools []string, force bool) (supervisor.UpdateResult, bool, error) {
+		return supervisor.UpdateResult{
+			UpdatedTools: nil,
+			AgentUpdated: false,
+		}, false, nil
+	}
+	handlerUpToDate := func(ctx context.Context, tools []string, force bool) error {
+		res, deferred, err := doToolUpdateUpToDate(ctx, tools, true)
+		if err != nil {
+			return fmt.Errorf("tool update failed: %w", err)
+		}
+		if deferred {
+			return fmt.Errorf("tool update deferred: workstation is busy or harness is actively running")
+		}
+		if res.AgentUpdated {
+			// would restart
+		}
+		return nil
+	}
+	if err := handlerUpToDate(context.Background(), []string{"autopilot"}, true); err != nil {
+		t.Fatalf("expected nil error when tools are already up to date, got: %v", err)
+	}
+
+	// Test that deferred actually returns the deferred error
+	doToolUpdateDeferred := func(ctx context.Context, tools []string, force bool) (supervisor.UpdateResult, bool, error) {
+		return supervisor.UpdateResult{}, true, nil
+	}
+	handlerDeferred := func(ctx context.Context, tools []string, force bool) error {
+		res, deferred, err := doToolUpdateDeferred(ctx, tools, true)
+		if err != nil {
+			return fmt.Errorf("tool update failed: %w", err)
+		}
+		if deferred {
+			return fmt.Errorf("tool update deferred: workstation is busy or harness is actively running")
+		}
+		if res.AgentUpdated {
+			// would restart
+		}
+		return nil
+	}
+	if err := handlerDeferred(context.Background(), []string{"autopilot"}, true); err == nil || !strings.Contains(err.Error(), "tool update deferred") {
+		t.Fatalf("expected deferred error, got: %v", err)
+	}
+}

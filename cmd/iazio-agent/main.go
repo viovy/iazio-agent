@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -50,7 +51,24 @@ func main() {
 var initialUpdateDelay = 5 * time.Second
 var isTesting = false
 
+type safeWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *safeWriter) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
 func execute(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
+	if stdout != nil {
+		stdout = &safeWriter{w: stdout}
+	}
+	if stderr != nil {
+		stderr = &safeWriter{w: stderr}
+	}
 	if getenv == nil {
 		getenv = os.Getenv
 	}
@@ -206,10 +224,132 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				return tools
 			}
 
+			repoPollInterval := 2 * time.Minute
+			if raw := getenv("IAZIO_AGENT_REPO_POLL_INTERVAL"); raw != "" {
+				if d, err := time.ParseDuration(raw); err == nil {
+					repoPollInterval = d
+				} else {
+					fmt.Fprintf(stderr, "[RepoMonitor] WARN: invalid IAZIO_AGENT_REPO_POLL_INTERVAL %q: %v. Defaulting to 2m\n", raw, err)
+				}
+			}
+			if repoPollInterval < 1*time.Minute || repoPollInterval > 5*time.Minute {
+				fmt.Fprintf(stderr, "[RepoMonitor] WARN: IAZIO_AGENT_REPO_POLL_INTERVAL %v outside permitted range [1m..5m]; clamping\n", repoPollInterval)
+				if repoPollInterval < 1*time.Minute {
+					repoPollInterval = 1 * time.Minute
+				} else {
+					repoPollInterval = 5 * time.Minute
+				}
+			}
+
+			var eagerUpdater *supervisor.EagerToolUpdater
+
+			getRepos := func() ([]supervisor.RepoConfigItem, error) {
+				if api == "" {
+					return nil, nil
+				}
+				fetchCtx, fetchCancel := context.WithTimeout(runCtx, 10*time.Second)
+				defer fetchCancel()
+				detail, err := client.GetHost(fetchCtx, host)
+				if err != nil {
+					return nil, fmt.Errorf("failed to fetch host repos: %w", err)
+				}
+				if len(detail.Repos) == 0 {
+					return nil, nil
+				}
+				var items []supervisor.RepoConfigItem
+				for _, r := range detail.Repos {
+					p := r.WorktreePath
+					if p == "" {
+						p = r.Path
+					}
+					if p != "" {
+						items = append(items, supervisor.RepoConfigItem{
+							Path:  p,
+							Alias: r.Alias,
+						})
+					}
+				}
+				return items, nil
+			}
+
+			repoMonitor := supervisor.NewRepoStateMonitor(
+				sup,
+				host,
+				repoPollInterval,
+				getRepos,
+				func(c context.Context, h string, st []controlplane.RepoRuntimeStatus) error {
+					return client.PostRepoStatus(c, h, st)
+				},
+				func(c context.Context, nr controlplane.NotificationRecord) error {
+					if api == "" {
+						return nil
+					}
+					return client.PostNotification(c, nr)
+				},
+				func(snap supervisor.FleetStateSnapshot) {
+					if eagerUpdater != nil && !updatingTools.Load() {
+						go func() {
+							agentUpdated, _, _ := eagerUpdater.EvaluateAndTrigger(runCtx, nil, false)
+							if agentUpdated {
+								restartOrExecSelf(stdout)
+								cancel()
+							}
+						}()
+					}
+				},
+			)
+
+			var willRestart atomic.Bool
+
+			eagerUpdater = supervisor.NewEagerToolUpdater(
+				sup,
+				repoMonitor,
+				host,
+				func(c context.Context, targetTools []string, force bool) (supervisor.UpdateResult, error) {
+					updatingTools.Store(true)
+					if api != "" {
+						_ = client.Heartbeat(c, host, getTools(), false)
+					}
+					defer func() {
+						if !willRestart.Load() {
+							updatingTools.Store(false)
+							if api != "" {
+								_ = client.Heartbeat(c, host, getTools(), false)
+							}
+						}
+					}()
+
+					opts := UpdateOptions{
+						Suite:       updateSuite,
+						Profile:     profile,
+						API:         api,
+						Force:       force,
+						TargetTools: targetTools,
+					}
+					res, err := performUpdateWithResult(c, opts, stdout, stderr, getenv)
+					if res.AgentUpdated {
+						willRestart.Store(true)
+					}
+					return supervisor.UpdateResult{
+						UpdatedTools: res.UpdatedTools,
+						AgentUpdated: res.AgentUpdated,
+					}, err
+				},
+				func(c context.Context, nr controlplane.NotificationRecord) error {
+					if api == "" {
+						return nil
+					}
+					return client.PostNotification(c, nr)
+				},
+			)
+
+			// Start repoMonitor AFTER eagerUpdater is fully constructed to eliminate initialization race
+			repoMonitor.Start(runCtx)
+
 			var lastUpdateCheck time.Time
 			var lastUpdateMu sync.Mutex
 
-			doToolUpdate := func(ctx context.Context, targetTools []string, force bool) bool {
+			doToolUpdateDetailed := func(ctx context.Context, targetTools []string, force bool) (supervisor.UpdateResult, bool, error) {
 				tracer := telemetry.GlobalTracer()
 				_, span := tracer.StartSpan(ctx, "agent.tools.update")
 				defer span.End()
@@ -217,6 +357,29 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				span.SetTag("force", fmt.Sprintf("%t", force))
 				if len(targetTools) > 0 {
 					span.SetTag("target_tools", strings.Join(targetTools, ","))
+				}
+
+				if eagerUpdater != nil {
+					res, deferred, err := eagerUpdater.EvaluateAndTriggerDetailed(ctx, targetTools, force)
+					if err != nil {
+						if errors.Is(err, supervisor.ErrUpdateInProgress) {
+							span.SetTag("result", "queued")
+							return res, true, err
+						}
+						span.SetTag("result", "error")
+						span.SetError(err)
+						return res, false, err
+					}
+					if deferred {
+						span.SetTag("result", "deferred")
+						return res, true, nil
+					}
+					if len(res.UpdatedTools) > 0 || res.AgentUpdated {
+						span.SetTag("result", "updated")
+					} else {
+						span.SetTag("result", "up-to-date")
+					}
+					return res, false, nil
 				}
 
 				if !areAllReposCleanAndHarnessIdle(ctx, client, sup, host, api, force, stdout) {
@@ -227,30 +390,22 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							"action": "tool_update_deferred",
 						})
 					}
-					return false
+					return supervisor.UpdateResult{}, true, nil
 				}
+
 				updatingTools.Store(true)
 				if api != "" {
 					_ = client.Heartbeat(ctx, host, getTools(), false)
 				}
-				var willRestart bool
+				var willRestartFallback bool
 				defer func() {
-					if !willRestart {
+					if !willRestartFallback {
 						updatingTools.Store(false)
 						if api != "" {
 							_ = client.Heartbeat(ctx, host, getTools(), false)
 						}
 					}
 				}()
-
-				if sink != nil {
-					sink.Info(fmt.Sprintf("Tool update check started (force=%t, target=%v)", force, targetTools), map[string]any{
-						"host":   host,
-						"action": "tool_update_started",
-						"force":  force,
-						"tools":  targetTools,
-					})
-				}
 
 				opts := UpdateOptions{
 					Suite:       updateSuite,
@@ -259,57 +414,31 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					Force:       force,
 					TargetTools: targetTools,
 				}
-				res, err := performUpdateWithResult(ctx, opts, stdout, stderr, getenv)
+				upRes, err := performUpdateWithResult(ctx, opts, stdout, stderr, getenv)
+				res := supervisor.UpdateResult{
+					UpdatedTools: upRes.UpdatedTools,
+					AgentUpdated: upRes.AgentUpdated,
+				}
 				if err != nil {
 					span.SetTag("result", "error")
 					span.SetError(err)
-					if stderr != nil {
-						fmt.Fprintf(stderr, "[supervisor] update check error: %v\n", err)
-					}
-					if sink != nil {
-						sink.Error("Tool update check error", err, map[string]any{
-							"host":   host,
-							"action": "tool_update_error",
-						})
-					}
-					return false
+					return res, false, err
 				}
-
-				if len(res.UpdatedTools) > 0 {
+				if upRes.AgentUpdated {
+					willRestartFallback = true
+				}
+				if len(res.UpdatedTools) > 0 || res.AgentUpdated {
 					span.SetTag("result", "updated")
-					span.SetTag("updated_tools", strings.Join(res.UpdatedTools, ","))
-					if sink != nil {
-						sink.Info(fmt.Sprintf("Successfully updated %d tools: %s", len(res.UpdatedTools), strings.Join(res.UpdatedTools, ", ")), map[string]any{
-							"host":          host,
-							"action":        "tool_update_succeeded",
-							"updated_tools": res.UpdatedTools,
-						})
-					}
-					if api != "" {
-						_ = client.PostNotification(ctx, controlplane.NotificationRecord{
-							Title:    "Tool Update Completed",
-							Message:  fmt.Sprintf("Successfully updated %d tools on %s: %s", len(res.UpdatedTools), host, strings.Join(res.UpdatedTools, ", ")),
-							Category: "success",
-							Source:   "iazio-agent",
-							HostID:   host,
-							Metadata: map[string]any{
-								"updated_tools": res.UpdatedTools,
-								"force":         force,
-							},
-						})
-					}
 				} else {
 					span.SetTag("result", "up-to-date")
-					if sink != nil {
-						sink.Info("Tool update check complete: all tools up-to-date", map[string]any{
-							"host":   host,
-							"action": "tool_update_checked",
-						})
-					}
 				}
+				return res, false, nil
+			}
 
-				if res.AgentUpdated {
-					willRestart = true
+			doToolUpdate := func(ctx context.Context, targetTools []string, force bool) bool {
+				res, deferred, err := doToolUpdateDetailed(ctx, targetTools, force)
+				if err != nil || deferred {
+					return false
 				}
 				return res.AgentUpdated
 			}
@@ -332,16 +461,15 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						t := pendingRemoteTools
 						f := pendingRemoteForce
 						isRemote := hasPendingRemote
+						if isRemote {
+							hasPendingRemote = false
+							pendingRemoteTools = nil
+							pendingRemoteForce = false
+						}
 						pendingRemoteMu.Unlock()
 
 						if isRemote {
-							if doToolUpdate(runCtx, t, f) {
-								pendingRemoteMu.Lock()
-								hasPendingRemote = false
-								pendingRemoteMu.Unlock()
-								return true
-							}
-							return false
+							return doToolUpdate(runCtx, t, f)
 						}
 						return doToolUpdate(runCtx, nil, false)
 					}
@@ -392,13 +520,12 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						pendingRemoteMu.Lock()
 						t := pendingRemoteTools
 						f := pendingRemoteForce
+						pendingRemoteTools = nil
+						pendingRemoteForce = false
+						hasPendingRemote = false
 						pendingRemoteMu.Unlock()
 
 						if doToolUpdate(runCtx, t, f) {
-							pendingRemoteMu.Lock()
-							hasPendingRemote = false
-							pendingRemoteMu.Unlock()
-
 							restartOrExecSelf(stdout)
 							cancel()
 						}
@@ -496,6 +623,17 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					if home, err := os.UserHomeDir(); err == nil && home != "" {
 						_, _ = preflight.FreeSpace(home)
 					}
+					// If harness finished and idle, trigger eager update check if fleet clean
+					if len(reaped) > 0 && eagerUpdater != nil && !updatingTools.Load() {
+						go func() {
+							repoMonitor.InspectFleet(runCtx)
+							agentUpdated, _, _ := eagerUpdater.EvaluateAndTrigger(runCtx, nil, false)
+							if agentUpdated {
+								restartOrExecSelf(stdout)
+								cancel()
+							}
+						}()
+					}
 					return nil
 				},
 			}
@@ -510,11 +648,17 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 					// Dispatched agent.tools.update jobs treat force=true so paused/healing repo states
 					// do not prevent the runner host from updating tools, provided harness is not executing.
-					if !doToolUpdate(ctx, tools, true) {
+					res, deferred, err := doToolUpdateDetailed(ctx, tools, true)
+					if err != nil {
+						return fmt.Errorf("tool update failed: %w", err)
+					}
+					if deferred {
 						return fmt.Errorf("tool update deferred: workstation is busy or harness is actively running")
 					}
-					restartOrExecSelf(stdout)
-					cancel()
+					if res.AgentUpdated {
+						restartOrExecSelf(stdout)
+						cancel()
+					}
 					return nil
 				})
 				disp.SetWorktreeResolver(func(repoName string) string {
