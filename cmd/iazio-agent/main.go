@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -27,6 +28,7 @@ import (
 	"github.com/viovy/iazio-agent/internal/preflight"
 	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/service"
+	"github.com/viovy/iazio-agent/internal/sessionstore"
 	"github.com/viovy/iazio-agent/internal/supervisor"
 	"github.com/viovy/iazio-agent/internal/telemetry"
 	"github.com/viovy/iazio-agent/internal/watchdog"
@@ -678,6 +680,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}
 				if convID == "" && lockInfo.ConversationID != "" && lockInfo.Status != "COMPLETED" && (a.Kind == "resume" || (a.StoryID != "" && lockInfo.StoryID == a.StoryID)) {
 					convID = lockInfo.ConversationID
+				}
+				if convID != "" && !sessionstore.IsValidConversationID(convID) {
+					log.Printf("[agent] ignoring invalid conversation id format: %q", convID)
+					convID = ""
 				}
 
 				var spawnExtras []string

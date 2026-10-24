@@ -102,6 +102,56 @@ func DefaultResolver() *Resolver {
 	}
 }
 
+// IsValidConversationID checks if a conversation ID has a safe format (alphanumeric, hyphens, underscores, max 128 chars).
+// It prevents directory traversal and injection.
+func IsValidConversationID(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" || len(id) > 128 {
+		return false
+	}
+	if strings.Contains(id, "..") || strings.Contains(id, "/") || strings.Contains(id, "\\") {
+		return false
+	}
+	for _, r := range id {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// SessionExists reports whether the given conversation ID exists locally on disk
+// in the brain directory, conversations SQLite databases, or local worktree.
+func (r *Resolver) SessionExists(conversationID string) bool {
+	conversationID = strings.TrimSpace(conversationID)
+	if !IsValidConversationID(conversationID) {
+		return false
+	}
+	// 1. Brain directory check
+	if r != nil && r.BrainDir != "" {
+		brainPath := filepath.Join(r.BrainDir, conversationID)
+		if fi, err := os.Stat(brainPath); err == nil && fi.IsDir() {
+			return true
+		}
+	}
+	// 2. Antigravity conversations storage directories
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		flavors := []string{"antigravity-cli", "antigravity-ide", "antigravity"}
+		for _, fl := range flavors {
+			p := filepath.Join(home, ".gemini", fl, "conversations", conversationID+".db")
+			if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+				return true
+			}
+			brainP := filepath.Join(home, ".gemini", fl, "brain", conversationID)
+			if fi, err := os.Stat(brainP); err == nil && fi.IsDir() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ResolveLatest finds the most recent conversation ID for the worktree across all tiers.
 func (r *Resolver) ResolveLatest(worktreePath string) (*Session, error) {
 	sessions, err := r.ListRecent(worktreePath, 1)
