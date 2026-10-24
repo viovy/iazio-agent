@@ -206,6 +206,104 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				return tools
 			}
 
+			repoPollInterval := 2 * time.Minute
+			if raw := getenv("IAZIO_AGENT_REPO_POLL_INTERVAL"); raw != "" {
+				if d, err := time.ParseDuration(raw); err == nil {
+					repoPollInterval = d
+				}
+			}
+
+			var eagerUpdater *supervisor.EagerToolUpdater
+
+			getRepos := func() []supervisor.RepoConfigItem {
+				if api == "" {
+					return nil
+				}
+				detail, err := client.GetHost(runCtx, host)
+				if err != nil || len(detail.Repos) == 0 {
+					return nil
+				}
+				var items []supervisor.RepoConfigItem
+				for _, r := range detail.Repos {
+					p := r.WorktreePath
+					if p == "" {
+						p = r.Path
+					}
+					if p != "" {
+						items = append(items, supervisor.RepoConfigItem{
+							Path:  p,
+							Alias: r.Alias,
+						})
+					}
+				}
+				return items
+			}
+
+			repoMonitor := supervisor.NewRepoStateMonitor(
+				sup,
+				host,
+				repoPollInterval,
+				getRepos,
+				func(c context.Context, h string, st []controlplane.RepoRuntimeStatus) error {
+					return client.PostRepoStatus(c, h, st)
+				},
+				func(c context.Context, nr controlplane.NotificationRecord) error {
+					if api == "" {
+						return nil
+					}
+					return client.PostNotification(c, nr)
+				},
+				func(snap supervisor.FleetStateSnapshot) {
+					if eagerUpdater != nil && !updatingTools.Load() {
+						go func() {
+							agentUpdated, deferred, err := eagerUpdater.EvaluateAndTrigger(runCtx, nil, false)
+							if err == nil && !deferred && agentUpdated {
+								restartOrExecSelf(stdout)
+								cancel()
+							}
+						}()
+					}
+				},
+			)
+			repoMonitor.Start(runCtx)
+
+			eagerUpdater = supervisor.NewEagerToolUpdater(
+				sup,
+				repoMonitor,
+				host,
+				func(c context.Context, targetTools []string, force bool) (supervisor.UpdateResult, error) {
+					updatingTools.Store(true)
+					if api != "" {
+						_ = client.Heartbeat(c, host, getTools(), false)
+					}
+					defer func() {
+						updatingTools.Store(false)
+						if api != "" {
+							_ = client.Heartbeat(c, host, getTools(), false)
+						}
+					}()
+
+					opts := UpdateOptions{
+						Suite:       updateSuite,
+						Profile:     profile,
+						API:         api,
+						Force:       force,
+						TargetTools: targetTools,
+					}
+					res, err := performUpdateWithResult(c, opts, stdout, stderr, getenv)
+					return supervisor.UpdateResult{
+						UpdatedTools: res.UpdatedTools,
+						AgentUpdated: res.AgentUpdated,
+					}, err
+				},
+				func(c context.Context, nr controlplane.NotificationRecord) error {
+					if api == "" {
+						return nil
+					}
+					return client.PostNotification(c, nr)
+				},
+			)
+
 			var lastUpdateCheck time.Time
 			var lastUpdateMu sync.Mutex
 
@@ -217,6 +315,25 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				span.SetTag("force", fmt.Sprintf("%t", force))
 				if len(targetTools) > 0 {
 					span.SetTag("target_tools", strings.Join(targetTools, ","))
+				}
+
+				if eagerUpdater != nil {
+					agentUpdated, deferred, err := eagerUpdater.EvaluateAndTrigger(ctx, targetTools, force)
+					if err != nil {
+						span.SetTag("result", "error")
+						span.SetError(err)
+						return false
+					}
+					if deferred {
+						span.SetTag("result", "deferred")
+						return false
+					}
+					if agentUpdated {
+						span.SetTag("result", "updated")
+						return true
+					}
+					span.SetTag("result", "up-to-date")
+					return false
 				}
 
 				if !areAllReposCleanAndHarnessIdle(ctx, client, sup, host, api, force, stdout) {
@@ -495,6 +612,16 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					// Host resource telemetry check
 					if home, err := os.UserHomeDir(); err == nil && home != "" {
 						_, _ = preflight.FreeSpace(home)
+					}
+					// If harness finished and idle, trigger eager update check if fleet clean
+					if len(reaped) > 0 && eagerUpdater != nil && !updatingTools.Load() {
+						go func() {
+							agentUpdated, deferred, err := eagerUpdater.EvaluateAndTrigger(runCtx, nil, false)
+							if err == nil && !deferred && agentUpdated {
+								restartOrExecSelf(stdout)
+								cancel()
+							}
+						}()
 					}
 					return nil
 				},

@@ -612,6 +612,12 @@ type RepoRuntimeStatus struct {
 	Alias                string    `json:"alias,omitempty"`
 	IsClean              bool      `json:"is_clean"`
 	Branch               string    `json:"branch,omitempty"`
+	HeadSHA              string    `json:"head_sha,omitempty"`
+	DirtyFilesCount      int       `json:"dirty_files_count,omitempty"`
+	UntrackedFilesCount  int       `json:"untracked_files_count,omitempty"`
+	Ahead                int       `json:"ahead,omitempty"`
+	Behind               int       `json:"behind,omitempty"`
+	HasActiveGitLock     bool      `json:"has_active_git_lock,omitempty"`
 	Porcelain            string    `json:"porcelain,omitempty"`
 	SubmodulesClean      bool      `json:"submodules_clean"`
 	DirtySubmodules      []string  `json:"dirty_submodules,omitempty"`
