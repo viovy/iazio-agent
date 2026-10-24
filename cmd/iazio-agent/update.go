@@ -189,6 +189,17 @@ func performUpdate(ctx context.Context, opts UpdateOptions, stdout, stderr io.Wr
 
 func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, stderr io.Writer, getenv func(string) string) (UpdateResult, error) {
 	var res UpdateResult
+
+	// Single-tool guard (F2, F7): TargetVersion can only be applied when exactly one tool is targeted
+	if opts.TargetVersion != "" {
+		if opts.Suite {
+			return res, fmt.Errorf("target_version %q can only be specified when exactly one tool is targeted, got suite with multiple targets", opts.TargetVersion)
+		}
+		if len(opts.TargetTools) > 1 {
+			return res, fmt.Errorf("target_version %q can only be specified when exactly one tool is targeted, got %d targets", opts.TargetVersion, len(opts.TargetTools))
+		}
+	}
+
 	if getenv == nil {
 		getenv = os.Getenv
 	}
@@ -214,23 +225,23 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 		return res, fmt.Errorf("create manifest request: %w", err)
 	}
 
+	var manifest ManifestResponse
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		// Control plane might be unreachable in offline or mock test runs
-		return res, nil
-	}
-	defer resp.Body.Close()
-
-	var manifest ManifestResponse
-	if resp.StatusCode == http.StatusNotFound {
-		// Fallback to baseline default profile if control plane hasn't registered profile yet
+		// Control plane might be unreachable in offline or mock test runs; fallback to baseline
 		manifest = defaultBaselineManifest(opts.Profile)
-	} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return res, fmt.Errorf("fetch manifest returned HTTP %d", resp.StatusCode)
 	} else {
-		if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
-			return res, fmt.Errorf("decode manifest: %w", err)
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			// Fallback to baseline default profile if control plane hasn't registered profile yet
+			manifest = defaultBaselineManifest(opts.Profile)
+		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return res, fmt.Errorf("fetch manifest returned HTTP %d", resp.StatusCode)
+		} else {
+			if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
+				return res, fmt.Errorf("decode manifest: %w", err)
+			}
 		}
 	}
 
