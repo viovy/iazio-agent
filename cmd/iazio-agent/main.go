@@ -305,13 +305,17 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			performUpdateFn := func(c context.Context, targetTools []string, force bool, targetVersion ...string) (supervisor.UpdateResult, error) {
 				updatingTools.Store(true)
 				if api != "" {
-					_ = client.Heartbeat(c, host, getTools(), false)
+					if err := client.Heartbeat(c, host, getTools(), false); err != nil && stderr != nil {
+						fmt.Fprintf(stderr, "[agent] pre-update heartbeat error: %v\n", err)
+					}
 				}
 				defer func() {
 					if !willRestart.Load() {
 						updatingTools.Store(false)
 						if api != "" {
-							_ = client.Heartbeat(c, host, getTools(), false)
+							if err := client.Heartbeat(c, host, getTools(), false); err != nil && stderr != nil {
+								fmt.Fprintf(stderr, "[agent] post-update heartbeat error: %v\n", err)
+							}
 						}
 					}
 				}()
@@ -459,14 +463,18 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 
 				updatingTools.Store(true)
 				if api != "" {
-					_ = client.Heartbeat(ctx, host, getTools(), false)
+					if err := client.Heartbeat(ctx, host, getTools(), false); err != nil && stderr != nil {
+						fmt.Fprintf(stderr, "[agent] fallback pre-update heartbeat error: %v\n", err)
+					}
 				}
 				var willRestartFallback bool
 				defer func() {
 					if !willRestartFallback {
 						updatingTools.Store(false)
 						if api != "" {
-							_ = client.Heartbeat(ctx, host, getTools(), false)
+							if err := client.Heartbeat(ctx, host, getTools(), false); err != nil && stderr != nil {
+								fmt.Fprintf(stderr, "[agent] fallback post-update heartbeat error: %v\n", err)
+							}
 						}
 					}
 				}()

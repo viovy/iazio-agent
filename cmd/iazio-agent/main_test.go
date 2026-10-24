@@ -2534,12 +2534,14 @@ func TestBuildEagerHooks_SuiteOptOutAndBackoff(t *testing.T) {
 	}
 	fetcher := &testManifestFetcher{manifest: manifest}
 
+	tempDir := t.TempDir()
+
 	// 1. Suite update disabled: listSuiteTools returns ONLY ["iazio-agent"]
 	checkDriftFalse, listSuiteFalse := buildEagerHooks(
 		false,
 		fetcher,
 		func(tool string) bool { return tool == "tool-b" },
-		func(_ *supervisor.FleetManifest) string { return t.TempDir() },
+		func(_ *supervisor.FleetManifest) string { return tempDir },
 		runtime.GOOS,
 	)
 
@@ -2552,11 +2554,11 @@ func TestBuildEagerHooks_SuiteOptOutAndBackoff(t *testing.T) {
 	}
 
 	// 2. Suite update enabled: listSuiteTools returns all tools in manifest
-	_, listSuiteTrue := buildEagerHooks(
+	checkDriftTrue, listSuiteTrue := buildEagerHooks(
 		true,
 		fetcher,
 		func(tool string) bool { return tool == "tool-b" },
-		func(_ *supervisor.FleetManifest) string { return t.TempDir() },
+		func(_ *supervisor.FleetManifest) string { return tempDir },
 		runtime.GOOS,
 	)
 
@@ -2568,6 +2570,23 @@ func TestBuildEagerHooks_SuiteOptOutAndBackoff(t *testing.T) {
 		t.Fatalf("expected all 3 tools when suite enabled, got: %v", allTools)
 	}
 
-	// 3. Check drift runs without error and excludes backed off tools
-	_, _ = checkDriftFalse(context.Background(), nil)
+	// 3. Seed binaries: iazio-agent at 1.0.0 (up to date), tool-c at 3.0.0 (up to date). tool-b is missing/drifting but in backoff.
+	if runtime.GOOS != "windows" {
+		agentScript := filepath.Join(tempDir, "iazio-agent")
+		_ = os.WriteFile(agentScript, []byte("#!/bin/sh\necho 'iazio-agent 1.0.0'\n"), 0755)
+		toolCScript := filepath.Join(tempDir, "tool-c")
+		_ = os.WriteFile(toolCScript, []byte("#!/bin/sh\necho 'tool-c 3.0.0'\n"), 0755)
+
+		// checkDriftFalse only checks iazio-agent -> no drift
+		driftFalse, err := checkDriftFalse(context.Background(), nil)
+		if err != nil || driftFalse {
+			t.Fatalf("expected false drift for opt-out when iazio-agent is current, got %v err=%v", driftFalse, err)
+		}
+
+		// checkDriftTrue checks manifest but excludes backed-off tool-b -> no drift
+		driftTrue, err := checkDriftTrue(context.Background(), nil)
+		if err != nil || driftTrue {
+			t.Fatalf("expected false drift when only backed-off tool drifts, got %v err=%v", driftTrue, err)
+		}
+	}
 }

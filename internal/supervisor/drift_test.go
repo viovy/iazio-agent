@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 type mockDriftFetcher struct {
@@ -161,5 +162,68 @@ func TestDrift_HTTPDriftFetcher_E2E(t *testing.T) {
 	}
 	if len(m.Tools) != 1 || m.Tools[0].TargetVersion != "0.0.492" {
 		t.Fatalf("unexpected fetched manifest: %+v", m)
+	}
+}
+
+func TestHTTPDriftFetcher_TTLCache(t *testing.T) {
+	// L3: Verify that HTTPDriftFetcher caches manifest across TTL and does not cache errors
+	var callCount int
+	var failNext bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if failNext {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"tools":[{"name":"cached-tool","target_version":"1.0.0"}]}`))
+	}))
+	defer srv.Close()
+
+	fetcher := &HTTPDriftFetcher{
+		API:     srv.URL,
+		Client:  srv.Client(),
+		Profile: "generic",
+	}
+
+	// 1. First fetch: network request succeeds
+	m1, err := fetcher.FetchManifest(context.Background())
+	if err != nil || m1 == nil || callCount != 1 {
+		t.Fatalf("expected initial fetch to hit server, count=%d err=%v", callCount, err)
+	}
+
+	// 2. Second fetch within TTL: served from memory cache without network hit
+	m2, err := fetcher.FetchManifest(context.Background())
+	if err != nil || m2 == nil || callCount != 1 {
+		t.Fatalf("expected second fetch to hit cache, count=%d err=%v", callCount, err)
+	}
+
+	// 3. Expiration: fast-forward expiresAt
+	fetcher.mu.Lock()
+	fetcher.expiresAt = time.Now().Add(-1 * time.Second)
+	fetcher.mu.Unlock()
+
+	// 4. Third fetch after expiration: fetches fresh from server
+	m3, err := fetcher.FetchManifest(context.Background())
+	if err != nil || m3 == nil || callCount != 2 {
+		t.Fatalf("expected third fetch after TTL to hit server, count=%d err=%v", callCount, err)
+	}
+
+	// 5. Error path: errors are not cached
+	fetcher.mu.Lock()
+	fetcher.expiresAt = time.Now().Add(-1 * time.Second)
+	fetcher.mu.Unlock()
+	failNext = true
+
+	_, errFail := fetcher.FetchManifest(context.Background())
+	if errFail == nil {
+		t.Fatalf("expected error on failure")
+	}
+
+	// Next immediate call when server recovers should succeed (not serving error)
+	failNext = false
+	m4, errRecover := fetcher.FetchManifest(context.Background())
+	if errRecover != nil || m4 == nil {
+		t.Fatalf("expected recovery after server error, err=%v", errRecover)
 	}
 }
