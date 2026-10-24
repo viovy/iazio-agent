@@ -117,6 +117,11 @@ type Tool struct {
 	ServiceType      string   `json:"service_type,omitempty"`
 	ServiceStatus    string   `json:"service_status,omitempty"`
 	Capabilities     []string `json:"capabilities,omitempty"`
+	Installed        bool     `json:"installed,omitempty"`
+	InstallationType string   `json:"installation_type,omitempty"`
+	ActiveState      string   `json:"active_state,omitempty"`
+	WatchdogEnabled  bool     `json:"watchdog_enabled,omitempty"`
+	ConfigStatus     string   `json:"config_status,omitempty"`
 }
 
 // InspectToolService probes whether a tool is installed as an OS service (e.g. systemd user service),
@@ -144,7 +149,7 @@ func InspectToolService(toolName, goos string) (installed bool, svcType string, 
 					caps = append(caps, "path_watcher")
 				}
 				if toolName == "iazio-agent" || toolName == "iazio-harvester" {
-					caps = append(caps, "self_update", "dev_install")
+					caps = append(caps, "self_update", "dev_install", "user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1")
 				}
 
 				// Check runtime status via systemctl
@@ -177,7 +182,7 @@ func InspectToolService(toolName, goos string) (installed bool, svcType string, 
 				installed = true
 				svcType = "launchd_agent"
 				svcStatus = "installed"
-				caps = append(caps, "auto_restart", "path_watcher", "self_update", "dev_install")
+				caps = append(caps, "auto_restart", "path_watcher", "self_update", "dev_install", "user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1")
 				return
 			}
 		}
@@ -189,7 +194,7 @@ func InspectToolService(toolName, goos string) (installed bool, svcType string, 
 			installed = true
 			svcType = "task_scheduler"
 			svcStatus = "installed"
-			caps = append(caps, "auto_restart", "self_update", "dev_install")
+			caps = append(caps, "auto_restart", "self_update", "dev_install", "user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1")
 			return
 		}
 	}
@@ -267,6 +272,28 @@ func scan(dirs []string, goos string) []Tool {
 				out[idx].ServiceType = sType
 				out[idx].ServiceStatus = sStatus
 				out[idx].Capabilities = caps
+				out[idx].Installed = installed || out[idx].Executable || out[idx].Status == "OK"
+				if sType == "user_service" {
+					out[idx].InstallationType = "systemd-user"
+				} else if sType != "" && sType != "none" {
+					out[idx].InstallationType = sType
+				} else {
+					out[idx].InstallationType = "binary"
+				}
+				if sStatus != "" && sStatus != "not_installed" {
+					out[idx].ActiveState = sStatus
+				} else {
+					out[idx].ActiveState = "active"
+				}
+				hasWd := false
+				for _, c := range caps {
+					if strings.Contains(c, "watchdog") {
+						hasWd = true
+						break
+					}
+				}
+				out[idx].WatchdogEnabled = hasWd
+				out[idx].ConfigStatus = "synced"
 			}
 		}(i)
 	}

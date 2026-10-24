@@ -759,3 +759,47 @@ func TestClient_Loop_WithHeartbeatAndCommands(t *testing.T) {
 		t.Fatalf("expected OnCommand to be called")
 	}
 }
+
+func TestHeartbeat_SupportedCapabilitiesAndVersion(t *testing.T) {
+	var bodyMap map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &bodyMap)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(HeartbeatResponse{Status: "ok"})
+	}))
+	defer srv.Close()
+
+	c := Client{
+		BaseURL:               srv.URL,
+		SupportedCapabilities: []string{"user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1"},
+		Version:               "1.2.3",
+		CommitSHA:             "abc1234",
+	}
+	ctx := context.Background()
+	tools := []Tool{
+		{
+			Name:             "iazio-agent",
+			Installed:        true,
+			InstallationType: "systemd-user",
+			ActiveState:      "active",
+			WatchdogEnabled:  true,
+			ConfigStatus:     "synced",
+			Capabilities:     []string{"user_service_watchdog_v2", "deterministic_resume_4tuple_v1"},
+		},
+	}
+	res, err := c.HeartbeatDetailed(ctx, "debian", tools, false)
+	if err != nil {
+		t.Fatalf("HeartbeatDetailed failed: %v", err)
+	}
+	if res.Status != "ok" {
+		t.Fatalf("unexpected res status: %s", res.Status)
+	}
+	caps, ok := bodyMap["supported_capabilities"].([]any)
+	if !ok || len(caps) != 3 {
+		t.Fatalf("expected 3 supported_capabilities, got: %v", bodyMap["supported_capabilities"])
+	}
+	if bodyMap["version"] != "1.2.3" || bodyMap["commit_sha"] != "abc1234" {
+		t.Fatalf("expected version 1.2.3 and sha abc1234, got: %v, %v", bodyMap["version"], bodyMap["commit_sha"])
+	}
+}

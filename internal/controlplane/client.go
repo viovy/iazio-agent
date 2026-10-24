@@ -57,17 +57,20 @@ type CommandEnvelope struct {
 
 // Client posts heartbeats and finish checks. It does not send IDE credentials.
 type Client struct {
-	BaseURL        string
-	Token          string
-	HTTP           *http.Client
-	Presence       func() string
-	Tools          func() []Tool
-	ActiveJobs     func() []ActiveJob
-	OnTick         func(ctx context.Context, hostID string) error
-	OnToolUpdate   func(ctx context.Context, tools []string, force bool, targetVersion ...string) error
-	OnCommand      func(ctx context.Context, cmd CommandEnvelope) error
-	MaxRetries     int
-	InitialBackoff time.Duration
+	BaseURL               string
+	Token                 string
+	HTTP                  *http.Client
+	Presence              func() string
+	Tools                 func() []Tool
+	ActiveJobs            func() []ActiveJob
+	OnTick                func(ctx context.Context, hostID string) error
+	OnToolUpdate          func(ctx context.Context, tools []string, force bool, targetVersion ...string) error
+	OnCommand             func(ctx context.Context, cmd CommandEnvelope) error
+	SupportedCapabilities []string
+	Version               string
+	CommitSHA             string
+	MaxRetries            int
+	InitialBackoff        time.Duration
 }
 
 func (c Client) retryParams() (int, time.Duration) {
@@ -101,6 +104,11 @@ type Tool struct {
 	ServiceType      string   `json:"service_type,omitempty"`
 	ServiceStatus    string   `json:"service_status,omitempty"`
 	Capabilities     []string `json:"capabilities,omitempty"`
+	Installed        bool     `json:"installed,omitempty"`
+	InstallationType string   `json:"installation_type,omitempty"`
+	ActiveState      string   `json:"active_state,omitempty"`
+	WatchdogEnabled  bool     `json:"watchdog_enabled,omitempty"`
+	ConfigStatus     string   `json:"config_status,omitempty"`
 }
 
 // PendingToolUpdate describes a remote tool update command for the agent.
@@ -131,11 +139,22 @@ func (c Client) HeartbeatDetailed(ctx context.Context, hostID string, tools []To
 			presence = strings.TrimSpace(p)
 		}
 	}
+	supportedCaps := c.SupportedCapabilities
+	if len(supportedCaps) == 0 {
+		supportedCaps = []string{
+			"user_service_watchdog_v2",
+			"deterministic_resume_4tuple_v1",
+			"agy_conversation_pinning_v1",
+		}
+	}
 	body := map[string]any{
-		"presence":     presence,
-		"fetch_failed": fetchFailed,
-		"tools":        tools,
-		"active_jobs":  activeJobs,
+		"presence":               presence,
+		"fetch_failed":           fetchFailed,
+		"tools":                  tools,
+		"active_jobs":            activeJobs,
+		"supported_capabilities": supportedCaps,
+		"version":                c.Version,
+		"commit_sha":             c.CommitSHA,
 	}
 	var res HeartbeatResponse
 	if err := c.postJSON(ctx, "/v1/hosts/"+hostID+"/heartbeat", body, &res); err != nil {

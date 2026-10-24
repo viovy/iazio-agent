@@ -54,19 +54,19 @@ type Runner interface {
 
 // Sup is the in-process repo lock table.
 type Sup struct {
-	mu           sync.Mutex
-	gates        map[string]*sync.Mutex
-	locks        map[string]string
-	until        map[string]time.Time
-	deadline     map[string]time.Time
-	pids         map[string]int
-	jobIDs       map[string]string
-	reasons      map[string]string
-	now          func() time.Time
-	sleep        func(time.Duration)
-	signal       func(pid int, sig string) error
-	alive        func(pid int) bool
-	fetches      []string
+	mu                  sync.Mutex
+	gates               map[string]*sync.Mutex
+	locks               map[string]string
+	until               map[string]time.Time
+	deadline            map[string]time.Time
+	pids                map[string]int
+	jobIDs              map[string]string
+	reasons             map[string]string
+	now                 func() time.Time
+	sleep               func(time.Duration)
+	signal              func(pid int, sig string) error
+	alive               func(pid int) bool
+	fetches             []string
 	halted              bool
 	loopDetector        *LoopDetector
 	toolUpdating        bool

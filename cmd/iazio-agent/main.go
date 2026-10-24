@@ -220,6 +220,11 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						ServiceType:      t.ServiceType,
 						ServiceStatus:    t.ServiceStatus,
 						Capabilities:     t.Capabilities,
+						Installed:        t.Installed,
+						InstallationType: t.InstallationType,
+						ActiveState:      t.ActiveState,
+						WatchdogEnabled:  t.WatchdogEnabled,
+						ConfigStatus:     t.ConfigStatus,
 					})
 				}
 				return tools
@@ -582,6 +587,13 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return "ONLINE"
 				},
 				Tools: getTools,
+				SupportedCapabilities: []string{
+					"user_service_watchdog_v2",
+					"deterministic_resume_4tuple_v1",
+					"agy_conversation_pinning_v1",
+				},
+				Version:   formatVersion(),
+				CommitSHA: commit,
 				OnToolUpdate: func(ctx context.Context, tools []string, force bool, targetVersion ...string) error {
 					var tv string
 					if len(targetVersion) > 0 {
