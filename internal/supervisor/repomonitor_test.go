@@ -442,3 +442,79 @@ func TestEagerToolUpdater_NoUpdateStartedWhenNoDrift(t *testing.T) {
 		t.Fatalf("expected 0 notifications when CheckDrift returns false, got %v (E4)", emittedEvents)
 	}
 }
+
+func TestEagerToolUpdater_PendingForceRunsAfterUnforcedPassDefersOnDirtyFleet(t *testing.T) {
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	// Fleet is dirty
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: false, DirtyRepoPaths: []string{"/work/dirty"}}
+
+	var forcedExecuted bool
+	var mu sync.Mutex
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
+		mu.Lock()
+		if force {
+			forcedExecuted = true
+		}
+		mu.Unlock()
+		return UpdateResult{UpdatedTools: []string{"tool-forced"}}, nil
+	}, nil)
+
+	// Pre-queue a pending forced update by taking the mutex temporarily
+	updater.updateMutex.Lock()
+	_, def, err := updater.EvaluateAndTrigger(context.Background(), []string{"tool-forced"}, true)
+	if !def || err != ErrUpdateInProgress {
+		t.Fatalf("expected queued pending force, got def=%v err=%v", def, err)
+	}
+	updater.updateMutex.Unlock()
+
+	// An unforced call now runs; pass 1 will defer because fleet is dirty, but MUST drain pending force (H1)
+	_, deferred, err := updater.EvaluateAndTrigger(context.Background(), nil, false)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if deferred {
+		t.Fatalf("expected deferred=false because queued force was executed")
+	}
+
+	mu.Lock()
+	wasForced := forcedExecuted
+	mu.Unlock()
+
+	if !wasForced {
+		t.Fatalf("expected queued forced update to run even when initial pass deferred on dirty fleet (H1)")
+	}
+}
+
+func TestEagerToolUpdater_AgentUpdatedPreservedWhenPass2Defers(t *testing.T) {
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	var pass int
+	var mu sync.Mutex
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
+		mu.Lock()
+		pass++
+		currentPass := pass
+		mu.Unlock()
+
+		if currentPass == 1 {
+			// Pass 1 updates the agent
+			return UpdateResult{AgentUpdated: true, UpdatedTools: []string{"iazio-agent"}}, nil
+		}
+		return UpdateResult{}, nil
+	}, nil)
+
+	// Pre-queue pass 2 targeted
+	updater.updateMutex.Lock()
+	_, _, _ = updater.EvaluateAndTrigger(context.Background(), []string{"tool-queued"}, true)
+	updater.updateMutex.Unlock()
+
+	agentUpdated, _, _ := updater.EvaluateAndTrigger(context.Background(), nil, false)
+	if !agentUpdated {
+		t.Fatalf("expected agentUpdated=true to be sticky and preserved for caller restart (H2)")
+	}
+}

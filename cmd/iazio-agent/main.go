@@ -289,8 +289,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				func(snap supervisor.FleetStateSnapshot) {
 					if eagerUpdater != nil && !updatingTools.Load() {
 						go func() {
-							agentUpdated, deferred, err := eagerUpdater.EvaluateAndTrigger(runCtx, nil, false)
-							if err == nil && !deferred && agentUpdated {
+							agentUpdated, _, _ := eagerUpdater.EvaluateAndTrigger(runCtx, nil, false)
+							if agentUpdated {
 								restartOrExecSelf(stdout)
 								cancel()
 							}
@@ -354,6 +354,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 
 				if eagerUpdater != nil {
 					agentUpdated, deferred, err := eagerUpdater.EvaluateAndTrigger(ctx, targetTools, force)
+					if agentUpdated {
+						span.SetTag("result", "updated")
+						return true
+					}
 					if err != nil {
 						if errors.Is(err, supervisor.ErrUpdateInProgress) {
 							span.SetTag("result", "queued")
@@ -366,10 +370,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					if deferred {
 						span.SetTag("result", "deferred")
 						return false
-					}
-					if agentUpdated {
-						span.SetTag("result", "updated")
-						return true
 					}
 					span.SetTag("result", "up-to-date")
 					return false
@@ -654,8 +654,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					if len(reaped) > 0 && eagerUpdater != nil && !updatingTools.Load() {
 						go func() {
 							repoMonitor.InspectFleet(runCtx)
-							agentUpdated, deferred, err := eagerUpdater.EvaluateAndTrigger(runCtx, nil, false)
-							if err == nil && !deferred && agentUpdated {
+							agentUpdated, _, _ := eagerUpdater.EvaluateAndTrigger(runCtx, nil, false)
+							if agentUpdated {
 								restartOrExecSelf(stdout)
 								cancel()
 							}

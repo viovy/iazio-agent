@@ -107,13 +107,13 @@ func (u *EagerToolUpdater) EvaluateAndTrigger(ctx context.Context, targetTools [
 		if passErr != nil {
 			lastErr = passErr
 		}
-		if passDeferred && !curForce {
-			return anyAgentUpdated, true, lastErr
-		}
 
 		u.mu.Lock()
 		if !u.hasPending {
 			u.mu.Unlock()
+			if passDeferred && !curForce {
+				return anyAgentUpdated, true, lastErr
+			}
 			break
 		}
 		curTools = u.pendingTools
@@ -145,9 +145,15 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 	// 2. Fleet Git Clean check
 	snap := u.monitor.LastSnapshot()
 	if snap.HarnessActive && !force {
-		reason := "BlockedByActiveHarness"
-		u.emitDeferredOnce(ctx, targetTools, reason, "Tool update deferred: harness execution active on host")
-		return false, true, nil
+		// If supervisor reports no active harness, snapshot is stale; refresh inspection (M1)
+		if u.sup != nil && !u.sup.HasRunningHarness() {
+			snap = u.monitor.InspectFleet(ctx)
+		}
+		if snap.HarnessActive {
+			reason := "BlockedByActiveHarness"
+			u.emitDeferredOnce(ctx, targetTools, reason, "Tool update deferred: harness execution active on host")
+			return false, true, nil
+		}
 	}
 	if !snap.FleetGitClean && !force {
 		// If dirty repo paths is empty, run a fresh inspection instead of deferring on stale guard (R3)
@@ -199,6 +205,11 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 		}
 	}
 
+	// Reset deferred key on any pass that passed the guards (L6)
+	u.mu.Lock()
+	u.lastDeferredKey = ""
+	u.mu.Unlock()
+
 	// Check drift before emitting update_started to eliminate noise on unforced no-op ticks (E4)
 	if !force && u.CheckDrift != nil {
 		hasDrift, driftErr := u.CheckDrift(ctx, targetTools)
@@ -206,11 +217,6 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 			return false, false, nil
 		}
 	}
-
-	// Reset deferred key on successful entry
-	u.mu.Lock()
-	u.lastDeferredKey = ""
-	u.mu.Unlock()
 
 	// Emit update_started prior to executing update operations (G5)
 	if u.postNotif != nil {
