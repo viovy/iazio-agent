@@ -2398,4 +2398,25 @@ func TestResolveDispatchConversationID_Precedence(t *testing.T) {
 	if got := ResolveDispatchConversationID(a6, "", "", ""); got != "" {
 		t.Fatalf("expected empty for invalid ID, got %s", got)
 	}
+
+	// 7. ResumeMode == fallback_new_conversation with empty ActiveConversationID starts fresh (Finding C3)
+	a7 := controlplane.Assignment{
+		ResumeMode:            "fallback_new_conversation",
+		InitialConversationID: cInitial,
+		ResumeConversationID:  cResume,
+		ConversationIDs:       []string{cSlice},
+	}
+	if got := ResolveDispatchConversationID(a7, cLock, "STORY-1", "RUNNING"); got != "" {
+		t.Fatalf("expected empty conversation for fallback_new_conversation without active ID, got %s", got)
+	}
+
+	// 8. ResumeMode == fallback_new_conversation with ActiveConversationID already pinned reuses active
+	a8 := controlplane.Assignment{
+		ResumeMode:            "fallback_new_conversation",
+		ActiveConversationID:  cActive,
+		InitialConversationID: cInitial,
+	}
+	if got := ResolveDispatchConversationID(a8, cLock, "STORY-1", "RUNNING"); got != cActive {
+		t.Fatalf("expected active %s for pinned fallback conversation, got %s", cActive, got)
+	}
 }

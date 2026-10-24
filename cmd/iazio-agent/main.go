@@ -1601,8 +1601,17 @@ func resolveWorktreeForRepo(ctx context.Context, getter hostDetailGetter, host, 
 }
 
 // ResolveDispatchConversationID resolves the conversation ID to resume with strict priority:
-// ActiveConversationID -> ResumeConversationID -> InitialConversationID -> latest from ConversationIDs -> lockInfo
+// ActiveConversationID -> ResumeConversationID -> InitialConversationID -> latest from ConversationIDs -> lockInfo.
+// If ResumeMode is "fallback_new_conversation" and ActiveConversationID is empty, it returns ""
+// so that a fresh, unanchored session starts without reusing obsolete initial IDs (Finding C3).
 func ResolveDispatchConversationID(a controlplane.Assignment, lockConvID, lockStoryID, lockStatus string) string {
+	if a.ResumeMode == "fallback_new_conversation" {
+		if a.ActiveConversationID != "" && sessionstore.IsValidConversationID(a.ActiveConversationID) {
+			return a.ActiveConversationID
+		}
+		// CP explicitly instructed a clean fallback conversation: do not reuse initial/historical ID
+		return ""
+	}
 	convID := a.ActiveConversationID
 	if convID == "" {
 		convID = a.ResumeConversationID
@@ -1611,7 +1620,7 @@ func ResolveDispatchConversationID(a controlplane.Assignment, lockConvID, lockSt
 		convID = a.InitialConversationID
 	}
 	if convID == "" && len(a.ConversationIDs) > 0 {
-		convID = a.ConversationIDs[len(a.ConversationIDs)-1]
+		convID = a.ConversationIDs[0]
 	}
 	if convID == "" && lockConvID != "" && lockStatus != "COMPLETED" && (a.Kind == "resume" || (a.StoryID != "" && lockStoryID == a.StoryID)) {
 		convID = lockConvID
