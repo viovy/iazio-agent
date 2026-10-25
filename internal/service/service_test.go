@@ -1445,6 +1445,7 @@ func TestReconcileServiceConfiguration(t *testing.T) {
 	if !strings.Contains(string(data), "WatchdogSec=30s") {
 		t.Fatalf("expected WatchdogSec=30s after healing, got:\n%s", string(data))
 	}
+}
 
 func TestLinuxUnitHardening(t *testing.T) {
 	text := UnitText("linux", "/usr/bin/iazio-agent")
