@@ -1407,9 +1407,6 @@ func isGitSubmoduleDir(path string) bool {
 }
 
 func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
-	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
-		return true // Not checked out on this host
-	}
 	// First: verify repoPath is a valid git repository top-level root
 	topCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--show-toplevel")
 	topOut, err := topCmd.Output()
@@ -1549,6 +1546,9 @@ func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Cli
 			if path == "" {
 				continue
 			}
+			if _, err := os.Stat(path); os.IsNotExist(err) {
+				continue
+			}
 			// Verify repo queue is open (not paused or blocked)
 			q := strings.ToUpper(strings.TrimSpace(r.Queue))
 			if q != "" && q != "OPEN" && q != "ACTIVE" {
@@ -1570,6 +1570,7 @@ func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Cli
 					fmt.Fprintf(stdout, "[SIR: IDLE_UPDATE_DEFERRED] worktree=\"%s\" running_job=\"%s\"\n", path, r.RunningJobID)
 				}
 				return false
+
 			}
 			if sup != nil {
 				supLock := sup.Lock(path)

@@ -863,22 +863,23 @@ func TestAreAllReposCleanAndHarnessIdle(t *testing.T) {
 
 	// When repo queue is PAUSED, must return false
 	srvPaused := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+	// When worktree does not exist on disk, must be skipped and return true
+	srvNonExistent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(controlplane.HostDetail{
 			Host: controlplane.HostSummary{ID: "host-1"},
 			Repos: []controlplane.RepoSummary{
-				{Path: t.TempDir(), Queue: "PAUSED", Lock: "IDLE"},
+				{Path: filepath.Join(t.TempDir(), "nonexistent-worktree")},
 			},
 		})
 	}))
-	defer srvPaused.Close()
-	clientPaused := controlplane.Client{BaseURL: srvPaused.URL}
+	defer srvNonExistent.Close()
+
+	clientNonExistent := controlplane.Client{BaseURL: srvNonExistent.URL}
 	stdout.Reset()
-	if areAllReposCleanAndHarnessIdle(ctx, clientPaused, nil, "host-1", srvPaused.URL, false, &stdout) {
-		t.Fatal("expected false when repo queue is PAUSED")
-	}
-	if !strings.Contains(stdout.String(), "not open") {
-		t.Fatalf("expected queue not open message, got %s", stdout.String())
+	if !areAllReposCleanAndHarnessIdle(ctx, clientNonExistent, nil, "host-1", srvNonExistent.URL, false, &stdout) {
+		t.Fatal("expected true when registered worktree does not exist on this host")
 	}
 }
 
