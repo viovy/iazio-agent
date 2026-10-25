@@ -532,6 +532,7 @@ func updateSingleTool(
 		} {
 			altPath := filepath.Join(altDir, filepath.Base(destPath))
 			if _, err := os.Stat(altPath); err == nil {
+				_ = installExecutableSafe(altPath, binBytes)
 				_ = os.WriteFile(altPath+".version", []byte(latestVer), 0644)
 				inventory.InvalidateVersionCache(altPath)
 			}
