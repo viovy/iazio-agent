@@ -1122,6 +1122,14 @@ func applyLinux(action, bin string, stdout io.Writer, force bool) error {
 	if action == "install" {
 		return service.InstallLinux(bin)
 	}
+	if action == "status" {
+		cmd := exec.Command("systemctl", "--user", "status", "iazio-agent.service", "--no-pager")
+		out, err := cmd.CombinedOutput()
+		if stdout != nil {
+			fmt.Fprint(stdout, string(out))
+		}
+		return err
+	}
 	_, err := service.Apply("linux", action, bin, false, force, execCommand)
 	return err
 }
@@ -1538,6 +1546,9 @@ func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Cli
 			if path == "" {
 				continue
 			}
+			if _, err := os.Stat(path); os.IsNotExist(err) {
+				continue
+			}
 			// Verify repo queue is open (not paused or blocked)
 			q := strings.ToUpper(strings.TrimSpace(r.Queue))
 			if q != "" && q != "OPEN" && q != "ACTIVE" {
@@ -1559,6 +1570,7 @@ func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Cli
 					fmt.Fprintf(stdout, "[SIR: IDLE_UPDATE_DEFERRED] worktree=\"%s\" running_job=\"%s\"\n", path, r.RunningJobID)
 				}
 				return false
+
 			}
 			if sup != nil {
 				supLock := sup.Lock(path)

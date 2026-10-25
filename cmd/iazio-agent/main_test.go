@@ -880,6 +880,24 @@ func TestAreAllReposCleanAndHarnessIdle(t *testing.T) {
 	if !strings.Contains(stdout.String(), "not open") {
 		t.Fatalf("expected queue not open message, got %s", stdout.String())
 	}
+
+	// When worktree does not exist on disk, must be skipped and return true
+	srvNonExistent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(controlplane.HostDetail{
+			Host: controlplane.HostSummary{ID: "host-1"},
+			Repos: []controlplane.RepoSummary{
+				{Path: filepath.Join(t.TempDir(), "nonexistent-worktree")},
+			},
+		})
+	}))
+	defer srvNonExistent.Close()
+
+	clientNonExistent := controlplane.Client{BaseURL: srvNonExistent.URL}
+	stdout.Reset()
+	if !areAllReposCleanAndHarnessIdle(ctx, clientNonExistent, nil, "host-1", srvNonExistent.URL, false, &stdout) {
+		t.Fatal("expected true when registered worktree does not exist on this host")
+	}
 }
 
 func TestExecCommand(t *testing.T) {
