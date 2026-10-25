@@ -1332,3 +1332,129 @@ func TestUpdateSingleTool_ShadowingBinarySync(t *testing.T) {
 		t.Fatalf("shadow .version mismatch: got %q, want 0.0.492", string(shadowVer))
 	}
 }
+
+func TestCleanTargetVersion_Table(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"", ""},
+		{"latest", ""},
+		{"LATEST", ""},
+		{"autopilot-fleet version dev", ""},
+		{"v1.2.3", "1.2.3"},
+		{"1.2.3", "1.2.3"},
+		{"v2.0.0-beta.1", "2.0.0-beta.1"},
+		{"tool-name-v3.4.5", "3.4.5"},
+		{"custom_tag", "custom_tag"},
+	}
+	for _, tc := range cases {
+		got := cleanTargetVersion(tc.input)
+		if got != tc.want {
+			t.Errorf("cleanTargetVersion(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestResolveInstallDir_Coverage(t *testing.T) {
+	getenv := func(key string) string {
+		switch key {
+		case "HOME":
+			return "/home/testuser"
+		case "USERPROFILE":
+			return "C:\\Users\\testuser"
+		case "HOMEDRIVE":
+			return "C:"
+		case "HOMEPATH":
+			return "\\Users\\testuser"
+		default:
+			return ""
+		}
+	}
+
+	rootsUnixTilde := ManifestInstallRoots{
+		Unix: ManifestInstallRootPaths{Primary: "~/.local/bin"},
+	}
+	if dir := resolveInstallDir(rootsUnixTilde, getenv); dir != "" {
+		if runtime.GOOS != "windows" && dir != "/home/testuser/.local/bin" {
+			t.Errorf("expected /home/testuser/.local/bin, got %s", dir)
+		}
+	}
+
+	rootsUnixDirect := ManifestInstallRoots{
+		Unix: ManifestInstallRootPaths{Primary: "/opt/custom/bin"},
+	}
+	if dir := resolveInstallDir(rootsUnixDirect, getenv); dir != "" {
+		if runtime.GOOS != "windows" && dir != "/opt/custom/bin" {
+			t.Errorf("expected /opt/custom/bin, got %s", dir)
+		}
+	}
+
+	rootsUnixEmpty := ManifestInstallRoots{}
+	if dir := resolveInstallDir(rootsUnixEmpty, getenv); dir != "" {
+		if runtime.GOOS != "windows" && dir != "/home/testuser/.local/bin" {
+			t.Errorf("expected /home/testuser/.local/bin, got %s", dir)
+		}
+	}
+}
+
+func TestInstallExecutableSafeDirect_Unit(t *testing.T) {
+	tmpDir := t.TempDir()
+	binPath := filepath.Join(tmpDir, "testtool")
+	data := []byte("#!/bin/sh\necho ok\n")
+
+	// Direct install
+	if err := installExecutableSafeDirect(binPath, data); err != nil {
+		t.Fatalf("installExecutableSafeDirect failed: %v", err)
+	}
+
+	read, err := os.ReadFile(binPath)
+	if err != nil || string(read) != string(data) {
+		t.Fatalf("unexpected content after install: %v", err)
+	}
+
+	// Overwrite install
+	newData := []byte("#!/bin/sh\necho updated\n")
+	if err := installExecutableSafeDirect(binPath, newData); err != nil {
+		t.Fatalf("installExecutableSafeDirect overwrite failed: %v", err)
+	}
+
+	read2, err := os.ReadFile(binPath)
+	if err != nil || string(read2) != string(newData) {
+		t.Fatalf("unexpected content after overwrite: %v", err)
+	}
+}
+
+func TestInstallExecutableSafe_MultiDirSync(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	altDir1 := filepath.Join(tmpHome, ".local", "bin")
+	altDir2 := filepath.Join(tmpHome, ".iazio", "bin")
+	altDir3 := filepath.Join(tmpHome, ".gemini", "antigravity-cli", "bin")
+
+	if err := os.MkdirAll(altDir1, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(altDir2, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	destPath := filepath.Join(altDir3, "my-tool")
+	payload := []byte("binary-payload-multi-dir")
+
+	if err := installExecutableSafe(destPath, payload); err != nil {
+		t.Fatalf("installExecutableSafe failed: %v", err)
+	}
+
+	// Verify all existing alternate dirs have the binary
+	for _, dir := range []string{altDir1, altDir2, altDir3} {
+		p := filepath.Join(dir, "my-tool")
+		c, err := os.ReadFile(p)
+		if err != nil {
+			t.Errorf("expected binary at %s: %v", p, err)
+		} else if string(c) != string(payload) {
+			t.Errorf("binary content mismatch at %s", p)
+		}
+	}
+}
