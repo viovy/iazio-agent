@@ -672,6 +672,8 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 	}
 
 	if runtime.GOOS == "linux" {
+		cleanStaleBackups(filepath.Join(home, ".iazio", "bin"))
+		cleanStaleBackups(filepath.Join(home, ".local", "bin"))
 		unitDir := filepath.Join(home, ".config", "systemd", "user")
 		if err := os.MkdirAll(unitDir, 0o755); err != nil {
 			return err
@@ -736,7 +738,24 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 	} else if runtime.GOOS == "darwin" {
 		return InstallDarwinResilience(home, bin, run)
 	} else if runtime.GOOS == "windows" {
-		return InstallWindowsAt(home, bin, windowsLogonUser(), run)
+		tasksDir := filepath.Join(home, ".iazio", "tasks")
+		cleanStaleBackups(tasksDir)
+		binDir := filepath.Join(home, ".iazio", "bin")
+		cleanStaleBackups(binDir)
+
+		batPath := filepath.Join(tasksDir, "iazio-agent.bat")
+		xmlPath := filepath.Join(tasksDir, "iazio-agent.xml")
+		needsInstall := false
+		if data, err := os.ReadFile(batPath); err != nil || !strings.Contains(string(data), bin) {
+			needsInstall = true
+		} else if xData, err := os.ReadFile(xmlPath); err != nil || (!strings.Contains(string(xData), "PT1M") && !bytes.Contains(xData, []byte{'P', 0, 'T', 0, '1', 0, 'M', 0})) {
+			needsInstall = true
+		}
+		if needsInstall {
+			return InstallWindowsAt(home, bin, windowsLogonUser(), run)
+		}
+		_ = ReviveCheck(home, run)
+		return nil
 	}
 	return nil
 }
@@ -1280,6 +1299,8 @@ func InstallWindowsAt(home, bin, user string, run func(name string, args ...stri
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return err
 	}
+	cleanStaleBackups(dir)
+	cleanStaleBackups(filepath.Join(home, ".iazio", "bin"))
 	batPath := filepath.Join(dir, "iazio-agent.bat")
 	xmlPath := filepath.Join(dir, "iazio-agent.xml")
 	logPath := filepath.Join(logDir, "agent.log")
@@ -1300,7 +1321,7 @@ func InstallWindowsAt(home, bin, user string, run func(name string, args ...stri
       <Enabled>true</Enabled>
       <StartBoundary>2026-01-01T00:00:00</StartBoundary>
       <Repetition>
-        <Interval>PT5M</Interval>
+        <Interval>PT1M</Interval>
         <StopAtDurationEnd>false</StopAtDurationEnd>
       </Repetition>
     </TimeTrigger>
@@ -1414,5 +1435,22 @@ func SetCrontabCommandForTest(list func() ([]byte, error), apply func(string) er
 		crontabListCommand = origList
 		crontabApplyCommand = origApply
 		crontabRemoveCommand = origRemove
+	}
+}
+
+// cleanStaleBackups purges backup files matching .old. or .tmp in dir.
+func cleanStaleBackups(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		if strings.Contains(name, ".old.") || strings.HasSuffix(name, ".tmp") {
+			_ = os.Remove(filepath.Join(dir, name))
+		}
 	}
 }

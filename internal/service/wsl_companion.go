@@ -144,6 +144,7 @@ func (s *WSLCompanionSupervisor) CheckAndHeal(ctx context.Context) WSLServiceSta
 		if !status.AgentActive {
 			installOut, installErr := runServiceCmd("iazio-agent", "service", "install")
 			enableOut, enableErr := wslExec("systemctl", "--user", "enable", "--now", "iazio-agent.service")
+			_, _ = wslExec("systemctl", "--user", "enable", "--now", "iazio-agent-watchdog.timer")
 			chk, chkErr := wslExec("systemctl", "--user", "is-active", "iazio-agent.service")
 			if strings.TrimSpace(string(chk)) == "active" {
 				status.AgentActive = true
@@ -169,6 +170,7 @@ func (s *WSLCompanionSupervisor) CheckAndHeal(ctx context.Context) WSLServiceSta
 		if !status.HarvesterActive {
 			installOut, installErr := runServiceCmd("iazio-harvester", "service", "install")
 			enableOut, enableErr := wslExec("systemctl", "--user", "enable", "--now", "iazio-harvester.service")
+			_, _ = wslExec("systemctl", "--user", "enable", "--now", "iazio-harvester-watchdog.timer")
 			chk, chkErr := wslExec("systemctl", "--user", "is-active", "iazio-harvester.service")
 			if strings.TrimSpace(string(chk)) == "active" {
 				status.HarvesterActive = true

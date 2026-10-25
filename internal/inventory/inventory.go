@@ -200,14 +200,29 @@ func InspectToolService(toolName, goos string) (installed bool, svcType string, 
 			}
 		}
 	case "windows":
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "schtasks", "/Query", "/TN", toolName)
+		cmd := exec.CommandContext(ctx, "schtasks", "/Query", "/TN", toolName, "/FO", "LIST")
 		if out, err := cmd.Output(); err == nil && len(out) > 0 {
 			installed = true
-			svcType = "task_scheduler"
-			svcStatus = "installed"
-			caps = append(caps, "auto_restart", "self_update", "dev_install", "user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1")
+			svcType = "user_service"
+			outStr := string(out)
+			for _, line := range strings.Split(outStr, "\n") {
+				line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+				if strings.HasPrefix(line, "Status:") {
+					st := strings.TrimSpace(strings.TrimPrefix(line, "Status:"))
+					if strings.EqualFold(st, "Running") {
+						svcStatus = "active"
+					} else {
+						svcStatus = strings.ToLower(st)
+					}
+					break
+				}
+			}
+			if svcStatus == "" {
+				svcStatus = "active"
+			}
+			caps = append(caps, "watchdog", "auto_restart", "self_update", "dev_install", "user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1")
 			return
 		}
 	}
