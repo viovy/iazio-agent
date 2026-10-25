@@ -2048,6 +2048,46 @@ func TestProbeRepoRuntime_StateFiles(t *testing.T) {
 	}
 }
 
+func TestProbeRepoRuntime_MetadataYmlAndGitVersion(t *testing.T) {
+	tmp := t.TempDir()
+	cmdInit := exec.Command("git", "init", tmp)
+	if err := cmdInit.Run(); err != nil {
+		t.Skip("git not installed")
+	}
+
+	metadataContent := []byte("schema_version: 1\nname: test-fleet\n")
+	if err := os.WriteFile(filepath.Join(tmp, "metadata.yml"), metadataContent, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	st := probeRepoRuntime(ctx, tmp, "test-repo")
+
+	if st.MetadataYmlRaw != string(metadataContent) {
+		t.Fatalf("expected raw metadata %q, got %q", string(metadataContent), st.MetadataYmlRaw)
+	}
+	if st.MetadataYmlSHA == "" {
+		t.Fatal("expected non-empty MetadataYmlSHA")
+	}
+	if st.MetadataYmlModTime == "" {
+		t.Fatal("expected non-empty MetadataYmlModTime")
+	}
+}
+
+func TestHealGitRepo_RemovesLockAndCleans(t *testing.T) {
+	tmp := t.TempDir()
+	gitDir := filepath.Join(tmp, ".git")
+	_ = os.MkdirAll(gitDir, 0755)
+	lockFile := filepath.Join(gitDir, "index.lock")
+	_ = os.WriteFile(lockFile, []byte("lock"), 0644)
+
+	healGitRepo(context.Background(), tmp)
+
+	if _, err := os.Stat(lockFile); !os.IsNotExist(err) {
+		t.Fatalf("expected index.lock to be removed, got err: %v", err)
+	}
+}
+
 func TestExecuteRun_WithCommandsAndToolUpdate(t *testing.T) {
 	orig := syscallExec
 	defer func() { syscallExec = orig }()
