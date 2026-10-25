@@ -31,6 +31,9 @@ type PromptExecutionResult struct {
 	PromptID      string   `json:"prompt_id,omitempty"`
 	Repo          string   `json:"repo,omitempty"`
 	TargetAgent   string   `json:"target_agent,omitempty"`
+	StoryID       string   `json:"story_id,omitempty"`
+	StoryTitle    string   `json:"story_title,omitempty"`
+	StoryPath     string   `json:"story_path,omitempty"`
 	Status        string   `json:"status"`
 	ExitCode      int      `json:"exit_code,omitempty"`
 	GitHeadSHA    string   `json:"git_head_sha,omitempty"`

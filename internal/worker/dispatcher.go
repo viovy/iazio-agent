@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -63,11 +64,19 @@ type HeartbeatRequest struct {
 	FencingToken int64 `json:"fencing_token"`
 }
 
+// StoryBindingRequest is sent to dynamically bind an allocated story ID to a running job.
+type StoryBindingRequest struct {
+	StoryID    string `json:"story_id"`
+	StoryTitle string `json:"story_title,omitempty"`
+	StoryPath  string `json:"story_path,omitempty"`
+}
+
 // ControlPlaneClient defines communication with iazio-harness-api for agent jobs.
 type ControlPlaneClient interface {
 	ClaimJob(ctx context.Context, req ClaimRequest) (*Job, error)
 	CompleteJob(ctx context.Context, jobID string, req CompleteRequest) error
 	HeartbeatJob(ctx context.Context, jobID string, fencingToken int64) error
+	BindStory(ctx context.Context, jobID string, req StoryBindingRequest) error
 }
 
 // HTTPControlPlaneClient is a concrete implementation of ControlPlaneClient over HTTP.
@@ -187,6 +196,36 @@ func (c *HTTPControlPlaneClient) HeartbeatJob(ctx context.Context, jobID string,
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("heartbeat returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+// BindStory calls PATCH /api/v1/jobs/{job_id}/story-binding.
+func (c *HTTPControlPlaneClient) BindStory(ctx context.Context, jobID string, req StoryBindingRequest) error {
+	url := fmt.Sprintf("%s/api/v1/jobs/%s/story-binding", c.BaseURL, jobID)
+	bodyBytes, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal bind story request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPatch, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("create bind story request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if c.AuthToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.AuthToken)
+	}
+
+	resp, err := c.HTTPClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("execute bind story request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("bind story returned status %d: %s", resp.StatusCode, string(respBody))
 	}
 	return nil
 }
@@ -347,6 +386,19 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: err.Error()})
 			return true, err
 		}
+		if res != nil {
+			storyID := res.StoryID
+			if storyID == "" {
+				storyID = extractStoryID(res.Summary, res.Output)
+			}
+			if storyID != "" {
+				_ = d.client.BindStory(ctx, job.ID, StoryBindingRequest{
+					StoryID:    storyID,
+					StoryTitle: res.StoryTitle,
+					StoryPath:  res.StoryPath,
+				})
+			}
+		}
 		resBytes, _ := json.Marshal(res)
 		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Result: resBytes})
 		if compErr == nil && d.syncer != nil {
@@ -401,4 +453,18 @@ func EnsurePromptID(jobID string, raw json.RawMessage) json.RawMessage {
 // EnsurePromptIDWithTrace ensures that a prompt payload JSON contains a valid prompt_id and trace_id.
 func EnsurePromptIDWithTrace(jobID, traceID string, raw json.RawMessage) json.RawMessage {
 	return harness.EnsurePromptPayloadWithTrace(jobID, traceID, raw)
+}
+
+var storyIDRegex = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+(?:-[A-Z0-9]+)*)\b`)
+
+func extractStoryID(texts ...string) string {
+	for _, text := range texts {
+		if text == "" {
+			continue
+		}
+		if match := storyIDRegex.FindString(text); match != "" {
+			return strings.ToUpper(match)
+		}
+	}
+	return ""
 }

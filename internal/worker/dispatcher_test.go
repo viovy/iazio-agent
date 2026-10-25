@@ -62,13 +62,16 @@ func (m *mockInvoker) WithWorkDir(workDir string) harness.Invoker {
 type mockControlPlane struct {
 	claimFunc    func(ctx context.Context, req ClaimRequest) (*Job, error)
 	completeFunc func(ctx context.Context, jobID string, req CompleteRequest) error
+	bindFunc     func(ctx context.Context, jobID string, req StoryBindingRequest) error
 
 	completedJobs map[string]CompleteRequest
+	boundStories  map[string]StoryBindingRequest
 }
 
 func newMockControlPlane() *mockControlPlane {
 	return &mockControlPlane{
 		completedJobs: make(map[string]CompleteRequest),
+		boundStories:  make(map[string]StoryBindingRequest),
 	}
 }
 
@@ -88,6 +91,14 @@ func (m *mockControlPlane) CompleteJob(ctx context.Context, jobID string, req Co
 }
 
 func (m *mockControlPlane) HeartbeatJob(ctx context.Context, jobID string, fencingToken int64) error {
+	return nil
+}
+
+func (m *mockControlPlane) BindStory(ctx context.Context, jobID string, req StoryBindingRequest) error {
+	m.boundStories[jobID] = req
+	if m.bindFunc != nil {
+		return m.bindFunc(ctx, jobID, req)
+	}
 	return nil
 }
 
@@ -904,5 +915,84 @@ func TestEnsurePromptID_Helpers(t *testing.T) {
 	outTrace := EnsurePromptIDWithTrace("job-123", "trace-456", raw)
 	if !strings.Contains(string(outTrace), "trace_id") {
 		t.Fatalf("expected trace_id in output: %s", string(outTrace))
+	}
+}
+
+func TestDispatcher_PromptExecute_BindsStory(t *testing.T) {
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:      "job-prompt-bind-1",
+			Type:    JobTypePromptExecute,
+			Repo:    "iazio-mcp",
+			Payload: json.RawMessage(`{"prompt":"/autonomous-story-execution implement feature"}`),
+		}, nil
+	}
+
+	inv := &mockInvoker{
+		executePromptFunc: func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+			return &harness.PromptExecutionResult{
+				Status:     "completed",
+				StoryID:    "STORY-GOV-3688",
+				StoryTitle: "Gemini Web MCP ASE Tool Priority",
+				StoryPath:  "docs/stories/2026-10-25-gov-3688.story.md",
+				Summary:    "Successfully executed STORY-GOV-3688",
+			}, nil
+		},
+	}
+
+	d := NewDispatcher(cp, inv, "host-1")
+	processed, err := d.PollAndProcess(context.Background())
+	if err != nil {
+		t.Fatalf("PollAndProcess failed: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected job to be processed")
+	}
+
+	bound, ok := cp.boundStories["job-prompt-bind-1"]
+	if !ok {
+		t.Fatal("expected story to be bound to job-prompt-bind-1")
+	}
+	if bound.StoryID != "STORY-GOV-3688" {
+		t.Errorf("expected story ID STORY-GOV-3688, got %s", bound.StoryID)
+	}
+	if bound.StoryTitle != "Gemini Web MCP ASE Tool Priority" {
+		t.Errorf("expected story title 'Gemini Web MCP ASE Tool Priority', got %s", bound.StoryTitle)
+	}
+}
+
+func TestHTTPControlPlaneClient_BindStory(t *testing.T) {
+	var receivedMethod string
+	var receivedPath string
+	var reqBody StoryBindingRequest
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedMethod = r.Method
+		receivedPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&reqBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer ts.Close()
+
+	client := NewHTTPControlPlaneClient(ts.URL, "test-token", ts.Client())
+	err := client.BindStory(context.Background(), "job-999", StoryBindingRequest{
+		StoryID:    "STORY-GOV-3688",
+		StoryTitle: "Title",
+		StoryPath:  "docs/stories/story.md",
+	})
+	if err != nil {
+		t.Fatalf("BindStory failed: %v", err)
+	}
+
+	if receivedMethod != http.MethodPatch {
+		t.Errorf("expected method PATCH, got %s", receivedMethod)
+	}
+	if receivedPath != "/api/v1/jobs/job-999/story-binding" {
+		t.Errorf("expected path /api/v1/jobs/job-999/story-binding, got %s", receivedPath)
+	}
+	if reqBody.StoryID != "STORY-GOV-3688" {
+		t.Errorf("expected StoryID STORY-GOV-3688, got %s", reqBody.StoryID)
 	}
 }

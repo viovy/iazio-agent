@@ -476,6 +476,7 @@ func TestInspectInstalledVersion(t *testing.T) {
 }
 
 func TestUpdateSingleTool_Lifecycle(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	ctx := context.Background()
 	binDir := t.TempDir()
 	binPath := filepath.Join(binDir, "iazio-agent")
@@ -685,6 +686,7 @@ func TestCleanStaleBackups_StaleFileRemoved(t *testing.T) {
 }
 
 func TestUpdateSingleTool_ErrorsAndRepoPrefix(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	ctx := context.Background()
 	binDir := t.TempDir()
 	var stdout, stderr bytes.Buffer
@@ -955,6 +957,7 @@ func TestCleanStaleBackups_ExpiredFiles(t *testing.T) {
 }
 
 func TestUpdateTool_ChecksumMismatchRejection(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	tmpDir := t.TempDir()
 	binDir := filepath.Join(tmpDir, "bin")
 	_ = os.MkdirAll(binDir, 0o755)
@@ -1037,6 +1040,7 @@ func TestUpdateTool_ChecksumMismatchRejection(t *testing.T) {
 }
 
 func TestUpdateSingleTool_MissingChecksumsAssetFailsClosed(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	tempDir := t.TempDir()
 	binDir := filepath.Join(tempDir, "bin")
 	_ = os.MkdirAll(binDir, 0755)
@@ -1211,6 +1215,7 @@ func TestFindMatchingAsset_MacOS_ArchitectureAliases(t *testing.T) {
 }
 
 func TestUpdateSingleTool_ShadowingBinarySync(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	tempDir := t.TempDir()
 	binDir := filepath.Join(tempDir, "bin")
 	shadowDir := filepath.Join(tempDir, "shadow")
