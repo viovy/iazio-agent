@@ -159,10 +159,16 @@ func (m *ConversationLivenessMonitor) resolveSubprocessTimestamp(pid int) time.T
 		return time.Time{}
 	}
 
-	// Check /proc/<pid>/stat or process mtime if available
+	// Check /proc/<pid>/stat or process mtime if available (Linux)
 	procPath := fmt.Sprintf("/proc/%d", pid)
 	if fi, err := os.Stat(procPath); err == nil {
 		return fi.ModTime().UTC()
+	}
+
+	// Darwin/macOS fallback: check if child processes exist under pid
+	cmdDarwin := exec.Command("pgrep", "-P", strconv.Itoa(pid))
+	if outDarwin, errDarwin := cmdDarwin.CombinedOutput(); errDarwin == nil && len(strings.TrimSpace(string(outDarwin))) > 0 {
+		return time.Now().UTC()
 	}
 
 	return time.Time{}
@@ -191,10 +197,16 @@ func (m *ConversationLivenessMonitor) captureProcessTree(pid int) string {
 	if pid <= 0 {
 		return ""
 	}
+	// Try GNU ps first (Linux)
 	cmd := exec.Command("ps", "-f", "--ppid", strconv.Itoa(pid))
 	out, err := cmd.CombinedOutput()
 	if err == nil && len(out) > 0 {
 		return strings.TrimSpace(string(out))
+	}
+	// Darwin / BSD fallback
+	cmdDarwin := exec.Command("pgrep", "-P", strconv.Itoa(pid))
+	if outDarwin, errDarwin := cmdDarwin.CombinedOutput(); errDarwin == nil && len(outDarwin) > 0 {
+		return fmt.Sprintf("Child PIDs of %d:\n%s", pid, strings.TrimSpace(string(outDarwin)))
 	}
 	return fmt.Sprintf("PID %d running", pid)
 }
