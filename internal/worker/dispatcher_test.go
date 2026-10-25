@@ -919,7 +919,6 @@ func TestEnsurePromptID_Helpers(t *testing.T) {
 	}
 }
 
-<<<<<<< HEAD
 func TestDispatcher_PromptExecute_BindsStory(t *testing.T) {
 	cp := newMockControlPlane()
 	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {

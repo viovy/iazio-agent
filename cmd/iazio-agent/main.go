@@ -654,9 +654,20 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				},
 				OnCommand: func(ctx context.Context, cmd controlplane.CommandEnvelope) error {
 					switch cmd.Type {
-					case "TRIGGER_IDLE_UPDATE":
+					case "TRIGGER_IDLE_UPDATE", "EVALUATE_EAGER_UPDATE":
+						if eagerUpdater != nil {
+							eagerUpdater.TriggerEvaluation("command")
+						} else {
+							go func() {
+								if doToolUpdate(runCtx, nil, false) {
+									restartOrExecSelf(stdout)
+									cancel()
+								}
+							}()
+						}
+					case "FORCE_TOOL_UPDATE":
 						go func() {
-							if doToolUpdate(runCtx, nil, false) {
+							if doToolUpdate(runCtx, nil, true) {
 								restartOrExecSelf(stdout)
 								cancel()
 							}
