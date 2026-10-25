@@ -2680,3 +2680,28 @@ func TestBuildEagerHooks_SuiteOptOutAndBackoff(t *testing.T) {
 		}
 	}
 }
+
+func TestExecute_CommandsAndHarvest(t *testing.T) {
+	// 1. flushHarvestConversation empty
+	if err := flushHarvestConversation(context.Background(), ""); err != nil {
+		t.Errorf("expected nil err for empty conv, got %v", err)
+	}
+
+	// 2. flushHarvestConversation with mock harvester
+	tmpDir := t.TempDir()
+	mockHarvester := filepath.Join(tmpDir, "iazio-harvester")
+	_ = os.WriteFile(mockHarvester, []byte("#!/bin/sh\nexit 0\n"), 0755)
+	t.Setenv("PATH", tmpDir+":"+os.Getenv("PATH"))
+	if err := flushHarvestConversation(context.Background(), "conv-test-123"); err != nil {
+		t.Errorf("expected success for mock harvester, got %v", err)
+	}
+
+	// 3. execute help & version & unknown
+	var stdout, stderr strings.Builder
+	_ = execute(context.Background(), []string{"help"}, &stdout, &stderr, nil)
+	_ = execute(context.Background(), []string{"--help"}, &stdout, &stderr, nil)
+	_ = execute(context.Background(), []string{"version"}, &stdout, &stderr, nil)
+	_ = execute(context.Background(), []string{}, &stdout, &stderr, nil)
+	_ = execute(context.Background(), []string{"unknown-cmd"}, &stdout, &stderr, nil)
+}
+

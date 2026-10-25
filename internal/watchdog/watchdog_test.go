@@ -191,9 +191,15 @@ func TestWatchdog_MaxResumesExceeded(t *testing.T) {
 
 	// Fail 3 -> Exceeds max resumes (2) -> FAILED
 	runner.complete(3002, 1, nil)
-	time.Sleep(50 * time.Millisecond)
-
-	got, err := w.GetJob("job-103")
+	var got TrackedJob
+	var err error
+	for i := 0; i < 20; i++ {
+		time.Sleep(25 * time.Millisecond)
+		got, err = w.GetJob("job-103")
+		if err == nil && got.Status == StatusFailed {
+			break
+		}
+	}
 	if err != nil {
 		t.Fatalf("get job error: %v", err)
 	}
@@ -718,3 +724,48 @@ func TestWatchdog_NoDoubleResumeOnStallTermination(t *testing.T) {
 		t.Fatalf("expected spawn count to remain 1 after reapProcess exit, got %d (double resume race condition!)", spawnCount)
 	}
 }
+
+func TestWatchdog_CoverageHelpers(t *testing.T) {
+	// 1. DefaultAutoResumePolicy
+	pol := DefaultAutoResumePolicy()
+	if !pol.Enabled || pol.MaxAutoResumes != 5 {
+		t.Errorf("unexpected default policy: %+v", pol)
+	}
+
+	// 2. IsProcessAlive & defaultKillProcess
+	_ = IsProcessAlive(os.Getpid())
+	_ = IsProcessAlive(99999999)
+
+	// 3. appendOrphanToolLog
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	spoolDir := filepath.Join(tmpDir, ".iazio", "spool")
+	_ = os.MkdirAll(spoolDir, 0755)
+
+	var orphanNotified bool
+	w := New(Options{
+		StateFile: filepath.Join(tmpDir, "watchdog.json"),
+		OnOrphanTool: func(j TrackedJob) {
+			orphanNotified = true
+		},
+	})
+	job := TrackedJob{
+		JobID:          "job-orphan-cov",
+		PID:            123,
+		ToolPID:        456,
+		Engine:         "agy",
+		ConversationID: "conv-orphan",
+		WorktreePath:   tmpDir,
+	}
+	w.appendOrphanToolLog(job)
+	if !orphanNotified {
+		t.Errorf("expected orphan callback called")
+	}
+
+	// 4. NotifyWatchdog & StartSystemdWatchdog
+	NotifyWatchdog()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	StartSystemdWatchdog(ctx)
+}
+

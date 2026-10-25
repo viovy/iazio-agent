@@ -120,3 +120,40 @@ func TestSanitizeWorkspace_HeldLock_SetsCleanLocksFalse(t *testing.T) {
 		t.Fatalf("expected Manifest.CleanLocks to be false when index.lock is held and present on disk")
 	}
 }
+
+func TestResolveGitDir_AndLockHelpers(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Regular directory
+	dirGit := filepath.Join(tmpDir, ".git")
+	_ = os.MkdirAll(dirGit, 0755)
+	if res := resolveGitDir(tmpDir, dirGit, true); res != dirGit {
+		t.Errorf("expected %s, got %s", dirGit, res)
+	}
+
+	// 2. Relative gitdir file
+	fileGit := filepath.Join(tmpDir, "submodule", ".git")
+	_ = os.MkdirAll(filepath.Dir(fileGit), 0755)
+	_ = os.WriteFile(fileGit, []byte("gitdir: ../../.git/modules/sub\n"), 0644)
+	res := resolveGitDir(filepath.Dir(fileGit), fileGit, false)
+	expected := filepath.Clean(filepath.Join(filepath.Dir(fileGit), "../../.git/modules/sub"))
+	if filepath.Clean(res) != expected {
+		t.Errorf("expected %s, got %s", expected, res)
+	}
+
+	// 3. Absolute gitdir file
+	absTarget := filepath.Join(tmpDir, "actual-git")
+	_ = os.WriteFile(fileGit, []byte("gitdir: "+absTarget+"\n"), 0644)
+	if res := resolveGitDir(filepath.Dir(fileGit), fileGit, false); res != absTarget {
+		t.Errorf("expected %s, got %s", absTarget, res)
+	}
+
+	// 4. isLockFileHeld non-existent
+	if isLockFileHeld(filepath.Join(tmpDir, "nonexistent.lock")) {
+		t.Errorf("expected false for nonexistent lock file")
+	}
+
+	// 5. hasRunningGitProcess empty
+	_ = hasRunningGitProcess(tmpDir)
+}
+
