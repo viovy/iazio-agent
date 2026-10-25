@@ -225,6 +225,9 @@ func DefaultDirs(pathEnv, home, goos string) []string {
 			filepath.Join(home, ".iazio", "bin"),
 			filepath.Join(home, ".local", "bin"),
 		)
+		if goos == "darwin" {
+			dirs = append(dirs, filepath.Join(home, ".gemini", "antigravity-cli", "bin"))
+		}
 		if goos == "windows" {
 			dirs = append(dirs, filepath.Join(home, "bin"))
 		}

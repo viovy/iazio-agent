@@ -524,6 +524,20 @@ func updateSingleTool(
 		}
 	}
 
+	if home := os.Getenv("HOME"); home != "" {
+		for _, altDir := range []string{
+			filepath.Join(home, ".local", "bin"),
+			filepath.Join(home, ".iazio", "bin"),
+			filepath.Join(home, ".gemini", "antigravity-cli", "bin"),
+		} {
+			altPath := filepath.Join(altDir, filepath.Base(destPath))
+			if _, err := os.Stat(altPath); err == nil {
+				_ = os.WriteFile(altPath+".version", []byte(latestVer), 0644)
+				inventory.InvalidateVersionCache(altPath)
+			}
+		}
+	}
+
 	fmt.Fprintf(stdout, "  [+] %s: %s -> %s\n", tool.Name, latestVer, destPath)
 	return true, nil
 }
@@ -906,22 +920,22 @@ func installExecutableSafe(destPath string, data []byte) error {
 		}
 	}
 
-	// Synchronize ~/.local/bin and ~/.iazio/bin on Unix to prevent service / PATH shadowing
+	// Synchronize alternate binary directories on Unix to prevent service / PATH shadowing
 	if home := os.Getenv("HOME"); home != "" {
-		binDir1 := filepath.Join(home, ".local", "bin")
-		binDir2 := filepath.Join(home, ".iazio", "bin")
-		var altPath string
-		if strings.HasPrefix(destPath, binDir1) {
-			altPath = filepath.Join(binDir2, filepath.Base(destPath))
-		} else if strings.HasPrefix(destPath, binDir2) {
-			altPath = filepath.Join(binDir1, filepath.Base(destPath))
-		}
-		if altPath != "" {
+		for _, altDir := range []string{
+			filepath.Join(home, ".local", "bin"),
+			filepath.Join(home, ".iazio", "bin"),
+			filepath.Join(home, ".gemini", "antigravity-cli", "bin"),
+		} {
+			altPath := filepath.Join(altDir, filepath.Base(destPath))
+			if filepath.Clean(altPath) == filepath.Clean(destPath) {
+				continue
+			}
 			if _, statErr := os.Stat(altPath); statErr == nil {
 				if err := installExecutableSafeDirect(altPath, data); err != nil {
 					return fmt.Errorf("failed to synchronize existing alternate binary at %s: %w", altPath, err)
 				}
-			} else if _, statErr := os.Stat(filepath.Dir(altPath)); statErr == nil {
+			} else if _, statErr := os.Stat(altDir); statErr == nil {
 				if err := installExecutableSafeDirect(altPath, data); err != nil {
 					return fmt.Errorf("failed to initialize alternate binary at %s: %w", altPath, err)
 				}

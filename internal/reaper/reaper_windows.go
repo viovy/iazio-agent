@@ -10,6 +10,19 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
+)
+
+var (
+	kernel32               = syscall.NewLazyDLL("kernel32.dll")
+	procOpenProcess        = kernel32.NewProc("OpenProcess")
+	procCloseHandle        = kernel32.NewProc("CloseHandle")
+	procGetExitCodeProcess = kernel32.NewProc("GetExitCodeProcess")
+)
+
+const (
+	processQueryLimitedInformation = 0x1000
+	stillActive                    = 259
 )
 
 // TerminateProcessGroup terminates the process and any child processes via taskkill on Windows.
@@ -50,12 +63,17 @@ func isPIDAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
+	h, _, _ := procOpenProcess.Call(uintptr(processQueryLimitedInformation), 0, uintptr(pid))
+	if h == 0 {
 		return false
 	}
-	err = p.Signal(syscall.Signal(0))
-	return err == nil
+	defer procCloseHandle.Call(h)
+	var exitCode uint32
+	r, _, _ := procGetExitCodeProcess.Call(h, uintptr(unsafe.Pointer(&exitCode)))
+	if r == 0 {
+		return false
+	}
+	return exitCode == stillActive
 }
 
 func findOrphanPIDs(workspacePath, conversationID string) ([]int, error) {
