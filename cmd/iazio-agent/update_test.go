@@ -1158,3 +1158,177 @@ func TestUpdate_CLIFlagParsing_Version(t *testing.T) {
 		t.Fatalf("expected TargetVersion 0.0.493, got %s", opts2.TargetVersion)
 	}
 }
+
+func TestCleanTargetVersion(t *testing.T) {
+	cases := []struct {
+		input    string
+		expected string
+	}{
+		{"autopilot-fleet version dev", ""},
+		{"autopilot-fleet 0.0.492", "0.0.492"},
+		{"v0.0.492", "0.0.492"},
+		{"0.0.492", "0.0.492"},
+		{"latest", ""},
+		{"dev", ""},
+		{"", ""},
+		{"autopilot-fleet version 1.2.3-beta.1", "1.2.3-beta.1"},
+	}
+
+	for _, c := range cases {
+		got := cleanTargetVersion(c.input)
+		if got != c.expected {
+			t.Errorf("cleanTargetVersion(%q) = %q; want %q", c.input, got, c.expected)
+		}
+	}
+}
+
+func TestFindMatchingAsset_MacOS_ArchitectureAliases(t *testing.T) {
+	rel := &gitHubRelease{
+		TagName: "v0.0.492",
+		Assets: []gitHubAsset{
+			{Name: "autopilot-fleet_0.0.492_macos_aarch64.tar.gz"},
+			{Name: "autopilot-fleet_0.0.492_linux_x86_64.tar.gz"},
+		},
+	}
+
+	// 1. macOS on arm64 matching macos + aarch64
+	a1, err := findMatchingAsset(rel, "autopilot-fleet", "darwin", "arm64")
+	if err != nil {
+		t.Fatalf("expected to match darwin/arm64 to macos/aarch64 asset, got err: %v", err)
+	}
+	if a1.Name != "autopilot-fleet_0.0.492_macos_aarch64.tar.gz" {
+		t.Errorf("matched wrong asset: %s", a1.Name)
+	}
+
+	// 2. Linux on amd64 matching linux + x86_64
+	a2, err := findMatchingAsset(rel, "autopilot-fleet", "linux", "amd64")
+	if err != nil {
+		t.Fatalf("expected to match linux/amd64 to linux/x86_64 asset, got err: %v", err)
+	}
+	if a2.Name != "autopilot-fleet_0.0.492_linux_x86_64.tar.gz" {
+		t.Errorf("matched wrong asset: %s", a2.Name)
+	}
+}
+
+func TestUpdateSingleTool_ShadowingBinarySync(t *testing.T) {
+	tempDir := t.TempDir()
+	binDir := filepath.Join(tempDir, "bin")
+	shadowDir := filepath.Join(tempDir, "shadow")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(shadowDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	toolName := "autopilot-fleet"
+	shadowBin := filepath.Join(shadowDir, toolName)
+	if err := os.WriteFile(shadowBin, []byte("#!/bin/sh\necho old-dev\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(shadowBin+".version", []byte("autopilot-fleet version dev"), 0644)
+
+	// Prepend shadowDir to PATH so LookPath finds it
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", shadowDir+string(os.PathListSeparator)+origPath)
+
+	payload := []byte("#!/bin/sh\necho v0.0.492\n")
+	tarData := createTarGz(t, toolName, payload)
+	sum := sha256.Sum256(tarData)
+	hashStr := hex.EncodeToString(sum[:])
+	checksumsData := fmt.Sprintf("%s  %s_0.0.492_linux_amd64.tar.gz\n", hashStr, toolName)
+
+	client := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(req.URL.Path, "/releases/latest") || strings.HasSuffix(req.URL.Path, "/releases/tags/0.0.492") {
+				rel := gitHubRelease{
+					TagName: "0.0.492",
+					Assets: []gitHubAsset{
+						{
+							Name:               fmt.Sprintf("%s_0.0.492_linux_amd64.tar.gz", toolName),
+							BrowserDownloadURL: fmt.Sprintf("https://github.com/viovy/%s/releases/download/0.0.492/%s_0.0.492_linux_amd64.tar.gz", toolName, toolName),
+						},
+						{
+							Name:               "checksums.txt",
+							BrowserDownloadURL: fmt.Sprintf("https://github.com/viovy/%s/releases/download/0.0.492/checksums.txt", toolName),
+						},
+					},
+				}
+				data, _ := json.Marshal(rel)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(bytes.NewReader(data)),
+					Header:     make(http.Header),
+				}, nil
+			}
+			if strings.HasSuffix(req.URL.Path, ".tar.gz") {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(bytes.NewReader(tarData)),
+					Header:     make(http.Header),
+				}, nil
+			}
+			if strings.HasSuffix(req.URL.Path, "checksums.txt") {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(strings.NewReader(checksumsData)),
+					Header:     make(http.Header),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Status:     "404 Not Found",
+				Body:       io.NopCloser(strings.NewReader("404")),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+
+	tool := ManifestToolItem{
+		Name:          toolName,
+		Repository:    "viovy/" + toolName,
+		BinaryName:    toolName,
+		Tier:          "baseline",
+		TargetVersion: "autopilot-fleet version dev",
+	}
+
+	var stdout, stderr bytes.Buffer
+	updated, err := updateSingleTool(context.Background(), client, tool, binDir, "", true, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !updated {
+		t.Fatalf("expected tool to be updated")
+	}
+
+	// Verify target binDir was written
+	destBin := filepath.Join(binDir, toolName)
+	destData, err := os.ReadFile(destBin)
+	if err != nil {
+		t.Fatalf("failed to read dest binary: %v", err)
+	}
+	if string(destData) != string(payload) {
+		t.Fatalf("dest binary content mismatch")
+	}
+
+	// Verify shadowing binary was also updated
+	shadowData, err := os.ReadFile(shadowBin)
+	if err != nil {
+		t.Fatalf("failed to read shadow binary: %v", err)
+	}
+	if string(shadowData) != string(payload) {
+		t.Fatalf("shadow binary content mismatch: got %q, want %q", string(shadowData), string(payload))
+	}
+
+	// Verify .version in shadowDir was updated to 0.0.492
+	shadowVer, err := os.ReadFile(shadowBin + ".version")
+	if err != nil {
+		t.Fatalf("failed to read shadow .version: %v", err)
+	}
+	if string(shadowVer) != "0.0.492" {
+		t.Fatalf("shadow .version mismatch: got %q, want 0.0.492", string(shadowVer))
+	}
+}

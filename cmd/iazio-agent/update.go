@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -443,7 +444,18 @@ func updateSingleTool(
 	}
 
 	destPath := filepath.Join(binDir, binName)
+	var existingShadowPath string
+	if lookPath, err := exec.LookPath(binName); err == nil && lookPath != "" {
+		if absLook, err := filepath.Abs(lookPath); err == nil {
+			if absDest, err := filepath.Abs(destPath); err == nil && absLook != absDest {
+				existingShadowPath = absLook
+			}
+		}
+	}
 	curVer := inventory.InspectInstalledVersion(destPath)
+	if curVer == "" && existingShadowPath != "" {
+		curVer = inventory.InspectInstalledVersion(existingShadowPath)
+	}
 
 	repo := tool.Repository
 	if !strings.Contains(repo, "/") {
@@ -500,6 +512,18 @@ func updateSingleTool(
 	}
 
 	_ = os.WriteFile(destPath+".version", []byte(latestVer), 0644)
+	inventory.InvalidateVersionCache(destPath)
+
+	if existingShadowPath != "" {
+		if err := installExecutableSafe(existingShadowPath, binBytes); err == nil {
+			_ = os.WriteFile(existingShadowPath+".version", []byte(latestVer), 0644)
+			inventory.InvalidateVersionCache(existingShadowPath)
+			fmt.Fprintf(stdout, "  [+] %s: synchronized active PATH binary at %s\n", tool.Name, existingShadowPath)
+		} else if stderr != nil {
+			fmt.Fprintf(stderr, "  [!] %s: warning: failed to update shadowing binary at %s: %v\n", tool.Name, existingShadowPath, err)
+		}
+	}
+
 	fmt.Fprintf(stdout, "  [+] %s: %s -> %s\n", tool.Name, latestVer, destPath)
 	return true, nil
 }
@@ -551,10 +575,25 @@ func resolveGitHubToken(getenv func(string) string) string {
 	return ""
 }
 
+func cleanTargetVersion(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" || strings.EqualFold(v, "latest") {
+		return ""
+	}
+	if strings.Contains(strings.ToLower(v), "dev") {
+		return ""
+	}
+	re := regexp.MustCompile(`v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?)|([0-9]+\.[0-9]+\.[0-9]+)`)
+	if match := re.FindString(v); match != "" {
+		return strings.TrimPrefix(match, "v")
+	}
+	return strings.TrimPrefix(v, "v")
+}
+
 func fetchRelease(ctx context.Context, client *http.Client, repo, version, token string) (*gitHubRelease, error) {
+	tag := cleanTargetVersion(version)
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
-	if version != "" && version != "latest" {
-		tag := strings.TrimPrefix(version, "v")
+	if tag != "" {
 		url = fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, tag)
 	}
 
@@ -574,9 +613,9 @@ func fetchRelease(ctx context.Context, client *http.Client, repo, version, token
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound && version != "" && version != "latest" {
+	if resp.StatusCode == http.StatusNotFound && tag != "" {
 		// Try with v prefix
-		vURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/v%s", repo, strings.TrimPrefix(version, "v"))
+		vURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/v%s", repo, strings.TrimPrefix(tag, "v"))
 		req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, vURL, nil)
 		req2.Header.Set("Accept", "application/vnd.github.v3+json")
 		req2.Header.Set("User-Agent", "iazio-agent/1.0")
@@ -592,7 +631,7 @@ func fetchRelease(ctx context.Context, client *http.Client, repo, version, token
 		}
 	}
 
-	if resp.StatusCode == http.StatusNotFound && (version == "" || version == "latest") {
+	if resp.StatusCode == http.StatusNotFound && tag == "" {
 		listURL := fmt.Sprintf("https://api.github.com/repos/%s/releases", repo)
 		reqList, _ := http.NewRequestWithContext(ctx, http.MethodGet, listURL, nil)
 		if reqList != nil {
@@ -631,8 +670,8 @@ func findMatchingAsset(rel *gitHubRelease, toolName, targetOS, targetArch string
 		if strings.HasSuffix(lower, ".txt") || strings.HasSuffix(lower, ".sig") {
 			return false
 		}
-		osMatch := strings.Contains(lower, targetOS)
-		archMatch := strings.Contains(lower, targetArch) || (targetArch == "amd64" && strings.Contains(lower, "x86_64"))
+		osMatch := strings.Contains(lower, targetOS) || (targetOS == "darwin" && (strings.Contains(lower, "macos") || strings.Contains(lower, "osx") || strings.Contains(lower, "apple")))
+		archMatch := strings.Contains(lower, targetArch) || (targetArch == "amd64" && strings.Contains(lower, "x86_64")) || (targetArch == "arm64" && strings.Contains(lower, "aarch64"))
 		return osMatch && archMatch
 	}
 

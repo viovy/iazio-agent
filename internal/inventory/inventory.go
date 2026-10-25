@@ -25,6 +25,13 @@ type cachedVersion struct {
 	version string
 }
 
+// InvalidateVersionCache evicts the cached version for a binary path.
+func InvalidateVersionCache(binaryPath string) {
+	verCacheMu.Lock()
+	delete(verCache, binaryPath)
+	verCacheMu.Unlock()
+}
+
 // InspectInstalledVersion returns the semantic or release version of a binary.
 // It checks <path>.version first, then falls back to running --version or version,
 // caching results based on file modtime and size.
@@ -36,7 +43,13 @@ func InspectInstalledVersion(binaryPath string) string {
 	if data, err := os.ReadFile(binaryPath + ".version"); err == nil {
 		v := strings.TrimSpace(string(data))
 		if v != "" {
-			return strings.TrimPrefix(v, "v")
+			re := regexp.MustCompile(`v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?)|([0-9]+\.[0-9]+\.[0-9]+)`)
+			if match := re.FindString(v); match != "" {
+				return strings.TrimPrefix(match, "v")
+			}
+			if !strings.Contains(strings.ToLower(v), "dev") {
+				return strings.TrimPrefix(v, "v")
+			}
 		}
 	}
 
