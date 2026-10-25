@@ -273,7 +273,7 @@ func DefaultOSProcessScanner(repoPaths []string) ([]ActiveHarnessSignal, error) 
 			}
 		}
 
-		if matchingRepo != "" || strings.Contains(commandLine, "iazio-harness run") {
+		if matchingRepo != "" || (len(repoPaths) == 0 && strings.Contains(commandLine, "iazio-harness run")) {
 			signals = append(signals, ActiveHarnessSignal{
 				Source:     "process_table",
 				RepoPath:   matchingRepo,
