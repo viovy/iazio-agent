@@ -474,6 +474,10 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 
 	// Pre-job workspace sanitization: non-destructive lock clearing, interrupted git ops recovery, dirty patch archiving, and line ending hygiene
 	if worktreeDir != "" && worktreeDir != "." {
+		_, wsPrepSpan := telemetry.StartSpan(ctx, "agent.workspace_prep",
+			telemetry.WithTag("job.id", job.ID),
+			telemetry.WithTag("workspace", worktreeDir),
+		)
 		if sanRes, sanErr := workspace.ResetAndSanitizeFreshWorkspace(ctx, worktreeDir, job.ID); sanErr != nil {
 			fmt.Fprintf(os.Stderr, "[dispatcher] pre-job sanitize warning: %v\n", sanErr)
 		} else if sanRes != nil && len(sanRes.RemovedLockPaths) > 0 {
@@ -481,6 +485,9 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		}
 		if cfgErr := exec.CommandContext(ctx, "git", "-C", worktreeDir, "config", "core.autocrlf", "input").Run(); cfgErr != nil {
 			fmt.Fprintf(os.Stderr, "[dispatcher] git autocrlf config warning: %v\n", cfgErr)
+		}
+		if wsPrepSpan != nil {
+			wsPrepSpan.End()
 		}
 	}
 
@@ -566,9 +573,20 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		return true, compErr
 
 	case JobTypePromptExecute:
+		toolName := job.TargetAgent
+		if toolName == "" {
+			toolName = "default"
+		}
+		_, toolSpan := telemetry.StartSpan(ctx, "agent.tool_execution."+toolName,
+			telemetry.WithTag("job.id", job.ID),
+			telemetry.WithTag("tool", toolName),
+		)
 		payload := EnsurePromptIDWithTrace(job.ID, job.TraceID, job.Payload)
 		startTime := time.Now()
 		res, err := invoker.ExecutePrompt(execCtx, payload)
+		if toolSpan != nil {
+			toolSpan.End()
+		}
 		if err != nil {
 			elapsed := time.Since(startTime)
 			if execCtx.Err() == nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) && elapsed < 45*time.Second && job.TargetAgent != "" {
@@ -595,6 +613,9 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: err.Error()})
 			return true, err
 		}
+		_, gateSpan := telemetry.StartSpan(ctx, "agent.ase_completion_gate",
+			telemetry.WithTag("job.id", job.ID),
+		)
 		if res != nil {
 			storyID := res.StoryID
 			if storyID == "" {
@@ -610,6 +631,9 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		}
 		resBytes, _ := json.Marshal(res)
 		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Result: resBytes})
+		if gateSpan != nil {
+			gateSpan.End()
+		}
 		if compErr == nil && d.syncer != nil {
 			targetRepo := job.Repo
 			if targetRepo == "" && res != nil {
