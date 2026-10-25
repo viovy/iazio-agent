@@ -938,12 +938,25 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				if job.ConversationID != "" {
 					argv = append(argv, "--resume-conversation", job.ConversationID)
 				}
+				if job.AttachToolPID > 0 {
+					argv = append(argv, "--attach-tool-pid", strconv.Itoa(job.AttachToolPID))
+				}
 				newPID, err := wdRunner.Start(argv)
 				return newPID, err
 			}
 			wd = watchdog.New(watchdog.Options{
 				Runner:  wdRunner,
 				Spawner: spawner,
+				OnOrphanTool: func(job watchdog.TrackedJob) {
+					msg := fmt.Sprintf("\n[ASE-SUPERVISOR] [watchdog.orphan_tool_detected] Harness process (PID %d) terminated, but AI tool process (ToolPID %d, engine: %s) is STILL RUNNING for conversation %s in %s. Attaching new supervisor...\n",
+						job.PID, job.ToolPID, job.Engine, job.ConversationID, job.WorktreePath)
+					_ = client.PostChunk(runCtx, job.JobID, "stdout", msg)
+				},
+				OnAutoResume: func(job watchdog.TrackedJob, reason string, attempt, max int) {
+					msg := fmt.Sprintf("\n[ASE-SUPERVISOR] [watchdog.auto_resume] Harness process (PID %d) and AI tool terminated. Story incomplete. Auto-resuming session (conversation %s, attempt %d/%d) with prompt \"resume\"...\n",
+						job.PID, job.ConversationID, attempt, max)
+					_ = client.PostChunk(runCtx, job.JobID, "stdout", msg)
+				},
 			})
 			wd.StartWatchguard(runCtx, 5*time.Second)
 
@@ -1068,6 +1081,15 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				if convID != "" {
 					spawnExtras = append(spawnExtras, "--resume-conversation", convID)
 				}
+				toolPID := 0
+				if a.WorktreePath != "" {
+					if lockInfo, err := repolock.Read(a.WorktreePath); err == nil && lockInfo.ToolPID > 0 {
+						if watchdog.IsProcessAlive(lockInfo.ToolPID) {
+							toolPID = lockInfo.ToolPID
+							spawnExtras = append(spawnExtras, "--attach-tool-pid", strconv.Itoa(lockInfo.ToolPID))
+						}
+					}
+				}
 
 				err := sup.Spawn(wdRunner, a.ID, api, a.WorktreePath, a.DocsHubPath, "", spawnExtras...)
 				if err != nil {
@@ -1089,6 +1111,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					StoryID:        a.StoryID,
 					ConversationID: convID,
 					PID:            pid,
+					HarnessPID:     pid,
+					ToolPID:        toolPID,
 				})
 				return nil
 			}

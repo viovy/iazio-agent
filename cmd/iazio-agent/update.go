@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -443,7 +444,18 @@ func updateSingleTool(
 	}
 
 	destPath := filepath.Join(binDir, binName)
+	var existingShadowPath string
+	if lookPath, err := exec.LookPath(binName); err == nil && lookPath != "" {
+		if absLook, err := filepath.Abs(lookPath); err == nil {
+			if absDest, err := filepath.Abs(destPath); err == nil && absLook != absDest {
+				existingShadowPath = absLook
+			}
+		}
+	}
 	curVer := inventory.InspectInstalledVersion(destPath)
+	if curVer == "" && existingShadowPath != "" {
+		curVer = inventory.InspectInstalledVersion(existingShadowPath)
+	}
 
 	repo := tool.Repository
 	if !strings.Contains(repo, "/") {
@@ -500,6 +512,33 @@ func updateSingleTool(
 	}
 
 	_ = os.WriteFile(destPath+".version", []byte(latestVer), 0644)
+	inventory.InvalidateVersionCache(destPath)
+
+	if existingShadowPath != "" {
+		if err := installExecutableSafe(existingShadowPath, binBytes); err == nil {
+			_ = os.WriteFile(existingShadowPath+".version", []byte(latestVer), 0644)
+			inventory.InvalidateVersionCache(existingShadowPath)
+			fmt.Fprintf(stdout, "  [+] %s: synchronized active PATH binary at %s\n", tool.Name, existingShadowPath)
+		} else if stderr != nil {
+			fmt.Fprintf(stderr, "  [!] %s: warning: failed to update shadowing binary at %s: %v\n", tool.Name, existingShadowPath, err)
+		}
+	}
+
+	if home := os.Getenv("HOME"); home != "" {
+		for _, altDir := range []string{
+			filepath.Join(home, ".local", "bin"),
+			filepath.Join(home, ".iazio", "bin"),
+			filepath.Join(home, ".gemini", "antigravity-cli", "bin"),
+		} {
+			altPath := filepath.Join(altDir, filepath.Base(destPath))
+			if _, err := os.Stat(altPath); err == nil {
+				_ = installExecutableSafe(altPath, binBytes)
+				_ = os.WriteFile(altPath+".version", []byte(latestVer), 0644)
+				inventory.InvalidateVersionCache(altPath)
+			}
+		}
+	}
+
 	fmt.Fprintf(stdout, "  [+] %s: %s -> %s\n", tool.Name, latestVer, destPath)
 	return true, nil
 }
@@ -551,10 +590,25 @@ func resolveGitHubToken(getenv func(string) string) string {
 	return ""
 }
 
+func cleanTargetVersion(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" || strings.EqualFold(v, "latest") {
+		return ""
+	}
+	if strings.Contains(strings.ToLower(v), "dev") {
+		return ""
+	}
+	re := regexp.MustCompile(`v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?)|([0-9]+\.[0-9]+\.[0-9]+)`)
+	if match := re.FindString(v); match != "" {
+		return strings.TrimPrefix(match, "v")
+	}
+	return strings.TrimPrefix(v, "v")
+}
+
 func fetchRelease(ctx context.Context, client *http.Client, repo, version, token string) (*gitHubRelease, error) {
+	tag := cleanTargetVersion(version)
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
-	if version != "" && version != "latest" {
-		tag := strings.TrimPrefix(version, "v")
+	if tag != "" {
 		url = fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, tag)
 	}
 
@@ -574,9 +628,9 @@ func fetchRelease(ctx context.Context, client *http.Client, repo, version, token
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound && version != "" && version != "latest" {
+	if resp.StatusCode == http.StatusNotFound && tag != "" {
 		// Try with v prefix
-		vURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/v%s", repo, strings.TrimPrefix(version, "v"))
+		vURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/v%s", repo, strings.TrimPrefix(tag, "v"))
 		req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, vURL, nil)
 		req2.Header.Set("Accept", "application/vnd.github.v3+json")
 		req2.Header.Set("User-Agent", "iazio-agent/1.0")
@@ -592,7 +646,7 @@ func fetchRelease(ctx context.Context, client *http.Client, repo, version, token
 		}
 	}
 
-	if resp.StatusCode == http.StatusNotFound && (version == "" || version == "latest") {
+	if resp.StatusCode == http.StatusNotFound && tag == "" {
 		listURL := fmt.Sprintf("https://api.github.com/repos/%s/releases", repo)
 		reqList, _ := http.NewRequestWithContext(ctx, http.MethodGet, listURL, nil)
 		if reqList != nil {
@@ -631,8 +685,8 @@ func findMatchingAsset(rel *gitHubRelease, toolName, targetOS, targetArch string
 		if strings.HasSuffix(lower, ".txt") || strings.HasSuffix(lower, ".sig") {
 			return false
 		}
-		osMatch := strings.Contains(lower, targetOS)
-		archMatch := strings.Contains(lower, targetArch) || (targetArch == "amd64" && strings.Contains(lower, "x86_64"))
+		osMatch := strings.Contains(lower, targetOS) || (targetOS == "darwin" && (strings.Contains(lower, "macos") || strings.Contains(lower, "osx") || strings.Contains(lower, "apple")))
+		archMatch := strings.Contains(lower, targetArch) || (targetArch == "amd64" && strings.Contains(lower, "x86_64")) || (targetArch == "arm64" && strings.Contains(lower, "aarch64"))
 		return osMatch && archMatch
 	}
 
@@ -799,144 +853,6 @@ func extractBinary(archiveData []byte, archiveName, binaryName, targetOS string)
 	}
 
 	return nil, fmt.Errorf("unsupported archive format: %s", archiveName)
-}
-
-func installExecutableSafe(destPath string, data []byte) error {
-	dir := filepath.Dir(destPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("create dest dir: %w", err)
-	}
-
-	if runtime.GOOS == "windows" {
-		cleanStaleBackups(dir)
-		if err := installExecutableSafeDirect(destPath, data); err != nil {
-			return err
-		}
-
-		// Synchronize active running process executable if installed from alternate location
-		if currentExe, err := os.Executable(); err == nil && currentExe != "" {
-			if strings.EqualFold(filepath.Base(currentExe), filepath.Base(destPath)) &&
-				!strings.EqualFold(filepath.Clean(currentExe), filepath.Clean(destPath)) {
-				if err := installExecutableSafeDirect(currentExe, data); err != nil {
-					return fmt.Errorf("failed to synchronize running executable at %s: %w", currentExe, err)
-				}
-			}
-		}
-
-		// Synchronize %USERPROFILE%\bin and %USERPROFILE%\.local\bin to prevent PATH shadowing
-		userProfile := os.Getenv("USERPROFILE")
-		if userProfile != "" {
-			binDir1 := filepath.Join(userProfile, "bin")
-			binDir2 := filepath.Join(userProfile, ".local", "bin")
-			var altPath string
-			if strings.HasPrefix(strings.ToLower(destPath), strings.ToLower(binDir1)) {
-				altPath = filepath.Join(binDir2, filepath.Base(destPath))
-			} else if strings.HasPrefix(strings.ToLower(destPath), strings.ToLower(binDir2)) {
-				altPath = filepath.Join(binDir1, filepath.Base(destPath))
-			}
-			if altPath != "" {
-				if _, statErr := os.Stat(altPath); statErr == nil {
-					if err := installExecutableSafeDirect(altPath, data); err != nil {
-						return fmt.Errorf("failed to synchronize existing alternate binary at %s: %w", altPath, err)
-					}
-				} else if _, statErr := os.Stat(filepath.Dir(altPath)); statErr == nil {
-					if err := installExecutableSafeDirect(altPath, data); err != nil {
-						return fmt.Errorf("failed to initialize alternate binary at %s: %w", altPath, err)
-					}
-				}
-			}
-		}
-		return nil
-	}
-
-	if err := installExecutableSafeDirect(destPath, data); err != nil {
-		return err
-	}
-
-	// Synchronize active running process executable on Unix if installed from alternate location
-	if currentExe, err := os.Executable(); err == nil && currentExe != "" {
-		if resolvedCurrent, err := filepath.EvalSymlinks(currentExe); err == nil {
-			currentExe = resolvedCurrent
-		}
-		cleanCurrent := filepath.Clean(currentExe)
-		cleanDest := filepath.Clean(destPath)
-		if filepath.Base(cleanCurrent) == filepath.Base(cleanDest) && cleanCurrent != cleanDest {
-			if err := installExecutableSafeDirect(cleanCurrent, data); err != nil {
-				return fmt.Errorf("failed to synchronize running executable at %s: %w", cleanCurrent, err)
-			}
-		}
-	}
-
-	// Synchronize ~/.local/bin and ~/.iazio/bin on Unix to prevent service / PATH shadowing
-	if home := os.Getenv("HOME"); home != "" {
-		binDir1 := filepath.Join(home, ".local", "bin")
-		binDir2 := filepath.Join(home, ".iazio", "bin")
-		var altPath string
-		if strings.HasPrefix(destPath, binDir1) {
-			altPath = filepath.Join(binDir2, filepath.Base(destPath))
-		} else if strings.HasPrefix(destPath, binDir2) {
-			altPath = filepath.Join(binDir1, filepath.Base(destPath))
-		}
-		if altPath != "" {
-			if _, statErr := os.Stat(altPath); statErr == nil {
-				if err := installExecutableSafeDirect(altPath, data); err != nil {
-					return fmt.Errorf("failed to synchronize existing alternate binary at %s: %w", altPath, err)
-				}
-			} else if _, statErr := os.Stat(filepath.Dir(altPath)); statErr == nil {
-				if err := installExecutableSafeDirect(altPath, data); err != nil {
-					return fmt.Errorf("failed to initialize alternate binary at %s: %w", altPath, err)
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func installExecutableSafeDirect(destPath string, data []byte) error {
-	dir := filepath.Dir(destPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-	if runtime.GOOS == "windows" {
-		if _, err := os.Stat(destPath); err == nil {
-			f, err := os.OpenFile(destPath, os.O_WRONLY|os.O_TRUNC, 0755)
-			if err != nil {
-				backupPath := fmt.Sprintf("%s.old.%d.exe", strings.TrimSuffix(destPath, ".exe"), time.Now().UnixNano())
-				if renameErr := os.Rename(destPath, backupPath); renameErr != nil {
-					return fmt.Errorf("file locked and rename failed: %w", renameErr)
-				}
-			} else {
-				_ = f.Close()
-			}
-		}
-		return os.WriteFile(destPath, data, 0755)
-	}
-	tmpPath := fmt.Sprintf("%s.tmp.%d", destPath, time.Now().UnixNano())
-	if err := os.WriteFile(tmpPath, data, 0755); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, destPath)
-}
-
-func cleanStaleBackups(dir string) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return
-	}
-	for _, ent := range entries {
-		if ent.IsDir() {
-			continue
-		}
-		name := ent.Name()
-		if strings.Contains(name, ".old.") && strings.HasSuffix(name, ".exe") {
-			fullPath := filepath.Join(dir, name)
-			if info, err := ent.Info(); err == nil {
-				if time.Since(info.ModTime()) > 5*time.Minute {
-					_ = os.Remove(fullPath)
-				}
-			}
-		}
-	}
 }
 
 func inspectInstalledVersion(binaryPath string) string {

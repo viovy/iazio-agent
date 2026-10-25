@@ -22,6 +22,7 @@ type LockInfo struct {
 	ScheduleID     string    `json:"schedule_id,omitempty"`
 	PID            int       `json:"pid"`
 	HarnessPID     int       `json:"harness_pid,omitempty"`
+	ToolPID        int       `json:"tool_pid,omitempty"`
 	Engine         string    `json:"engine,omitempty"`
 	ConversationID string    `json:"conversation_id,omitempty"`
 	StoryID        string    `json:"story_id,omitempty"`

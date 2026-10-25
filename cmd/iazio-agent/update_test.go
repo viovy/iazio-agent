@@ -1158,3 +1158,303 @@ func TestUpdate_CLIFlagParsing_Version(t *testing.T) {
 		t.Fatalf("expected TargetVersion 0.0.493, got %s", opts2.TargetVersion)
 	}
 }
+
+func TestCleanTargetVersion(t *testing.T) {
+	cases := []struct {
+		input    string
+		expected string
+	}{
+		{"autopilot-fleet version dev", ""},
+		{"autopilot-fleet 0.0.492", "0.0.492"},
+		{"v0.0.492", "0.0.492"},
+		{"0.0.492", "0.0.492"},
+		{"latest", ""},
+		{"dev", ""},
+		{"", ""},
+		{"autopilot-fleet version 1.2.3-beta.1", "1.2.3-beta.1"},
+	}
+
+	for _, c := range cases {
+		got := cleanTargetVersion(c.input)
+		if got != c.expected {
+			t.Errorf("cleanTargetVersion(%q) = %q; want %q", c.input, got, c.expected)
+		}
+	}
+}
+
+func TestFindMatchingAsset_MacOS_ArchitectureAliases(t *testing.T) {
+	rel := &gitHubRelease{
+		TagName: "v0.0.492",
+		Assets: []gitHubAsset{
+			{Name: "autopilot-fleet_0.0.492_macos_aarch64.tar.gz"},
+			{Name: "autopilot-fleet_0.0.492_linux_x86_64.tar.gz"},
+		},
+	}
+
+	// 1. macOS on arm64 matching macos + aarch64
+	a1, err := findMatchingAsset(rel, "autopilot-fleet", "darwin", "arm64")
+	if err != nil {
+		t.Fatalf("expected to match darwin/arm64 to macos/aarch64 asset, got err: %v", err)
+	}
+	if a1.Name != "autopilot-fleet_0.0.492_macos_aarch64.tar.gz" {
+		t.Errorf("matched wrong asset: %s", a1.Name)
+	}
+
+	// 2. Linux on amd64 matching linux + x86_64
+	a2, err := findMatchingAsset(rel, "autopilot-fleet", "linux", "amd64")
+	if err != nil {
+		t.Fatalf("expected to match linux/amd64 to linux/x86_64 asset, got err: %v", err)
+	}
+	if a2.Name != "autopilot-fleet_0.0.492_linux_x86_64.tar.gz" {
+		t.Errorf("matched wrong asset: %s", a2.Name)
+	}
+}
+
+func TestUpdateSingleTool_ShadowingBinarySync(t *testing.T) {
+	tempDir := t.TempDir()
+	binDir := filepath.Join(tempDir, "bin")
+	shadowDir := filepath.Join(tempDir, "shadow")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(shadowDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	toolName := "autopilot-fleet"
+	shadowBin := filepath.Join(shadowDir, toolName)
+	if err := os.WriteFile(shadowBin, []byte("#!/bin/sh\necho old-dev\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(shadowBin+".version", []byte("autopilot-fleet version dev"), 0644)
+
+	// Prepend shadowDir to PATH so LookPath finds it
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", shadowDir+string(os.PathListSeparator)+origPath)
+
+	payload := []byte("#!/bin/sh\necho v0.0.492\n")
+	tarData := createTarGz(t, toolName, payload)
+	sum := sha256.Sum256(tarData)
+	hashStr := hex.EncodeToString(sum[:])
+	checksumsData := fmt.Sprintf("%s  %s_0.0.492_linux_amd64.tar.gz\n", hashStr, toolName)
+
+	client := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(req.URL.Path, "/releases/latest") || strings.HasSuffix(req.URL.Path, "/releases/tags/0.0.492") {
+				rel := gitHubRelease{
+					TagName: "0.0.492",
+					Assets: []gitHubAsset{
+						{
+							Name:               fmt.Sprintf("%s_0.0.492_linux_amd64.tar.gz", toolName),
+							BrowserDownloadURL: fmt.Sprintf("https://github.com/viovy/%s/releases/download/0.0.492/%s_0.0.492_linux_amd64.tar.gz", toolName, toolName),
+						},
+						{
+							Name:               "checksums.txt",
+							BrowserDownloadURL: fmt.Sprintf("https://github.com/viovy/%s/releases/download/0.0.492/checksums.txt", toolName),
+						},
+					},
+				}
+				data, _ := json.Marshal(rel)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(bytes.NewReader(data)),
+					Header:     make(http.Header),
+				}, nil
+			}
+			if strings.HasSuffix(req.URL.Path, ".tar.gz") {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(bytes.NewReader(tarData)),
+					Header:     make(http.Header),
+				}, nil
+			}
+			if strings.HasSuffix(req.URL.Path, "checksums.txt") {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(strings.NewReader(checksumsData)),
+					Header:     make(http.Header),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Status:     "404 Not Found",
+				Body:       io.NopCloser(strings.NewReader("404")),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+
+	tool := ManifestToolItem{
+		Name:          toolName,
+		Repository:    "viovy/" + toolName,
+		BinaryName:    toolName,
+		Tier:          "baseline",
+		TargetVersion: "autopilot-fleet version dev",
+	}
+
+	var stdout, stderr bytes.Buffer
+	updated, err := updateSingleTool(context.Background(), client, tool, binDir, "", true, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !updated {
+		t.Fatalf("expected tool to be updated")
+	}
+
+	// Verify target binDir was written
+	destBin := filepath.Join(binDir, toolName)
+	destData, err := os.ReadFile(destBin)
+	if err != nil {
+		t.Fatalf("failed to read dest binary: %v", err)
+	}
+	if string(destData) != string(payload) {
+		t.Fatalf("dest binary content mismatch")
+	}
+
+	// Verify shadowing binary was also updated
+	shadowData, err := os.ReadFile(shadowBin)
+	if err != nil {
+		t.Fatalf("failed to read shadow binary: %v", err)
+	}
+	if string(shadowData) != string(payload) {
+		t.Fatalf("shadow binary content mismatch: got %q, want %q", string(shadowData), string(payload))
+	}
+
+	// Verify .version in shadowDir was updated to 0.0.492
+	shadowVer, err := os.ReadFile(shadowBin + ".version")
+	if err != nil {
+		t.Fatalf("failed to read shadow .version: %v", err)
+	}
+	if string(shadowVer) != "0.0.492" {
+		t.Fatalf("shadow .version mismatch: got %q, want 0.0.492", string(shadowVer))
+	}
+}
+
+func TestCleanTargetVersion_Table(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"", ""},
+		{"latest", ""},
+		{"LATEST", ""},
+		{"autopilot-fleet version dev", ""},
+		{"v1.2.3", "1.2.3"},
+		{"1.2.3", "1.2.3"},
+		{"v2.0.0-beta.1", "2.0.0-beta.1"},
+		{"tool-name-v3.4.5", "3.4.5"},
+		{"custom_tag", "custom_tag"},
+	}
+	for _, tc := range cases {
+		got := cleanTargetVersion(tc.input)
+		if got != tc.want {
+			t.Errorf("cleanTargetVersion(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestResolveInstallDir_Coverage(t *testing.T) {
+	getenv := func(key string) string {
+		switch key {
+		case "HOME":
+			return "/home/testuser"
+		case "USERPROFILE":
+			return "C:\\Users\\testuser"
+		case "HOMEDRIVE":
+			return "C:"
+		case "HOMEPATH":
+			return "\\Users\\testuser"
+		default:
+			return ""
+		}
+	}
+
+	rootsUnixTilde := ManifestInstallRoots{
+		Unix: ManifestInstallRootPaths{Primary: "~/.local/bin"},
+	}
+	if dir := resolveInstallDir(rootsUnixTilde, getenv); dir != "" {
+		if runtime.GOOS != "windows" && dir != "/home/testuser/.local/bin" {
+			t.Errorf("expected /home/testuser/.local/bin, got %s", dir)
+		}
+	}
+
+	rootsUnixDirect := ManifestInstallRoots{
+		Unix: ManifestInstallRootPaths{Primary: "/opt/custom/bin"},
+	}
+	if dir := resolveInstallDir(rootsUnixDirect, getenv); dir != "" {
+		if runtime.GOOS != "windows" && dir != "/opt/custom/bin" {
+			t.Errorf("expected /opt/custom/bin, got %s", dir)
+		}
+	}
+
+	rootsUnixEmpty := ManifestInstallRoots{}
+	if dir := resolveInstallDir(rootsUnixEmpty, getenv); dir != "" {
+		if runtime.GOOS != "windows" && dir != "/home/testuser/.local/bin" {
+			t.Errorf("expected /home/testuser/.local/bin, got %s", dir)
+		}
+	}
+}
+
+func TestInstallExecutableSafeDirect_Unit(t *testing.T) {
+	tmpDir := t.TempDir()
+	binPath := filepath.Join(tmpDir, "testtool")
+	data := []byte("#!/bin/sh\necho ok\n")
+
+	// Direct install
+	if err := installExecutableSafeDirect(binPath, data); err != nil {
+		t.Fatalf("installExecutableSafeDirect failed: %v", err)
+	}
+
+	read, err := os.ReadFile(binPath)
+	if err != nil || string(read) != string(data) {
+		t.Fatalf("unexpected content after install: %v", err)
+	}
+
+	// Overwrite install
+	newData := []byte("#!/bin/sh\necho updated\n")
+	if err := installExecutableSafeDirect(binPath, newData); err != nil {
+		t.Fatalf("installExecutableSafeDirect overwrite failed: %v", err)
+	}
+
+	read2, err := os.ReadFile(binPath)
+	if err != nil || string(read2) != string(newData) {
+		t.Fatalf("unexpected content after overwrite: %v", err)
+	}
+}
+
+func TestInstallExecutableSafe_MultiDirSync(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	altDir1 := filepath.Join(tmpHome, ".local", "bin")
+	altDir2 := filepath.Join(tmpHome, ".iazio", "bin")
+	altDir3 := filepath.Join(tmpHome, ".gemini", "antigravity-cli", "bin")
+
+	if err := os.MkdirAll(altDir1, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(altDir2, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	destPath := filepath.Join(altDir3, "my-tool")
+	payload := []byte("binary-payload-multi-dir")
+
+	if err := installExecutableSafe(destPath, payload); err != nil {
+		t.Fatalf("installExecutableSafe failed: %v", err)
+	}
+
+	// Verify all existing alternate dirs have the binary
+	for _, dir := range []string{altDir1, altDir2, altDir3} {
+		p := filepath.Join(dir, "my-tool")
+		c, err := os.ReadFile(p)
+		if err != nil {
+			t.Errorf("expected binary at %s: %v", p, err)
+		} else if string(c) != string(payload) {
+			t.Errorf("binary content mismatch at %s", p)
+		}
+	}
+}

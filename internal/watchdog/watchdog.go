@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/ase/gate"
@@ -73,6 +72,9 @@ type TrackedJob struct {
 	StoryID                 string           `json:"story_id,omitempty"`
 	ConversationID          string           `json:"conversation_id,omitempty"`
 	PID                     int              `json:"pid"`
+	HarnessPID              int              `json:"harness_pid,omitempty"`
+	ToolPID                 int              `json:"tool_pid,omitempty"`
+	AttachToolPID           int              `json:"attach_tool_pid,omitempty"`
 	StartedAt               time.Time        `json:"started_at"`
 	UpdatedAt               time.Time        `json:"updated_at"`
 	ResumeCount             int              `json:"resume_count"`
@@ -103,21 +105,25 @@ type Watchdog struct {
 	isAlive     func(pid int) bool
 	now         func() time.Time
 	monitor     *ConversationLivenessMonitor
-	killProcess func(pid int) error
-	sleep       func(time.Duration)
+	killProcess  func(pid int) error
+	sleep        func(time.Duration)
+	onOrphanTool func(job TrackedJob)
+	onAutoResume func(job TrackedJob, reason string, attempt, max int)
 }
 
 // Options configures a Watchdog.
 type Options struct {
-	StateFile   string
-	Runner      supervisor.Runner
-	Spawner     Spawner
-	MaxResumes  int
-	IsAlive     func(pid int) bool
-	Now         func() time.Time
-	Monitor     *ConversationLivenessMonitor
-	KillProcess func(pid int) error
-	Sleep       func(time.Duration)
+	StateFile    string
+	Runner       supervisor.Runner
+	Spawner      Spawner
+	MaxResumes   int
+	IsAlive      func(pid int) bool
+	Now          func() time.Time
+	Monitor      *ConversationLivenessMonitor
+	KillProcess  func(pid int) error
+	Sleep        func(time.Duration)
+	OnOrphanTool func(job TrackedJob)
+	OnAutoResume func(job TrackedJob, reason string, attempt, max int)
 }
 
 // New creates a Watchdog.
@@ -155,8 +161,10 @@ func New(opts Options) *Watchdog {
 		isAlive:     opts.IsAlive,
 		now:         opts.Now,
 		monitor:     opts.Monitor,
-		killProcess: opts.KillProcess,
-		sleep:       opts.Sleep,
+		killProcess:  opts.KillProcess,
+		sleep:        opts.Sleep,
+		onOrphanTool: opts.OnOrphanTool,
+		onAutoResume: opts.OnAutoResume,
 	}
 
 	// Load existing persistent state if present
@@ -164,16 +172,9 @@ func New(opts Options) *Watchdog {
 	return w
 }
 
-func defaultIsProcessAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	err = process.Signal(syscall.Signal(0))
-	return err == nil
+// IsProcessAlive tests whether a process with the given PID is actively running.
+func IsProcessAlive(pid int) bool {
+	return defaultIsProcessAlive(pid)
 }
 
 func defaultKillProcess(pid int) error {
@@ -306,7 +307,7 @@ func (w *Watchdog) OnProcessExit(jobID string, pid, exitCode int, waitErr error)
 	}
 
 	// H2: Guard against double-resume race condition on stall termination
-	if job.PID != pid {
+	if job.PID != pid && job.HarnessPID != pid {
 		w.mu.Unlock()
 		return
 	}
@@ -321,6 +322,20 @@ func (w *Watchdog) OnProcessExit(jobID string, pid, exitCode int, waitErr error)
 	job.ExitCode = exitCode
 	if waitErr != nil {
 		job.LastError = waitErr.Error()
+	}
+
+	// First inspect if AI tool process (ToolPID) is still running while harness terminated
+	if job.ToolPID <= 0 && job.WorktreePath != "" {
+		if lockInfo, err := repolock.Read(job.WorktreePath); err == nil && lockInfo.ToolPID > 0 {
+			job.ToolPID = lockInfo.ToolPID
+		}
+	}
+	if job.ToolPID > 0 && w.isAlive(job.ToolPID) {
+		w.appendOrphanToolLog(*job)
+		w.persistStateLocked()
+		w.mu.Unlock()
+		w.attemptResumeWithReason(jobID, "attach_running_tool", nil)
+		return
 	}
 
 	// Clean completion check with "Don't Stop Till Done" ASE Completion Gate
@@ -380,6 +395,38 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 
 	if job.Status == StatusCompleted || job.Status == StatusFailed || job.Status == StatusCircuitBreakerTripped {
 		w.mu.Unlock()
+		return
+	}
+
+	if reason == "attach_running_tool" {
+		job.AttachToolPID = job.ToolPID
+		job.Status = StatusAutoResuming
+		jobCopy := *job
+		spawner := w.spawner
+		w.persistStateLocked()
+		w.mu.Unlock()
+
+		w.appendOrphanToolLog(jobCopy)
+		if spawner != nil {
+			newPID, err := spawner(context.Background(), jobCopy)
+			w.mu.Lock()
+			if err != nil {
+				job.LastError = fmt.Sprintf("attach spawn error: %v", err)
+				w.persistStateLocked()
+				w.mu.Unlock()
+				return
+			}
+			job.PID = newPID
+			job.HarnessPID = newPID
+			job.Status = StatusRunning
+			job.UpdatedAt = w.now().UTC()
+			w.persistStateLocked()
+			w.mu.Unlock()
+
+			if w.runner != nil && newPID > 0 {
+				go w.reapProcess(jobID, newPID)
+			}
+		}
 		return
 	}
 
@@ -504,7 +551,30 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 	}
 }
 
+func (w *Watchdog) appendOrphanToolLog(job TrackedJob) {
+	if w.onOrphanTool != nil {
+		w.onOrphanTool(job)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return
+	}
+	logPath := filepath.Join(home, ".iazio", "spool", fmt.Sprintf("%s.log", job.JobID))
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	msg := fmt.Sprintf("\n[ASE-SUPERVISOR] [watchdog.orphan_tool_detected] Harness process (PID %d) terminated, but AI tool process (ToolPID %d, engine: %s) is STILL RUNNING for conversation %s in %s. Attaching new supervisor...\n",
+		job.PID, job.ToolPID, job.Engine, job.ConversationID, job.WorktreePath)
+	_, _ = f.WriteString(msg)
+}
+
 func (w *Watchdog) appendResumeLog(job TrackedJob) {
+	if w.onAutoResume != nil {
+		w.onAutoResume(job, job.LastError, job.ResumeCount, w.maxResumes)
+	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return
@@ -581,7 +651,19 @@ func (w *Watchdog) CheckInterrupted(ctx context.Context) []TrackedJob {
 		if job.PID > 0 && !w.isAlive(job.PID) {
 			job.Status = StatusTerminatedUnexpectedly
 			job.UpdatedAt = now
-			toResume = append(toResume, resumeReq{jobID: id, reason: "unexpected_termination"})
+
+			// Check if AI tool (ToolPID) is still running while harness died
+			if job.ToolPID <= 0 && job.WorktreePath != "" {
+				if lockInfo, err := repolock.Read(job.WorktreePath); err == nil && lockInfo.ToolPID > 0 {
+					job.ToolPID = lockInfo.ToolPID
+				}
+			}
+			if job.ToolPID > 0 && w.isAlive(job.ToolPID) {
+				w.appendOrphanToolLog(*job)
+				toResume = append(toResume, resumeReq{jobID: id, reason: "attach_running_tool"})
+			} else {
+				toResume = append(toResume, resumeReq{jobID: id, reason: "unexpected_termination"})
+			}
 		}
 	}
 	w.persistStateLocked()
