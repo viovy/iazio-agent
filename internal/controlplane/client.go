@@ -145,6 +145,8 @@ func (c Client) HeartbeatDetailed(ctx context.Context, hostID string, tools []To
 			"user_service_watchdog_v2",
 			"deterministic_resume_4tuple_v1",
 			"agy_conversation_pinning_v1",
+			"workspace_recovery_modes_v1",
+			"background_task_watchdog_v1",
 		}
 	}
 	body := map[string]any{

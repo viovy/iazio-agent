@@ -592,6 +592,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					"user_service_watchdog_v2",
 					"deterministic_resume_4tuple_v1",
 					"agy_conversation_pinning_v1",
+					"workspace_recovery_modes_v1",
+					"background_task_watchdog_v1",
 				},
 				Version:   formatVersion(),
 				CommitSHA: commit,
@@ -694,6 +696,21 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 								healGitRepo(runCtx, target)
 								st := probeRepoRuntime(runCtx, target, filepath.Base(target))
 								_ = client.PostRepoStatus(runCtx, host, []controlplane.RepoRuntimeStatus{st})
+							}
+						}()
+					case "KILL_BACKGROUND_TASKS":
+						go func() {
+							var jobID string
+							if err := json.Unmarshal(cmd.Payload, &jobID); err != nil {
+								jobID = strings.Trim(strings.TrimSpace(string(cmd.Payload)), "\"")
+							}
+							if stderr != nil {
+								fmt.Fprintf(stderr, "[supervisor] remote kill background tasks received: jobID=%s\n", jobID)
+							}
+							for _, rj := range sup.RunningJobs() {
+								if jobID == "" || rj.JobID == jobID {
+									sup.Cancel(rj.WorktreePath, "KILL_BACKGROUND_TASKS")
+								}
 							}
 						}()
 					}
