@@ -426,8 +426,14 @@ func ResetAndSanitizeFreshWorkspace(ctx context.Context, workspacePath, jobID st
 		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "reset", "--hard", "HEAD").Run()
 		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "clean", "-fd").Run()
 
+		// Fetch all remotes and reset to clean origin/main if available
+		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "fetch", "--all", "--prune").Run()
+		if errOrigin := exec.CommandContext(ctx, "git", "-C", workspacePath, "rev-parse", "--verify", "origin/main").Run(); errOrigin == nil {
+			_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "reset", "--hard", "origin/main").Run()
+		}
+
 		// Hard reset and clean recursive submodules
-		submoduleCmd := `rm -f .git/index.lock || true; git reset --hard HEAD; git clean -fd`
+		submoduleCmd := `rm -f .git/index.lock || true; git reset --hard; git clean -fd`
 		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "submodule", "foreach", "--recursive", submoduleCmd).Run()
 	}
 
