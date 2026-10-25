@@ -1244,7 +1244,7 @@ func TestInspectRepoGitState_RecursiveSubmodules(t *testing.T) {
 
 	ctx := context.Background()
 
-	stClean := InspectRepoGitState(ctx, rootTemp, "meta-repo")
+	stClean := InspectRepoGitState(ctx, rootTemp, "fleet-workspace")
 	if !stClean.IsClean || !stClean.SubmodulesClean || !stClean.RootClean {
 		t.Fatalf("expected both root and subrepo clean, got: is_clean=%t root_clean=%t submodules_clean=%t (err=%s)",
 			stClean.IsClean, stClean.RootClean, stClean.SubmodulesClean, stClean.Error)
@@ -1259,7 +1259,7 @@ func TestInspectRepoGitState_RecursiveSubmodules(t *testing.T) {
 		t.Fatalf("write sub dirty file: %v", err)
 	}
 
-	stSubDirty := InspectRepoGitState(ctx, rootTemp, "meta-repo")
+	stSubDirty := InspectRepoGitState(ctx, rootTemp, "fleet-workspace")
 	if stSubDirty.IsClean {
 		t.Fatalf("expected workspace to be marked DIRTY because nested sub-repository has untracked file")
 	}
@@ -1277,7 +1277,7 @@ func TestInspectRepoGitState_RecursiveSubmodules(t *testing.T) {
 		t.Fatalf("write sub lock: %v", err)
 	}
 
-	stSubLock := InspectRepoGitState(ctx, rootTemp, "meta-repo")
+	stSubLock := InspectRepoGitState(ctx, rootTemp, "fleet-workspace")
 	if stSubLock.IsClean {
 		t.Fatalf("expected workspace dirty when subrepo has active index.lock")
 	}
@@ -1287,7 +1287,7 @@ func TestInspectRepoGitState_RecursiveSubmodules(t *testing.T) {
 	_ = os.Remove(subLock)
 
 	// 4. Verify clean again
-	stRestored := InspectRepoGitState(ctx, rootTemp, "meta-repo")
+	stRestored := InspectRepoGitState(ctx, rootTemp, "fleet-workspace")
 	if !stRestored.IsClean || !stRestored.SubmodulesClean {
 		t.Fatalf("expected workspace clean after clearing lock, got: %v (err=%s)", stRestored.IsClean, stRestored.Error)
 	}
@@ -1356,17 +1356,17 @@ func TestEagerToolUpdater_ReadinessReportAndGateIntegration(t *testing.T) {
 	monitor.mu.Lock()
 	monitor.lastSnapshot = FleetStateSnapshot{
 		FleetGitClean:  false,
-		DirtyRepoPaths: []string{"/path/meta-repo"},
+		DirtyRepoPaths: []string{"/path/fleet-workspace"},
 		Repos: map[string]RepoGitState{
-			"/path/meta-repo": {
-				RepoPath:        "/path/meta-repo",
+			"/path/fleet-workspace": {
+				RepoPath:        "/path/fleet-workspace",
 				IsClean:         false,
 				RootClean:       true,
 				SubmodulesClean: false,
 				DirtySubmodules: []string{"sub-module-x"},
 				SubRepos: map[string]SubRepoGitState{
 					"sub-module-x": {
-						SubRepoPath:         "/path/meta-repo/sub-module-x",
+						SubRepoPath:         "/path/fleet-workspace/sub-module-x",
 						RelPath:             "sub-module-x",
 						DirtyFilesCount:     3,
 						UntrackedFilesCount: 1,

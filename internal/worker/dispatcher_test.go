@@ -1027,7 +1027,7 @@ func TestDispatcher_PreDispatchAndPostJobHooks(t *testing.T) {
 		return &Job{
 			ID:      "job-hook-1",
 			Type:    JobTypePromptExecute,
-			Repo:    "meta-repo-03",
+			Repo:    "workspace-fleet",
 			Payload: json.RawMessage(`{"prompt":"test"}`),
 		}, nil
 	}
@@ -1076,7 +1076,7 @@ func TestDispatcher_HostGateLockedBlocksDispatch(t *testing.T) {
 		return &Job{
 			ID:      "job-blocked-1",
 			Type:    JobTypePromptExecute,
-			Repo:    "meta-repo-03",
+			Repo:    "workspace-fleet",
 			Payload: json.RawMessage(`{"prompt":"test"}`),
 		}, nil
 	}

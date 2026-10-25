@@ -98,7 +98,7 @@ func TestMultiSignalExecutionDetector_WorkspaceSentinel(t *testing.T) {
 
 func TestMultiSignalExecutionDetector_ProcessTableAndControlPlane(t *testing.T) {
 	detector := NewMultiSignalExecutionDetector(nil, nil, func() ([]RepoConfigItem, error) {
-		return []RepoConfigItem{{Path: "/path/to/meta-repo", Alias: "meta-repo"}}, nil
+		return []RepoConfigItem{{Path: "/path/to/fleet-workspace", Alias: "fleet-workspace"}}, nil
 	}, func(ctx context.Context) ([]ActiveHarnessSignal, error) {
 		return []ActiveHarnessSignal{
 			{
