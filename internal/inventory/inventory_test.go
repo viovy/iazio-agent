@@ -157,6 +157,7 @@ func writeExe(t *testing.T, path string) {
 func TestInspectToolService(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 
 	// 1. Not installed
 	installed, svcType, svcStatus, caps := InspectToolService("iazio-agent", "linux")
@@ -244,9 +245,12 @@ func TestCompareCoreAndDedupe(t *testing.T) {
 		t.Errorf("expected s1 == s5")
 	}
 
+	expA := filepath.Clean("/dir/a")
+	expB := filepath.Clean("/dir/b")
+	expC := filepath.Clean("/dir/c")
 	dirs := []string{"/dir/a", "/dir/b", "/dir/a", "/dir/c", "/dir/b"}
 	deduped := dedupe(dirs)
-	if len(deduped) != 3 || deduped[0] != "/dir/a" || deduped[1] != "/dir/b" || deduped[2] != "/dir/c" {
+	if len(deduped) != 3 || deduped[0] != expA || deduped[1] != expB || deduped[2] != expC {
 		t.Fatalf("unexpected dedupe result: %+v", deduped)
 	}
 
@@ -272,6 +276,7 @@ func TestCompareCoreAndDedupe(t *testing.T) {
 func TestInspectToolServiceDarwin(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 
 	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
 	_ = os.MkdirAll(launchAgentsDir, 0755)
