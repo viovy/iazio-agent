@@ -193,7 +193,7 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 
 	// Single-tool guard (F2, F7): TargetVersion can only be applied when exactly one tool is targeted
 	if opts.TargetVersion != "" {
-		if opts.Suite {
+		if opts.Suite && len(opts.TargetTools) != 1 {
 			return res, fmt.Errorf("target_version %q can only be specified when exactly one tool is targeted, got suite with multiple targets", opts.TargetVersion)
 		}
 		if len(opts.TargetTools) > 1 {

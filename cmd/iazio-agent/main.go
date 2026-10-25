@@ -344,7 +344,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}
 
 				opts := UpdateOptions{
-					Suite:         updateSuite,
+					Suite:         updateSuite && len(targetTools) == 0,
 					Profile:       profile,
 					API:           api,
 					Force:         force,
