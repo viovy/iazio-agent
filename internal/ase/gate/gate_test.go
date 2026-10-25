@@ -225,3 +225,12 @@ func TestVerify_StoryNotDone_EvenWithGitCommit(t *testing.T) {
 		t.Errorf("expected StoryDone=false when story markdown status is IN_PROGRESS")
 	}
 }
+
+func TestDefaultGitRunner(t *testing.T) {
+	tmpDir := t.TempDir()
+	runner := DefaultGitRunner(tmpDir)
+	out, err := runner("version")
+	if err != nil || len(out) == 0 {
+		t.Fatalf("DefaultGitRunner failed: %v out=%s", err, out)
+	}
+}

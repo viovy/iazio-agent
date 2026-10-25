@@ -204,6 +204,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			}
 
 			sup := supervisor.New(time.Now)
+			hostGate := supervisor.NewHostExecutionAndUpdateGate()
 			var client controlplane.Client
 
 			var updatingTools atomic.Bool
@@ -297,6 +298,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				},
 				func(snap supervisor.FleetStateSnapshot) {
 					if eagerUpdater != nil && !updatingTools.Load() {
+						eagerUpdater.TriggerEvaluation("periodic_fleet_clean")
 						go func() {
 							agentUpdated, _, _ := eagerUpdater.EvaluateAndTrigger(runCtx, nil, false)
 							if agentUpdated {
@@ -374,6 +376,21 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				},
 			)
 			eagerUpdater.SetDetailedUpdateFunc(performUpdateFn)
+			eagerUpdater.SetHostGate(hostGate)
+
+			execDetector := supervisor.NewMultiSignalExecutionDetector(sup, hostGate, getRepos, nil)
+			eagerUpdater.SetExecutionDetector(execDetector)
+			eagerUpdater.SetReadinessReporter(func(c context.Context, h string, r supervisor.EagerUpdateReadinessReport) error {
+				if api == "" {
+					return nil
+				}
+				return client.PostEagerReadiness(c, h, r)
+			})
+			eagerUpdater.StartHybridTriggerLoop(runCtx, func() {
+				restartOrExecSelf(stdout)
+				cancel()
+			})
+			eagerUpdater.TriggerEvaluation("agent_startup")
 
 			if api != "" {
 				driftFetcher := &supervisor.HTTPDriftFetcher{
@@ -607,6 +624,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					if stdout != nil {
 						fmt.Fprintf(stdout, "[supervisor] remote tool update requested: tools=%v force=%v target_version=%s\n", tools, force, tv)
 					}
+					if eagerUpdater != nil {
+						eagerUpdater.TriggerEvaluation("control_plane_broadcast")
+					}
 					pendingRemoteMu.Lock()
 					pendingRemoteTools = tools
 					pendingRemoteForce = force
@@ -634,9 +654,20 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				},
 				OnCommand: func(ctx context.Context, cmd controlplane.CommandEnvelope) error {
 					switch cmd.Type {
-					case "TRIGGER_IDLE_UPDATE":
+					case "TRIGGER_IDLE_UPDATE", "EVALUATE_EAGER_UPDATE":
+						if eagerUpdater != nil {
+							eagerUpdater.TriggerEvaluation("command")
+						} else {
+							go func() {
+								if doToolUpdate(runCtx, nil, false) {
+									restartOrExecSelf(stdout)
+									cancel()
+								}
+							}()
+						}
+					case "FORCE_TOOL_UPDATE":
 						go func() {
-							if doToolUpdate(runCtx, nil, false) {
+							if doToolUpdate(runCtx, nil, true) {
 								restartOrExecSelf(stdout)
 								cancel()
 							}
@@ -783,6 +814,28 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				cpClient := worker.NewHTTPControlPlaneClient(api, "", nil)
 				cliInvoker := harness.NewCLIInvoker("", "")
 				disp := worker.NewDispatcher(cpClient, cliInvoker, host)
+				disp.SetHostGate(hostGate)
+				disp.SetPreDispatchHook(func(ctx context.Context, job *worker.Job) error {
+					if eagerUpdater != nil && !updatingTools.Load() {
+						rep := eagerUpdater.EvaluateReadiness(ctx)
+						if rep.EagerUpdateState == supervisor.StateUpToDate {
+							res, _, err := eagerUpdater.EvaluateAndTriggerWithOpts(ctx, supervisor.TriggerOptions{
+								BypassDirty: false,
+								Force:       false,
+							})
+							if err == nil && res.AgentUpdated {
+								restartOrExecSelf(stdout)
+								cancel()
+							}
+						}
+					}
+					return nil
+				})
+				disp.SetPostJobHook(func(ctx context.Context, job *worker.Job) {
+					if eagerUpdater != nil {
+						eagerUpdater.TriggerEvaluation("post_job_completion")
+					}
+				})
 				disp.SetToolUpdater(func(ctx context.Context, tools []string, force bool, targetVersion ...string) error {
 					var tv string
 					if len(targetVersion) > 0 {

@@ -16,20 +16,39 @@ import (
 	"github.com/viovy/iazio-agent/internal/controlplane"
 )
 
+// SubRepoGitState details the parsed git posture of a nested submodule or child repository.
+type SubRepoGitState struct {
+	SubRepoPath         string `json:"sub_repo_path"`
+	RelPath             string `json:"rel_path"`
+	Branch              string `json:"branch"`
+	HeadSHA             string `json:"head_sha"`
+	IsClean             bool   `json:"is_clean"`
+	DirtyFilesCount     int    `json:"dirty_files_count"`
+	UntrackedFilesCount int    `json:"untracked_files_count"`
+	Ahead               int    `json:"ahead"`
+	Behind              int    `json:"behind"`
+	HasActiveGitLock    bool   `json:"has_active_git_lock"`
+	Error               string `json:"error,omitempty"`
+}
+
 // RepoGitState details the parsed git posture of a repository on the host.
 type RepoGitState struct {
-	RepoPath            string    `json:"repo_path"`
-	Alias               string    `json:"alias,omitempty"`
-	Branch              string    `json:"branch"`
-	HeadSHA             string    `json:"head_sha"`
-	IsClean             bool      `json:"is_clean"`
-	DirtyFilesCount     int       `json:"dirty_files_count"`
-	UntrackedFilesCount int       `json:"untracked_files_count"`
-	Ahead               int       `json:"ahead"`
-	Behind              int       `json:"behind"`
-	HasActiveGitLock    bool      `json:"has_active_git_lock"`
-	LastCheckedAt       time.Time `json:"last_checked_at"`
-	Error               string    `json:"error,omitempty"`
+	RepoPath            string                     `json:"repo_path"`
+	Alias               string                     `json:"alias,omitempty"`
+	Branch              string                     `json:"branch"`
+	HeadSHA             string                     `json:"head_sha"`
+	IsClean             bool                       `json:"is_clean"`
+	RootClean           bool                       `json:"root_clean"`
+	SubmodulesClean     bool                       `json:"submodules_clean"`
+	DirtySubmodules     []string                   `json:"dirty_submodules,omitempty"`
+	DirtyFilesCount     int                        `json:"dirty_files_count"`
+	UntrackedFilesCount int                        `json:"untracked_files_count"`
+	Ahead               int                        `json:"ahead"`
+	Behind              int                        `json:"behind"`
+	HasActiveGitLock    bool                       `json:"has_active_git_lock"`
+	SubRepos            map[string]SubRepoGitState `json:"sub_repos,omitempty"`
+	LastCheckedAt       time.Time                  `json:"last_checked_at"`
+	Error               string                     `json:"error,omitempty"`
 }
 
 // FleetStateSnapshot represents the aggregated git state of all host repos.
@@ -42,17 +61,105 @@ type FleetStateSnapshot struct {
 	CheckedAt      time.Time               `json:"checked_at"`
 }
 
-// InspectRepoGitState inspects a single repository via non-locking read-only operations.
-func InspectRepoGitState(ctx context.Context, repoPath, alias string) RepoGitState {
-	st := RepoGitState{
-		RepoPath:      repoPath,
-		Alias:         alias,
-		LastCheckedAt: time.Now().UTC(),
-		IsClean:       true,
+type singleDirGitResult struct {
+	Branch              string
+	HeadSHA             string
+	Ahead               int
+	Behind              int
+	DirtyFilesCount     int
+	UntrackedFilesCount int
+	HasActiveGitLock    bool
+	IsClean             bool
+	Error               string
+}
+
+// DiscoverSubRepositories discovers nested git submodules and child repositories within repoPath.
+func DiscoverSubRepositories(repoPath string) []string {
+	seen := make(map[string]bool)
+	var subRepos []string
+
+	// 1. Parse .gitmodules if present
+	gitmodulesPath := filepath.Join(repoPath, ".gitmodules")
+	if data, err := os.ReadFile(gitmodulesPath); err == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "path =") || strings.HasPrefix(trimmed, "path=") {
+				parts := strings.SplitN(trimmed, "=", 2)
+				if len(parts) == 2 {
+					p := strings.TrimSpace(parts[1])
+					p = strings.Trim(p, "\"'")
+					if p != "" && !seen[p] {
+						fullPath := filepath.Join(repoPath, p)
+						if fi, statErr := os.Stat(fullPath); statErr == nil && fi.IsDir() {
+							seen[p] = true
+							subRepos = append(subRepos, p)
+						}
+					}
+				}
+			}
+		}
 	}
 
+	// 2. Discover child directories with .git (up to 2 levels deep)
+	entries, err := os.ReadDir(repoPath)
+	if err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" ||
+				name == "build" || name == "target" || name == "tmp" || name == "dist" ||
+				name == "bin" || name == "obj" || name == ".dart_tool" {
+				continue
+			}
+
+			subPath := filepath.Join(repoPath, name)
+			gitTarget := filepath.Join(subPath, ".git")
+			if _, statErr := os.Stat(gitTarget); statErr == nil {
+				if !seen[name] {
+					seen[name] = true
+					subRepos = append(subRepos, name)
+				}
+				continue // Do not recurse into another git repo
+			}
+
+			// Check 1 level deeper
+			subEntries, subErr := os.ReadDir(subPath)
+			if subErr == nil {
+				for _, subEntry := range subEntries {
+					if !subEntry.IsDir() {
+						continue
+					}
+					subName := subEntry.Name()
+					if strings.HasPrefix(subName, ".") || subName == "node_modules" || subName == "vendor" ||
+						subName == "build" || subName == "target" || subName == "tmp" || subName == "dist" {
+						continue
+					}
+					deepPath := filepath.Join(subPath, subName)
+					deepGit := filepath.Join(deepPath, ".git")
+					rel, relErr := filepath.Rel(repoPath, deepPath)
+					if relErr == nil && !seen[rel] {
+						if _, deepStatErr := os.Stat(deepGit); deepStatErr == nil {
+							seen[rel] = true
+							subRepos = append(subRepos, rel)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	sort.Strings(subRepos)
+	return subRepos
+}
+
+func inspectSingleGitDirectory(ctx context.Context, dir string) singleDirGitResult {
+	res := singleDirGitResult{IsClean: true}
+
 	// 1. Sentinel checks for active git operations or locks
-	gitDir := filepath.Join(repoPath, ".git")
+	gitDir := filepath.Join(dir, ".git")
 	if fi, err := os.Stat(gitDir); err == nil && !fi.IsDir() {
 		// Submodule gitfile pointing to actual gitdir
 		if b, rErr := os.ReadFile(gitDir); rErr == nil {
@@ -60,7 +167,7 @@ func InspectRepoGitState(ctx context.Context, repoPath, alias string) RepoGitSta
 			if strings.HasPrefix(content, "gitdir:") {
 				target := strings.TrimSpace(strings.TrimPrefix(content, "gitdir:"))
 				if !filepath.IsAbs(target) {
-					target = filepath.Join(repoPath, target)
+					target = filepath.Join(dir, target)
 				}
 				gitDir = target
 			}
@@ -80,23 +187,23 @@ func InspectRepoGitState(ctx context.Context, repoPath, alias string) RepoGitSta
 	}
 	for _, sentinel := range lockSentinels {
 		if _, err := os.Stat(sentinel); err == nil {
-			st.HasActiveGitLock = true
-			st.IsClean = false
-			st.Error = fmt.Sprintf("active git operation or lockfile present: %s", filepath.Base(sentinel))
-			return st
+			res.HasActiveGitLock = true
+			res.IsClean = false
+			res.Error = fmt.Sprintf("active git operation or lockfile present: %s", filepath.Base(sentinel))
+			return res
 		}
 	}
 
 	// 2. Non-locking git status --porcelain=v2 --branch with per-repo 15s timeout
 	repoCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(repoCtx, "git", "-C", repoPath, "status", "--porcelain=v2", "--branch")
+	cmd := exec.CommandContext(repoCtx, "git", "-C", dir, "status", "--porcelain=v2", "--branch")
 	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		st.IsClean = false
-		st.Error = fmt.Sprintf("git status failed: %v (%s)", err, strings.TrimSpace(string(out)))
-		return st
+		res.IsClean = false
+		res.Error = fmt.Sprintf("git status failed: %v (%s)", err, strings.TrimSpace(string(out)))
+		return res
 	}
 
 	lines := strings.Split(string(out), "\n")
@@ -106,27 +213,98 @@ func InspectRepoGitState(ctx context.Context, repoPath, alias string) RepoGitSta
 			continue
 		}
 		if strings.HasPrefix(l, "# branch.oid ") {
-			st.HeadSHA = strings.TrimPrefix(l, "# branch.oid ")
+			res.HeadSHA = strings.TrimPrefix(l, "# branch.oid ")
 		} else if strings.HasPrefix(l, "# branch.head ") {
-			st.Branch = strings.TrimPrefix(l, "# branch.head ")
+			res.Branch = strings.TrimPrefix(l, "# branch.head ")
 		} else if strings.HasPrefix(l, "# branch.ab ") {
 			parts := strings.Fields(strings.TrimPrefix(l, "# branch.ab "))
 			if len(parts) >= 2 {
 				if strings.HasPrefix(parts[0], "+") {
-					st.Ahead, _ = strconv.Atoi(parts[0][1:])
+					res.Ahead, _ = strconv.Atoi(parts[0][1:])
 				}
 				if strings.HasPrefix(parts[1], "-") {
-					st.Behind, _ = strconv.Atoi(parts[1][1:])
+					res.Behind, _ = strconv.Atoi(parts[1][1:])
 				}
 			}
 		} else if strings.HasPrefix(l, "? ") {
-			st.UntrackedFilesCount++
+			res.UntrackedFilesCount++
 		} else if !strings.HasPrefix(l, "# ") {
-			st.DirtyFilesCount++
+			res.DirtyFilesCount++
 		}
 	}
 
-	st.IsClean = (st.DirtyFilesCount == 0 && st.UntrackedFilesCount == 0 && !st.HasActiveGitLock)
+	res.IsClean = (res.DirtyFilesCount == 0 && res.UntrackedFilesCount == 0 && !res.HasActiveGitLock)
+	return res
+}
+
+// InspectRepoGitState inspects a repository and recursively inspects all nested submodules and sub-repositories.
+func InspectRepoGitState(ctx context.Context, repoPath, alias string) RepoGitState {
+	st := RepoGitState{
+		RepoPath:        repoPath,
+		Alias:           alias,
+		LastCheckedAt:   time.Now().UTC(),
+		IsClean:         true,
+		RootClean:       true,
+		SubmodulesClean: true,
+		SubRepos:        make(map[string]SubRepoGitState),
+	}
+
+	// 1. Inspect root repository
+	rootRes := inspectSingleGitDirectory(ctx, repoPath)
+	st.Branch = rootRes.Branch
+	st.HeadSHA = rootRes.HeadSHA
+	st.Ahead = rootRes.Ahead
+	st.Behind = rootRes.Behind
+	st.DirtyFilesCount = rootRes.DirtyFilesCount
+	st.UntrackedFilesCount = rootRes.UntrackedFilesCount
+	st.HasActiveGitLock = rootRes.HasActiveGitLock
+	st.RootClean = rootRes.IsClean
+	if rootRes.Error != "" {
+		st.Error = rootRes.Error
+	}
+
+	// 2. Discover and inspect nested sub-repositories / submodules recursively
+	subRepoRelPaths := DiscoverSubRepositories(repoPath)
+	for _, relPath := range subRepoRelPaths {
+		subFullPath := filepath.Join(repoPath, relPath)
+		subRes := inspectSingleGitDirectory(ctx, subFullPath)
+		subState := SubRepoGitState{
+			SubRepoPath:         subFullPath,
+			RelPath:             relPath,
+			Branch:              subRes.Branch,
+			HeadSHA:             subRes.HeadSHA,
+			IsClean:             subRes.IsClean,
+			DirtyFilesCount:     subRes.DirtyFilesCount,
+			UntrackedFilesCount: subRes.UntrackedFilesCount,
+			Ahead:               subRes.Ahead,
+			Behind:              subRes.Behind,
+			HasActiveGitLock:    subRes.HasActiveGitLock,
+			Error:               subRes.Error,
+		}
+		st.SubRepos[relPath] = subState
+
+		if !subState.IsClean {
+			st.SubmodulesClean = false
+			st.DirtySubmodules = append(st.DirtySubmodules, relPath)
+			if subState.HasActiveGitLock {
+				st.HasActiveGitLock = true
+			}
+		}
+		st.DirtyFilesCount += subState.DirtyFilesCount
+		st.UntrackedFilesCount += subState.UntrackedFilesCount
+	}
+	sort.Strings(st.DirtySubmodules)
+
+	// Workspace is clean iff root is clean AND 100% of nested sub-repositories are clean
+	st.IsClean = st.RootClean && st.SubmodulesClean
+	if !st.IsClean && st.Error == "" {
+		if !st.SubmodulesClean {
+			st.Error = fmt.Sprintf("nested submodules dirty: %s", strings.Join(st.DirtySubmodules, ", "))
+		} else {
+			st.Error = "root repository dirty or has active git lock"
+		}
+	}
+
 	return st
 }
 
@@ -311,6 +489,8 @@ func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot 
 			Ahead:               r.state.Ahead,
 			Behind:              r.state.Behind,
 			HasActiveGitLock:    r.state.HasActiveGitLock,
+			SubmodulesClean:     r.state.SubmodulesClean,
+			DirtySubmodules:     r.state.DirtySubmodules,
 			LastCheckedAt:       r.state.LastCheckedAt,
 		})
 	}

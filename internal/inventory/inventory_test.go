@@ -199,3 +199,91 @@ WatchdogSec=30s
 		t.Fatalf("missing expected capabilities: %+v", caps)
 	}
 }
+
+func TestInvalidateVersionCache(t *testing.T) {
+	verCacheMu.Lock()
+	verCache["/bin/fake-tool-bin"] = cachedVersion{version: "1.0.0"}
+	verCacheMu.Unlock()
+
+	InvalidateVersionCache("/bin/fake-tool-bin")
+
+	verCacheMu.RLock()
+	_, exists := verCache["/bin/fake-tool-bin"]
+	verCacheMu.RUnlock()
+	if exists {
+		t.Fatalf("expected /bin/fake-tool-bin to be evicted from version cache")
+	}
+}
+
+func TestCompareCoreAndDedupe(t *testing.T) {
+	s1 := semver{major: 1, minor: 2, patch: 3}
+	s2 := semver{major: 2, minor: 0, patch: 0}
+	s3 := semver{major: 1, minor: 3, patch: 0}
+	s4 := semver{major: 1, minor: 2, patch: 4}
+	s5 := semver{major: 1, minor: 2, patch: 3}
+
+	if compareCore(s1, s2) >= 0 {
+		t.Errorf("expected s1 < s2")
+	}
+	if compareCore(s2, s1) <= 0 {
+		t.Errorf("expected s2 > s1")
+	}
+	if compareCore(s1, s3) >= 0 {
+		t.Errorf("expected s1 < s3")
+	}
+	if compareCore(s3, s1) <= 0 {
+		t.Errorf("expected s3 > s1")
+	}
+	if compareCore(s1, s4) >= 0 {
+		t.Errorf("expected s1 < s4")
+	}
+	if compareCore(s4, s1) <= 0 {
+		t.Errorf("expected s4 > s1")
+	}
+	if compareCore(s1, s5) != 0 {
+		t.Errorf("expected s1 == s5")
+	}
+
+	dirs := []string{"/dir/a", "/dir/b", "/dir/a", "/dir/c", "/dir/b"}
+	deduped := dedupe(dirs)
+	if len(deduped) != 3 || deduped[0] != "/dir/a" || deduped[1] != "/dir/b" || deduped[2] != "/dir/c" {
+		t.Fatalf("unexpected dedupe result: %+v", deduped)
+	}
+
+	// parseSemver edge cases
+	if _, ok := parseSemver(""); ok {
+		t.Errorf("expected empty string to fail parseSemver")
+	}
+	if _, ok := parseSemver("not.a.number"); ok {
+		t.Errorf("expected invalid semver to fail")
+	}
+	if _, ok := parseSemver("1.2"); ok {
+		t.Errorf("expected missing patch to fail")
+	}
+	if _, ok := parseSemver("1.2.-3"); ok {
+		t.Errorf("expected negative number to fail")
+	}
+	parsed, ok := parseSemver("v2.4.6+abcdef-dirty")
+	if !ok || parsed.major != 2 || parsed.minor != 4 || parsed.patch != 6 {
+		t.Fatalf("unexpected parsed semver: %+v", parsed)
+	}
+}
+
+func TestInspectToolServiceDarwin(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
+	_ = os.MkdirAll(launchAgentsDir, 0755)
+	plistPath := filepath.Join(launchAgentsDir, "io.iazio.iazio-agent.plist")
+	_ = os.WriteFile(plistPath, []byte("<plist></plist>"), 0644)
+
+	installed, svcType, svcStatus, caps := InspectToolService("iazio-agent", "darwin")
+	if !installed || svcType != "launchd_agent" || svcStatus != "installed" {
+		t.Fatalf("expected launchd_agent, got: %v, %s, %s", installed, svcType, svcStatus)
+	}
+	if len(caps) == 0 {
+		t.Fatalf("expected non-empty caps on darwin launchd")
+	}
+}
+

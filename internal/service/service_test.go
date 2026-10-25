@@ -1467,3 +1467,16 @@ func TestLinuxUnitHardening(t *testing.T) {
 		}
 	}
 }
+
+func TestReviveCheck_MaintenanceLockActive(t *testing.T) {
+	tmpDir := t.TempDir()
+	lockDir := filepath.Join(tmpDir, ".iazio")
+	_ = os.MkdirAll(lockDir, 0755)
+	lockFile := filepath.Join(lockDir, "maintenance.lock")
+	_ = os.WriteFile(lockFile, []byte("active"), 0644)
+
+	err := ReviveCheck(tmpDir, func(name string, args ...string) error { return nil })
+	if err != nil {
+		t.Fatalf("expected nil for active maintenance lock, got %v", err)
+	}
+}

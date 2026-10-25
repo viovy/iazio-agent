@@ -142,3 +142,25 @@ func TestReleaseConversationSessionLocks_PreservesHeldLock(t *testing.T) {
 		t.Fatalf("expected 0 locks released in reap result, got %d", res.LocksReleased)
 	}
 }
+
+func TestTerminateProcessGroup_InvalidPID(t *testing.T) {
+	if err := TerminateProcessGroup(0, time.Second); err != nil {
+		t.Errorf("expected nil for pid 0, got %v", err)
+	}
+	if err := TerminateProcessGroup(-1, time.Second); err != nil {
+		t.Errorf("expected nil for pid -1, got %v", err)
+	}
+}
+
+func TestTerminateProcessGroup_LiveChild(t *testing.T) {
+	cmd := exec.Command("sleep", "10")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start sleep: %v", err)
+	}
+	pid := cmd.Process.Pid
+	err := TerminateProcessGroup(pid, 200*time.Millisecond)
+	if err != nil {
+		t.Fatalf("expected clean termination, got %v", err)
+	}
+	_ = cmd.Wait()
+}

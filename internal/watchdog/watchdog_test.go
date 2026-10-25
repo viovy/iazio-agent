@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -767,5 +768,49 @@ func TestWatchdog_CoverageHelpers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	StartSystemdWatchdog(ctx)
+
+	// 5. defaultKillProcess
+	_ = defaultKillProcess(0)
+	_ = defaultKillProcess(-1)
 }
+
+func TestSystemdWatchdog_WithSocket(t *testing.T) {
+	sockDir := t.TempDir()
+	sockPath := filepath.Join(sockDir, "notify.sock")
+	addr, err := net.ResolveUnixAddr("unixgram", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.ListenUnixgram("unixgram", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	t.Setenv("NOTIFY_SOCKET", sockPath)
+	t.Setenv("WATCHDOG_USEC", "10000") // 10ms
+
+	if err := NotifyWatchdog(); err != nil {
+		t.Fatalf("NotifyWatchdog failed: %v", err)
+	}
+
+	buf := make([]byte, 1024)
+	n, _, err := conn.ReadFrom(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != "WATCHDOG=1\n" {
+		t.Fatalf("unexpected message: %s", string(buf[:n]))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	StartSystemdWatchdog(ctx)
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+
+	// Invalid WATCHDOG_USEC branch
+	t.Setenv("WATCHDOG_USEC", "-1")
+	StartSystemdWatchdog(ctx)
+}
+
 

@@ -196,7 +196,7 @@ func TestEagerToolUpdater_PreconditionsAndDeduplicatedNotifications(t *testing.T
 	if err != nil || !deferred {
 		t.Fatalf("expected deferred=true when harness active, err=%v", err)
 	}
-	if len(notifications) != 1 || notifications[0].Metadata["event"] != "agent.tool.update_deferred" {
+	if len(notifications) != 1 || (notifications[0].Metadata["event"] != "agent.tool.update_deferred" && notifications[0].Metadata["event"] != "agent.eager_update.deferred") {
 		t.Fatalf("expected 1 update_deferred notification, got %v", notifications)
 	}
 
@@ -217,7 +217,7 @@ func TestEagerToolUpdater_PreconditionsAndDeduplicatedNotifications(t *testing.T
 	if !deferredDirty {
 		t.Fatalf("expected deferred=true when repo is dirty")
 	}
-	if len(notifications) != 2 || notifications[1].Metadata["event"] != "agent.tool.update_deferred" {
+	if len(notifications) != 2 || (notifications[1].Metadata["event"] != "agent.tool.update_deferred" && notifications[1].Metadata["event"] != "agent.eager_update.deferred") {
 		t.Fatalf("expected new notification for dirty repo deferral")
 	}
 
@@ -236,10 +236,10 @@ func TestEagerToolUpdater_PreconditionsAndDeduplicatedNotifications(t *testing.T
 	// Check that started and succeeded notifications were emitted
 	var foundStarted, foundSucceeded bool
 	for _, n := range notifications {
-		if n.Metadata["event"] == "agent.tool.update_started" {
+		if n.Metadata["event"] == "agent.tool.update_started" || n.Metadata["event"] == "agent.eager_update.started" {
 			foundStarted = true
 		}
-		if n.Metadata["event"] == "agent.tool.update_succeeded" {
+		if n.Metadata["event"] == "agent.tool.update_succeeded" || n.Metadata["event"] == "agent.eager_update.succeeded" {
 			foundSucceeded = true
 		}
 	}
@@ -559,7 +559,7 @@ func TestEagerToolUpdater_DedupeKeyResetOnCleanPass(t *testing.T) {
 	notifFn := func(ctx context.Context, rec controlplane.NotificationRecord) error {
 		mu.Lock()
 		defer mu.Unlock()
-		if evt, ok := rec.Metadata["event"].(string); ok && evt == "agent.tool.update_deferred" {
+		if evt, ok := rec.Metadata["event"].(string); ok && (evt == "agent.tool.update_deferred" || evt == "agent.eager_update.deferred") {
 			deferredNotifs++
 		}
 		return nil
@@ -608,7 +608,7 @@ func TestEagerToolUpdater_DedupeMultipleDirtyReposOrderAgnostic(t *testing.T) {
 	notifFn := func(ctx context.Context, rec controlplane.NotificationRecord) error {
 		mu.Lock()
 		defer mu.Unlock()
-		if evt, ok := rec.Metadata["event"].(string); ok && evt == "agent.tool.update_deferred" {
+		if evt, ok := rec.Metadata["event"].(string); ok && (evt == "agent.tool.update_deferred" || evt == "agent.eager_update.deferred") {
 			deferredNotifs++
 		}
 		return nil
@@ -1212,5 +1212,279 @@ func TestEagerToolUpdater_BackedOffToolOnlyDriftingDoesNotTriggerUpdate(t *testi
 	}
 	if updateCalled {
 		t.Fatalf("expected doUpdateDetailed NOT to be called when only backed-off tool drifts (S1)")
+	}
+}
+
+func TestInspectRepoGitState_RecursiveSubmodules(t *testing.T) {
+	rootTemp := t.TempDir()
+	initTestGitRepo(t, rootTemp)
+
+	// Create a nested sub-repository
+	subRepoPath := filepath.Join(rootTemp, "nested-subrepo")
+	if err := os.MkdirAll(subRepoPath, 0755); err != nil {
+		t.Fatalf("mkdir subrepo: %v", err)
+	}
+	initTestGitRepo(t, subRepoPath)
+
+	// Add .gitmodules and submodule gitlink in root
+	gitmodulesContent := `[submodule "nested-subrepo"]
+	path = nested-subrepo
+	url = https://example.com/nested-subrepo.git
+`
+	if err := os.WriteFile(filepath.Join(rootTemp, ".gitmodules"), []byte(gitmodulesContent), 0644); err != nil {
+		t.Fatalf("write .gitmodules: %v", err)
+	}
+
+	cmdAdd := exec.Command("git", "-C", rootTemp, "add", ".gitmodules", "nested-subrepo")
+	cmdAdd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=t@e.com", "GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=t@e.com")
+	_ = cmdAdd.Run()
+	cmdCommit := exec.Command("git", "-C", rootTemp, "commit", "-m", "add gitmodules and subrepo gitlink")
+	cmdCommit.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=t@e.com", "GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=t@e.com")
+	_ = cmdCommit.Run()
+
+	ctx := context.Background()
+
+	stClean := InspectRepoGitState(ctx, rootTemp, "fleet-workspace")
+	if !stClean.IsClean || !stClean.SubmodulesClean || !stClean.RootClean {
+		t.Fatalf("expected both root and subrepo clean, got: is_clean=%t root_clean=%t submodules_clean=%t (err=%s)",
+			stClean.IsClean, stClean.RootClean, stClean.SubmodulesClean, stClean.Error)
+	}
+	if len(stClean.SubRepos) != 1 {
+		t.Fatalf("expected 1 subrepo discovered, got %d", len(stClean.SubRepos))
+	}
+
+	// 2. Make subrepo dirty by adding untracked file
+	subDirtyFile := filepath.Join(subRepoPath, "dirty.txt")
+	if err := os.WriteFile(subDirtyFile, []byte("dirty content"), 0644); err != nil {
+		t.Fatalf("write sub dirty file: %v", err)
+	}
+
+	stSubDirty := InspectRepoGitState(ctx, rootTemp, "fleet-workspace")
+	if stSubDirty.IsClean {
+		t.Fatalf("expected workspace to be marked DIRTY because nested sub-repository has untracked file")
+	}
+	if stSubDirty.SubmodulesClean {
+		t.Fatalf("expected SubmodulesClean == false")
+	}
+	if len(stSubDirty.DirtySubmodules) != 1 || stSubDirty.DirtySubmodules[0] != "nested-subrepo" {
+		t.Fatalf("expected DirtySubmodules to contain nested-subrepo, got: %v", stSubDirty.DirtySubmodules)
+	}
+
+	// 3. Clean subrepo, but add git lock to subrepo
+	_ = os.Remove(subDirtyFile)
+	subLock := filepath.Join(subRepoPath, ".git", "index.lock")
+	if err := os.WriteFile(subLock, []byte(""), 0644); err != nil {
+		t.Fatalf("write sub lock: %v", err)
+	}
+
+	stSubLock := InspectRepoGitState(ctx, rootTemp, "fleet-workspace")
+	if stSubLock.IsClean {
+		t.Fatalf("expected workspace dirty when subrepo has active index.lock")
+	}
+	if !stSubLock.HasActiveGitLock {
+		t.Fatalf("expected HasActiveGitLock == true propagated from subrepo")
+	}
+	_ = os.Remove(subLock)
+
+	// 4. Verify clean again
+	stRestored := InspectRepoGitState(ctx, rootTemp, "fleet-workspace")
+	if !stRestored.IsClean || !stRestored.SubmodulesClean {
+		t.Fatalf("expected workspace clean after clearing lock, got: %v (err=%s)", stRestored.IsClean, stRestored.Error)
+	}
+}
+
+func TestEagerToolUpdater_ReadinessReportAndGateIntegration(t *testing.T) {
+	sup := New(time.Now)
+	gate := NewHostExecutionAndUpdateGate()
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.mu.Lock()
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+	monitor.mu.Unlock()
+
+	var reportedReadiness []EagerUpdateReadinessReport
+	var readMu sync.Mutex
+	reportFn := func(ctx context.Context, hostID string, rep EagerUpdateReadinessReport) error {
+		readMu.Lock()
+		reportedReadiness = append(reportedReadiness, rep)
+		readMu.Unlock()
+		return nil
+	}
+
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
+		return UpdateResult{UpdatedTools: []string{"autopilot"}}, nil
+	}, nil)
+	updater.SetHostGate(gate)
+	updater.SetReadinessReporter(reportFn)
+
+	detector := NewMultiSignalExecutionDetector(sup, gate, nil, nil)
+	detector.SetProcessScanner(func(repoPaths []string) ([]ActiveHarnessSignal, error) {
+		return nil, nil
+	})
+	updater.SetExecutionDetector(detector)
+
+	ctx := context.Background()
+
+	// 1. Initial State: clean & idle -> UP_TO_DATE
+	rep1 := updater.EvaluateReadiness(ctx)
+	if rep1.EagerUpdateState != StateUpToDate {
+		t.Fatalf("expected StateUpToDate, got %s", rep1.EagerUpdateState)
+	}
+
+	// 2. Active Harness via Gate Lease -> DEFERRED_HARNESS_ACTIVE
+	relLease, err := gate.AcquireExecutionLease(ctx, "job-test-42", "/path/repo")
+	if err != nil {
+		t.Fatalf("acquire lease: %v", err)
+	}
+
+	rep2 := updater.EvaluateReadiness(ctx)
+	if rep2.EagerUpdateState != StateDeferredHarnessActive {
+		t.Fatalf("expected StateDeferredHarnessActive, got %s", rep2.EagerUpdateState)
+	}
+	if len(rep2.BlockingActiveJobs) == 0 || rep2.BlockingActiveJobs[0].JobID != "job-test-42" {
+		t.Fatalf("expected BlockingActiveJobs to cite job-test-42, got: %+v", rep2.BlockingActiveJobs)
+	}
+
+	// Verify EvaluateAndTrigger is deferred
+	_, def, err := updater.EvaluateAndTrigger(ctx, nil, false)
+	if !def || err != nil {
+		t.Fatalf("expected deferred=true when harness is active")
+	}
+
+	relLease()
+
+	// 3. Dirty Repo -> DEFERRED_GIT_DIRTY
+	monitor.mu.Lock()
+	monitor.lastSnapshot = FleetStateSnapshot{
+		FleetGitClean:  false,
+		DirtyRepoPaths: []string{"/path/fleet-workspace"},
+		Repos: map[string]RepoGitState{
+			"/path/fleet-workspace": {
+				RepoPath:        "/path/fleet-workspace",
+				IsClean:         false,
+				RootClean:       true,
+				SubmodulesClean: false,
+				DirtySubmodules: []string{"sub-module-x"},
+				SubRepos: map[string]SubRepoGitState{
+					"sub-module-x": {
+						SubRepoPath:         "/path/fleet-workspace/sub-module-x",
+						RelPath:             "sub-module-x",
+						DirtyFilesCount:     3,
+						UntrackedFilesCount: 1,
+						Branch:              "feature-branch",
+					},
+				},
+			},
+		},
+	}
+	monitor.mu.Unlock()
+
+	rep3 := updater.EvaluateReadiness(ctx)
+	if rep3.EagerUpdateState != StateDeferredGitDirty {
+		t.Fatalf("expected StateDeferredGitDirty, got %s", rep3.EagerUpdateState)
+	}
+	if len(rep3.BlockingDirtyRepos) == 0 || rep3.BlockingDirtyRepos[0].SubRepoPath != "sub-module-x" {
+		t.Fatalf("expected BlockingDirtyRepos to cite sub-module-x, got: %+v", rep3.BlockingDirtyRepos)
+	}
+
+	// 4. Clear dirty state -> UP_TO_DATE again
+	monitor.mu.Lock()
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+	monitor.mu.Unlock()
+
+	rep4 := updater.EvaluateReadiness(ctx)
+	if rep4.EagerUpdateState != StateUpToDate {
+		t.Fatalf("expected StateUpToDate, got %s", rep4.EagerUpdateState)
+	}
+
+	// 5. Test TriggerEvaluation wake
+	loopCtx, cancelLoop := context.WithCancel(ctx)
+	defer cancelLoop()
+	updater.StartHybridTriggerLoop(loopCtx, nil)
+
+	updater.TriggerEvaluation("test_event")
+	time.Sleep(600 * time.Millisecond)
+
+	readMu.Lock()
+	defer readMu.Unlock()
+	if len(reportedReadiness) < 4 {
+		t.Errorf("expected at least 4 readiness reports posted, got %d", len(reportedReadiness))
+	}
+}
+
+func TestEagerToolUpdater_AuxiliaryMethods(t *testing.T) {
+	updater := NewEagerToolUpdater(nil, nil, "host-aux", nil, nil)
+	if updater.IsUpdating() {
+		t.Errorf("expected IsUpdating=false")
+	}
+
+	updater.recordSuiteFailure()
+	updater.mu.Lock()
+	if updater.suiteFailCount != 1 {
+		t.Errorf("expected suiteFailCount=1, got %d", updater.suiteFailCount)
+	}
+	updater.mu.Unlock()
+
+	updater.recordSuiteSuccess()
+	updater.mu.Lock()
+	if updater.suiteFailCount != 0 {
+		t.Errorf("expected suiteFailCount=0, got %d", updater.suiteFailCount)
+	}
+	updater.mu.Unlock()
+
+	last := updater.LastReadiness()
+	if last.HostID != "host-aux" {
+		t.Errorf("expected host-aux LastReadiness, got %+v", last)
+	}
+}
+
+func TestRepoStateMonitor_Start(t *testing.T) {
+	monitor := NewRepoStateMonitor(nil, "host-1", 5*time.Minute, nil, nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // canceled immediately
+	monitor.Start(ctx)
+}
+
+func TestDiscoverSubRepositories_GitModules(t *testing.T) {
+	tmpDir := t.TempDir()
+	subDir := filepath.Join(tmpDir, "sub-mod")
+	_ = os.MkdirAll(subDir, 0755)
+
+	gitmodulesContent := `[submodule "sub-mod"]
+	path = sub-mod
+	url = https://example.com/repo.git
+`
+	_ = os.WriteFile(filepath.Join(tmpDir, ".gitmodules"), []byte(gitmodulesContent), 0644)
+
+	discovered := DiscoverSubRepositories(tmpDir)
+	found := false
+	for _, p := range discovered {
+		if p == "sub-mod" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected sub-mod discovered from .gitmodules, got %v", discovered)
+	}
+}
+
+func TestInspectSingleGitDirectory_Gitfile(t *testing.T) {
+	tmpDir := t.TempDir()
+	actualGitDir := filepath.Join(tmpDir, "actual-git")
+	_ = os.MkdirAll(actualGitDir, 0755)
+
+	worktreeDir := filepath.Join(tmpDir, "worktree")
+	_ = os.MkdirAll(worktreeDir, 0755)
+
+	gitfile := filepath.Join(worktreeDir, ".git")
+	_ = os.WriteFile(gitfile, []byte("gitdir: "+actualGitDir+"\n"), 0644)
+
+	// Create index.lock in actualGitDir
+	lockFile := filepath.Join(actualGitDir, "index.lock")
+	_ = os.WriteFile(lockFile, []byte("lock"), 0644)
+
+	res := inspectSingleGitDirectory(context.Background(), worktreeDir)
+	if res.IsClean || !res.HasActiveGitLock {
+		t.Fatalf("expected active git lock detected via gitfile redirection")
 	}
 }
