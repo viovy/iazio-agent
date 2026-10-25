@@ -1025,6 +1025,13 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							"orphans_reaped": reapRes.OrphansReaped,
 							"locks_released": reapRes.LocksReleased,
 						}
+						if reapErr != nil {
+							reapMap["error"] = reapErr.Error()
+						}
+					} else if reapErr != nil {
+						reapMap = map[string]any{
+							"error": reapErr.Error(),
+						}
 					}
 					var manifestMap map[string]any
 					if sanRes != nil {

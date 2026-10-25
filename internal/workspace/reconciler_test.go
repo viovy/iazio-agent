@@ -86,3 +86,37 @@ func TestSanitizeWorkspaceLocksAndInterruptedState(t *testing.T) {
 		t.Errorf("expected untracked files to contain feature.go, got: %v", res.Manifest.UntrackedFiles)
 	}
 }
+
+func TestSanitizeWorkspace_HeldLock_SetsCleanLocksFalse(t *testing.T) {
+	tempDir := t.TempDir()
+
+	cmd := exec.Command("git", "init", tempDir)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to git init: %v", err)
+	}
+
+	gitDir := filepath.Join(tempDir, ".git")
+	indexLock := filepath.Join(gitDir, "index.lock")
+	f, err := os.OpenFile(indexLock, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("failed to open index.lock: %v", err)
+	}
+	defer f.Close()
+
+	if !isLockFileHeld(indexLock) {
+		t.Skip("environment cannot detect open file descriptor via /proc or lsof")
+	}
+
+	res, err := SanitizeWorkspace(context.Background(), tempDir)
+	if err != nil {
+		t.Fatalf("SanitizeWorkspace failed: %v", err)
+	}
+
+	if _, statErr := os.Stat(indexLock); statErr != nil {
+		t.Fatalf("expected held index.lock to be preserved, but got stat error: %v", statErr)
+	}
+
+	if res.Manifest.CleanLocks {
+		t.Fatalf("expected Manifest.CleanLocks to be false when index.lock is held and present on disk")
+	}
+}

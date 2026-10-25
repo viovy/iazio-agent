@@ -3,6 +3,7 @@
 package reaper
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
@@ -30,6 +31,18 @@ func TerminateProcessGroup(pid int, gracePeriod time.Duration) error {
 
 	// Forceful terminate
 	_ = exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid), "/T").Run()
+
+	killDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(killDeadline) {
+		if !isPIDAlive(pid) {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if isPIDAlive(pid) {
+		return fmt.Errorf("process %d still alive after taskkill /F", pid)
+	}
 	return nil
 }
 

@@ -81,12 +81,15 @@ func postStartProc(cmd *exec.Cmd) {
 			LimitFlags: jobObjectLimitKillOnJobClose,
 		},
 	}
-	procSetInformationJobObject.Call(
+	rSet, _, errSet := procSetInformationJobObject.Call(
 		jobHandle,
 		uintptr(jobObjectExtendedLimitInformationClass),
 		uintptr(unsafe.Pointer(&info)),
 		unsafe.Sizeof(info),
 	)
+	if rSet == 0 {
+		fmt.Fprintf(os.Stderr, "[agent] Warning: SetInformationJobObject failed for PID %d: %v\n", cmd.Process.Pid, errSet)
+	}
 	rProc, _, errProc := procOpenProcess.Call(uintptr(processSetQuota|processTerminate), 0, uintptr(cmd.Process.Pid))
 	if rProc != 0 {
 		hProc := rProc

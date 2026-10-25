@@ -62,13 +62,16 @@ func SanitizeWorkspace(ctx context.Context, workspacePath string) (*WorkspaceSan
 
 	// 1. Stale Git Lock Cleanup
 	// Verify no active git process exists in workspace before removing locks
-	if !hasRunningGitProcess(workspacePath) {
+	gitProcRunning := hasRunningGitProcess(workspacePath)
+	if !gitProcRunning {
 		removedLocks := cleanGitLocks(workspacePath, gitDir, fi.IsDir())
 		res.StaleLocksRemoved = len(removedLocks)
 		res.RemovedLockPaths = removedLocks
-	} else {
-		res.Manifest.CleanLocks = false
 	}
+
+	// Verify no remaining lock files exist across root and submodules
+	remainingLocks := hasRemainingGitLocks(workspacePath, gitDir, fi.IsDir())
+	res.Manifest.CleanLocks = !gitProcRunning && !remainingLocks
 
 	// 2. Interrupted Git Operation Recovery
 	res.InterruptedGitOperation, res.InterruptedSubmodules = detectInterruptedGitOps(workspacePath, gitDir, fi.IsDir())
@@ -139,20 +142,68 @@ func hasRunningGitProcess(workspacePath string) bool {
 }
 
 func isLockFileHeld(lockPath string) bool {
+	cleanPath, err := filepath.Abs(lockPath)
+	if err != nil {
+		cleanPath = filepath.Clean(lockPath)
+	}
+
+	// 1. Linux /proc/*/fd scanning
+	procEntries, err := os.ReadDir("/proc")
+	if err == nil {
+		for _, entry := range procEntries {
+			if !entry.IsDir() {
+				continue
+			}
+			pidStr := entry.Name()
+			if pidStr == "self" || pidStr == "thread-self" {
+				continue
+			}
+			fdDir := filepath.Join("/proc", pidStr, "fd")
+			fds, err := os.ReadDir(fdDir)
+			if err != nil {
+				continue
+			}
+			for _, fd := range fds {
+				target, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
+				if err == nil && filepath.Clean(target) == cleanPath {
+					return true
+				}
+			}
+		}
+		// On Linux /proc is authoritative
+		return false
+	}
+
+	// 2. lsof detection for macOS / Darwin / Unix
 	if lsofBin, err := exec.LookPath("lsof"); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		out, _ := exec.CommandContext(ctx, lsofBin, lockPath, "-t").Output()
-		cancel()
+		defer cancel()
+		out, _ := exec.CommandContext(ctx, lsofBin, cleanPath, "-t").Output()
 		if len(strings.TrimSpace(string(out))) > 0 {
 			return true
 		}
+		return false
+	}
+
+	// 3. Fallback: if fuser exists
+	if fuserBin, err := exec.LookPath("fuser"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		out, _ := exec.CommandContext(ctx, fuserBin, cleanPath).Output()
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return true
+		}
+		return false
+	}
+
+	// Fail closed if inspection tooling is unavailable and the file exists
+	if _, err := os.Stat(cleanPath); err == nil {
+		return true
 	}
 	return false
 }
 
-func cleanGitLocks(workspacePath, gitDir string, isDir bool) []string {
-	var removed []string
-
+func resolveGitDir(workspacePath, gitDir string, isDir bool) string {
 	targetGitDir := gitDir
 	if !isDir {
 		// Submodule or worktree where .git is a file containing "gitdir: <path>"
@@ -166,6 +217,42 @@ func cleanGitLocks(workspacePath, gitDir string, isDir bool) []string {
 			}
 		}
 	}
+	return targetGitDir
+}
+
+func hasRemainingGitLocks(workspacePath, gitDir string, isDir bool) bool {
+	targetGitDir := resolveGitDir(workspacePath, gitDir, isDir)
+
+	rootLocks := []string{
+		filepath.Join(targetGitDir, "index.lock"),
+		filepath.Join(targetGitDir, "HEAD.lock"),
+		filepath.Join(targetGitDir, "config.lock"),
+	}
+	for _, l := range rootLocks {
+		if _, err := os.Stat(l); err == nil {
+			return true
+		}
+	}
+
+	modulesDir := filepath.Join(targetGitDir, "modules")
+	var foundLock bool
+	if _, err := os.Stat(modulesDir); err == nil {
+		_ = filepath.Walk(modulesDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || foundLock {
+				return nil
+			}
+			if !info.IsDir() && strings.HasSuffix(info.Name(), ".lock") {
+				foundLock = true
+			}
+			return nil
+		})
+	}
+	return foundLock
+}
+
+func cleanGitLocks(workspacePath, gitDir string, isDir bool) []string {
+	var removed []string
+	targetGitDir := resolveGitDir(workspacePath, gitDir, isDir)
 
 	// Root lock files
 	rootLocks := []string{
@@ -205,18 +292,7 @@ func cleanGitLocks(workspacePath, gitDir string, isDir bool) []string {
 }
 
 func detectInterruptedGitOps(workspacePath, gitDir string, isDir bool) (string, []string) {
-	targetGitDir := gitDir
-	if !isDir {
-		if data, err := os.ReadFile(gitDir); err == nil {
-			content := strings.TrimSpace(string(data))
-			if strings.HasPrefix(content, "gitdir:") {
-				targetGitDir = strings.TrimSpace(strings.TrimPrefix(content, "gitdir:"))
-				if !filepath.IsAbs(targetGitDir) {
-					targetGitDir = filepath.Join(workspacePath, targetGitDir)
-				}
-			}
-		}
-	}
+	targetGitDir := resolveGitDir(workspacePath, gitDir, isDir)
 
 	interruptedOp := ""
 	checkPaths := map[string]string{

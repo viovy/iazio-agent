@@ -100,3 +100,45 @@ func TestFindOrphanPIDs(t *testing.T) {
 		t.Errorf("expected sleep process %d (cwd %s) to be discovered by findOrphanPIDs, found: %v", cmd.Process.Pid, tempWorkspace, pids)
 	}
 }
+
+func TestReleaseConversationSessionLocks_PreservesHeldLock(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	convID := "test-conv-held-1234"
+	brainDir := filepath.Join(tempHome, ".gemini", "antigravity-cli", "brain", convID)
+	if err := os.MkdirAll(brainDir, 0755); err != nil {
+		t.Fatalf("failed to create brain dir: %v", err)
+	}
+	lockFile := filepath.Join(brainDir, "LOCK")
+	f, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("failed to open lock file: %v", err)
+	}
+	defer f.Close()
+
+	// An active file descriptor is open by this process, so isSessionLockHeld must be true
+	if !isSessionLockHeld(lockFile) {
+		t.Skip("environment cannot detect open file descriptor via /proc or lsof")
+	}
+
+	released, err := releaseConversationSessionLocks(convID)
+	if err == nil {
+		t.Fatalf("expected error for held session lock, got nil")
+	}
+	if len(released) != 0 {
+		t.Fatalf("expected 0 locks released, got %d", len(released))
+	}
+	if _, statErr := os.Stat(lockFile); statErr != nil {
+		t.Fatalf("expected held lock file %s to be preserved, but got stat error: %v", lockFile, statErr)
+	}
+
+	// Test ReapWorkspaceOrphansAndLocks surfaces this error
+	res, reapErr := ReapWorkspaceOrphansAndLocks(context.Background(), "", convID)
+	if reapErr == nil {
+		t.Fatalf("expected ReapWorkspaceOrphansAndLocks to surface held lock error, got nil")
+	}
+	if res.LocksReleased != 0 {
+		t.Fatalf("expected 0 locks released in reap result, got %d", res.LocksReleased)
+	}
+}
