@@ -1122,6 +1122,14 @@ func applyLinux(action, bin string, stdout io.Writer, force bool) error {
 	if action == "install" {
 		return service.InstallLinux(bin)
 	}
+	if action == "status" {
+		cmd := exec.Command("systemctl", "--user", "status", "iazio-agent.service", "--no-pager")
+		out, err := cmd.CombinedOutput()
+		if stdout != nil {
+			fmt.Fprint(stdout, string(out))
+		}
+		return err
+	}
 	_, err := service.Apply("linux", action, bin, false, force, execCommand)
 	return err
 }
@@ -1399,6 +1407,9 @@ func isGitSubmoduleDir(path string) bool {
 }
 
 func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
+	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
+		return true // Not checked out on this host
+	}
 	// First: verify repoPath is a valid git repository top-level root
 	topCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--show-toplevel")
 	topOut, err := topCmd.Output()

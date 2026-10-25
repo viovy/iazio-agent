@@ -1445,4 +1445,24 @@ func TestReconcileServiceConfiguration(t *testing.T) {
 	if !strings.Contains(string(data), "WatchdogSec=30s") {
 		t.Fatalf("expected WatchdogSec=30s after healing, got:\n%s", string(data))
 	}
+
+func TestLinuxUnitHardening(t *testing.T) {
+	text := UnitText("linux", "/usr/bin/iazio-agent")
+	needles := []string{
+		"StartLimitIntervalSec=0",
+		"Nice=10",
+		"IOSchedulingClass=idle",
+		"IOSchedulingPriority=7",
+		"EnvironmentFile=-%h/.iazio/agent.env",
+		"StandardOutput=journal",
+		"StandardError=journal",
+		"RestartSec=5s",
+		"WatchdogSec=30s",
+		"OOMScoreAdjust=-500",
+	}
+	for _, needle := range needles {
+	if !strings.Contains(text, needle) {
+			t.Errorf("missing %q in linux unit:\n%s", needle, text)
+		}
+	}
 }

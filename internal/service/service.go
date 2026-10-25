@@ -473,6 +473,13 @@ Restart=always
 RestartSec=5s
 WatchdogSec=30s
 OOMScoreAdjust=-500
+# Low intrusion: yield CPU/IO to interactive sessions (STORY-GOV-3198 / STORY-GOV-3597).
+Nice=10
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+EnvironmentFile=-%%h/.iazio/agent.env
+StandardOutput=journal
+StandardError=journal
 Environment=IAZIO_AGENT_NONINTERACTIVE=1
 %s%s
 [Install]
@@ -1236,6 +1243,17 @@ func InstallLinuxAt(home, bin string, run func(name string, args ...string) erro
 	}
 	if err := run("systemctl", "--user", "enable", "--now", "iazio-agent.service"); err != nil {
 		return err
+	}
+	u := os.Getenv("USER")
+	if u == "" {
+		if curr, err := user.Current(); err == nil && curr.Username != "" {
+			u = curr.Username
+		}
+	}
+	if u != "" {
+		if err := run("loginctl", "enable-linger", u); err == nil {
+			return nil
+		}
 	}
 	return run("loginctl", "enable-linger")
 }
