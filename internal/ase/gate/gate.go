@@ -151,15 +151,7 @@ func Verify(opts GateOptions) GateResult {
 }
 
 func isStoryCompleted(worktreePath, storyID string, git func(args ...string) (string, error)) bool {
-	// First check git log on origin/main or HEAD for story commit
-	if git != nil {
-		out, err := git("log", "-n", "10", "--grep="+storyID, "--format=%H")
-		if err == nil && strings.TrimSpace(out) != "" {
-			return true
-		}
-	}
-
-	// Next inspect story files in docs/stories/
+	// First inspect story files in docs/stories/ (Primary SSOT for local worktree)
 	storiesDir := filepath.Join(worktreePath, "docs", "stories")
 	entries, err := os.ReadDir(storiesDir)
 	if err == nil {
@@ -172,16 +164,31 @@ func isStoryCompleted(worktreePath, storyID string, git func(args ...string) (st
 				content, err := os.ReadFile(filepath.Join(storiesDir, e.Name()))
 				if err == nil {
 					text := string(content)
-					if strings.Contains(text, "status: DONE") {
+					if strings.Contains(text, "status: DONE") || strings.Contains(text, "status: \"DONE\"") || strings.Contains(text, "status: 'DONE'") {
 						return true
 					}
 				}
 			}
 		}
 		if hasStoryFile {
+			// Story file exists and is NOT marked DONE -> story is still incomplete
 			return false
 		}
 	}
 
-	return true
+	// Fallback: check git log strictly on origin/main (already merged closeout)
+	if git != nil {
+		out, err := git("log", "origin/main", "-n", "10", "--grep="+storyID, "--format=%H")
+		if err == nil && strings.TrimSpace(out) != "" {
+			return true
+		}
+	}
+
+	// If docs/stories directory does not exist in this worktree (e.g. submodule repo or test tempdir),
+	// story files are not managed locally in this repo.
+	if _, err := os.Stat(storiesDir); os.IsNotExist(err) {
+		return true
+	}
+
+	return false
 }

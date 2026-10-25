@@ -600,8 +600,11 @@ func TestWatchdog_PrematureExit0GateEnforcement(t *testing.T) {
 		t.Errorf("expected prompt to mention incomplete_ase_flow, got %s", spawnedJobs[0].Prompt)
 	}
 
-	// Now mark story as completed and simulate second exit 0
+	// Now mark story as completed and provide test/release stamps and simulate second exit 0
 	_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-3684\nstatus: DONE\n---\n"), 0644)
+	_ = os.MkdirAll(filepath.Join(tmpDir, "tmp", "reports"), 0755)
+	_ = os.WriteFile(filepath.Join(tmpDir, "tmp", "reports", "validate-local-ok.stamp"), []byte("ok"), 0644)
+	_ = os.WriteFile(filepath.Join(tmpDir, "tmp", "reports", "verify-live-release-ok.stamp"), []byte("ok"), 0644)
 	w.OnProcessExit("job-1311", 7777, 0, nil)
 
 	j, _ := w.GetJob("job-1311")
@@ -660,5 +663,56 @@ func TestWatchdog_CircuitBreakerOnZeroProgress(t *testing.T) {
 	}
 	if !strings.Contains(j.LastError, "CIRCUIT_BREAKER_TRIPPED") {
 		t.Errorf("expected LastError to contain CIRCUIT_BREAKER_TRIPPED, got %s", j.LastError)
+	}
+}
+
+func TestWatchdog_NoDoubleResumeOnStallTermination(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "watchdog-stall-race.json")
+	convID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	var spawnCount int
+
+	w := New(Options{
+		StateFile: stateFile,
+		IsAlive:   func(pid int) bool { return pid == 1000 },
+		Spawner: func(ctx context.Context, job TrackedJob) (int, error) {
+			spawnCount++
+			return 2000 + spawnCount, nil
+		},
+		Monitor: &ConversationLivenessMonitor{
+			StallTimeout: 10 * time.Millisecond,
+		},
+		KillProcess: func(pid int) error {
+			return nil
+		},
+	})
+
+	w.Track(TrackedJob{
+		JobID:          "job-stall-race",
+		PID:            1000,
+		ConversationID: convID,
+		WorktreePath:   tmpDir,
+		StartedAt:      time.Now().Add(-1 * time.Hour), // Way beyond stall timeout
+		AutoResumePolicy: AutoResumePolicy{
+			Enabled:                true,
+			MaxAutoResumes:         5,
+			BackoffInitialSec:      0,
+			RequireForwardProgress: false,
+		},
+	})
+
+	// CheckInterrupted detects stall and initiates auto-resume
+	w.CheckInterrupted(context.Background())
+
+	if spawnCount != 1 {
+		t.Fatalf("expected 1 auto-resume spawn on stall detection, got %d", spawnCount)
+	}
+
+	// Now simulate reapProcess waking up from process kill and calling OnProcessExit for the killed PID 1000
+	w.OnProcessExit("job-stall-race", 1000, 15, errors.New("signal: terminated"))
+
+	// Ensure NO second resume was triggered and spawn count is STILL 1
+	if spawnCount != 1 {
+		t.Fatalf("expected spawn count to remain 1 after reapProcess exit, got %d (double resume race condition!)", spawnCount)
 	}
 }

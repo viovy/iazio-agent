@@ -184,3 +184,44 @@ func TestVerify_StoryNotDone(t *testing.T) {
 		t.Errorf("expected StoryDone=false")
 	}
 }
+
+func TestVerify_StoryNotDone_EvenWithGitCommit(t *testing.T) {
+	tmpDir := t.TempDir()
+	storiesDir := filepath.Join(tmpDir, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0755)
+
+	storyFile := filepath.Join(storiesDir, "2026-10-25-gov-3684-test.story.md")
+	_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-3684\nstatus: IN_PROGRESS\n---\n"), 0644)
+
+	// Even if git log returns commits on HEAD matching the story ID,
+	// the story file is still IN_PROGRESS and must NOT be considered complete!
+	mockGit := func(args ...string) (string, error) {
+		cmd := args[0]
+		switch cmd {
+		case "status":
+			return "", nil
+		case "rev-parse":
+			return "main", nil
+		case "submodule":
+			return "", nil
+		case "log":
+			return "commit-initial-bind-3684", nil
+		default:
+			return "", nil
+		}
+	}
+
+	opts := GateOptions{
+		WorktreePath: tmpDir,
+		StoryID:      "STORY-GOV-3684",
+		GitRunner:    mockGit,
+	}
+
+	res := Verify(opts)
+	if res.Passed {
+		t.Fatalf("expected gate to fail when story file is IN_PROGRESS despite git commits on branch")
+	}
+	if res.StoryDone {
+		t.Errorf("expected StoryDone=false when story markdown status is IN_PROGRESS")
+	}
+}

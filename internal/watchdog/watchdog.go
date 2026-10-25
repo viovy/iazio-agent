@@ -44,6 +44,8 @@ type AutoResumePolicy struct {
 	BackoffInitialSec      int  `json:"backoff_initial_sec"`
 	BackoffMaxSec          int  `json:"backoff_max_sec"`
 	RequireForwardProgress bool `json:"require_forward_progress"`
+	RequireTestsPassed     bool `json:"require_tests_passed,omitempty"`
+	RequireReleaseVerified bool `json:"require_release_verified,omitempty"`
 }
 
 // DefaultAutoResumePolicy returns enterprise default values for autonomous story execution.
@@ -308,6 +310,17 @@ func (w *Watchdog) OnProcessExit(jobID string, pid, exitCode int, waitErr error)
 		return
 	}
 
+	// H2: Guard against double-resume race condition on stall termination
+	if job.PID != pid {
+		w.mu.Unlock()
+		return
+	}
+	if job.Status == StatusAutoResuming {
+		// Process exit was already anticipated and handled by stall detector / auto-resumer
+		w.mu.Unlock()
+		return
+	}
+
 	now := w.now().UTC()
 	job.UpdatedAt = now
 	job.ExitCode = exitCode
@@ -318,15 +331,20 @@ func (w *Watchdog) OnProcessExit(jobID string, pid, exitCode int, waitErr error)
 	// Clean completion check with "Don't Stop Till Done" ASE Completion Gate
 	if exitCode == 0 && waitErr == nil {
 		gateRes := gate.Verify(gate.GateOptions{
-			WorktreePath: job.WorktreePath,
-			StoryID:      job.StoryID,
+			WorktreePath:           job.WorktreePath,
+			StoryID:                job.StoryID,
+			RequireTestsPassed:     job.AutoResumePolicy.RequireTestsPassed || (job.StoryID != "" && job.AutoResumePolicy.Enabled),
+			RequireReleaseVerified: job.AutoResumePolicy.RequireReleaseVerified || (job.StoryID != "" && job.AutoResumePolicy.Enabled),
 		})
 		job.ASEGateStatus = map[string]any{
-			"passed":       gateRes.Passed,
-			"unmet_gates":  gateRes.UnmetGates,
-			"git_clean":    gateRes.GitClean,
-			"branch_clean": gateRes.BranchClean,
-			"story_done":   gateRes.StoryDone,
+			"passed":           gateRes.Passed,
+			"unmet_gates":      gateRes.UnmetGates,
+			"git_clean":        gateRes.GitClean,
+			"branch_clean":     gateRes.BranchClean,
+			"submodules_clean": gateRes.SubmodulesClean,
+			"story_done":       gateRes.StoryDone,
+			"tests_passed":     gateRes.TestsPassed,
+			"release_verified": gateRes.ReleaseVerified,
 		}
 
 		if !gateRes.Passed {
