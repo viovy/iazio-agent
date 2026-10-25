@@ -73,6 +73,8 @@ type Sup struct {
 	toolUpdating        bool
 	toolUpdatingHolders int
 	isProgressing       func(path string, pid int) bool
+	lastProgress        map[string]time.Time
+	stallTimeout        time.Duration
 }
 
 // New returns a supervisor. now injects the clock.
@@ -81,16 +83,17 @@ func New(now func() time.Time) *Sup {
 		now = time.Now
 	}
 	return &Sup{
-		gates:    map[string]*sync.Mutex{},
-		locks:    map[string]string{},
-		until:    map[string]time.Time{},
-		deadline: map[string]time.Time{},
-		pids:     map[string]int{},
-		jobIDs:   map[string]string{},
-		reasons:  map[string]string{},
-		now:      now,
-		sleep:    time.Sleep,
-		alive:    isProcessAlive,
+		gates:        map[string]*sync.Mutex{},
+		locks:        map[string]string{},
+		until:        map[string]time.Time{},
+		deadline:     map[string]time.Time{},
+		lastProgress: map[string]time.Time{},
+		pids:         map[string]int{},
+		jobIDs:       map[string]string{},
+		reasons:      map[string]string{},
+		now:          now,
+		sleep:        time.Sleep,
+		alive:        isProcessAlive,
 	}
 }
 
@@ -130,6 +133,7 @@ func (s *Sup) Spawn(r Runner, jobID, apiURL, worktree, docsHub, token string, ex
 	s.pids[worktree] = pid
 	s.jobIDs[worktree] = jobID
 	s.deadline[worktree] = s.now().Add(DefaultJobDuration)
+	s.lastProgress[worktree] = s.now()
 	if s.signal == nil && r != nil {
 		s.signal = r.Signal
 	}
@@ -364,6 +368,13 @@ type ReapedJob struct {
 	Reason       string
 }
 
+// SetStallTimeout overrides the default stall timeout for progress-aware supervision.
+func (s *Sup) SetStallTimeout(timeout time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stallTimeout = timeout
+}
+
 // Tick cancels harnesses that have reached their execution timeout or died, and finishes cooling-off.
 func (s *Sup) Tick() []ReapedJob {
 	now := s.now()
@@ -373,19 +384,33 @@ func (s *Sup) Tick() []ReapedJob {
 	for path, state := range s.locks {
 		if state == LockRunning {
 			timedOut := false
-			if DefaultJobDuration > 0 {
-				if deadline, ok := s.deadline[path]; ok && !deadline.After(now) {
-					pid := s.pids[path]
-					if s.isActivelyProgressingLocked(path, pid) {
-						s.deadline[path] = now.Add(DefaultJobDuration)
-					} else {
+			pid := s.pids[path]
+			if s.isActivelyProgressingLocked(path, pid) {
+				s.lastProgress[path] = now
+				if DefaultJobDuration > 0 {
+					s.deadline[path] = now.Add(DefaultJobDuration)
+				}
+			} else {
+				lastProg := s.lastProgress[path]
+				if lastProg.IsZero() {
+					lastProg = now
+					s.lastProgress[path] = now
+				}
+				stallLimit := s.stallTimeout
+				if stallLimit <= 0 {
+					stallLimit = 45 * time.Minute
+				}
+				if now.Sub(lastProg) >= stallLimit {
+					dueTimeout = append(dueTimeout, path)
+					timedOut = true
+				} else if DefaultJobDuration > 0 {
+					if deadline, ok := s.deadline[path]; ok && !deadline.After(now) {
 						dueTimeout = append(dueTimeout, path)
 						timedOut = true
 					}
 				}
 			}
 			if !timedOut {
-				pid := s.pids[path]
 				if pid > 0 && s.alive != nil && !s.alive(pid) {
 					dueDied = append(dueDied, path)
 				}
