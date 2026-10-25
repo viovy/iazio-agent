@@ -71,6 +71,9 @@ type Client struct {
 	CommitSHA             string
 	MaxRetries            int
 	InitialBackoff        time.Duration
+	Spooler               *OfflineReportSpooler
+	EagerUpdateEnabled    bool
+	LastEagerUpdateAt     func() *time.Time
 }
 
 func (c Client) retryParams() (int, time.Duration) {
@@ -157,6 +160,12 @@ func (c Client) HeartbeatDetailed(ctx context.Context, hostID string, tools []To
 		"supported_capabilities": supportedCaps,
 		"version":                c.Version,
 		"commit_sha":             c.CommitSHA,
+		"eager_update_enabled":   c.EagerUpdateEnabled,
+	}
+	if c.LastEagerUpdateAt != nil {
+		if t := c.LastEagerUpdateAt(); t != nil && !t.IsZero() {
+			body["last_eager_update_at"] = t.Format(time.RFC3339)
+		}
 	}
 	var res HeartbeatResponse
 	if err := c.postJSON(ctx, "/v1/hosts/"+hostID+"/heartbeat", body, &res); err != nil {
@@ -354,6 +363,10 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 			}
 		}
 	}()
+
+	if c.Spooler != nil {
+		c.Spooler.StartAutoDrain(ctx, 10*time.Second)
+	}
 
 	if onJob == nil {
 		<-ctx.Done()
@@ -772,6 +785,18 @@ func (c Client) postJSON(ctx context.Context, path string, body any, out any) er
 		case <-time.After(backoff + jitter):
 		}
 		backoff *= 2
+	}
+	if lastErr != nil && c.Spooler != nil && out == nil {
+		headers := map[string]string{"Content-Type": "application/json"}
+		if c.Token != "" {
+			headers["Authorization"] = "Bearer " + c.Token
+		}
+		_ = c.Spooler.Spool(SpooledRequest{
+			URL:     strings.TrimRight(c.BaseURL, "/") + path,
+			Method:  http.MethodPost,
+			Headers: headers,
+			Body:    raw,
+		})
 	}
 	return lastErr
 }

@@ -10,12 +10,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-agent/internal/harness"
 	"github.com/viovy/iazio-agent/internal/telemetry"
+	"github.com/viovy/iazio-agent/internal/workspace"
 )
 
 // Supported job types.
@@ -31,7 +36,8 @@ var (
 )
 
 // DefaultJobExecutionTimeout is the maximum duration an individual job can run before being terminated.
-const DefaultJobExecutionTimeout = 30 * time.Minute
+// Configured to 7 days for enterprise multi-day executions (STORY-GOV-3690).
+const DefaultJobExecutionTimeout = 7 * 24 * time.Hour
 
 // Job describes a unit of work received from the control plane.
 type Job struct {
@@ -84,18 +90,24 @@ type HTTPControlPlaneClient struct {
 	BaseURL    string
 	AuthToken  string
 	HTTPClient *http.Client
+	Spooler    *controlplane.OfflineReportSpooler
 }
 
 // NewHTTPControlPlaneClient constructs an HTTPControlPlaneClient.
-func NewHTTPControlPlaneClient(baseURL, authToken string, client *http.Client) *HTTPControlPlaneClient {
+func NewHTTPControlPlaneClient(baseURL, authToken string, client *http.Client, spooler ...*controlplane.OfflineReportSpooler) *HTTPControlPlaneClient {
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
+	var sp *controlplane.OfflineReportSpooler
+	if len(spooler) > 0 {
+		sp = spooler[0]
+	}
 	return &HTTPControlPlaneClient{
 		BaseURL:    baseURL,
 		AuthToken:  authToken,
 		HTTPClient: client,
+		Spooler:    sp,
 	}
 }
 
@@ -159,12 +171,36 @@ func (c *HTTPControlPlaneClient) CompleteJob(ctx context.Context, jobID string, 
 
 	resp, err := c.HTTPClient.Do(httpReq)
 	if err != nil {
+		if c.Spooler != nil {
+			headers := map[string]string{"Content-Type": "application/json"}
+			if c.AuthToken != "" {
+				headers["Authorization"] = "Bearer " + c.AuthToken
+			}
+			_ = c.Spooler.Spool(controlplane.SpooledRequest{
+				URL:     url,
+				Method:  http.MethodPost,
+				Headers: headers,
+				Body:    bodyBytes,
+			})
+		}
 		return fmt.Errorf("execute complete request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
+		if c.Spooler != nil && resp.StatusCode >= 500 {
+			headers := map[string]string{"Content-Type": "application/json"}
+			if c.AuthToken != "" {
+				headers["Authorization"] = "Bearer " + c.AuthToken
+			}
+			_ = c.Spooler.Spool(controlplane.SpooledRequest{
+				URL:     url,
+				Method:  http.MethodPost,
+				Headers: headers,
+				Body:    bodyBytes,
+			})
+		}
 		return fmt.Errorf("complete returned status %d: %s", resp.StatusCode, string(respBody))
 	}
 	return nil
@@ -354,9 +390,34 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	defer span.End()
 
 	invoker := d.invoker
+	worktreeDir := "."
 	if d.worktreeResolver != nil {
 		if wt := d.worktreeResolver(job.Repo); wt != "" {
+			worktreeDir = wt
 			invoker = invoker.WithWorkDir(wt)
+		}
+	}
+
+	// Pre-job workspace sanitization: non-destructive lock clearing, interrupted git ops recovery, dirty patch archiving, and line ending hygiene
+	if worktreeDir != "" && worktreeDir != "." {
+		if sanRes, sanErr := workspace.SanitizeWorkspace(ctx, worktreeDir); sanErr != nil {
+			fmt.Fprintf(os.Stderr, "[dispatcher] pre-job sanitize warning: %v\n", sanErr)
+		} else if sanRes != nil && len(sanRes.RemovedLockPaths) > 0 {
+			fmt.Fprintf(os.Stderr, "[dispatcher] pre-job sanitize removed %d stale locks\n", len(sanRes.RemovedLockPaths))
+		}
+		if cfgErr := exec.CommandContext(ctx, "git", "-C", worktreeDir, "config", "core.autocrlf", "input").Run(); cfgErr != nil {
+			fmt.Fprintf(os.Stderr, "[dispatcher] git autocrlf config warning: %v\n", cfgErr)
+		}
+
+		// Archive dirty workspace diff to .autopilot/recovery/<job_id>.patch on fresh queue jobs (STORY-GOV-3690)
+		diffOut, err := exec.CommandContext(ctx, "git", "-C", worktreeDir, "diff", "HEAD").Output()
+		if err == nil && len(bytes.TrimSpace(diffOut)) > 0 {
+			recoveryDir := filepath.Join(worktreeDir, ".autopilot", "recovery")
+			_ = os.MkdirAll(recoveryDir, 0o755)
+			patchPath := filepath.Join(recoveryDir, fmt.Sprintf("%s.patch", job.ID))
+			if pErr := os.WriteFile(patchPath, diffOut, 0o644); pErr == nil {
+				fmt.Fprintf(os.Stderr, "[dispatcher] archived dirty workspace state to %s\n", patchPath)
+			}
 		}
 	}
 
@@ -371,7 +432,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	defer hbCancel()
 	if job.FencingToken > 0 {
 		go func() {
-			ticker := time.NewTicker(30 * time.Second)
+			ticker := time.NewTicker(10 * time.Second)
 			defer ticker.Stop()
 			for {
 				select {
