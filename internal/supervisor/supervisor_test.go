@@ -334,6 +334,43 @@ func TestTickReapsDeadProcess(t *testing.T) {
 	}
 }
 
+func TestTick_ActiveProcessExtendsDeadlineRatherThanTimeout(t *testing.T) {
+	curr := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	s := New(func() time.Time { return curr })
+	s.alive = func(pid int) bool {
+		return pid == 1234
+	}
+
+	s.mu.Lock()
+	s.locks["/repos/active"] = LockRunning
+	s.pids["/repos/active"] = 1234
+	s.deadline["/repos/active"] = curr.Add(-1 * time.Minute) // Past deadline
+	s.mu.Unlock()
+
+	reaped := s.Tick()
+	if len(reaped) > 0 {
+		t.Fatalf("expected active job not to be reaped, got: %+v", reaped)
+	}
+
+	// Verify deadline was extended
+	newDeadline := s.Deadline("/repos/active")
+	if !newDeadline.After(curr) {
+		t.Fatalf("expected deadline to be extended into the future, got %v <= %v", newDeadline, curr)
+	}
+
+	// Now simulate dead process at expired deadline
+	s.alive = func(pid int) bool { return false }
+	s.mu.Lock()
+	s.deadline["/repos/active"] = curr.Add(-1 * time.Minute)
+	s.mu.Unlock()
+
+	reaped = s.Tick()
+	if len(reaped) != 1 || reaped[0].Reason != ReasonExecutionTimeout {
+		t.Fatalf("expected dead job to be reaped with timeout, got: %+v", reaped)
+	}
+}
+
+
 func TestReconcileHostCheckouts(t *testing.T) {
 	var discarded []string
 	var resumed []string

@@ -71,6 +71,7 @@ type Sup struct {
 	loopDetector        *LoopDetector
 	toolUpdating        bool
 	toolUpdatingHolders int
+	isProgressing       func(path string, pid int) bool
 }
 
 // New returns a supervisor. now injects the clock.
@@ -371,7 +372,12 @@ func (s *Sup) Tick() []ReapedJob {
 	for path, state := range s.locks {
 		if state == LockRunning {
 			if deadline, ok := s.deadline[path]; ok && !deadline.After(now) {
-				dueTimeout = append(dueTimeout, path)
+				pid := s.pids[path]
+				if s.isActivelyProgressingLocked(path, pid) {
+					s.deadline[path] = now.Add(DefaultJobDuration)
+				} else {
+					dueTimeout = append(dueTimeout, path)
+				}
 			} else {
 				pid := s.pids[path]
 				if pid > 0 && s.alive != nil && !s.alive(pid) {
@@ -409,6 +415,23 @@ func (s *Sup) Deadline(path string) time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.deadline[path]
+}
+
+// SetProgressChecker sets a custom function to determine if a job in a given worktree is actively progressing.
+func (s *Sup) SetProgressChecker(fn func(path string, pid int) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.isProgressing = fn
+}
+
+func (s *Sup) isActivelyProgressingLocked(path string, pid int) bool {
+	if s.isProgressing != nil {
+		return s.isProgressing(path, pid)
+	}
+	if pid > 0 && s.alive != nil && s.alive(pid) {
+		return true
+	}
+	return false
 }
 
 // GracefulStop sends TERM and forcefully reaps the process tree/group with KILL after 10s.
