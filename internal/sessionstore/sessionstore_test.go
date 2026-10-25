@@ -254,3 +254,35 @@ func TestDetectDirtyWorktreeContext_DirtyStoryFile(t *testing.T) {
 		t.Fatalf("expected STORY-FEAT-9999, got %q", dCtx.StoryID)
 	}
 }
+
+func TestIsValidConversationID(t *testing.T) {
+	if !IsValidConversationID("d6ae4fed-9a21-4708-a24e-eeb7dac91671") {
+		t.Errorf("expected valid UUID conversation ID")
+	}
+	if IsValidConversationID("") {
+		t.Errorf("expected empty conversation ID to be invalid")
+	}
+	if IsValidConversationID("../escape") {
+		t.Errorf("expected traversal conversation ID to be invalid")
+	}
+	if IsValidConversationID("bad/slash") {
+		t.Errorf("expected slash conversation ID to be invalid")
+	}
+}
+
+func TestSessionExists(t *testing.T) {
+	tmpBrain := t.TempDir()
+	convID := "test-conv-1234"
+	_ = os.MkdirAll(filepath.Join(tmpBrain, convID), 0755)
+
+	res := &Resolver{BrainDir: tmpBrain}
+	if !res.SessionExists(convID) {
+		t.Errorf("expected session to exist in brain dir")
+	}
+	if res.SessionExists("nonexistent-conv") {
+		t.Errorf("expected nonexistent session to not exist")
+	}
+	if res.SessionExists("invalid/id") {
+		t.Errorf("expected invalid ID to return false")
+	}
+}

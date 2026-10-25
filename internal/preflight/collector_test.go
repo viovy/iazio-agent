@@ -190,3 +190,14 @@ func TestCleanPorcelain(t *testing.T) {
 		t.Errorf("expected empty string for scratch only, got %q", CleanPorcelain(scratchOnly))
 	}
 }
+
+func TestCollectPackageFunction(t *testing.T) {
+	tmpDir := t.TempDir()
+	rep, err := Collect(context.Background(), tmpDir, "", KindOrdinary)
+	if err != nil {
+		t.Fatalf("Collect failed: %v", err)
+	}
+	if !rep.DocsHubOK {
+		t.Errorf("expected DocsHubOK true")
+	}
+}

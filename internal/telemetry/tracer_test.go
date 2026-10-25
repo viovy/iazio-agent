@@ -305,3 +305,20 @@ func TestZipkinExporter_OfflineSpoolAndDrain(t *testing.T) {
 		t.Fatalf("expected spool directory to be empty after drain, got %d files", len(remaining))
 	}
 }
+
+func TestNewZipkinExporter_EnvBranches(t *testing.T) {
+	t.Setenv("ZIPKIN_ENDPOINT", "")
+	t.Setenv("OTEL_EXPORTER_ZIPKIN_ENDPOINT", "http://otel.example.com:9411")
+	t.Setenv("ZIPKIN_SPOOL_DIR", "none")
+
+	exp := NewZipkinExporter("")
+	defer exp.Close()
+
+	if exp.endpoint != "http://otel.example.com:9411/api/v2/spans" {
+		t.Errorf("unexpected endpoint: %s", exp.endpoint)
+	}
+	if exp.spoolDir != "" {
+		t.Errorf("expected empty spoolDir with none, got: %s", exp.spoolDir)
+	}
+}
+

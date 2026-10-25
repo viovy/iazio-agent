@@ -2705,3 +2705,29 @@ func TestExecute_CommandsAndHarvest(t *testing.T) {
 	_ = execute(context.Background(), []string{"unknown-cmd"}, &stdout, &stderr, nil)
 }
 
+func TestScanRepoFleetStatus(t *testing.T) {
+	tmpDir := t.TempDir()
+	cmd := exec.Command("git", "init", tmpDir)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git init failed: %v", err)
+	}
+
+	ctx := context.Background()
+	if !scanRepoFleetStatus(ctx, tmpDir) {
+		t.Errorf("expected clean git repo to return true")
+	}
+
+	// Dirty file
+	dirty := filepath.Join(tmpDir, "dirty.go")
+	_ = os.WriteFile(dirty, []byte("package main\n"), 0644)
+	if scanRepoFleetStatus(ctx, tmpDir) {
+		t.Errorf("expected dirty git repo to return false")
+	}
+
+	// Non-git directory
+	nonGit := t.TempDir()
+	if scanRepoFleetStatus(ctx, nonGit) {
+		t.Errorf("expected non-git dir to return false")
+	}
+}
+

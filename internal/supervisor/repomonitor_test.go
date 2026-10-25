@@ -1410,3 +1410,81 @@ func TestEagerToolUpdater_ReadinessReportAndGateIntegration(t *testing.T) {
 		t.Errorf("expected at least 4 readiness reports posted, got %d", len(reportedReadiness))
 	}
 }
+
+func TestEagerToolUpdater_AuxiliaryMethods(t *testing.T) {
+	updater := NewEagerToolUpdater(nil, nil, "host-aux", nil, nil)
+	if updater.IsUpdating() {
+		t.Errorf("expected IsUpdating=false")
+	}
+
+	updater.recordSuiteFailure()
+	updater.mu.Lock()
+	if updater.suiteFailCount != 1 {
+		t.Errorf("expected suiteFailCount=1, got %d", updater.suiteFailCount)
+	}
+	updater.mu.Unlock()
+
+	updater.recordSuiteSuccess()
+	updater.mu.Lock()
+	if updater.suiteFailCount != 0 {
+		t.Errorf("expected suiteFailCount=0, got %d", updater.suiteFailCount)
+	}
+	updater.mu.Unlock()
+
+	last := updater.LastReadiness()
+	if last.HostID != "host-aux" {
+		t.Errorf("expected host-aux LastReadiness, got %+v", last)
+	}
+}
+
+func TestRepoStateMonitor_Start(t *testing.T) {
+	monitor := NewRepoStateMonitor(nil, "host-1", 5*time.Minute, nil, nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // canceled immediately
+	monitor.Start(ctx)
+}
+
+func TestDiscoverSubRepositories_GitModules(t *testing.T) {
+	tmpDir := t.TempDir()
+	subDir := filepath.Join(tmpDir, "sub-mod")
+	_ = os.MkdirAll(subDir, 0755)
+
+	gitmodulesContent := `[submodule "sub-mod"]
+	path = sub-mod
+	url = https://example.com/repo.git
+`
+	_ = os.WriteFile(filepath.Join(tmpDir, ".gitmodules"), []byte(gitmodulesContent), 0644)
+
+	discovered := DiscoverSubRepositories(tmpDir)
+	found := false
+	for _, p := range discovered {
+		if p == "sub-mod" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected sub-mod discovered from .gitmodules, got %v", discovered)
+	}
+}
+
+func TestInspectSingleGitDirectory_Gitfile(t *testing.T) {
+	tmpDir := t.TempDir()
+	actualGitDir := filepath.Join(tmpDir, "actual-git")
+	_ = os.MkdirAll(actualGitDir, 0755)
+
+	worktreeDir := filepath.Join(tmpDir, "worktree")
+	_ = os.MkdirAll(worktreeDir, 0755)
+
+	gitfile := filepath.Join(worktreeDir, ".git")
+	_ = os.WriteFile(gitfile, []byte("gitdir: "+actualGitDir+"\n"), 0644)
+
+	// Create index.lock in actualGitDir
+	lockFile := filepath.Join(actualGitDir, "index.lock")
+	_ = os.WriteFile(lockFile, []byte("lock"), 0644)
+
+	res := inspectSingleGitDirectory(context.Background(), worktreeDir)
+	if res.IsClean || !res.HasActiveGitLock {
+		t.Fatalf("expected active git lock detected via gitfile redirection")
+	}
+}

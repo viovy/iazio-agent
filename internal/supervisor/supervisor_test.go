@@ -875,3 +875,17 @@ func TestResolveBinaryAndRunnerSignal(t *testing.T) {
 		_ = cmd.Wait()
 	}
 }
+
+func TestSupervisor_AcquireToolUpdateForce(t *testing.T) {
+	s := New(time.Now)
+	rel := s.AcquireToolUpdateForce()
+	if !s.IsToolUpdating() {
+		t.Errorf("expected toolUpdating=true")
+	}
+	rel()
+	if s.IsToolUpdating() {
+		t.Errorf("expected toolUpdating=false after release")
+	}
+	// duplicate release does not panic or underflow
+	rel()
+}

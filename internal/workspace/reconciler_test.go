@@ -157,3 +157,15 @@ func TestResolveGitDir_AndLockHelpers(t *testing.T) {
 	_ = hasRunningGitProcess(tmpDir)
 }
 
+func TestIsLockFileHeld_OpenFD(t *testing.T) {
+	tmpDir := t.TempDir()
+	lockPath := filepath.Join(tmpDir, "held.lock")
+	f, err := os.Create(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	_ = isLockFileHeld(lockPath)
+}
+

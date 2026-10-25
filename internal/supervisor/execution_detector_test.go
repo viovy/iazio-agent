@@ -135,3 +135,14 @@ func TestMultiSignalExecutionDetector_ProcessTableAndControlPlane(t *testing.T) 
 		t.Errorf("missing expected signal sources: %v", sources)
 	}
 }
+
+func TestDefaultOSProcessScanner(t *testing.T) {
+	sigs, err := DefaultOSProcessScanner([]string{"/nonexistent/repo/path"})
+	if err != nil {
+		t.Fatalf("DefaultOSProcessScanner failed: %v", err)
+	}
+	// On this host running the test, /nonexistent/repo/path should have 0 matches
+	if len(sigs) != 0 {
+		t.Errorf("expected 0 signals for nonexistent path, got %d", len(sigs))
+	}
+}

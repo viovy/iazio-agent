@@ -827,3 +827,28 @@ func TestPostJobReadiness(t *testing.T) {
 		t.Fatalf("expected reap_result and workspace_state_manifest in payload: %v", receivedBody)
 	}
 }
+
+func TestClient_PostEagerReadiness(t *testing.T) {
+	var receivedBody map[string]any
+	var receivedPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+
+	c := Client{BaseURL: srv.URL}
+	report := map[string]any{"eager_update_state": "UP_TO_DATE", "host_id": "host-test"}
+	err := c.PostEagerReadiness(context.Background(), "host-test", report)
+	if err != nil {
+		t.Fatalf("PostEagerReadiness failed: %v", err)
+	}
+	if receivedPath != "/v1/hosts/host-test/eager-readiness" {
+		t.Fatalf("expected /v1/hosts/host-test/eager-readiness, got %s", receivedPath)
+	}
+	if receivedBody["eager_update_state"] != "UP_TO_DATE" {
+		t.Fatalf("expected UP_TO_DATE in payload: %v", receivedBody)
+	}
+}
