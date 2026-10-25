@@ -19,9 +19,11 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/ase/gate"
+	"github.com/viovy/iazio-agent/internal/reaper"
 	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/sessionstore"
 	"github.com/viovy/iazio-agent/internal/supervisor"
+	"github.com/viovy/iazio-agent/internal/workspace"
 )
 
 const (
@@ -178,14 +180,7 @@ func defaultKillProcess(pid int) error {
 	if pid <= 0 {
 		return nil
 	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return err
-	}
-	_ = p.Signal(syscall.SIGTERM)
-	time.Sleep(100 * time.Millisecond)
-	_ = p.Signal(syscall.SIGKILL)
-	return nil
+	return reaper.TerminateProcessGroup(pid, 2*time.Second)
 }
 
 // ComputeProgressFingerprint generates a SHA-256 fingerprint of the workspace progress.
@@ -481,6 +476,12 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 	continuationDirective := fmt.Sprintf("\n[ASE AUTO-RESUME CONTINUATION: Attempt %d/%d on conversation %s. Interrupted Reason: %s. Unmet Gates: %v. Continue execution from current workspace state without repeating completed steps.]\n\n",
 		jobCopy.ResumeCount, effectiveMaxResumes, jobCopy.ConversationID, reason, unmetGates)
 	jobCopy.Prompt = continuationDirective + jobCopy.Prompt
+
+	// Sanitize workspace and release orphan locks before spawning resume
+	if jobCopy.WorktreePath != "" {
+		_, _ = reaper.ReapWorkspaceOrphansAndLocks(context.Background(), jobCopy.WorktreePath, jobCopy.ConversationID)
+		_, _ = workspace.SanitizeWorkspace(context.Background(), jobCopy.WorktreePath)
+	}
 
 	if spawner != nil {
 		newPID, err := spawner(context.Background(), jobCopy)

@@ -29,6 +29,7 @@ import (
 	"github.com/viovy/iazio-agent/internal/harness"
 	"github.com/viovy/iazio-agent/internal/inventory"
 	"github.com/viovy/iazio-agent/internal/preflight"
+	"github.com/viovy/iazio-agent/internal/reaper"
 	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/service"
 	"github.com/viovy/iazio-agent/internal/sessionstore"
@@ -36,6 +37,7 @@ import (
 	"github.com/viovy/iazio-agent/internal/telemetry"
 	"github.com/viovy/iazio-agent/internal/watchdog"
 	"github.com/viovy/iazio-agent/internal/worker"
+	"github.com/viovy/iazio-agent/internal/workspace"
 )
 
 func main() {
@@ -979,6 +981,86 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 
 				convID := ResolveDispatchConversationID(a, lockInfo.ConversationID, lockInfo.StoryID, lockInfo.Status)
 
+				// Pre-resume workspace & session sanitization pass
+				if a.WorktreePath != "" {
+					reapRes, reapErr := reaper.ReapWorkspaceOrphansAndLocks(runCtx, a.WorktreePath, convID)
+					if reapErr != nil {
+						span.SetTag("reaper.error", reapErr.Error())
+						if stderr != nil {
+							fmt.Fprintf(stderr, "[agent] Warning: reaper encountered error for %s: %v\n", a.WorktreePath, reapErr)
+						}
+					}
+					if reapRes != nil && (reapRes.OrphansReaped > 0 || reapRes.LocksReleased > 0) {
+						span.SetTag("reaper.orphans_reaped", fmt.Sprintf("%d", reapRes.OrphansReaped))
+						span.SetTag("reaper.locks_released", fmt.Sprintf("%d", reapRes.LocksReleased))
+						if stderr != nil {
+							fmt.Fprintf(stderr, "[agent] Pre-resume reaper: %d orphans reaped, %d session locks released for %s\n",
+								reapRes.OrphansReaped, reapRes.LocksReleased, a.WorktreePath)
+						}
+					}
+
+					sanRes, sanErr := workspace.SanitizeWorkspace(runCtx, a.WorktreePath)
+					if sanErr != nil {
+						span.SetTag("workspace.sanitize_error", sanErr.Error())
+						if stderr != nil {
+							fmt.Fprintf(stderr, "[agent] Warning: workspace sanitization failed for %s: %v\n", a.WorktreePath, sanErr)
+						}
+					}
+					if sanRes != nil {
+						span.SetTag("workspace.stale_locks_removed", fmt.Sprintf("%d", sanRes.StaleLocksRemoved))
+						span.SetTag("workspace.preserved_files", fmt.Sprintf("%d", sanRes.Manifest.PreservedFilesCount))
+						if sanRes.InterruptedGitOperation != "" {
+							span.SetTag("workspace.interrupted_git_op", sanRes.InterruptedGitOperation)
+						}
+						if sanRes.StaleLocksRemoved > 0 && stderr != nil {
+							fmt.Fprintf(stderr, "[agent] Cleaned %d stale git lock files in %s (preserved %d uncommitted files)\n",
+								sanRes.StaleLocksRemoved, a.WorktreePath, sanRes.Manifest.PreservedFilesCount)
+						}
+					}
+
+					// Report readiness payload to iazio-harness-api
+					var reapMap map[string]any
+					if reapRes != nil {
+						reapMap = map[string]any{
+							"orphans_reaped": reapRes.OrphansReaped,
+							"locks_released": reapRes.LocksReleased,
+						}
+						if reapErr != nil {
+							reapMap["error"] = reapErr.Error()
+						}
+					} else if reapErr != nil {
+						reapMap = map[string]any{
+							"error": reapErr.Error(),
+						}
+					}
+					var manifestMap map[string]any
+					if sanRes != nil {
+						manifestMap = map[string]any{
+							"clean_locks":           sanRes.Manifest.CleanLocks,
+							"stale_locks_removed":   sanRes.StaleLocksRemoved,
+							"interrupted_git_op":    sanRes.InterruptedGitOperation,
+							"branch":                sanRes.Manifest.Branch,
+							"head_sha":              sanRes.Manifest.HeadSHA,
+							"preserved_files_count": sanRes.Manifest.PreservedFilesCount,
+							"modified_submodules":   sanRes.Manifest.ModifiedSubmodules,
+							"modified_files":        sanRes.Manifest.ModifiedFiles,
+							"untracked_files":       sanRes.Manifest.UntrackedFiles,
+						}
+					}
+					if reapMap != nil || manifestMap != nil {
+						if err := client.PostJobReadiness(runCtx, a.ID, reapMap, manifestMap, nil); err != nil {
+							span.SetTag("job.readiness_post_error", err.Error())
+						}
+					}
+
+					// Synchronous harvest flush before resume attempt
+					if convID != "" && (a.Kind == "resume" || a.ParentJobID != "") {
+						if err := flushHarvestConversation(runCtx, convID); err != nil {
+							span.SetTag("harvest.flush_error", err.Error())
+						}
+					}
+				}
+
 				var spawnExtras []string
 				if a.Kind != "" {
 					spawnExtras = append(spawnExtras, "--kind", a.Kind)
@@ -1024,6 +1106,24 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 	default:
 		return fmt.Errorf("unknown command %s", args[0])
 	}
+}
+
+func flushHarvestConversation(ctx context.Context, conversationID string) error {
+	if strings.TrimSpace(conversationID) == "" {
+		return nil
+	}
+	fCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	harvesterBin := supervisor.ResolveBinary("iazio-harvester")
+	cmd := exec.CommandContext(fCtx, harvesterBin, "once", "--conversation", conversationID)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[agent] Warning: harvest flush for conversation %s failed: %v (output: %s)\n",
+			conversationID, err, strings.TrimSpace(string(out)))
+		return err
+	}
+	return nil
 }
 
 func runAuth(ctx context.Context, args []string, stdout io.Writer, getenv func(string) string) error {
