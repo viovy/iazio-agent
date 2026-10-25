@@ -112,7 +112,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		fmt.Fprintln(stdout, kind)
 		api := resolveLocalAPI(getenv)
 		profile := getenv("IAZIO_AGENT_PROFILE")
-		updateInterval := 30 * time.Minute
+		updateInterval := 15 * time.Minute
 		if raw := getenv("IAZIO_AGENT_UPDATE_INTERVAL"); raw != "" {
 			if d, err := time.ParseDuration(raw); err == nil {
 				updateInterval = d
@@ -598,8 +598,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}()
 			}
 			var wd *watchdog.Watchdog
+			spooler, _ := controlplane.NewOfflineReportSpooler("", nil)
 			client = controlplane.Client{
 				BaseURL: api,
+				Spooler: spooler,
 				Presence: func() string {
 					if updatingTools.Load() {
 						return "ONLINE_UPDATING_TOOLS"
@@ -811,7 +813,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			}
 
 			if api != "" {
-				cpClient := worker.NewHTTPControlPlaneClient(api, "", nil)
+				cpSpooler, _ := controlplane.NewOfflineReportSpooler("", nil)
+				cpClient := worker.NewHTTPControlPlaneClient(api, "", nil, cpSpooler)
 				cliInvoker := harness.NewCLIInvoker("", "")
 				disp := worker.NewDispatcher(cpClient, cliInvoker, host)
 				disp.SetHostGate(hostGate)
@@ -897,6 +900,11 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						}
 					}
 				}()
+
+				if runtime.GOOS == "windows" {
+					wslSupervisor := service.NewWSLCompanionSupervisor("")
+					wslSupervisor.StartSupervisor(runCtx, 60*time.Second)
+				}
 
 				go func() {
 					defer func() {

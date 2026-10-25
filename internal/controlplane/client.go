@@ -71,6 +71,7 @@ type Client struct {
 	CommitSHA             string
 	MaxRetries            int
 	InitialBackoff        time.Duration
+	Spooler               *OfflineReportSpooler
 }
 
 func (c Client) retryParams() (int, time.Duration) {
@@ -354,6 +355,10 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 			}
 		}
 	}()
+
+	if c.Spooler != nil {
+		c.Spooler.StartAutoDrain(ctx, 10*time.Second)
+	}
 
 	if onJob == nil {
 		<-ctx.Done()
@@ -772,6 +777,18 @@ func (c Client) postJSON(ctx context.Context, path string, body any, out any) er
 		case <-time.After(backoff + jitter):
 		}
 		backoff *= 2
+	}
+	if lastErr != nil && c.Spooler != nil && out == nil {
+		headers := map[string]string{"Content-Type": "application/json"}
+		if c.Token != "" {
+			headers["Authorization"] = "Bearer " + c.Token
+		}
+		_ = c.Spooler.Spool(SpooledRequest{
+			URL:     strings.TrimRight(c.BaseURL, "/") + path,
+			Method:  http.MethodPost,
+			Headers: headers,
+			Body:    raw,
+		})
 	}
 	return lastErr
 }

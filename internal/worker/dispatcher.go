@@ -10,12 +10,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os/exec"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-agent/internal/harness"
 	"github.com/viovy/iazio-agent/internal/telemetry"
+	"github.com/viovy/iazio-agent/internal/workspace"
 )
 
 // Supported job types.
@@ -31,7 +34,8 @@ var (
 )
 
 // DefaultJobExecutionTimeout is the maximum duration an individual job can run before being terminated.
-const DefaultJobExecutionTimeout = 30 * time.Minute
+// Configured to 7 days for enterprise multi-day executions (STORY-GOV-3690).
+const DefaultJobExecutionTimeout = 7 * 24 * time.Hour
 
 // Job describes a unit of work received from the control plane.
 type Job struct {
@@ -84,18 +88,24 @@ type HTTPControlPlaneClient struct {
 	BaseURL    string
 	AuthToken  string
 	HTTPClient *http.Client
+	Spooler    *controlplane.OfflineReportSpooler
 }
 
 // NewHTTPControlPlaneClient constructs an HTTPControlPlaneClient.
-func NewHTTPControlPlaneClient(baseURL, authToken string, client *http.Client) *HTTPControlPlaneClient {
+func NewHTTPControlPlaneClient(baseURL, authToken string, client *http.Client, spooler ...*controlplane.OfflineReportSpooler) *HTTPControlPlaneClient {
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
+	var sp *controlplane.OfflineReportSpooler
+	if len(spooler) > 0 {
+		sp = spooler[0]
+	}
 	return &HTTPControlPlaneClient{
 		BaseURL:    baseURL,
 		AuthToken:  authToken,
 		HTTPClient: client,
+		Spooler:    sp,
 	}
 }
 
@@ -159,12 +169,36 @@ func (c *HTTPControlPlaneClient) CompleteJob(ctx context.Context, jobID string, 
 
 	resp, err := c.HTTPClient.Do(httpReq)
 	if err != nil {
+		if c.Spooler != nil {
+			headers := map[string]string{"Content-Type": "application/json"}
+			if c.AuthToken != "" {
+				headers["Authorization"] = "Bearer " + c.AuthToken
+			}
+			_ = c.Spooler.Spool(controlplane.SpooledRequest{
+				URL:     url,
+				Method:  http.MethodPost,
+				Headers: headers,
+				Body:    bodyBytes,
+			})
+		}
 		return fmt.Errorf("execute complete request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
+		if c.Spooler != nil && resp.StatusCode >= 500 {
+			headers := map[string]string{"Content-Type": "application/json"}
+			if c.AuthToken != "" {
+				headers["Authorization"] = "Bearer " + c.AuthToken
+			}
+			_ = c.Spooler.Spool(controlplane.SpooledRequest{
+				URL:     url,
+				Method:  http.MethodPost,
+				Headers: headers,
+				Body:    bodyBytes,
+			})
+		}
 		return fmt.Errorf("complete returned status %d: %s", resp.StatusCode, string(respBody))
 	}
 	return nil
@@ -354,10 +388,18 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	defer span.End()
 
 	invoker := d.invoker
+	worktreeDir := "."
 	if d.worktreeResolver != nil {
 		if wt := d.worktreeResolver(job.Repo); wt != "" {
+			worktreeDir = wt
 			invoker = invoker.WithWorkDir(wt)
 		}
+	}
+
+	// Pre-job workspace sanitization: non-destructive lock clearing, interrupted git ops recovery, and line ending hygiene
+	if worktreeDir != "" && worktreeDir != "." {
+		_, _ = workspace.SanitizeWorkspace(ctx, worktreeDir)
+		_ = exec.CommandContext(ctx, "git", "-C", worktreeDir, "config", "core.autocrlf", "input").Run()
 	}
 
 	timeout := d.jobTimeout
