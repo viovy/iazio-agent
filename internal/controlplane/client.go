@@ -633,6 +633,10 @@ type RepoRuntimeStatus struct {
 	ToolLiveness         string    `json:"tool_liveness,omitempty"`
 	ExecutionProvenance  string    `json:"execution_provenance,omitempty"`
 	ActiveConversationID string    `json:"active_conversation_id,omitempty"`
+	MetadataYmlRaw       string    `json:"metadata_yml_raw,omitempty"`
+	MetadataYmlSHA       string    `json:"metadata_yml_sha,omitempty"`
+	MetadataYmlModTime   string    `json:"metadata_yml_mod_time,omitempty"`
+	GitVersion           string    `json:"git_version,omitempty"`
 	LastCheckedAt        time.Time `json:"last_checked_at"`
 }
 

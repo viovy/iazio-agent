@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -633,7 +634,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						}()
 					case "CHECK_FLEET_GIT_STATUS":
 						go func() {
-							target := strings.Trim(strings.TrimSpace(string(cmd.Payload)), "\"")
+							var target string
+							if err := json.Unmarshal(cmd.Payload, &target); err != nil {
+								target = strings.Trim(strings.TrimSpace(string(cmd.Payload)), "\"")
+							}
 							if target != "" {
 								st := probeRepoRuntime(runCtx, target, filepath.Base(target))
 								_ = client.PostRepoStatus(runCtx, host, []controlplane.RepoRuntimeStatus{st})
@@ -655,6 +659,29 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							}
 							if len(statuses) > 0 {
 								_ = client.PostRepoStatus(runCtx, host, statuses)
+							}
+						}()
+					case "FETCH_METADATA_YML":
+						go func() {
+							var target string
+							if err := json.Unmarshal(cmd.Payload, &target); err != nil {
+								target = strings.Trim(strings.TrimSpace(string(cmd.Payload)), "\"")
+							}
+							if target != "" {
+								st := probeRepoRuntime(runCtx, target, filepath.Base(target))
+								_ = client.PostRepoStatus(runCtx, host, []controlplane.RepoRuntimeStatus{st})
+							}
+						}()
+					case "FORCE_CLEAN_GIT", "HEAL_GIT_REPO":
+						go func() {
+							var target string
+							if err := json.Unmarshal(cmd.Payload, &target); err != nil {
+								target = strings.Trim(strings.TrimSpace(string(cmd.Payload)), "\"")
+							}
+							if target != "" {
+								healGitRepo(runCtx, target)
+								st := probeRepoRuntime(runCtx, target, filepath.Base(target))
+								_ = client.PostRepoStatus(runCtx, host, []controlplane.RepoRuntimeStatus{st})
 							}
 						}()
 					}
@@ -1648,33 +1675,34 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 				}
 				st.Porcelain = strings.Join(pLines, "\n")
 			}
-			return st
 		}
 	}
 
-	// Fallback git status & branch
-	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain=v2", "--branch")
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		lines := strings.Split(string(out), "\n")
-		var porcelainLines []string
-		for _, l := range lines {
-			l = strings.TrimSpace(l)
-			if l == "" {
-				continue
+	if st.Branch == "" {
+		// Fallback git status & branch
+		cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain=v2", "--branch")
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			lines := strings.Split(string(out), "\n")
+			var porcelainLines []string
+			for _, l := range lines {
+				l = strings.TrimSpace(l)
+				if l == "" {
+					continue
+				}
+				if strings.HasPrefix(l, "# branch.head ") {
+					st.Branch = strings.TrimPrefix(l, "# branch.head ")
+				} else if !strings.HasPrefix(l, "# ") {
+					porcelainLines = append(porcelainLines, l)
+				}
 			}
-			if strings.HasPrefix(l, "# branch.head ") {
-				st.Branch = strings.TrimPrefix(l, "# branch.head ")
-			} else if !strings.HasPrefix(l, "# ") {
-				porcelainLines = append(porcelainLines, l)
-			}
+			st.Porcelain = strings.Join(porcelainLines, "\n")
+			isMain := st.Branch == "main" || st.Branch == "master"
+			st.IsClean = len(porcelainLines) == 0 && isMain
+		} else {
+			st.IsClean = false
+			st.Porcelain = err.Error()
 		}
-		st.Porcelain = strings.Join(porcelainLines, "\n")
-		isMain := st.Branch == "main" || st.Branch == "master"
-		st.IsClean = len(porcelainLines) == 0 && isMain
-	} else {
-		st.IsClean = false
-		st.Porcelain = err.Error()
 	}
 
 	// Submodules check
@@ -1721,7 +1749,51 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 			st.ASEState = "IDLE"
 		}
 	}
+
+	// metadata.yml snapshot sync
+	metaPath := filepath.Join(repoPath, "metadata.yml")
+	if fi, err := os.Stat(metaPath); err == nil && !fi.IsDir() && fi.Size() < 2<<20 {
+		if metaBytes, err := os.ReadFile(metaPath); err == nil {
+			st.MetadataYmlRaw = string(metaBytes)
+			hash := sha256.Sum256(metaBytes)
+			st.MetadataYmlSHA = fmt.Sprintf("%x", hash)
+			st.MetadataYmlModTime = fi.ModTime().UTC().Format(time.RFC3339)
+		}
+	}
+
+	// Git flow version autodetect (git describe --tags --always)
+	gitVerCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "describe", "--tags", "--always")
+	if out, err := gitVerCmd.Output(); err == nil {
+		st.GitVersion = strings.TrimSpace(string(out))
+	}
+
 	return st
+}
+
+// healGitRepo deterministic cleanup for broken, diverged, or locked repo state.
+func healGitRepo(ctx context.Context, repoPath string) {
+	if strings.TrimSpace(repoPath) == "" {
+		return
+	}
+
+	// 1. Remove stale git index lock if present
+	lockFile := filepath.Join(repoPath, ".git", "index.lock")
+	if fi, err := os.Stat(lockFile); err == nil && !fi.IsDir() {
+		_ = os.Remove(lockFile)
+	}
+
+	// 2. Remove autopilot / ase locks
+	_ = os.Remove(filepath.Join(repoPath, ".ase", "active.lock"))
+	_ = os.Remove(filepath.Join(repoPath, ".autopilot", "lock"))
+
+	// 3. Reset and clean working tree
+	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "reset", "--hard", "HEAD").Run()
+	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "clean", "-fd").Run()
+
+	// 4. Synchronize submodules
+	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "foreach", "--recursive", "git reset --hard HEAD").Run()
+	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "foreach", "--recursive", "git clean -fd").Run()
+	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "update", "--init", "--recursive").Run()
 }
 
 // resolveWorktreeFromHostDetail resolves a target worktree from the host's registered repos.
