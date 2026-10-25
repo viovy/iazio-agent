@@ -80,3 +80,35 @@ func TestWSLCompanionSupervisor_NoWSL(t *testing.T) {
 		t.Fatalf("expected LastCheckError populated")
 	}
 }
+
+func TestWSLCompanionSupervisor_HealingFailure_Diagnostics(t *testing.T) {
+	mockRunner := func(name string, args ...string) ([]byte, error) {
+		fullCmd := name + " " + strings.Join(args, " ")
+		if strings.Contains(fullCmd, "-l -q") {
+			return []byte("Ubuntu\n"), nil
+		}
+		if strings.Contains(fullCmd, "is-system-running") {
+			return []byte("running\n"), nil
+		}
+		if strings.Contains(fullCmd, "is-active") {
+			return []byte("failed\n"), nil
+		}
+		if strings.Contains(fullCmd, "service install") {
+			return []byte("command not found: iazio-agent\n"), context.DeadlineExceeded
+		}
+		return []byte("ok\n"), nil
+	}
+
+	supervisor := NewWSLCompanionSupervisor("Ubuntu", mockRunner)
+	status := supervisor.CheckAndHeal(context.Background())
+
+	if !status.WSLPresent {
+		t.Fatalf("expected WSLPresent true")
+	}
+	if status.AgentActive {
+		t.Fatalf("expected AgentActive false")
+	}
+	if !strings.Contains(status.LastCheckError, "service install") {
+		t.Fatalf("expected LastCheckError to contain diagnostic info, got: %s", status.LastCheckError)
+	}
+}

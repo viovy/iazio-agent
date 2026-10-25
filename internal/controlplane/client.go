@@ -72,6 +72,8 @@ type Client struct {
 	MaxRetries            int
 	InitialBackoff        time.Duration
 	Spooler               *OfflineReportSpooler
+	EagerUpdateEnabled    bool
+	LastEagerUpdateAt     func() *time.Time
 }
 
 func (c Client) retryParams() (int, time.Duration) {
@@ -158,6 +160,12 @@ func (c Client) HeartbeatDetailed(ctx context.Context, hostID string, tools []To
 		"supported_capabilities": supportedCaps,
 		"version":                c.Version,
 		"commit_sha":             c.CommitSHA,
+		"eager_update_enabled":   c.EagerUpdateEnabled,
+	}
+	if c.LastEagerUpdateAt != nil {
+		if t := c.LastEagerUpdateAt(); t != nil && !t.IsZero() {
+			body["last_eager_update_at"] = t.Format(time.RFC3339)
+		}
 	}
 	var res HeartbeatResponse
 	if err := c.postJSON(ctx, "/v1/hosts/"+hostID+"/heartbeat", body, &res); err != nil {

@@ -118,6 +118,22 @@ func (s *WSLCompanionSupervisor) CheckAndHeal(ctx context.Context) WSLServiceSta
 		status.LingerActive = true
 	}
 
+	// Helper to invoke binary command with login shell fallback or explicit paths
+	runServiceCmd := func(binName string, subArgs ...string) ([]byte, error) {
+		fullArgs := append([]string{binName}, subArgs...)
+		out, err := wslExec(fullArgs...)
+		if err != nil {
+			// Fallback 1: try via bash login shell so ~/.profile and ~/.bashrc PATH are loaded
+			script := fmt.Sprintf("PATH=\"$HOME/.local/bin:$HOME/bin:/usr/local/bin:$PATH\" %s %s", binName, strings.Join(subArgs, " "))
+			out2, err2 := wslExec("bash", "-lc", script)
+			if err2 == nil {
+				return out2, nil
+			}
+			return out, err
+		}
+		return out, nil
+	}
+
 	// 6. Heal if services are inactive or linger is disabled
 	needsHealing := !status.AgentActive || !status.HarvesterActive || !status.LingerActive
 	if needsHealing && status.SystemdActive {
@@ -126,23 +142,55 @@ func (s *WSLCompanionSupervisor) CheckAndHeal(ctx context.Context) WSLServiceSta
 
 		// Re-install or enable iazio-agent service if inactive
 		if !status.AgentActive {
-			_, _ = wslExec("iazio-agent", "service", "install")
-			_, _ = wslExec("systemctl", "--user", "enable", "--now", "iazio-agent.service")
-			chk, _ := wslExec("systemctl", "--user", "is-active", "iazio-agent.service")
+			installOut, installErr := runServiceCmd("iazio-agent", "service", "install")
+			enableOut, enableErr := wslExec("systemctl", "--user", "enable", "--now", "iazio-agent.service")
+			chk, chkErr := wslExec("systemctl", "--user", "is-active", "iazio-agent.service")
 			if strings.TrimSpace(string(chk)) == "active" {
 				status.AgentActive = true
 				status.AutoHealed = true
+			} else {
+				var errMsgs []string
+				if installErr != nil {
+					errMsgs = append(errMsgs, fmt.Sprintf("iazio-agent service install: %v (output: %s)", installErr, strings.TrimSpace(string(installOut))))
+				}
+				if enableErr != nil {
+					errMsgs = append(errMsgs, fmt.Sprintf("systemctl enable: %v (output: %s)", enableErr, strings.TrimSpace(string(enableOut))))
+				}
+				if chkErr != nil || strings.TrimSpace(string(chk)) != "active" {
+					errMsgs = append(errMsgs, fmt.Sprintf("systemctl is-active iazio-agent: %s", strings.TrimSpace(string(chk))))
+				}
+				if len(errMsgs) > 0 {
+					status.LastCheckError = strings.Join(errMsgs, "; ")
+				}
 			}
 		}
 
 		// Re-install or enable iazio-harvester service if inactive
 		if !status.HarvesterActive {
-			_, _ = wslExec("iazio-harvester", "service", "install")
-			_, _ = wslExec("systemctl", "--user", "enable", "--now", "iazio-harvester.service")
-			chk, _ := wslExec("systemctl", "--user", "is-active", "iazio-harvester.service")
+			installOut, installErr := runServiceCmd("iazio-harvester", "service", "install")
+			enableOut, enableErr := wslExec("systemctl", "--user", "enable", "--now", "iazio-harvester.service")
+			chk, chkErr := wslExec("systemctl", "--user", "is-active", "iazio-harvester.service")
 			if strings.TrimSpace(string(chk)) == "active" {
 				status.HarvesterActive = true
 				status.AutoHealed = true
+			} else {
+				var errMsgs []string
+				if installErr != nil {
+					errMsgs = append(errMsgs, fmt.Sprintf("iazio-harvester service install: %v (output: %s)", installErr, strings.TrimSpace(string(installOut))))
+				}
+				if enableErr != nil {
+					errMsgs = append(errMsgs, fmt.Sprintf("systemctl enable: %v (output: %s)", enableErr, strings.TrimSpace(string(enableOut))))
+				}
+				if chkErr != nil || strings.TrimSpace(string(chk)) != "active" {
+					errMsgs = append(errMsgs, fmt.Sprintf("systemctl is-active iazio-harvester: %s", strings.TrimSpace(string(chk))))
+				}
+				if len(errMsgs) > 0 {
+					if status.LastCheckError != "" {
+						status.LastCheckError += "; " + strings.Join(errMsgs, "; ")
+					} else {
+						status.LastCheckError = strings.Join(errMsgs, "; ")
+					}
+				}
 			}
 		}
 	}

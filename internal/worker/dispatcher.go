@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -396,10 +398,27 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		}
 	}
 
-	// Pre-job workspace sanitization: non-destructive lock clearing, interrupted git ops recovery, and line ending hygiene
+	// Pre-job workspace sanitization: non-destructive lock clearing, interrupted git ops recovery, dirty patch archiving, and line ending hygiene
 	if worktreeDir != "" && worktreeDir != "." {
-		_, _ = workspace.SanitizeWorkspace(ctx, worktreeDir)
-		_ = exec.CommandContext(ctx, "git", "-C", worktreeDir, "config", "core.autocrlf", "input").Run()
+		if sanRes, sanErr := workspace.SanitizeWorkspace(ctx, worktreeDir); sanErr != nil {
+			fmt.Fprintf(os.Stderr, "[dispatcher] pre-job sanitize warning: %v\n", sanErr)
+		} else if sanRes != nil && len(sanRes.RemovedLockPaths) > 0 {
+			fmt.Fprintf(os.Stderr, "[dispatcher] pre-job sanitize removed %d stale locks\n", len(sanRes.RemovedLockPaths))
+		}
+		if cfgErr := exec.CommandContext(ctx, "git", "-C", worktreeDir, "config", "core.autocrlf", "input").Run(); cfgErr != nil {
+			fmt.Fprintf(os.Stderr, "[dispatcher] git autocrlf config warning: %v\n", cfgErr)
+		}
+
+		// Archive dirty workspace diff to .autopilot/recovery/<job_id>.patch on fresh queue jobs (STORY-GOV-3690)
+		diffOut, err := exec.CommandContext(ctx, "git", "-C", worktreeDir, "diff", "HEAD").Output()
+		if err == nil && len(bytes.TrimSpace(diffOut)) > 0 {
+			recoveryDir := filepath.Join(worktreeDir, ".autopilot", "recovery")
+			_ = os.MkdirAll(recoveryDir, 0o755)
+			patchPath := filepath.Join(recoveryDir, fmt.Sprintf("%s.patch", job.ID))
+			if pErr := os.WriteFile(patchPath, diffOut, 0o644); pErr == nil {
+				fmt.Fprintf(os.Stderr, "[dispatcher] archived dirty workspace state to %s\n", patchPath)
+			}
+		}
 	}
 
 	timeout := d.jobTimeout
@@ -413,7 +432,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	defer hbCancel()
 	if job.FencingToken > 0 {
 		go func() {
-			ticker := time.NewTicker(30 * time.Second)
+			ticker := time.NewTicker(10 * time.Second)
 			defer ticker.Stop()
 			for {
 				select {

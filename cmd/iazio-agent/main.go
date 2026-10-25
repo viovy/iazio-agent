@@ -421,7 +421,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			// Start repoMonitor AFTER eagerUpdater is fully constructed to eliminate initialization race
 			repoMonitor.Start(runCtx)
 
-			var lastUpdateCheck time.Time
+			var lastUpdateCheck time.Time = time.Now().UTC()
 			var lastUpdateMu sync.Mutex
 
 			var doToolUpdateWithOpts func(ctx context.Context, opts supervisor.TriggerOptions) (supervisor.UpdateResult, bool, error)
@@ -556,6 +556,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 
 					checkOnce := func() bool {
+						lastUpdateMu.Lock()
+						lastUpdateCheck = time.Now().UTC()
+						lastUpdateMu.Unlock()
 						pendingRemoteMu.Lock()
 						t := pendingRemoteTools
 						f := pendingRemoteForce
@@ -600,8 +603,18 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			var wd *watchdog.Watchdog
 			spooler, _ := controlplane.NewOfflineReportSpooler("", nil)
 			client = controlplane.Client{
-				BaseURL: api,
-				Spooler: spooler,
+				BaseURL:            api,
+				Spooler:            spooler,
+				EagerUpdateEnabled: updateInterval > 0 || eagerUpdater != nil,
+				LastEagerUpdateAt: func() *time.Time {
+					lastUpdateMu.Lock()
+					defer lastUpdateMu.Unlock()
+					if lastUpdateCheck.IsZero() {
+						return nil
+					}
+					t := lastUpdateCheck
+					return &t
+				},
 				Presence: func() string {
 					if updatingTools.Load() {
 						return "ONLINE_UPDATING_TOOLS"
