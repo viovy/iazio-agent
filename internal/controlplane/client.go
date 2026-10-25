@@ -202,6 +202,13 @@ type Assignment struct {
 	ResumeMode            string         `json:"resume_mode,omitempty"`
 	ResumeFallbackReason  string         `json:"resume_fallback_reason,omitempty"`
 	InterruptedASEState   map[string]any `json:"interrupted_ase_state,omitempty"`
+	LeaseToken            string         `json:"lease_token,omitempty"`
+	LeaseAckDeadlineAt    string         `json:"lease_ack_deadline_at,omitempty"`
+	ZipkinTraceID         string         `json:"zipkin_trace_id,omitempty"`
+	ZipkinTraceURL        string         `json:"zipkin_trace_url,omitempty"`
+	Traceparent           string         `json:"traceparent,omitempty"`
+	InfraRequeueCount     int            `json:"infra_requeue_count,omitempty"`
+	FailureCategory       string         `json:"failure_category,omitempty"`
 }
 
 // NextLease asks for the next job for this host. ok is false when the queue is empty.
@@ -573,6 +580,42 @@ func (c Client) DeclineJob(ctx context.Context, jobID, reason string) error {
 	return c.post(ctx, "/v1/jobs/"+jobID+"/decline", map[string]string{
 		"reason": reason,
 	})
+}
+
+// AckLease completes Phase 2 of the two-phase lease handshake.
+func (c Client) AckLease(ctx context.Context, jobID, leaseToken string, pid int, activeConvID string) error {
+	payload := map[string]any{
+		"lease_token":            leaseToken,
+		"agent_pid":              pid,
+		"active_conversation_id": activeConvID,
+	}
+	return c.post(ctx, "/v1/jobs/"+jobID+"/ack-lease", payload)
+}
+
+// HeartbeatJob sends an active lease heartbeat to prevent lease timeout during long tasks.
+func (c Client) HeartbeatJob(ctx context.Context, jobID, leaseToken string) error {
+	payload := map[string]any{
+		"lease_token": leaseToken,
+	}
+	return c.post(ctx, "/v1/jobs/"+jobID+"/heartbeat", payload)
+}
+
+// AttemptFailure reports a tool startup or pre-progress fault for circuit breaking and failover.
+type AttemptFailure struct {
+	Host            string `json:"host"`
+	Tool            string `json:"tool"`
+	Workspace       string `json:"workspace"`
+	ExitCode        int    `json:"exit_code"`
+	StderrTail      string `json:"stderr_tail"`
+	FailureCategory string `json:"failure_category"`
+	FailureStage    string `json:"failure_stage"`
+	Reason          string `json:"reason"`
+	Timestamp       string `json:"timestamp"`
+}
+
+// FailoverJob reports early tool failure and triggers multi-tier priority failover.
+func (c Client) FailoverJob(ctx context.Context, jobID string, req AttemptFailure) error {
+	return c.post(ctx, "/v1/jobs/"+jobID+"/failover", req)
 }
 
 // HostDetail contains full details of a registered host and its checkouts.

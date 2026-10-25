@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-agent/internal/harness"
 )
 
@@ -91,7 +92,7 @@ func (m *mockControlPlane) CompleteJob(ctx context.Context, jobID string, req Co
 	return nil
 }
 
-func (m *mockControlPlane) HeartbeatJob(ctx context.Context, jobID string, fencingToken int64) error {
+func (m *mockControlPlane) HeartbeatJob(ctx context.Context, jobID, leaseToken string, fencingToken int64) error {
 	return nil
 }
 
@@ -100,6 +101,14 @@ func (m *mockControlPlane) BindStory(ctx context.Context, jobID string, req Stor
 	if m.bindFunc != nil {
 		return m.bindFunc(ctx, jobID, req)
 	}
+	return nil
+}
+
+func (m *mockControlPlane) AckLease(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) error {
+	return nil
+}
+
+func (m *mockControlPlane) FailoverJob(ctx context.Context, jobID string, req controlplane.AttemptFailure) error {
 	return nil
 }
 
@@ -897,12 +906,12 @@ func TestHTTPControlPlaneClient_AllMethods(t *testing.T) {
 	}
 
 	// 6. Heartbeat success
-	if err := client.HeartbeatJob(ctx, "job-1", 12); err != nil {
+	if err := client.HeartbeatJob(ctx, "job-1", "lease-token-1", 12); err != nil {
 		t.Fatalf("HeartbeatJob error: %v", err)
 	}
 
 	// 7. Heartbeat failure (fenced)
-	if err := client.HeartbeatJob(ctx, "job-1", 999); err == nil {
+	if err := client.HeartbeatJob(ctx, "job-1", "lease-token-1", 999); err == nil {
 		t.Fatal("expected error for fenced heartbeat")
 	}
 }
