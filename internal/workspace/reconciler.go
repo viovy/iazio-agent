@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // WorkspaceManifest captures non-destructive snapshot telemetry for a workspace.
@@ -85,10 +86,11 @@ func SanitizeWorkspace(ctx context.Context, workspacePath string) (*WorkspaceSan
 }
 
 func hasRunningGitProcess(workspacePath string) bool {
-	// Look for any running git process referencing workspacePath
+	cleanWorkspace := filepath.Clean(workspacePath)
+
+	// 1. Linux /proc scanning
 	procEntries, err := os.ReadDir("/proc")
 	if err == nil {
-		cleanWorkspace := filepath.Clean(workspacePath)
 		for _, entry := range procEntries {
 			if !entry.IsDir() {
 				continue
@@ -103,7 +105,8 @@ func hasRunningGitProcess(workspacePath string) bool {
 					return true
 				}
 				if cwdLink, err := os.Readlink(filepath.Join("/proc", entry.Name(), "cwd")); err == nil {
-					if filepath.Clean(cwdLink) == cleanWorkspace {
+					cleanCwd := filepath.Clean(cwdLink)
+					if cleanCwd == cleanWorkspace || strings.HasPrefix(cleanCwd, cleanWorkspace+string(filepath.Separator)) {
 						return true
 					}
 				}
@@ -112,14 +115,36 @@ func hasRunningGitProcess(workspacePath string) bool {
 		return false
 	}
 
-	// Fallback using ps
+	// 2. lsof detection for macOS/Darwin (and BSD/Solaris)
+	if lsofBin, err := exec.LookPath("lsof"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		out, _ := exec.CommandContext(ctx, lsofBin, "-a", "-c", "git", "+D", cleanWorkspace, "-t").Output()
+		cancel()
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return true
+		}
+	}
+
+	// 3. Fallback using ps
 	out, err := exec.Command("ps", "-eo", "command").Output()
 	if err == nil {
 		lines := strings.Split(string(out), "\n")
 		for _, line := range lines {
-			if strings.Contains(line, "git") && strings.Contains(line, workspacePath) {
+			if strings.Contains(line, "git") && strings.Contains(line, cleanWorkspace) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func isLockFileHeld(lockPath string) bool {
+	if lsofBin, err := exec.LookPath("lsof"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		out, _ := exec.CommandContext(ctx, lsofBin, lockPath, "-t").Output()
+		cancel()
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return true
 		}
 	}
 	return false
@@ -150,8 +175,10 @@ func cleanGitLocks(workspacePath, gitDir string, isDir bool) []string {
 	}
 	for _, l := range rootLocks {
 		if _, err := os.Stat(l); err == nil {
-			if err := os.Remove(l); err == nil {
-				removed = append(removed, l)
+			if !isLockFileHeld(l) {
+				if err := os.Remove(l); err == nil {
+					removed = append(removed, l)
+				}
 			}
 		}
 	}
@@ -164,8 +191,10 @@ func cleanGitLocks(workspacePath, gitDir string, isDir bool) []string {
 				return nil
 			}
 			if !info.IsDir() && strings.HasSuffix(info.Name(), ".lock") {
-				if err := os.Remove(path); err == nil {
-					removed = append(removed, path)
+				if !isLockFileHeld(path) {
+					if err := os.Remove(path); err == nil {
+						removed = append(removed, path)
+					}
 				}
 			}
 			return nil

@@ -540,6 +540,21 @@ func (c Client) PostChunk(ctx context.Context, jobID, stream, text string) error
 	})
 }
 
+// PostJobReadiness reports pre-execution or resume readiness, reap results, and workspace manifest to iazio-harness-api.
+func (c Client) PostJobReadiness(ctx context.Context, jobID string, reapResult, manifest, rehydrationStatus map[string]any) error {
+	payload := map[string]any{}
+	if reapResult != nil {
+		payload["reap_result"] = reapResult
+	}
+	if manifest != nil {
+		payload["workspace_state_manifest"] = manifest
+	}
+	if rehydrationStatus != nil {
+		payload["rehydration_status"] = rehydrationStatus
+	}
+	return c.post(ctx, "/v1/jobs/"+jobID+"/readiness", payload)
+}
+
 // DeclineJob rejects an assignment when the worktree is busy or cannot be executed.
 func (c Client) DeclineJob(ctx context.Context, jobID, reason string) error {
 	return c.post(ctx, "/v1/jobs/"+jobID+"/decline", map[string]string{

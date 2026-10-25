@@ -71,3 +71,32 @@ func TestReapWorkspaceOrphansAndLocks(t *testing.T) {
 		t.Fatalf("expected db lock file %s to be removed", dbLock)
 	}
 }
+
+func TestFindOrphanPIDs(t *testing.T) {
+	tempWorkspace := t.TempDir()
+	cmd := exec.Command("sleep", "10")
+	cmd.Dir = tempWorkspace
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start sleep command: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	pids, err := findOrphanPIDs(tempWorkspace, "")
+	if err != nil {
+		t.Fatalf("findOrphanPIDs failed: %v", err)
+	}
+	found := false
+	for _, p := range pids {
+		if p == cmd.Process.Pid {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected sleep process %d (cwd %s) to be discovered by findOrphanPIDs, found: %v", cmd.Process.Pid, tempWorkspace, pids)
+	}
+}

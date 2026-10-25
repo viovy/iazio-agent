@@ -137,7 +137,9 @@ func TestWatchdog_UnexpectedTerminationAutoResume(t *testing.T) {
 
 	// Process crashes with exit 99 (like binary update or crash)
 	runner.complete(1002, 99, errors.New("child killed"))
-	time.Sleep(50 * time.Millisecond)
+	for i := 0; i < 20 && resumeSpawns.Load() == 0; i++ {
+		time.Sleep(25 * time.Millisecond)
+	}
 
 	got, err := w.GetJob("job-102")
 	if err != nil {

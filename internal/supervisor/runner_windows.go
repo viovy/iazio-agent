@@ -3,6 +3,8 @@
 package supervisor
 
 import (
+	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"sync"
@@ -68,8 +70,9 @@ func postStartProc(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 0 {
 		return
 	}
-	r1, _, _ := procCreateJobObjectW.Call(0, 0)
+	r1, _, err := procCreateJobObjectW.Call(0, 0)
 	if r1 == 0 {
+		fmt.Fprintf(os.Stderr, "[agent] Warning: CreateJobObjectW failed for PID %d: %v\n", cmd.Process.Pid, err)
 		return
 	}
 	jobHandle := r1
@@ -84,11 +87,16 @@ func postStartProc(cmd *exec.Cmd) {
 		uintptr(unsafe.Pointer(&info)),
 		unsafe.Sizeof(info),
 	)
-	rProc, _, _ := procOpenProcess.Call(uintptr(processSetQuota|processTerminate), 0, uintptr(cmd.Process.Pid))
+	rProc, _, errProc := procOpenProcess.Call(uintptr(processSetQuota|processTerminate), 0, uintptr(cmd.Process.Pid))
 	if rProc != 0 {
 		hProc := rProc
-		procAssignProcessToJobObject.Call(jobHandle, hProc)
+		rAssign, _, errAssign := procAssignProcessToJobObject.Call(jobHandle, hProc)
+		if rAssign == 0 {
+			fmt.Fprintf(os.Stderr, "[agent] Warning: AssignProcessToJobObject failed for PID %d: %v\n", cmd.Process.Pid, errAssign)
+		}
 		procCloseHandle.Call(hProc)
+	} else {
+		fmt.Fprintf(os.Stderr, "[agent] Warning: OpenProcess failed for Job Object binding on PID %d: %v\n", cmd.Process.Pid, errProc)
 	}
 
 	agentJobMu.Lock()

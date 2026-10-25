@@ -803,3 +803,27 @@ func TestHeartbeat_SupportedCapabilitiesAndVersion(t *testing.T) {
 		t.Fatalf("expected version 1.2.3 and sha abc1234, got: %v, %v", bodyMap["version"], bodyMap["commit_sha"])
 	}
 }
+
+func TestPostJobReadiness(t *testing.T) {
+	var receivedBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/jobs/test-job-1/readiness" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+
+	c := Client{BaseURL: srv.URL}
+	reap := map[string]any{"orphans_reaped": 1, "locks_released": 1}
+	manifest := map[string]any{"clean_locks": true, "preserved_files_count": 2}
+	err := c.PostJobReadiness(context.Background(), "test-job-1", reap, manifest, nil)
+	if err != nil {
+		t.Fatalf("PostJobReadiness failed: %v", err)
+	}
+	if receivedBody["reap_result"] == nil || receivedBody["workspace_state_manifest"] == nil {
+		t.Fatalf("expected reap_result and workspace_state_manifest in payload: %v", receivedBody)
+	}
+}
