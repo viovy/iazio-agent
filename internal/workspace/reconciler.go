@@ -393,3 +393,53 @@ func computeManifest(ctx context.Context, workspacePath string) (WorkspaceManife
 	manifest.PreservedFilesCount = len(manifest.ModifiedFiles) + len(manifest.UntrackedFiles)
 	return manifest, nil
 }
+
+// ResetAndSanitizeFreshWorkspace cleans stale locks and recovers dirty state to
+// .autopilot/recovery/<timestamp>-<job_id>.patch before resetting root and submodules to clean origin/main.
+func ResetAndSanitizeFreshWorkspace(ctx context.Context, workspacePath, jobID string) (*WorkspaceSanitizeResult, error) {
+	res, err := SanitizeWorkspace(ctx, workspacePath)
+	if err != nil {
+		return res, err
+	}
+	if workspacePath == "" {
+		return res, nil
+	}
+
+	// 1. Check if git status --porcelain is dirty
+	cmdStatus := exec.CommandContext(ctx, "git", "-C", workspacePath, "status", "--porcelain")
+	statusOut, _ := cmdStatus.Output()
+	if len(bytes.TrimSpace(statusOut)) > 0 {
+		// Archive dirty changes to .autopilot/recovery/<timestamp>-<job_id>.patch
+		recoveryDir := filepath.Join(workspacePath, ".autopilot", "recovery")
+		_ = os.MkdirAll(recoveryDir, 0755)
+		patchFileName := fmt.Sprintf("%d-%s.patch", time.Now().UTC().Unix(), jobID)
+		patchPath := filepath.Join(recoveryDir, patchFileName)
+
+		cmdDiff := exec.CommandContext(ctx, "git", "-C", workspacePath, "diff", "HEAD")
+		if diffOut, err := cmdDiff.Output(); err == nil && len(diffOut) > 0 {
+			_ = os.WriteFile(patchPath, diffOut, 0644)
+		} else {
+			_ = os.WriteFile(patchPath, statusOut, 0644)
+		}
+
+		// Hard reset and clean root
+		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "reset", "--hard", "HEAD").Run()
+		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "clean", "-fd").Run()
+
+		// Hard reset and clean recursive submodules
+		submoduleCmd := `rm -f .git/index.lock || true; git reset --hard HEAD; git clean -fd`
+		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "submodule", "foreach", "--recursive", submoduleCmd).Run()
+	}
+
+	// Re-clean any newly discovered stale locks
+	gitDir := filepath.Join(workspacePath, ".git")
+	if fi, err := os.Stat(gitDir); err == nil {
+		isDir := fi.IsDir()
+		removed := cleanGitLocks(workspacePath, gitDir, isDir)
+		res.StaleLocksRemoved += len(removed)
+		res.RemovedLockPaths = append(res.RemovedLockPaths, removed...)
+	}
+
+	res.Manifest, _ = computeManifest(ctx, workspacePath)
+	return res, nil
+}
