@@ -432,3 +432,233 @@ func TestWatchdog_SpawnerError(t *testing.T) {
 		t.Fatalf("expected LastError to contain 'spawn failed', got %q", j.LastError)
 	}
 }
+
+func TestWatchdog_MidFlowCrashAutoResume(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "watchdog-crash.json")
+	convID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	var spawnedJobs []TrackedJob
+
+	w := New(Options{
+		StateFile: stateFile,
+		IsAlive:   func(pid int) bool { return false },
+		Spawner: func(ctx context.Context, job TrackedJob) (int, error) {
+			spawnedJobs = append(spawnedJobs, job)
+			return 5555, nil
+		},
+	})
+
+	w.Track(TrackedJob{
+		JobID:          "job-1311",
+		PID:            1311,
+		ConversationID: convID,
+		Prompt:         "implement feature xyz",
+		AutoResumePolicy: AutoResumePolicy{
+			Enabled:                true,
+			MaxAutoResumes:         5,
+			BackoffInitialSec:      0, // immediate in test
+			RequireForwardProgress: false,
+		},
+	})
+
+	// Process crashes with exit code 1
+	w.OnProcessExit("job-1311", 1311, 1, errors.New("upstream LLM stream stall"))
+
+	if len(spawnedJobs) != 1 {
+		t.Fatalf("expected 1 resumed job, got %d", len(spawnedJobs))
+	}
+	resumed := spawnedJobs[0]
+	if resumed.ConversationID != convID {
+		t.Errorf("expected resumed conversation %s, got %s", convID, resumed.ConversationID)
+	}
+	if !strings.Contains(resumed.Prompt, "[ASE AUTO-RESUME CONTINUATION") {
+		t.Errorf("expected prompt to contain continuation directive, got %s", resumed.Prompt)
+	}
+	if resumed.ResumeCount != 1 {
+		t.Errorf("expected resume count 1, got %d", resumed.ResumeCount)
+	}
+
+	// Next run completes with exit code 0
+	w.OnProcessExit("job-1311", 5555, 0, nil)
+	j, _ := w.GetJob("job-1311")
+	if j.Status != StatusCompleted {
+		t.Errorf("expected job to be completed after second run, got %s", j.Status)
+	}
+}
+
+func TestWatchdog_SilentHangStallDetection(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "watchdog-stall.json")
+	convID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+
+	var killedPIDs []int
+	var spawnedJobs []TrackedJob
+	isAlivePID := true
+
+	now := time.Now().UTC()
+	pastTime := now.Add(-400 * time.Second)
+
+	monitor := &ConversationLivenessMonitor{
+		StallTimeout: 300 * time.Second,
+		Now:          func() time.Time { return now },
+		LivenessDir:  filepath.Join(tmpDir, "liveness"),
+		BrainDir:     filepath.Join(tmpDir, "brain"),
+	}
+
+	w := New(Options{
+		StateFile: stateFile,
+		IsAlive: func(pid int) bool {
+			return isAlivePID
+		},
+		KillProcess: func(pid int) error {
+			killedPIDs = append(killedPIDs, pid)
+			isAlivePID = false // process terminated
+			return nil
+		},
+		Spawner: func(ctx context.Context, job TrackedJob) (int, error) {
+			spawnedJobs = append(spawnedJobs, job)
+			return 6666, nil
+		},
+		Monitor: monitor,
+	})
+
+	w.Track(TrackedJob{
+		JobID:          "job-1311",
+		PID:            8888,
+		ConversationID: convID,
+		WorktreePath:   tmpDir,
+		StartedAt:      pastTime,
+		StallTimeoutSec: 300,
+		AutoResumePolicy: AutoResumePolicy{
+			Enabled:        true,
+			MaxAutoResumes: 5,
+		},
+	})
+
+	// Run periodic check while process is silently hung
+	_ = w.CheckInterrupted(context.Background())
+
+	if len(killedPIDs) != 1 || killedPIDs[0] != 8888 {
+		t.Fatalf("expected PID 8888 to be killed, got %v", killedPIDs)
+	}
+	if len(spawnedJobs) != 1 {
+		t.Fatalf("expected 1 auto-resumed job spawned, got %d", len(spawnedJobs))
+	}
+	if spawnedJobs[0].ConversationID != convID {
+		t.Errorf("expected resumed conversation %s, got %s", convID, spawnedJobs[0].ConversationID)
+	}
+	if !strings.Contains(spawnedJobs[0].Prompt, "conversation_stalled") {
+		t.Errorf("expected continuation prompt to reference conversation_stalled, got %s", spawnedJobs[0].Prompt)
+	}
+}
+
+func TestWatchdog_PrematureExit0GateEnforcement(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "watchdog-gate.json")
+	convID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+
+	storiesDir := filepath.Join(tmpDir, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0755)
+	storyFile := filepath.Join(storiesDir, "2026-10-25-gov-3684-premature.story.md")
+	// Story is still IN_PROGRESS (not DONE)
+	_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-3684\nstatus: IN_PROGRESS\n---\n"), 0644)
+
+	var spawnedJobs []TrackedJob
+	w := New(Options{
+		StateFile: stateFile,
+		IsAlive:   func(pid int) bool { return false },
+		Spawner: func(ctx context.Context, job TrackedJob) (int, error) {
+			spawnedJobs = append(spawnedJobs, job)
+			return 7777, nil
+		},
+	})
+
+	w.Track(TrackedJob{
+		JobID:          "job-1311",
+		PID:            1311,
+		ConversationID: convID,
+		WorktreePath:   tmpDir,
+		StoryID:        "STORY-GOV-3684",
+		Prompt:         "finish release",
+		AutoResumePolicy: AutoResumePolicy{
+			Enabled:                true,
+			MaxAutoResumes:         5,
+			BackoffInitialSec:      0,
+			RequireForwardProgress: false,
+		},
+	})
+
+	// Process prematurely exits with code 0 before story is completed
+	w.OnProcessExit("job-1311", 1311, 0, nil)
+
+	if len(spawnedJobs) != 1 {
+		t.Fatalf("expected 1 auto-resumed job due to incomplete gate, got %d", len(spawnedJobs))
+	}
+	if spawnedJobs[0].ConversationID != convID {
+		t.Errorf("expected resumed on conversation %s, got %s", convID, spawnedJobs[0].ConversationID)
+	}
+	if !strings.Contains(spawnedJobs[0].Prompt, "incomplete_ase_flow") {
+		t.Errorf("expected prompt to mention incomplete_ase_flow, got %s", spawnedJobs[0].Prompt)
+	}
+
+	// Now mark story as completed and simulate second exit 0
+	_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-3684\nstatus: DONE\n---\n"), 0644)
+	w.OnProcessExit("job-1311", 7777, 0, nil)
+
+	j, _ := w.GetJob("job-1311")
+	if j.Status != StatusCompleted {
+		t.Errorf("expected job to be completed once gate passes, got %s", j.Status)
+	}
+}
+
+func TestWatchdog_CircuitBreakerOnZeroProgress(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "watchdog-circuit.json")
+	convID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	var spawnCount int
+
+	// Initialize git repo in tmpDir so fingerprinting is active
+	_ = os.MkdirAll(filepath.Join(tmpDir, ".git"), 0755)
+
+	w := New(Options{
+		StateFile: stateFile,
+		IsAlive:   func(pid int) bool { return false },
+		Spawner: func(ctx context.Context, job TrackedJob) (int, error) {
+			spawnCount++
+			return 1000 + spawnCount, nil
+		},
+	})
+
+	w.Track(TrackedJob{
+		JobID:          "job-loop",
+		PID:            1000,
+		ConversationID: convID,
+		WorktreePath:   tmpDir,
+		AutoResumePolicy: AutoResumePolicy{
+			Enabled:                true,
+			MaxAutoResumes:         5,
+			BackoffInitialSec:      0,
+			RequireForwardProgress: true, // Circuit breaker active!
+		},
+	})
+
+	// Attempt 1: fails
+	w.OnProcessExit("job-loop", 1000, 1, errors.New("repeatable error"))
+	if spawnCount != 1 {
+		t.Fatalf("expected 1 spawn, got %d", spawnCount)
+	}
+
+	// Attempt 2: fails again with identical progress fingerprint
+	w.OnProcessExit("job-loop", 1001, 1, errors.New("repeatable error"))
+
+	// Verify circuit breaker tripped and no infinite looping
+	j, _ := w.GetJob("job-loop")
+	if j.Status != StatusFailed {
+		t.Errorf("expected job StatusFailed, got %s", j.Status)
+	}
+	if !j.CircuitBreakerTripped {
+		t.Errorf("expected CircuitBreakerTripped=true")
+	}
+	if !strings.Contains(j.LastError, "CIRCUIT_BREAKER_TRIPPED") {
+		t.Errorf("expected LastError to contain CIRCUIT_BREAKER_TRIPPED, got %s", j.LastError)
+	}
+}

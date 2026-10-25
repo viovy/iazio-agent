@@ -3,17 +3,22 @@ package watchdog
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/viovy/iazio-agent/internal/ase/gate"
 	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/sessionstore"
 	"github.com/viovy/iazio-agent/internal/supervisor"
@@ -25,29 +30,59 @@ const (
 	StatusFailed                 = "FAILED"
 	StatusTerminatedUnexpectedly = "TERMINATED_UNEXPECTEDLY"
 	StatusResumed                = "RESUMED"
+	StatusAutoResuming           = "AUTO_RESUMING"
+	StatusCircuitBreakerTripped  = "CIRCUIT_BREAKER_TRIPPED"
 
 	DefaultMaxResumes = 5
 	DefaultTick       = 5 * time.Second
 )
 
+// AutoResumePolicy defines the bounded retry and circuit-breaker configuration for autonomous jobs.
+type AutoResumePolicy struct {
+	Enabled                bool `json:"enabled"`
+	MaxAutoResumes         int  `json:"max_auto_resumes"`
+	BackoffInitialSec      int  `json:"backoff_initial_sec"`
+	BackoffMaxSec          int  `json:"backoff_max_sec"`
+	RequireForwardProgress bool `json:"require_forward_progress"`
+}
+
+// DefaultAutoResumePolicy returns enterprise default values for autonomous story execution.
+func DefaultAutoResumePolicy() AutoResumePolicy {
+	return AutoResumePolicy{
+		Enabled:                true,
+		MaxAutoResumes:         5,
+		BackoffInitialSec:      10,
+		BackoffMaxSec:          120,
+		RequireForwardProgress: true,
+	}
+}
+
 // TrackedJob records state of an in-flight or interrupted harness job.
 type TrackedJob struct {
-	JobID          string    `json:"job_id"`
-	ScheduleID     string    `json:"schedule_id,omitempty"`
-	WorktreePath   string    `json:"worktree_path"`
-	DocsHubPath    string    `json:"docs_hub_path,omitempty"`
-	APIURL         string    `json:"api_url"`
-	Engine         string    `json:"engine"`
-	Prompt         string    `json:"prompt"`
-	StoryID        string    `json:"story_id,omitempty"`
-	ConversationID string    `json:"conversation_id,omitempty"`
-	PID            int       `json:"pid"`
-	StartedAt      time.Time `json:"started_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
-	ResumeCount    int       `json:"resume_count"`
-	Status         string    `json:"status"`
-	ExitCode       int       `json:"exit_code"`
-	LastError      string    `json:"last_error,omitempty"`
+	JobID                   string           `json:"job_id"`
+	ScheduleID              string           `json:"schedule_id,omitempty"`
+	WorktreePath            string           `json:"worktree_path"`
+	DocsHubPath             string           `json:"docs_hub_path,omitempty"`
+	APIURL                  string           `json:"api_url"`
+	Engine                  string           `json:"engine"`
+	Prompt                  string           `json:"prompt"`
+	StoryID                 string           `json:"story_id,omitempty"`
+	ConversationID          string           `json:"conversation_id,omitempty"`
+	PID                     int              `json:"pid"`
+	StartedAt               time.Time        `json:"started_at"`
+	UpdatedAt               time.Time        `json:"updated_at"`
+	ResumeCount             int              `json:"resume_count"`
+	Status                  string           `json:"status"`
+	ExitCode                int              `json:"exit_code"`
+	LastError               string           `json:"last_error,omitempty"`
+	AutoResumePolicy        AutoResumePolicy `json:"auto_resume_policy"`
+	LastProgressFingerprint string           `json:"last_progress_fingerprint,omitempty"`
+	ConsecutiveZeroProgress int              `json:"consecutive_zero_progress,omitempty"`
+	CircuitBreakerTripped   bool             `json:"circuit_breaker_tripped,omitempty"`
+	ASEGateStatus           map[string]any   `json:"ase_gate_status,omitempty"`
+	StallTimeoutSec         int              `json:"stall_timeout_sec,omitempty"`
+	LastActivityAt          time.Time        `json:"last_activity_at,omitempty"`
+	IdleSeconds             float64          `json:"idle_seconds,omitempty"`
 }
 
 // Spawner restarts a terminated job.
@@ -55,24 +90,30 @@ type Spawner func(ctx context.Context, job TrackedJob) (newPID int, err error)
 
 // Watchdog tracks running harness jobs and autonomously resumes crashed or terminated jobs.
 type Watchdog struct {
-	mu         sync.Mutex
-	stateFile  string
-	jobs       map[string]*TrackedJob
-	runner     supervisor.Runner
-	spawner    Spawner
-	maxResumes int
-	isAlive    func(pid int) bool
-	now        func() time.Time
+	mu          sync.Mutex
+	stateFile   string
+	jobs        map[string]*TrackedJob
+	runner      supervisor.Runner
+	spawner     Spawner
+	maxResumes  int
+	isAlive     func(pid int) bool
+	now         func() time.Time
+	monitor     *ConversationLivenessMonitor
+	killProcess func(pid int) error
+	sleep       func(time.Duration)
 }
 
 // Options configures a Watchdog.
 type Options struct {
-	StateFile  string
-	Runner     supervisor.Runner
-	Spawner    Spawner
-	MaxResumes int
-	IsAlive    func(pid int) bool
-	Now        func() time.Time
+	StateFile   string
+	Runner      supervisor.Runner
+	Spawner     Spawner
+	MaxResumes  int
+	IsAlive     func(pid int) bool
+	Now         func() time.Time
+	Monitor     *ConversationLivenessMonitor
+	KillProcess func(pid int) error
+	Sleep       func(time.Duration)
 }
 
 // New creates a Watchdog.
@@ -94,15 +135,24 @@ func New(opts Options) *Watchdog {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+	if opts.Monitor == nil {
+		opts.Monitor = NewConversationLivenessMonitor(300 * time.Second)
+	}
+	if opts.KillProcess == nil {
+		opts.KillProcess = defaultKillProcess
+	}
 
 	w := &Watchdog{
-		stateFile:  opts.StateFile,
-		jobs:       make(map[string]*TrackedJob),
-		runner:     opts.Runner,
-		spawner:    opts.Spawner,
-		maxResumes: opts.MaxResumes,
-		isAlive:    opts.IsAlive,
-		now:        opts.Now,
+		stateFile:   opts.StateFile,
+		jobs:        make(map[string]*TrackedJob),
+		runner:      opts.Runner,
+		spawner:     opts.Spawner,
+		maxResumes:  opts.MaxResumes,
+		isAlive:     opts.IsAlive,
+		now:         opts.Now,
+		monitor:     opts.Monitor,
+		killProcess: opts.KillProcess,
+		sleep:       opts.Sleep,
 	}
 
 	// Load existing persistent state if present
@@ -120,6 +170,59 @@ func defaultIsProcessAlive(pid int) bool {
 	}
 	err = process.Signal(syscall.Signal(0))
 	return err == nil
+}
+
+func defaultKillProcess(pid int) error {
+	if pid <= 0 {
+		return nil
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	_ = p.Signal(syscall.SIGTERM)
+	time.Sleep(100 * time.Millisecond)
+	_ = p.Signal(syscall.SIGKILL)
+	return nil
+}
+
+// ComputeProgressFingerprint generates a SHA-256 fingerprint of the workspace progress.
+func ComputeProgressFingerprint(worktreePath, asePhase string, passingTestCount int, completedDoDItems []string) string {
+	if worktreePath == "" {
+		return ""
+	}
+	gitDir := filepath.Join(worktreePath, ".git")
+	if _, err := os.Stat(gitDir); err != nil {
+		return ""
+	}
+
+	h := sha256.New()
+	h.Write([]byte(asePhase))
+	h.Write([]byte{0})
+
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = worktreePath
+	if out, err := cmd.CombinedOutput(); err == nil {
+		h.Write([]byte(strings.TrimSpace(string(out))))
+	}
+	h.Write([]byte{0})
+
+	diffCmd := exec.Command("git", "diff", "--stat")
+	diffCmd.Dir = worktreePath
+	if diffOut, err := diffCmd.CombinedOutput(); err == nil {
+		h.Write([]byte(strings.TrimSpace(string(diffOut))))
+	}
+	h.Write([]byte{0})
+
+	h.Write([]byte(strconv.Itoa(passingTestCount)))
+	h.Write([]byte{0})
+	for _, item := range completedDoDItems {
+		h.Write([]byte(item))
+		h.Write([]byte(","))
+	}
+
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:16])
 }
 
 func (w *Watchdog) loadState() {
@@ -172,6 +275,14 @@ func (w *Watchdog) Track(job TrackedJob) {
 	if job.Status == "" {
 		job.Status = StatusRunning
 	}
+	if job.AutoResumePolicy.MaxAutoResumes <= 0 {
+		if w.maxResumes > 0 {
+			job.AutoResumePolicy.MaxAutoResumes = w.maxResumes
+		} else {
+			job.AutoResumePolicy.MaxAutoResumes = DefaultMaxResumes
+		}
+		job.AutoResumePolicy.Enabled = true
+	}
 
 	jobCopy := job
 	w.jobs[job.JobID] = &jobCopy
@@ -204,8 +315,29 @@ func (w *Watchdog) OnProcessExit(jobID string, pid, exitCode int, waitErr error)
 		job.LastError = waitErr.Error()
 	}
 
-	// Clean completion
+	// Clean completion check with "Don't Stop Till Done" ASE Completion Gate
 	if exitCode == 0 && waitErr == nil {
+		gateRes := gate.Verify(gate.GateOptions{
+			WorktreePath: job.WorktreePath,
+			StoryID:      job.StoryID,
+		})
+		job.ASEGateStatus = map[string]any{
+			"passed":       gateRes.Passed,
+			"unmet_gates":  gateRes.UnmetGates,
+			"git_clean":    gateRes.GitClean,
+			"branch_clean": gateRes.BranchClean,
+			"story_done":   gateRes.StoryDone,
+		}
+
+		if !gateRes.Passed {
+			job.Status = StatusAutoResuming
+			job.LastError = fmt.Sprintf("incomplete_ase_flow: unmet gates: %v", gateRes.UnmetGates)
+			w.persistStateLocked()
+			w.mu.Unlock()
+			w.attemptResumeWithReason(jobID, "incomplete_ase_flow", gateRes.UnmetGates)
+			return
+		}
+
 		job.Status = StatusCompleted
 		w.persistStateLocked()
 		w.mu.Unlock()
@@ -222,6 +354,10 @@ func (w *Watchdog) OnProcessExit(jobID string, pid, exitCode int, waitErr error)
 }
 
 func (w *Watchdog) attemptResume(jobID string) {
+	w.attemptResumeWithReason(jobID, "unexpected_termination", nil)
+}
+
+func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []string) {
 	w.mu.Lock()
 	job, ok := w.jobs[jobID]
 	if !ok || job == nil {
@@ -229,17 +365,54 @@ func (w *Watchdog) attemptResume(jobID string) {
 		return
 	}
 
-	if job.Status == StatusCompleted || job.Status == StatusFailed {
+	if job.Status == StatusCompleted || job.Status == StatusFailed || job.Status == StatusCircuitBreakerTripped {
 		w.mu.Unlock()
 		return
 	}
 
-	if job.ResumeCount >= w.maxResumes {
+	policy := job.AutoResumePolicy
+	if !policy.Enabled && job.ResumeCount > 0 {
 		job.Status = StatusFailed
-		job.LastError = fmt.Sprintf("WATCHDOG_MAX_RETRIES_EXCEEDED: failed after %d resume attempts (last exit code: %d)", job.ResumeCount, job.ExitCode)
+		job.LastError = "AUTO_RESUME_DISABLED: auto resume is not enabled for this job"
 		w.persistStateLocked()
 		w.mu.Unlock()
 		return
+	}
+
+	effectiveMaxResumes := policy.MaxAutoResumes
+	if effectiveMaxResumes <= 0 {
+		effectiveMaxResumes = w.maxResumes
+	}
+
+	if job.ResumeCount >= effectiveMaxResumes {
+		job.Status = StatusFailed
+		job.CircuitBreakerTripped = true
+		job.LastError = fmt.Sprintf("CIRCUIT_BREAKER_TRIPPED: max auto resumes reached (%d attempts, last reason: %s, last exit code: %d)", job.ResumeCount, reason, job.ExitCode)
+		w.persistStateLocked()
+		w.mu.Unlock()
+		return
+	}
+
+	// Compute progress fingerprint and enforce circuit breaker
+	fp := ComputeProgressFingerprint(job.WorktreePath, "IN_PROGRESS", 0, nil)
+	if policy.RequireForwardProgress && fp != "" {
+		if job.LastProgressFingerprint != "" && fp == job.LastProgressFingerprint {
+			job.ConsecutiveZeroProgress++
+		} else {
+			job.LastProgressFingerprint = fp
+			job.ConsecutiveZeroProgress = 1
+		}
+		if job.ConsecutiveZeroProgress >= 2 {
+			job.Status = StatusFailed
+			job.CircuitBreakerTripped = true
+			job.LastError = fmt.Sprintf("CIRCUIT_BREAKER_TRIPPED: zero forward progress detected across %d consecutive auto-resumes (fingerprint: %s, reason: %s)", job.ConsecutiveZeroProgress, fp, reason)
+			w.persistStateLocked()
+			w.mu.Unlock()
+			return
+		}
+	} else if fp != "" {
+		job.LastProgressFingerprint = fp
+		job.ConsecutiveZeroProgress = 0
 	}
 
 	// Early and eager conversation ID capture before resuming
@@ -267,14 +440,29 @@ func (w *Watchdog) attemptResume(jobID string) {
 	}
 
 	job.ResumeCount++
-	job.Status = StatusResumed
+	job.Status = StatusAutoResuming
 	jobCopy := *job
 	spawner := w.spawner
+	sleeper := w.sleep
 	w.persistStateLocked()
 	w.mu.Unlock()
 
 	// Append diagnostic chunk to spool log
 	w.appendResumeLog(jobCopy)
+
+	// Apply exponential backoff if configured
+	if policy.BackoffInitialSec > 0 && sleeper != nil {
+		backoff := time.Duration(policy.BackoffInitialSec*(1<<(jobCopy.ResumeCount-1))) * time.Second
+		if policy.BackoffMaxSec > 0 && backoff > time.Duration(policy.BackoffMaxSec)*time.Second {
+			backoff = time.Duration(policy.BackoffMaxSec) * time.Second
+		}
+		sleeper(backoff)
+	}
+
+	// Inject structured continuation prompt
+	continuationDirective := fmt.Sprintf("\n[ASE AUTO-RESUME CONTINUATION: Attempt %d/%d on conversation %s. Interrupted Reason: %s. Unmet Gates: %v. Continue execution from current workspace state without repeating completed steps.]\n\n",
+		jobCopy.ResumeCount, effectiveMaxResumes, jobCopy.ConversationID, reason, unmetGates)
+	jobCopy.Prompt = continuationDirective + jobCopy.Prompt
 
 	if spawner != nil {
 		newPID, err := spawner(context.Background(), jobCopy)
@@ -309,19 +497,23 @@ func (w *Watchdog) appendResumeLog(job TrackedJob) {
 	}
 	defer f.Close()
 
-	msg := fmt.Sprintf("\n[iazio-watchdog] Detected unexpected termination of job %s (PID %d, exit code %d). Autonomously resuming execution in-place (attempt %d/%d) with conversation %s...\n",
+	msg := fmt.Sprintf("\n[iazio-watchdog] Detected interruption/stall of job %s (PID %d, exit code %d). Autonomously resuming execution in-place (attempt %d/%d) with conversation %s...\n",
 		job.JobID, job.PID, job.ExitCode, job.ResumeCount, w.maxResumes, job.ConversationID)
 	_, _ = f.WriteString(msg)
 }
 
 // CheckInterrupted inspects all tracked jobs and restarts any dead or stranded jobs.
 func (w *Watchdog) CheckInterrupted(ctx context.Context) []TrackedJob {
+	type resumeReq struct {
+		jobID  string
+		reason string
+	}
 	w.mu.Lock()
-	var toResume []string
+	var toResume []resumeReq
 	now := w.now().UTC()
 
 	for id, job := range w.jobs {
-		if job.Status == StatusCompleted || job.Status == StatusFailed {
+		if job.Status == StatusCompleted || job.Status == StatusFailed || job.Status == StatusCircuitBreakerTripped {
 			continue
 		}
 		// Eagerly refresh conversation ID while process is still alive
@@ -340,17 +532,44 @@ func (w *Watchdog) CheckInterrupted(ctx context.Context) []TrackedJob {
 				}
 			}
 		}
+
+		// Liveness and stall detection for active processes
+		if job.PID > 0 && w.isAlive(job.PID) && w.monitor != nil {
+			stallSec := job.StallTimeoutSec
+			if stallSec <= 0 {
+				stallSec = int(w.monitor.StallTimeout.Seconds())
+			}
+			mon := *w.monitor
+			mon.StallTimeout = time.Duration(stallSec) * time.Second
+
+			snap := mon.CheckLiveness(job.WorktreePath, job.ConversationID, job.PID, job.StartedAt)
+			job.IdleSeconds = snap.IdleDurationSeconds
+			job.LastActivityAt = snap.LastActivityTime
+
+			if snap.IsStalled {
+				// Capture diagnostics and gracefully terminate hung process
+				if w.killProcess != nil {
+					_ = w.killProcess(job.PID)
+				}
+				job.Status = StatusAutoResuming
+				job.LastError = fmt.Sprintf("conversation_stalled: no activity for %.0fs (exceeded %ds stall timeout)", snap.IdleDurationSeconds, stallSec)
+				job.UpdatedAt = now
+				toResume = append(toResume, resumeReq{jobID: id, reason: "conversation_stalled"})
+				continue
+			}
+		}
+
 		if job.PID > 0 && !w.isAlive(job.PID) {
 			job.Status = StatusTerminatedUnexpectedly
 			job.UpdatedAt = now
-			toResume = append(toResume, id)
+			toResume = append(toResume, resumeReq{jobID: id, reason: "unexpected_termination"})
 		}
 	}
 	w.persistStateLocked()
 	w.mu.Unlock()
 
-	for _, id := range toResume {
-		w.attemptResume(id)
+	for _, req := range toResume {
+		w.attemptResumeWithReason(req.jobID, req.reason, nil)
 	}
 
 	w.mu.Lock()
@@ -386,34 +605,34 @@ func (w *Watchdog) GetJob(jobID string) (TrackedJob, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	j, ok := w.jobs[jobID]
-	if !ok || j == nil {
+	if !ok {
 		return TrackedJob{}, errors.New("job not found")
 	}
 	return *j, nil
 }
 
-// MarkCompleted marks a job cleanly finished.
+// MarkCompleted marks a job as cleanly completed and saves state.
 func (w *Watchdog) MarkCompleted(jobID string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if j, ok := w.jobs[jobID]; ok && j != nil {
+	if j, ok := w.jobs[jobID]; ok {
 		j.Status = StatusCompleted
 		j.UpdatedAt = w.now().UTC()
 		w.persistStateLocked()
 	}
 }
 
-// ActiveJobs returns a snapshot of all jobs currently running or in resume flow.
+// ActiveJobs returns a list of all currently active or interrupted jobs.
 func (w *Watchdog) ActiveJobs() []TrackedJob {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	var res []TrackedJob
+	var list []TrackedJob
 	for _, j := range w.jobs {
-		if j.Status == StatusRunning || j.Status == StatusResumed || j.Status == StatusTerminatedUnexpectedly {
-			res = append(res, *j)
+		if j.Status == StatusRunning || j.Status == StatusResumed || j.Status == StatusTerminatedUnexpectedly || j.Status == StatusAutoResuming {
+			list = append(list, *j)
 		}
 	}
-	return res
+	return list
 }
 
 // IsTracked reports whether a job is currently tracked and in-flight.
@@ -424,17 +643,13 @@ func (w *Watchdog) IsTracked(jobID string) bool {
 	return ok && j != nil && j.Status != StatusCompleted && j.Status != StatusFailed
 }
 
-// NotifyWatchdog sends a WATCHDOG=1 heartbeat notification to systemd via $NOTIFY_SOCKET.
+// NotifyWatchdog pings systemd sd_notify WATCHDOG=1 if NOTIFY_SOCKET is set.
 func NotifyWatchdog() error {
-	socket := os.Getenv("NOTIFY_SOCKET")
-	if socket == "" {
+	sock := os.Getenv("NOTIFY_SOCKET")
+	if sock == "" {
 		return nil
 	}
-	addr := &net.UnixAddr{
-		Name: socket,
-		Net:  "unixgram",
-	}
-	conn, err := net.DialUnix("unixgram", nil, addr)
+	conn, err := net.Dial("unixgram", sock)
 	if err != nil {
 		return err
 	}
@@ -443,26 +658,24 @@ func NotifyWatchdog() error {
 	return err
 }
 
-// StartSystemdWatchdog starts a background goroutine that periodically sends WATCHDOG=1
-// heartbeats to systemd as long as the context remains active.
+// StartSystemdWatchdog sends regular WATCHDOG=1 keepalives to systemd --user service manager.
 func StartSystemdWatchdog(ctx context.Context) {
-	socket := os.Getenv("NOTIFY_SOCKET")
-	if socket == "" {
+	usec := os.Getenv("WATCHDOG_USEC")
+	if usec == "" {
 		return
 	}
-	interval := 10 * time.Second
-	if usecStr := os.Getenv("WATCHDOG_USEC"); usecStr != "" {
-		if usec, err := strconv.ParseInt(usecStr, 10, 64); err == nil && usec > 0 {
-			interval = time.Duration(usec/2) * time.Microsecond
-			if interval < 1*time.Second {
-				interval = 1 * time.Second
-			}
-		}
+	val, err := strconv.ParseInt(usec, 10, 64)
+	if err != nil || val <= 0 {
+		return
 	}
+	interval := time.Duration(val/2) * time.Microsecond
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		_ = NotifyWatchdog()
 		for {
 			select {
 			case <-ctx.Done():
