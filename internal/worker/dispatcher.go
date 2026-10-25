@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -41,15 +40,22 @@ const DefaultJobExecutionTimeout = 7 * 24 * time.Hour
 
 // Job describes a unit of work received from the control plane.
 type Job struct {
-	ID           string          `json:"id"`
-	Type         string          `json:"type"`
-	Repo         string          `json:"repo"`
-	TargetHost   string          `json:"target_host,omitempty"`
-	TargetAgent  string          `json:"target_agent,omitempty"`
-	Payload      json.RawMessage `json:"payload"`
-	TraceID      string          `json:"trace_id,omitempty"`
-	ParentID     string          `json:"parent_id,omitempty"`
-	FencingToken int64           `json:"fencing_token,omitempty"`
+	ID                 string          `json:"id"`
+	Type               string          `json:"type"`
+	Repo               string          `json:"repo"`
+	TargetHost         string          `json:"target_host,omitempty"`
+	TargetAgent        string          `json:"target_agent,omitempty"`
+	Payload            json.RawMessage `json:"payload"`
+	TraceID            string          `json:"trace_id,omitempty"`
+	ParentID           string          `json:"parent_id,omitempty"`
+	FencingToken       int64           `json:"fencing_token,omitempty"`
+	LeaseToken         string          `json:"lease_token,omitempty"`
+	LeaseAckDeadlineAt string          `json:"lease_ack_deadline_at,omitempty"`
+	Traceparent        string          `json:"traceparent,omitempty"`
+	ZipkinTraceID      string          `json:"zipkin_trace_id,omitempty"`
+	ZipkinTraceURL     string          `json:"zipkin_trace_url,omitempty"`
+	InfraRequeueCount  int             `json:"infra_requeue_count,omitempty"`
+	FailureCategory    string          `json:"failure_category,omitempty"`
 }
 
 // ClaimRequest is sent to claim pending jobs.
@@ -83,6 +89,8 @@ type ControlPlaneClient interface {
 	CompleteJob(ctx context.Context, jobID string, req CompleteRequest) error
 	HeartbeatJob(ctx context.Context, jobID string, fencingToken int64) error
 	BindStory(ctx context.Context, jobID string, req StoryBindingRequest) error
+	AckLease(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) error
+	FailoverJob(ctx context.Context, jobID string, req controlplane.AttemptFailure) error
 }
 
 // HTTPControlPlaneClient is a concrete implementation of ControlPlaneClient over HTTP.
@@ -266,6 +274,71 @@ func (c *HTTPControlPlaneClient) BindStory(ctx context.Context, jobID string, re
 	return nil
 }
 
+// AckLease calls POST /api/v1/agent/jobs/{job_id}/ack-lease.
+func (c *HTTPControlPlaneClient) AckLease(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) error {
+	url := fmt.Sprintf("%s/api/v1/agent/jobs/%s/ack-lease", c.BaseURL, jobID)
+	payload := map[string]any{
+		"lease_token":            leaseToken,
+		"agent_pid":              agentPID,
+		"active_conversation_id": activeConvID,
+	}
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal ack lease request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("create ack lease request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if c.AuthToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.AuthToken)
+	}
+
+	resp, err := c.HTTPClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("execute ack lease request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("ack lease returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+// FailoverJob calls POST /api/v1/agent/jobs/{job_id}/failover.
+func (c *HTTPControlPlaneClient) FailoverJob(ctx context.Context, jobID string, req controlplane.AttemptFailure) error {
+	url := fmt.Sprintf("%s/api/v1/agent/jobs/%s/failover", c.BaseURL, jobID)
+	bodyBytes, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal failover request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("create failover request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if c.AuthToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.AuthToken)
+	}
+
+	resp, err := c.HTTPClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("execute failover request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failover returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
 // RepoSyncer defines the contract for triggering an on-demand codebase delta sync for a repository.
 type RepoSyncer interface {
 	TriggerRepoSync(repoName string)
@@ -400,7 +473,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 
 	// Pre-job workspace sanitization: non-destructive lock clearing, interrupted git ops recovery, dirty patch archiving, and line ending hygiene
 	if worktreeDir != "" && worktreeDir != "." {
-		if sanRes, sanErr := workspace.SanitizeWorkspace(ctx, worktreeDir); sanErr != nil {
+		if sanRes, sanErr := workspace.ResetAndSanitizeFreshWorkspace(ctx, worktreeDir, job.ID); sanErr != nil {
 			fmt.Fprintf(os.Stderr, "[dispatcher] pre-job sanitize warning: %v\n", sanErr)
 		} else if sanRes != nil && len(sanRes.RemovedLockPaths) > 0 {
 			fmt.Fprintf(os.Stderr, "[dispatcher] pre-job sanitize removed %d stale locks\n", len(sanRes.RemovedLockPaths))
@@ -408,16 +481,12 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		if cfgErr := exec.CommandContext(ctx, "git", "-C", worktreeDir, "config", "core.autocrlf", "input").Run(); cfgErr != nil {
 			fmt.Fprintf(os.Stderr, "[dispatcher] git autocrlf config warning: %v\n", cfgErr)
 		}
+	}
 
-		// Archive dirty workspace diff to .autopilot/recovery/<job_id>.patch on fresh queue jobs (STORY-GOV-3690)
-		diffOut, err := exec.CommandContext(ctx, "git", "-C", worktreeDir, "diff", "HEAD").Output()
-		if err == nil && len(bytes.TrimSpace(diffOut)) > 0 {
-			recoveryDir := filepath.Join(worktreeDir, ".autopilot", "recovery")
-			_ = os.MkdirAll(recoveryDir, 0o755)
-			patchPath := filepath.Join(recoveryDir, fmt.Sprintf("%s.patch", job.ID))
-			if pErr := os.WriteFile(patchPath, diffOut, 0o644); pErr == nil {
-				fmt.Fprintf(os.Stderr, "[dispatcher] archived dirty workspace state to %s\n", patchPath)
-			}
+	// Phase 2 of Two-Phase Lease Handshake: Acknowledge lease to transition from LEASED to RUNNING
+	if job.LeaseToken != "" {
+		if ackErr := d.client.AckLease(ctx, job.ID, job.LeaseToken, os.Getpid(), ""); ackErr != nil {
+			fmt.Fprintf(os.Stderr, "[dispatcher] ack lease warning for job %s: %v\n", job.ID, ackErr)
 		}
 	}
 
@@ -432,7 +501,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 
 	hbCtx, hbCancel := context.WithCancel(ctx)
 	defer hbCancel()
-	if job.FencingToken > 0 {
+	if job.FencingToken > 0 || job.LeaseToken != "" {
 		go func() {
 			ticker := time.NewTicker(10 * time.Second)
 			defer ticker.Stop()
@@ -497,8 +566,31 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 
 	case JobTypePromptExecute:
 		payload := EnsurePromptIDWithTrace(job.ID, job.TraceID, job.Payload)
+		startTime := time.Now()
 		res, err := invoker.ExecutePrompt(execCtx, payload)
 		if err != nil {
+			elapsed := time.Since(startTime)
+			if execCtx.Err() == nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) && elapsed < 45*time.Second && job.TargetAgent != "" {
+				category := "TOOL_CRASH"
+				errLower := strings.ToLower(err.Error())
+				if strings.Contains(errLower, "429") || strings.Contains(errLower, "quota") || strings.Contains(errLower, "auth") || strings.Contains(errLower, "token") {
+					category = "TOOL_QUOTA_OR_AUTH"
+				}
+				attemptReq := controlplane.AttemptFailure{
+					Host:            d.hostID,
+					Tool:            job.TargetAgent,
+					Workspace:       job.Repo,
+					ExitCode:        1,
+					StderrTail:      err.Error(),
+					FailureCategory: category,
+					FailureStage:    "TOOL_EXECUTION",
+					Reason:          "PREFLIGHT_OR_EARLY_TOOL_EXIT",
+					Timestamp:       time.Now().UTC().Format(time.RFC3339),
+				}
+				if foErr := d.client.FailoverJob(ctx, job.ID, attemptReq); foErr == nil {
+					return true, err
+				}
+			}
 			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: err.Error()})
 			return true, err
 		}

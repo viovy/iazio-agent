@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-agent/internal/harness"
 )
 
@@ -100,6 +101,14 @@ func (m *mockControlPlane) BindStory(ctx context.Context, jobID string, req Stor
 	if m.bindFunc != nil {
 		return m.bindFunc(ctx, jobID, req)
 	}
+	return nil
+}
+
+func (m *mockControlPlane) AckLease(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) error {
+	return nil
+}
+
+func (m *mockControlPlane) FailoverJob(ctx context.Context, jobID string, req controlplane.AttemptFailure) error {
 	return nil
 }
 
