@@ -241,6 +241,18 @@ type WorktreeResolver func(repo string) string
 // ToolUpdater defines the callback to execute tool suite updates.
 type ToolUpdater func(ctx context.Context, tools []string, force bool, targetVersion ...string) error
 
+// PreDispatchHook defines a callback invoked before dispatching a claimed job.
+// It enables eager tool updates between jobs to prevent queue starvation.
+type PreDispatchHook func(ctx context.Context, job *Job) error
+
+// PostJobHook defines a callback invoked after a job finishes execution and cleanup.
+type PostJobHook func(ctx context.Context, job *Job)
+
+// HostExecutionGate coordinates shared execution leases and exclusive maintenance leases.
+type HostExecutionGate interface {
+	AcquireExecutionLease(ctx context.Context, jobID, repoPath string, fencingToken ...int64) (release func(), err error)
+}
+
 // Dispatcher coordinates claiming jobs from the control plane and routing them to iazio-harness.
 type Dispatcher struct {
 	client           ControlPlaneClient
@@ -250,6 +262,9 @@ type Dispatcher struct {
 	syncer           RepoSyncer
 	worktreeResolver WorktreeResolver
 	toolUpdater      ToolUpdater
+	preDispatchHook  PreDispatchHook
+	postJobHook      PostJobHook
+	hostGate         HostExecutionGate
 	jobTimeout       time.Duration
 }
 
@@ -287,6 +302,21 @@ func (d *Dispatcher) SetWorktreeResolver(r WorktreeResolver) {
 // SetToolUpdater configures an optional tool updater callback on the Dispatcher.
 func (d *Dispatcher) SetToolUpdater(u ToolUpdater) {
 	d.toolUpdater = u
+}
+
+// SetPreDispatchHook configures an optional pre-dispatch hook for starvation prevention.
+func (d *Dispatcher) SetPreDispatchHook(h PreDispatchHook) {
+	d.preDispatchHook = h
+}
+
+// SetPostJobHook configures an optional post-job hook called after job completion.
+func (d *Dispatcher) SetPostJobHook(h PostJobHook) {
+	d.postJobHook = h
+}
+
+// SetHostGate configures the host execution and update gate for lease coordination.
+func (d *Dispatcher) SetHostGate(g HostExecutionGate) {
+	d.hostGate = g
 }
 
 // PollAndProcess claims one job and processes it. Returns (true, err) if a job was processed,
@@ -357,6 +387,29 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				}
 			}
 		}()
+	}
+
+	defer func() {
+		if d.postJobHook != nil && job != nil {
+			d.postJobHook(ctx, job)
+		}
+	}()
+
+	// Pre-dispatch hook: evaluate eager tool update before launching next job (starvation prevention)
+	if d.preDispatchHook != nil && job.Type != JobTypeToolsUpdate {
+		if hookErr := d.preDispatchHook(execCtx, job); hookErr != nil {
+			span.SetTag("pre_dispatch_hook.error", hookErr.Error())
+		}
+	}
+
+	// Shared execution lease acquisition for harness jobs (prevents collision with binary updates)
+	if d.hostGate != nil && (job.Type == JobTypeStoryCreate || job.Type == JobTypePromptExecute) {
+		relLease, leaseErr := d.hostGate.AcquireExecutionLease(execCtx, job.ID, job.Repo, job.FencingToken)
+		if leaseErr != nil {
+			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: leaseErr.Error()})
+			return true, leaseErr
+		}
+		defer relLease()
 	}
 
 	switch job.Type {

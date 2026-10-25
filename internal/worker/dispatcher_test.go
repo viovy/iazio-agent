@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -918,6 +919,7 @@ func TestEnsurePromptID_Helpers(t *testing.T) {
 	}
 }
 
+<<<<<<< HEAD
 func TestDispatcher_PromptExecute_BindsStory(t *testing.T) {
 	cp := newMockControlPlane()
 	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
@@ -994,5 +996,102 @@ func TestHTTPControlPlaneClient_BindStory(t *testing.T) {
 	}
 	if reqBody.StoryID != "STORY-GOV-3688" {
 		t.Errorf("expected StoryID STORY-GOV-3688, got %s", reqBody.StoryID)
+	}
+}
+
+type mockHostGate struct {
+	mu           sync.Mutex
+	acquireCount int
+	releaseCount int
+	lastJobID    string
+	block        bool
+}
+
+func (m *mockHostGate) AcquireExecutionLease(ctx context.Context, jobID, repoPath string, fencingToken ...int64) (func(), error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.block {
+		return nil, errors.New("gate locked by maintenance")
+	}
+	m.acquireCount++
+	m.lastJobID = jobID
+	return func() {
+		m.mu.Lock()
+		m.releaseCount++
+		m.mu.Unlock()
+	}, nil
+}
+
+func TestDispatcher_PreDispatchAndPostJobHooks(t *testing.T) {
+	client := newMockControlPlane()
+	client.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:      "job-hook-1",
+			Type:    JobTypePromptExecute,
+			Repo:    "meta-repo-03",
+			Payload: json.RawMessage(`{"prompt":"test"}`),
+		}, nil
+	}
+	invoker := &mockInvoker{}
+	disp := NewDispatcher(client, invoker, "host-1")
+
+	preCalled := false
+	postCalled := false
+
+	disp.SetPreDispatchHook(func(ctx context.Context, job *Job) error {
+		preCalled = true
+		if job.ID != "job-hook-1" {
+			t.Errorf("preDispatchHook expected job-hook-1, got %s", job.ID)
+		}
+		return nil
+	})
+	disp.SetPostJobHook(func(ctx context.Context, job *Job) {
+		postCalled = true
+		if job.ID != "job-hook-1" {
+			t.Errorf("postJobHook expected job-hook-1, got %s", job.ID)
+		}
+	})
+
+	gate := &mockHostGate{}
+	disp.SetHostGate(gate)
+
+	processed, err := disp.PollAndProcess(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("expected job processed successfully, got processed=%t err=%v", processed, err)
+	}
+
+	if !preCalled {
+		t.Errorf("expected preDispatchHook to be called")
+	}
+	if !postCalled {
+		t.Errorf("expected postJobHook to be called")
+	}
+	if gate.acquireCount != 1 || gate.releaseCount != 1 {
+		t.Errorf("expected 1 acquire and 1 release on gate, got acquire=%d release=%d", gate.acquireCount, gate.releaseCount)
+	}
+}
+
+func TestDispatcher_HostGateLockedBlocksDispatch(t *testing.T) {
+	client := newMockControlPlane()
+	client.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:      "job-blocked-1",
+			Type:    JobTypePromptExecute,
+			Repo:    "meta-repo-03",
+			Payload: json.RawMessage(`{"prompt":"test"}`),
+		}, nil
+	}
+	invoker := &mockInvoker{}
+	disp := NewDispatcher(client, invoker, "host-1")
+
+	gate := &mockHostGate{block: true}
+	disp.SetHostGate(gate)
+
+	processed, err := disp.PollAndProcess(context.Background())
+	if !processed || err == nil {
+		t.Fatalf("expected job to fail when gate fails to acquire lease")
+	}
+	if client.completedJobs["job-blocked-1"].Error == "" {
+		t.Errorf("expected completedJob to record error")
 	}
 }

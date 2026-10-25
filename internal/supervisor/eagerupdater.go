@@ -21,6 +21,54 @@ type UpdateResult struct {
 	AgentUpdated bool     `json:"agent_updated"`
 }
 
+// EagerUpdateState represents the status of eager auto-updating on an agent host.
+type EagerUpdateState string
+
+const (
+	StateUpToDate              EagerUpdateState = "UP_TO_DATE"
+	StateUpdating              EagerUpdateState = "UPDATING"
+	StateDeferredHarnessActive EagerUpdateState = "DEFERRED_HARNESS_ACTIVE"
+	StateDeferredGitDirty      EagerUpdateState = "DEFERRED_GIT_DIRTY"
+	StateBackoffAfterFailure   EagerUpdateState = "BACKOFF_AFTER_FAILURE"
+)
+
+// OutdatedToolInfo describes a tool that is behind the target release version.
+type OutdatedToolInfo struct {
+	ToolName         string `json:"tool_name"`
+	InstalledVersion string `json:"installed_version"`
+	TargetVersion    string `json:"target_version"`
+}
+
+// BlockingActiveJobInfo describes an active harness execution blocking tool updates.
+type BlockingActiveJobInfo struct {
+	RepoName  string    `json:"repo_name"`
+	JobID     string    `json:"job_id"`
+	PID       int       `json:"pid,omitempty"`
+	StartedAt time.Time `json:"started_at,omitempty"`
+	Source    string    `json:"source,omitempty"`
+}
+
+// BlockingDirtyRepoInfo describes a dirty repository or sub-repository blocking tool updates.
+type BlockingDirtyRepoInfo struct {
+	RepoName            string `json:"repo_name"`
+	SubRepoPath         string `json:"sub_repo_path,omitempty"`
+	DirtyFilesCount     int    `json:"dirty_files_count"`
+	UntrackedFilesCount int    `json:"untracked_files_count"`
+	Branch              string `json:"branch"`
+}
+
+// EagerUpdateReadinessReport provides comprehensive diagnostic visibility into eager update eligibility.
+type EagerUpdateReadinessReport struct {
+	HostID                    string                  `json:"host_id"`
+	EagerUpdateState          EagerUpdateState        `json:"eager_update_state"`
+	OutdatedTools             []OutdatedToolInfo      `json:"outdated_tools,omitempty"`
+	BlockingActiveJobs        []BlockingActiveJobInfo `json:"blocking_active_jobs,omitempty"`
+	BlockingDirtyRepos        []BlockingDirtyRepoInfo `json:"blocking_dirty_repos,omitempty"`
+	LastEvaluatedAt           time.Time               `json:"last_evaluated_at"`
+	NextScheduledEvaluationAt time.Time               `json:"next_scheduled_evaluation_at,omitempty"`
+	Details                   string                  `json:"details,omitempty"`
+}
+
 var (
 	// ErrUpdateInProgress is returned when an update is already executing and a forced or targeted request is queued (G4).
 	ErrUpdateInProgress = errors.New("tool update already in progress")
@@ -51,11 +99,14 @@ type EagerToolUpdater struct {
 	mu                    sync.Mutex
 	updateMutex           sync.Mutex // host-level execution and update mutex
 	sup                   *Sup
+	gate                  *HostExecutionAndUpdateGate
+	detector              *MultiSignalExecutionDetector
 	monitor               *RepoStateMonitor
 	hostID                string
 	doUpdate              func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error)
 	doUpdateDetailed      func(ctx context.Context, targetTools []string, force bool, targetVersion ...string) (UpdateResult, error)
 	postNotif             func(ctx context.Context, rec controlplane.NotificationRecord) error
+	postReadiness         func(ctx context.Context, hostID string, report EagerUpdateReadinessReport) error
 	CheckDrift            func(ctx context.Context, targetTools []string) (bool, error)
 	ListSuiteTools        func(ctx context.Context) ([]string, error)
 	lastDeferredKey       string
@@ -63,6 +114,8 @@ type EagerToolUpdater struct {
 	updating              bool
 	pendingRequests       []PendingToolRequest // discrete requests preserved per tool (R4, R5, N5)
 	hasPending            bool
+	lastReadiness         EagerUpdateReadinessReport
+	triggerCh             chan string
 
 	// Per-tool failure backoff tracking to prevent retry storms on un-installable tools (F5, R1, R7, N1, N1-R)
 	failedAttempts   map[string]int
@@ -88,7 +141,198 @@ func NewEagerToolUpdater(
 		pendingRequests: make([]PendingToolRequest, 0),
 		failedAttempts:  make(map[string]int),
 		failedLastTime:  make(map[string]time.Time),
+		triggerCh:       make(chan string, 32),
+		lastReadiness: EagerUpdateReadinessReport{
+			HostID:           hostID,
+			EagerUpdateState: StateUpToDate,
+			LastEvaluatedAt:  time.Now().UTC(),
+		},
 	}
+}
+
+// SetHostGate configures the shared host execution and update gate (Gap 3).
+func (u *EagerToolUpdater) SetHostGate(g *HostExecutionAndUpdateGate) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.gate = g
+}
+
+// SetExecutionDetector configures the multi-signal harness detector (Gap 2).
+func (u *EagerToolUpdater) SetExecutionDetector(d *MultiSignalExecutionDetector) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.detector = d
+}
+
+// SetReadinessReporter configures the callback to report readiness to backend API (Gap 6).
+func (u *EagerToolUpdater) SetReadinessReporter(fn func(ctx context.Context, hostID string, report EagerUpdateReadinessReport) error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.postReadiness = fn
+}
+
+// LastReadiness returns the most recently captured eager update readiness report.
+func (u *EagerToolUpdater) LastReadiness() EagerUpdateReadinessReport {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.lastReadiness
+}
+
+// TriggerEvaluation sends an evaluation request into the coalesced trigger channel (Gap 5).
+func (u *EagerToolUpdater) TriggerEvaluation(source string) {
+	select {
+	case u.triggerCh <- source:
+	default:
+	}
+}
+
+// EvaluateReadiness evaluates host eager update eligibility and persists the report (Gap 6).
+func (u *EagerToolUpdater) EvaluateReadiness(ctx context.Context) EagerUpdateReadinessReport {
+	now := time.Now().UTC()
+	rep := EagerUpdateReadinessReport{
+		HostID:                    u.hostID,
+		LastEvaluatedAt:           now,
+		NextScheduledEvaluationAt: now.Add(90 * time.Second),
+		EagerUpdateState:          StateUpToDate,
+	}
+
+	u.mu.Lock()
+	isUpdating := u.updating
+	u.mu.Unlock()
+
+	if isUpdating {
+		rep.EagerUpdateState = StateUpdating
+		rep.Details = "binary update in progress"
+		u.persistReadiness(ctx, rep)
+		return rep
+	}
+
+	// 1. Check Multi-Signal Active Execution (Gap 2)
+	if u.detector != nil {
+		if isExec, sigs := u.detector.DetectActiveExecutions(ctx); isExec {
+			rep.EagerUpdateState = StateDeferredHarnessActive
+			rep.Details = "harness execution active on host"
+			for _, s := range sigs {
+				rep.BlockingActiveJobs = append(rep.BlockingActiveJobs, BlockingActiveJobInfo{
+					RepoName:  s.RepoPath,
+					JobID:     s.JobID,
+					PID:       s.PID,
+					StartedAt: s.DetectedAt,
+					Source:    s.Source,
+				})
+			}
+			u.persistReadiness(ctx, rep)
+			return rep
+		}
+	} else if u.sup != nil && u.sup.HasRunningHarness() {
+		rep.EagerUpdateState = StateDeferredHarnessActive
+		rep.Details = "supervisor reports active running harness"
+		for _, j := range u.sup.RunningJobs() {
+			rep.BlockingActiveJobs = append(rep.BlockingActiveJobs, BlockingActiveJobInfo{
+				RepoName: j.WorktreePath,
+				JobID:    j.JobID,
+				PID:      j.PID,
+				Source:   "in_memory",
+			})
+		}
+		u.persistReadiness(ctx, rep)
+		return rep
+	}
+
+	// 2. Check Fleet Git Cleanliness (deep inspection, Gap 1)
+	if u.monitor != nil {
+		snap := u.monitor.LastSnapshot()
+		if !snap.FleetGitClean {
+			rep.EagerUpdateState = StateDeferredGitDirty
+			rep.Details = "registered repositories are dirty"
+			for _, rState := range snap.Repos {
+				if !rState.IsClean {
+					if len(rState.DirtySubmodules) > 0 {
+						for _, subRel := range rState.DirtySubmodules {
+							sub := rState.SubRepos[subRel]
+							rep.BlockingDirtyRepos = append(rep.BlockingDirtyRepos, BlockingDirtyRepoInfo{
+								RepoName:            rState.RepoPath,
+								SubRepoPath:         subRel,
+								DirtyFilesCount:     sub.DirtyFilesCount,
+								UntrackedFilesCount: sub.UntrackedFilesCount,
+								Branch:              sub.Branch,
+							})
+						}
+					}
+					if !rState.RootClean {
+						rep.BlockingDirtyRepos = append(rep.BlockingDirtyRepos, BlockingDirtyRepoInfo{
+							RepoName:            rState.RepoPath,
+							SubRepoPath:         "",
+							DirtyFilesCount:     rState.DirtyFilesCount,
+							UntrackedFilesCount: rState.UntrackedFilesCount,
+							Branch:              rState.Branch,
+						})
+					}
+				}
+			}
+			u.persistReadiness(ctx, rep)
+			return rep
+		}
+	}
+
+	// 3. Check failure backoff
+	if u.shouldBackoff(nil, false) {
+		rep.EagerUpdateState = StateBackoffAfterFailure
+		rep.Details = "eager update backing off after previous failure"
+		u.persistReadiness(ctx, rep)
+		return rep
+	}
+
+	rep.EagerUpdateState = StateUpToDate
+	rep.Details = "all preconditions met; tools are up to date or eligible for update"
+	u.persistReadiness(ctx, rep)
+	return rep
+}
+
+func (u *EagerToolUpdater) persistReadiness(ctx context.Context, rep EagerUpdateReadinessReport) {
+	u.mu.Lock()
+	u.lastReadiness = rep
+	u.mu.Unlock()
+
+	if u.postReadiness != nil {
+		_ = u.postReadiness(ctx, u.hostID, rep)
+	}
+}
+
+// StartHybridTriggerLoop runs the debounced 4-way trigger engine (Gap 5).
+func (u *EagerToolUpdater) StartHybridTriggerLoop(ctx context.Context, onAgentUpdated func()) {
+	go func() {
+		debounceTimer := time.NewTimer(500 * time.Millisecond)
+		debounceTimer.Stop()
+		var pendingSource string
+		timerActive := false
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case src := <-u.triggerCh:
+				pendingSource = src
+				if !timerActive {
+					debounceTimer.Reset(500 * time.Millisecond)
+					timerActive = true
+				}
+			case <-debounceTimer.C:
+				timerActive = false
+				_ = pendingSource
+				rep := u.EvaluateReadiness(ctx)
+				if rep.EagerUpdateState == StateUpToDate {
+					res, _, err := u.EvaluateAndTriggerWithOpts(ctx, TriggerOptions{
+						BypassDirty: false,
+						Force:       false,
+					})
+					if err == nil && res.AgentUpdated && onAgentUpdated != nil {
+						onAgentUpdated()
+					}
+				}
+			}
+		}
+	}()
 }
 
 // SetDetailedUpdateFunc configures an update callback that supports explicit TargetVersion (F1).
@@ -494,8 +738,18 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 		}
 	}
 
-	// 1. Guard check: Is harness executing? Protects all updates including forced (F-3)
-	if u.sup != nil && u.sup.HasRunningHarness() {
+	// 1. Guard check: Is harness executing? Multi-signal detection across in-memory, sentinels, process table, and control plane (Gap 2)
+	if u.detector != nil {
+		if isExec, sigs := u.detector.DetectActiveExecutions(ctx); isExec {
+			reason := "BlockedByActiveHarness"
+			msg := "Tool update deferred: harness execution active on host"
+			if len(sigs) > 0 && sigs[0].Details != "" {
+				msg = fmt.Sprintf("Tool update deferred: %s", sigs[0].Details)
+			}
+			u.emitDeferredOnce(ctx, targetTools, reason, msg)
+			return UpdateResult{}, true, nil
+		}
+	} else if u.sup != nil && u.sup.HasRunningHarness() {
 		reason := "BlockedByActiveHarness"
 		u.emitDeferredOnce(ctx, targetTools, reason, "Tool update deferred: harness execution active on host")
 		return UpdateResult{}, true, nil
@@ -528,9 +782,18 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 		}
 	}
 
-	// 3. Acquire exclusive host execution lock from supervisor (always, even on force)
+	// 3. Acquire exclusive host execution lock from HostExecutionGate or Sup (always, even on force, Gap 3)
 	var releaseHostLock func()
-	if u.sup != nil {
+	if u.gate != nil {
+		var ok bool
+		releaseHostLock, ok = u.gate.TryAcquireMaintenanceLease("eager_tool_updater")
+		if !ok {
+			reason := "BlockedByActiveHarness"
+			u.emitDeferredOnce(ctx, targetTools, reason, "Tool update deferred: harness execution active on host (shared lease held)")
+			return UpdateResult{}, true, nil
+		}
+		defer releaseHostLock()
+	} else if u.sup != nil {
 		var ok bool
 		releaseHostLock, ok = u.sup.TryAcquireToolUpdate()
 		if !ok {
@@ -588,13 +851,14 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 			targetsDesc = strings.Join(effectiveTargets, ", ")
 		}
 		if err := u.postNotif(ctx, controlplane.NotificationRecord{
-			Title:    "Tool Update Started",
+			Title:    "Eager Tool Update Started",
 			Message:  fmt.Sprintf("Eager tool update started on host %s (target: %s)", u.hostID, targetsDesc),
 			Category: "info",
 			Source:   "tool-updater",
 			HostID:   u.hostID,
 			Metadata: map[string]any{
-				"event":        "agent.tool.update_started",
+				"event":        "agent.eager_update.started",
+				"legacy_event": "agent.tool.update_started",
 				"target_tools": effectiveTargets,
 				"force":        force,
 			},
@@ -646,13 +910,14 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 	if updateErr != nil {
 		if u.postNotif != nil {
 			if err := u.postNotif(ctx, controlplane.NotificationRecord{
-				Title:    "Tool Update Failed",
+				Title:    "Eager Tool Update Failed",
 				Message:  fmt.Sprintf("Tool update failed on %s: %v", u.hostID, updateErr),
 				Category: "error",
 				Source:   "tool-updater",
 				HostID:   u.hostID,
 				Metadata: map[string]any{
-					"event":        "agent.tool.update_failed",
+					"event":        "agent.eager_update.failed",
+					"legacy_event": "agent.tool.update_failed",
 					"error":        updateErr.Error(),
 					"duration_ms":  durationMs,
 					"failed_tools": res.FailedTools,
@@ -674,13 +939,14 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 		}
 		if len(res.UpdatedTools) > 0 {
 			if err := u.postNotif(ctx, controlplane.NotificationRecord{
-				Title:    "Tool Update Succeeded",
+				Title:    "Eager Tool Update Succeeded",
 				Message:  fmt.Sprintf("Successfully updated tools on %s: %s (took %dms)", u.hostID, strings.Join(res.UpdatedTools, ", "), durationMs),
 				Category: "success",
 				Source:   "tool-updater",
 				HostID:   u.hostID,
 				Metadata: map[string]any{
-					"event":         "agent.tool.update_succeeded",
+					"event":         "agent.eager_update.succeeded",
+					"legacy_event":  "agent.tool.update_succeeded",
 					"updated_tools": res.UpdatedTools,
 					"duration_ms":   durationMs,
 					"agent_updated": res.AgentUpdated,
@@ -697,8 +963,9 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 				Source:   "tool-updater",
 				HostID:   u.hostID,
 				Metadata: map[string]any{
-					"event":       "agent.tool.update_noop",
-					"duration_ms": durationMs,
+					"event":        "agent.eager_update.noop",
+					"legacy_event": "agent.tool.update_noop",
+					"duration_ms":  durationMs,
 				},
 			})
 		}
@@ -739,7 +1006,7 @@ func (u *EagerToolUpdater) emitPartialFailureOnce(ctx context.Context, failedToo
 
 func (u *EagerToolUpdater) emitDeferredOnce(ctx context.Context, targetTools []string, reason, msg string) {
 	u.mu.Lock()
-	key := fmt.Sprintf("%s:%s", reason, strings.Join(targetTools, ","))
+	key := fmt.Sprintf("%s:%s:%s", u.hostID, reason, strings.Join(targetTools, ","))
 	if u.lastDeferredKey == key {
 		u.mu.Unlock()
 		return
@@ -749,13 +1016,14 @@ func (u *EagerToolUpdater) emitDeferredOnce(ctx context.Context, targetTools []s
 
 	if u.postNotif != nil {
 		if err := u.postNotif(ctx, controlplane.NotificationRecord{
-			Title:    "Tool Update Deferred",
+			Title:    "Eager Tool Update Deferred",
 			Message:  msg,
 			Category: "info",
 			Source:   "tool-updater",
 			HostID:   u.hostID,
 			Metadata: map[string]any{
-				"event":        "agent.tool.update_deferred",
+				"event":        "agent.eager_update.deferred",
+				"legacy_event": "agent.tool.update_deferred",
 				"reason":       reason,
 				"target_tools": targetTools,
 			},
