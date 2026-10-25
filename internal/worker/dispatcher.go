@@ -73,7 +73,8 @@ type CompleteRequest struct {
 
 // HeartbeatRequest extends the lease of an active claimed job.
 type HeartbeatRequest struct {
-	FencingToken int64 `json:"fencing_token"`
+	FencingToken int64  `json:"fencing_token,omitempty"`
+	LeaseToken   string `json:"lease_token,omitempty"`
 }
 
 // StoryBindingRequest is sent to dynamically bind an allocated story ID to a running job.
@@ -87,7 +88,7 @@ type StoryBindingRequest struct {
 type ControlPlaneClient interface {
 	ClaimJob(ctx context.Context, req ClaimRequest) (*Job, error)
 	CompleteJob(ctx context.Context, jobID string, req CompleteRequest) error
-	HeartbeatJob(ctx context.Context, jobID string, fencingToken int64) error
+	HeartbeatJob(ctx context.Context, jobID, leaseToken string, fencingToken int64) error
 	BindStory(ctx context.Context, jobID string, req StoryBindingRequest) error
 	AckLease(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) error
 	FailoverJob(ctx context.Context, jobID string, req controlplane.AttemptFailure) error
@@ -215,9 +216,9 @@ func (c *HTTPControlPlaneClient) CompleteJob(ctx context.Context, jobID string, 
 }
 
 // HeartbeatJob calls POST /api/v1/agent/jobs/{job_id}/heartbeat.
-func (c *HTTPControlPlaneClient) HeartbeatJob(ctx context.Context, jobID string, fencingToken int64) error {
+func (c *HTTPControlPlaneClient) HeartbeatJob(ctx context.Context, jobID, leaseToken string, fencingToken int64) error {
 	url := fmt.Sprintf("%s/api/v1/agent/jobs/%s/heartbeat", c.BaseURL, jobID)
-	bodyBytes, err := json.Marshal(HeartbeatRequest{FencingToken: fencingToken})
+	bodyBytes, err := json.Marshal(HeartbeatRequest{FencingToken: fencingToken, LeaseToken: leaseToken})
 	if err != nil {
 		return fmt.Errorf("marshal heartbeat request: %w", err)
 	}
@@ -510,7 +511,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				case <-hbCtx.Done():
 					return
 				case <-ticker.C:
-					if err := d.client.HeartbeatJob(hbCtx, job.ID, job.FencingToken); err != nil {
+					if err := d.client.HeartbeatJob(hbCtx, job.ID, job.LeaseToken, job.FencingToken); err != nil {
 						if strings.Contains(err.Error(), "409") || strings.Contains(err.Error(), "LEASE_FENCED") {
 							execCancel()
 							return

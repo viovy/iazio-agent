@@ -415,6 +415,9 @@ func ResetAndSanitizeFreshWorkspace(ctx context.Context, workspacePath, jobID st
 		patchFileName := fmt.Sprintf("%d-%s.patch", time.Now().UTC().Unix(), jobID)
 		patchPath := filepath.Join(recoveryDir, patchFileName)
 
+		// Stage untracked files with intent-to-add so git diff HEAD captures all untracked files into the patch
+		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "add", "-N", ".").Run()
+
 		cmdDiff := exec.CommandContext(ctx, "git", "-C", workspacePath, "diff", "HEAD")
 		if diffOut, err := cmdDiff.Output(); err == nil && len(diffOut) > 0 {
 			_ = os.WriteFile(patchPath, diffOut, 0644)
