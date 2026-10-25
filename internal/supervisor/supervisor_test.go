@@ -335,6 +335,9 @@ func TestTickReapsDeadProcess(t *testing.T) {
 }
 
 func TestTick_ActiveProcessExtendsDeadlineRatherThanTimeout(t *testing.T) {
+	orig := DefaultJobDuration
+	DefaultJobDuration = 65 * time.Minute
+	defer func() { DefaultJobDuration = orig }()
 	curr := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
 	s := New(func() time.Time { return curr })
 	s.alive = func(pid int) bool {

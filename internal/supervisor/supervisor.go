@@ -23,13 +23,14 @@ const (
 
 	// TermGrace is the wait between TERM and KILL.
 	TermGrace = 10 * time.Second
-	// DefaultJobDuration is the execution timeout (65m), providing a 5m grace
-	// buffer beyond the default 60m engine timeout so the child harness can finish
-	// diagnostics, auto-healing, and terminal exit reporting before supervisor SIGKILL.
-	DefaultJobDuration = 65 * time.Minute
 	// HubLockTimeout is how long a docs-hub discard waits for the hub lock.
 	HubLockTimeout = 30 * time.Second
+)
 
+// DefaultJobDuration is the execution timeout (0 = unbounded, no timeout on execution of jobs).
+var DefaultJobDuration time.Duration = 0
+
+const (
 	// ReasonCancelRequested is stored when a caller cancels a running harness.
 	ReasonCancelRequested = "CANCEL_REQUESTED"
 	// ReasonExecutionTimeout is stored when the harness exceeds its duration.
@@ -371,14 +372,19 @@ func (s *Sup) Tick() []ReapedJob {
 	var dueDied []string
 	for path, state := range s.locks {
 		if state == LockRunning {
-			if deadline, ok := s.deadline[path]; ok && !deadline.After(now) {
-				pid := s.pids[path]
-				if s.isActivelyProgressingLocked(path, pid) {
-					s.deadline[path] = now.Add(DefaultJobDuration)
-				} else {
-					dueTimeout = append(dueTimeout, path)
+			timedOut := false
+			if DefaultJobDuration > 0 {
+				if deadline, ok := s.deadline[path]; ok && !deadline.After(now) {
+					pid := s.pids[path]
+					if s.isActivelyProgressingLocked(path, pid) {
+						s.deadline[path] = now.Add(DefaultJobDuration)
+					} else {
+						dueTimeout = append(dueTimeout, path)
+						timedOut = true
+					}
 				}
-			} else {
+			}
+			if !timedOut {
 				pid := s.pids[path]
 				if pid > 0 && s.alive != nil && !s.alive(pid) {
 					dueDied = append(dueDied, path)
