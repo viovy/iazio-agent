@@ -20,8 +20,12 @@ func TerminateProcessGroup(pid int, gracePeriod time.Duration) error {
 		return nil
 	}
 
-	// 1. Send SIGTERM to process group
-	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	// 1. Send SIGTERM to process group (never signal iazio-agent's own PGID)
+	myPgrp := syscall.Getpgrp()
+	pgid, err := syscall.Getpgid(pid)
+	if err == nil && pgid > 1 && pgid != myPgrp {
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	}
 	_ = syscall.Kill(pid, syscall.SIGTERM)
 
 	deadline := time.Now().Add(gracePeriod)
@@ -33,7 +37,9 @@ func TerminateProcessGroup(pid int, gracePeriod time.Duration) error {
 	}
 
 	// 2. Escalate to SIGKILL if still alive
-	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	if err == nil && pgid > 1 && pgid != myPgrp {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	}
 	_ = syscall.Kill(pid, syscall.SIGKILL)
 	time.Sleep(50 * time.Millisecond)
 

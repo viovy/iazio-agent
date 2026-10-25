@@ -51,7 +51,10 @@ func findOrphanPIDs(workspacePath, conversationID string) ([]int, error) {
 
 	out, err := exec.Command("wmic", "process", "get", "ProcessId,CommandLine").Output()
 	if err != nil {
-		return results, nil
+		out, err = exec.Command("powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.CommandLine) $($_.ProcessId)\" }").Output()
+		if err != nil {
+			return results, nil
+		}
 	}
 
 	lines := strings.Split(string(out), "\n")
