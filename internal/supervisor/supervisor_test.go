@@ -334,6 +334,92 @@ func TestTickReapsDeadProcess(t *testing.T) {
 	}
 }
 
+func TestTick_ActiveProcessExtendsDeadlineRatherThanTimeout(t *testing.T) {
+	orig := DefaultJobDuration
+	DefaultJobDuration = 65 * time.Minute
+	defer func() { DefaultJobDuration = orig }()
+	curr := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	s := New(func() time.Time { return curr })
+	s.alive = func(pid int) bool {
+		return pid == 1234
+	}
+
+	s.mu.Lock()
+	s.locks["/repos/active"] = LockRunning
+	s.pids["/repos/active"] = 1234
+	s.deadline["/repos/active"] = curr.Add(-1 * time.Minute) // Past deadline
+	s.mu.Unlock()
+
+	reaped := s.Tick()
+	if len(reaped) > 0 {
+		t.Fatalf("expected active job not to be reaped, got: %+v", reaped)
+	}
+
+	// Verify deadline was extended
+	newDeadline := s.Deadline("/repos/active")
+	if !newDeadline.After(curr) {
+		t.Fatalf("expected deadline to be extended into the future, got %v <= %v", newDeadline, curr)
+	}
+
+	// Now simulate dead process at expired deadline
+	s.alive = func(pid int) bool { return false }
+	s.mu.Lock()
+	s.deadline["/repos/active"] = curr.Add(-1 * time.Minute)
+	s.mu.Unlock()
+
+	reaped = s.Tick()
+	if len(reaped) != 1 || reaped[0].Reason != ReasonExecutionTimeout {
+		t.Fatalf("expected dead job to be reaped with timeout, got: %+v", reaped)
+	}
+}
+
+func TestTick_ProgressAwareStallReaping_DefaultZeroDuration(t *testing.T) {
+	curr := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	s := New(func() time.Time { return curr })
+	s.SetStallTimeout(10 * time.Minute)
+	s.alive = func(pid int) bool { return true }
+
+	// DefaultJobDuration is 0 (unbounded wall-clock)
+	if DefaultJobDuration != 0 {
+		t.Fatalf("expected DefaultJobDuration == 0, got: %v", DefaultJobDuration)
+	}
+
+	progressing := true
+	s.SetProgressChecker(func(worktree string, pid int) bool {
+		return progressing
+	})
+
+	s.mu.Lock()
+	s.locks["/repos/test-stall"] = LockRunning
+	s.pids["/repos/test-stall"] = 999
+	s.lastProgress["/repos/test-stall"] = curr
+	s.mu.Unlock()
+
+	// 1. Advance 2 hours while progressing = true: should NOT be reaped!
+	curr = curr.Add(2 * time.Hour)
+	reaped := s.Tick()
+	if len(reaped) > 0 {
+		t.Fatalf("expected actively progressing job not to be reaped even after 2 hours, got: %+v", reaped)
+	}
+
+	// 2. Now simulate complete stall (no model output, no child tasks, no git changes)
+	progressing = false
+	// Advance 5 minutes (under stallTimeout of 10m): still not reaped
+	curr = curr.Add(5 * time.Minute)
+	reaped = s.Tick()
+	if len(reaped) > 0 {
+		t.Fatalf("expected job under stall timeout not to be reaped, got: %+v", reaped)
+	}
+
+	// Advance past 10m stall timeout (total 11m stalled): should be reaped for timeout!
+	curr = curr.Add(6 * time.Minute)
+	reaped = s.Tick()
+	if len(reaped) != 1 || reaped[0].Reason != ReasonExecutionTimeout {
+		t.Fatalf("expected stalled job to be reaped with timeout, got: %+v", reaped)
+	}
+}
+
+
 func TestReconcileHostCheckouts(t *testing.T) {
 	var discarded []string
 	var resumed []string

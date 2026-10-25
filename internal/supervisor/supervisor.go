@@ -23,13 +23,14 @@ const (
 
 	// TermGrace is the wait between TERM and KILL.
 	TermGrace = 10 * time.Second
-	// DefaultJobDuration is the execution timeout (65m), providing a 5m grace
-	// buffer beyond the default 60m engine timeout so the child harness can finish
-	// diagnostics, auto-healing, and terminal exit reporting before supervisor SIGKILL.
-	DefaultJobDuration = 65 * time.Minute
 	// HubLockTimeout is how long a docs-hub discard waits for the hub lock.
 	HubLockTimeout = 30 * time.Second
+)
 
+// DefaultJobDuration is the execution timeout (0 = unbounded, no timeout on execution of jobs).
+var DefaultJobDuration time.Duration = 0
+
+const (
 	// ReasonCancelRequested is stored when a caller cancels a running harness.
 	ReasonCancelRequested = "CANCEL_REQUESTED"
 	// ReasonExecutionTimeout is stored when the harness exceeds its duration.
@@ -71,6 +72,9 @@ type Sup struct {
 	loopDetector        *LoopDetector
 	toolUpdating        bool
 	toolUpdatingHolders int
+	isProgressing       func(path string, pid int) bool
+	lastProgress        map[string]time.Time
+	stallTimeout        time.Duration
 }
 
 // New returns a supervisor. now injects the clock.
@@ -79,16 +83,17 @@ func New(now func() time.Time) *Sup {
 		now = time.Now
 	}
 	return &Sup{
-		gates:    map[string]*sync.Mutex{},
-		locks:    map[string]string{},
-		until:    map[string]time.Time{},
-		deadline: map[string]time.Time{},
-		pids:     map[string]int{},
-		jobIDs:   map[string]string{},
-		reasons:  map[string]string{},
-		now:      now,
-		sleep:    time.Sleep,
-		alive:    isProcessAlive,
+		gates:        map[string]*sync.Mutex{},
+		locks:        map[string]string{},
+		until:        map[string]time.Time{},
+		deadline:     map[string]time.Time{},
+		lastProgress: map[string]time.Time{},
+		pids:         map[string]int{},
+		jobIDs:       map[string]string{},
+		reasons:      map[string]string{},
+		now:          now,
+		sleep:        time.Sleep,
+		alive:        isProcessAlive,
 	}
 }
 
@@ -128,6 +133,7 @@ func (s *Sup) Spawn(r Runner, jobID, apiURL, worktree, docsHub, token string, ex
 	s.pids[worktree] = pid
 	s.jobIDs[worktree] = jobID
 	s.deadline[worktree] = s.now().Add(DefaultJobDuration)
+	s.lastProgress[worktree] = s.now()
 	if s.signal == nil && r != nil {
 		s.signal = r.Signal
 	}
@@ -362,6 +368,13 @@ type ReapedJob struct {
 	Reason       string
 }
 
+// SetStallTimeout overrides the default stall timeout for progress-aware supervision.
+func (s *Sup) SetStallTimeout(timeout time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stallTimeout = timeout
+}
+
 // Tick cancels harnesses that have reached their execution timeout or died, and finishes cooling-off.
 func (s *Sup) Tick() []ReapedJob {
 	now := s.now()
@@ -370,10 +383,34 @@ func (s *Sup) Tick() []ReapedJob {
 	var dueDied []string
 	for path, state := range s.locks {
 		if state == LockRunning {
-			if deadline, ok := s.deadline[path]; ok && !deadline.After(now) {
-				dueTimeout = append(dueTimeout, path)
+			timedOut := false
+			pid := s.pids[path]
+			if s.isActivelyProgressingLocked(path, pid) {
+				s.lastProgress[path] = now
+				if DefaultJobDuration > 0 {
+					s.deadline[path] = now.Add(DefaultJobDuration)
+				}
 			} else {
-				pid := s.pids[path]
+				lastProg := s.lastProgress[path]
+				if lastProg.IsZero() {
+					lastProg = now
+					s.lastProgress[path] = now
+				}
+				stallLimit := s.stallTimeout
+				if stallLimit <= 0 {
+					stallLimit = 45 * time.Minute
+				}
+				if now.Sub(lastProg) >= stallLimit {
+					dueTimeout = append(dueTimeout, path)
+					timedOut = true
+				} else if DefaultJobDuration > 0 {
+					if deadline, ok := s.deadline[path]; ok && !deadline.After(now) {
+						dueTimeout = append(dueTimeout, path)
+						timedOut = true
+					}
+				}
+			}
+			if !timedOut {
 				if pid > 0 && s.alive != nil && !s.alive(pid) {
 					dueDied = append(dueDied, path)
 				}
@@ -409,6 +446,23 @@ func (s *Sup) Deadline(path string) time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.deadline[path]
+}
+
+// SetProgressChecker sets a custom function to determine if a job in a given worktree is actively progressing.
+func (s *Sup) SetProgressChecker(fn func(path string, pid int) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.isProgressing = fn
+}
+
+func (s *Sup) isActivelyProgressingLocked(path string, pid int) bool {
+	if s.isProgressing != nil {
+		return s.isProgressing(path, pid)
+	}
+	if pid > 0 && s.alive != nil && s.alive(pid) {
+		return true
+	}
+	return false
 }
 
 // GracefulStop sends TERM and forcefully reaps the process tree/group with KILL after 10s.

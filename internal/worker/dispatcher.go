@@ -316,7 +316,7 @@ func NewDispatcher(client ControlPlaneClient, invoker harness.Invoker, hostID st
 		hostID:     hostID,
 		jobTypes:   []string{JobTypeStoryCreate, JobTypePromptExecute, JobTypeToolsUpdate},
 		syncer:     s,
-		jobTimeout: DefaultJobExecutionTimeout,
+		jobTimeout: 0,
 	}
 }
 
@@ -421,11 +421,13 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		}
 	}
 
-	timeout := d.jobTimeout
-	if timeout <= 0 {
-		timeout = DefaultJobExecutionTimeout
+	var execCtx context.Context
+	var execCancel context.CancelFunc
+	if d.jobTimeout > 0 {
+		execCtx, execCancel = context.WithTimeout(ctx, d.jobTimeout)
+	} else {
+		execCtx, execCancel = context.WithCancel(ctx)
 	}
-	execCtx, execCancel := context.WithTimeout(ctx, timeout)
 	defer execCancel()
 
 	hbCtx, hbCancel := context.WithCancel(ctx)

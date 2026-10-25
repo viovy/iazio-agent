@@ -204,6 +204,14 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			}
 
 			sup := supervisor.New(time.Now)
+			liveMon := watchdog.NewConversationLivenessMonitor(5 * time.Minute)
+			sup.SetProgressChecker(func(worktreePath string, pid int) bool {
+				if pid <= 0 || !watchdog.IsProcessAlive(pid) {
+					return false
+				}
+				snap := liveMon.CheckLiveness(worktreePath, "", pid, time.Time{})
+				return !snap.IsStalled
+			})
 			hostGate := supervisor.NewHostExecutionAndUpdateGate()
 			var client controlplane.Client
 
