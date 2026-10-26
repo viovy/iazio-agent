@@ -30,6 +30,10 @@ func InvalidateVersionCache(binaryPath string) {
 	verCacheMu.Lock()
 	delete(verCache, binaryPath)
 	verCacheMu.Unlock()
+
+	shaCacheMu.Lock()
+	delete(shaCache, binaryPath)
+	shaCacheMu.Unlock()
 }
 
 // InspectInstalledVersion returns the semantic or release version of a binary.

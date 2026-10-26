@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -42,6 +43,17 @@ var ManagedTools = []string{
 	"autopilot",
 }
 
+type shaCacheEntry struct {
+	modTime   time.Time
+	size      int64
+	commitSHA string
+}
+
+var (
+	shaCacheMu sync.RWMutex
+	shaCache   = make(map[string]shaCacheEntry)
+)
+
 // InspectToolCommitSHA probes the binary using --version --json, falling back to version string or sha256.
 func InspectToolCommitSHA(binaryPath string) string {
 	fi, err := os.Stat(binaryPath)
@@ -49,7 +61,42 @@ func InspectToolCommitSHA(binaryPath string) string {
 		return ""
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	shaCacheMu.RLock()
+	cached, ok := shaCache[binaryPath]
+	shaCacheMu.RUnlock()
+	if ok && cached.modTime.Equal(fi.ModTime()) && cached.size == fi.Size() {
+		return cached.commitSHA
+	}
+
+	setCache := func(result string) string {
+		shaCacheMu.Lock()
+		shaCache[binaryPath] = shaCacheEntry{
+			modTime:   fi.ModTime(),
+			size:      fi.Size(),
+			commitSHA: result,
+		}
+		shaCacheMu.Unlock()
+		return result
+	}
+
+	// Fast path: check .version sidecar if present and contains hex SHA
+	if sidecar, err := os.ReadFile(binaryPath + ".version"); err == nil {
+		s := strings.TrimSpace(string(sidecar))
+		if len(s) >= 7 && len(s) <= 40 {
+			isHex := true
+			for _, r := range s {
+				if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+					isHex = false
+					break
+				}
+			}
+			if isHex {
+				return setCache(s)
+			}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, binaryPath, "--version", "--json")
@@ -58,7 +105,7 @@ func InspectToolCommitSHA(binaryPath string) string {
 			CommitSHA string `json:"commit_sha"`
 		}
 		if jsonErr := json.Unmarshal(out, &v); jsonErr == nil && v.CommitSHA != "" && v.CommitSHA != "unknown" {
-			return v.CommitSHA
+			return setCache(v.CommitSHA)
 		}
 	}
 
@@ -72,7 +119,7 @@ func InspectToolCommitSHA(binaryPath string) string {
 				shaPart = shaPart[:shaEnd]
 			}
 			if len(shaPart) >= 7 {
-				return shaPart
+				return setCache(shaPart)
 			}
 		}
 	}
@@ -81,18 +128,23 @@ func InspectToolCommitSHA(binaryPath string) string {
 	if sidecar, err := os.ReadFile(binaryPath + ".version"); err == nil {
 		s := strings.TrimSpace(string(sidecar))
 		if len(s) >= 7 && len(s) <= 40 {
-			return s
+			return setCache(s)
 		}
 	}
 
-	// Fallback to SHA-256 fingerprint
-	data, err := os.ReadFile(binaryPath)
-	if err == nil && len(data) > 0 {
-		sum := sha256.Sum256(data)
-		return hex.EncodeToString(sum[:])
+	// Fallback to SHA-256 fingerprint (bounded to first 64KB for performance)
+	f, err := os.Open(binaryPath)
+	if err == nil {
+		defer f.Close()
+		buf := make([]byte, 64*1024)
+		n, _ := f.Read(buf)
+		if n > 0 {
+			h := sha256.Sum256(buf[:n])
+			return setCache(hex.EncodeToString(h[:]))
+		}
 	}
 
-	return fmt.Sprintf("size:%d-mod:%d", fi.Size(), fi.ModTime().Unix())
+	return setCache(fmt.Sprintf("size:%d-mod:%d", fi.Size(), fi.ModTime().Unix()))
 }
 
 // ScanDevAndShadowBinaries identifies non-canonical name variants and duplicate shadow binaries.

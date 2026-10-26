@@ -480,7 +480,7 @@ func TestUpdateSingleTool_Lifecycle(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	ctx := context.Background()
 	binDir := t.TempDir()
-	binPath := filepath.Join(binDir, "iazio-agent")
+	binPath := filepath.Join(binDir, "iazio-dummy")
 	if runtime.GOOS == "windows" {
 		binPath += ".exe"
 	}
@@ -493,7 +493,7 @@ func TestUpdateSingleTool_Lifecycle(t *testing.T) {
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			rel := gitHubRelease{
 				TagName: "v1.0.0",
-				Assets:  []gitHubAsset{{Name: "iazio-agent_1.0.0_darwin_arm64.tar.gz"}},
+				Assets:  []gitHubAsset{{Name: "iazio-dummy_1.0.0_darwin_arm64.tar.gz"}},
 			}
 			b, _ := json.Marshal(rel)
 			return &http.Response{
@@ -507,9 +507,9 @@ func TestUpdateSingleTool_Lifecycle(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	tool := ManifestToolItem{
-		Name:       "iazio-agent",
-		Repository: "viovy/iazio-agent",
-		BinaryName: "iazio-agent",
+		Name:       "iazio-dummy",
+		Repository: "viovy/iazio-dummy",
+		BinaryName: "iazio-dummy",
 	}
 
 	updated, err := updateSingleTool(ctx, client, tool, binDir, "", false, &stdout, &stderr)
@@ -521,9 +521,9 @@ func TestUpdateSingleTool_Lifecycle(t *testing.T) {
 	}
 
 	// 2. Tool out of date -> installs new version
-	tarContent := createTarGz(t, "iazio-agent", []byte("#!/bin/sh\necho updated\n"))
+	tarContent := createTarGz(t, "iazio-dummy", []byte("#!/bin/sh\necho updated\n"))
 	sum := sha256.Sum256(tarContent)
-	sumText := fmt.Sprintf("%s  iazio-agent_2.0.0_%s_%s.tar.gz\n", hex.EncodeToString(sum[:]), runtime.GOOS, runtime.GOARCH)
+	sumText := fmt.Sprintf("%s  iazio-dummy_2.0.0_%s_%s.tar.gz\n", hex.EncodeToString(sum[:]), runtime.GOOS, runtime.GOARCH)
 
 	client2 := &http.Client{
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -534,7 +534,7 @@ func TestUpdateSingleTool_Lifecycle(t *testing.T) {
 					TagName: "v2.0.0",
 					Assets: []gitHubAsset{
 						{
-							Name:               fmt.Sprintf("iazio-agent_2.0.0_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH),
+							Name:               fmt.Sprintf("iazio-dummy_2.0.0_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH),
 							BrowserDownloadURL: "https://example.com/asset.tar.gz",
 						},
 						{
@@ -621,7 +621,7 @@ func TestInstallExecutableSafe_ReverseSync(t *testing.T) {
 	target2 := filepath.Join(binDir2, "iazio-agent")
 
 	data := []byte("reverse-sync-bytes")
-	// Install to binDir2; binDir1 exists as a directory so it initializes altPath
+	// Install to binDir2; target2 is installed exclusively per AC4/H2
 	if err := installExecutableSafe(target2, data); err != nil {
 		t.Fatalf("installExecutableSafe reverse failed: %v", err)
 	}
@@ -629,8 +629,8 @@ func TestInstallExecutableSafe_ReverseSync(t *testing.T) {
 	if c, _ := os.ReadFile(target2); string(c) != string(data) {
 		t.Fatalf("target2 mismatch: %q", string(c))
 	}
-	if c, _ := os.ReadFile(target1); string(c) != string(data) {
-		t.Fatalf("target1 was not initialized: %q", string(c))
+	if _, err := os.Stat(target1); !os.IsNotExist(err) {
+		t.Fatalf("target1 should not be initialized per AC4/H2")
 	}
 }
 
@@ -651,13 +651,16 @@ func TestInstallExecutableSafe_ExistingAltPath(t *testing.T) {
 	_ = os.WriteFile(target2, []byte("old-bytes"), 0755)
 
 	data := []byte("new-sync-bytes")
-	// Install to binDir1; binDir2 file exists so it synchronizes altPath
+	// Install to binDir1; target2 must not be modified per AC4/H2
 	if err := installExecutableSafe(target1, data); err != nil {
 		t.Fatalf("installExecutableSafe failed: %v", err)
 	}
 
-	if c, _ := os.ReadFile(target2); string(c) != string(data) {
-		t.Fatalf("target2 was not updated: %q", string(c))
+	if c, _ := os.ReadFile(target1); string(c) != string(data) {
+		t.Fatalf("target1 mismatch: %q", string(c))
+	}
+	if c, _ := os.ReadFile(target2); string(c) != "old-bytes" {
+		t.Fatalf("target2 should remain untouched per AC4/H2: %q", string(c))
 	}
 }
 
@@ -732,9 +735,9 @@ func TestUpdateSingleTool_ErrorsAndRepoPrefix(t *testing.T) {
 		}),
 	}
 	toolMatchErr := ManifestToolItem{
-		Name:       "iazio-mcp",
+		Name:       "iazio-custom-no-source",
 		Repository: "viovy/iazio-mcp",
-		BinaryName: "iazio-mcp",
+		BinaryName: "iazio-custom-no-source",
 	}
 	updated, err = updateSingleTool(ctx, clientNoAsset, toolMatchErr, binDir, "", true, &stdout, &stderr)
 	if err == nil || updated {
@@ -1320,22 +1323,13 @@ func TestUpdateSingleTool_ShadowingBinarySync(t *testing.T) {
 		t.Fatalf("dest binary content mismatch")
 	}
 
-	// Verify shadowing binary was also updated
+	// Verify shadowing binary was not overwritten (prevent resurrecting shadow duplicates per AC4/H2)
 	shadowData, err := os.ReadFile(shadowBin)
 	if err != nil {
 		t.Fatalf("failed to read shadow binary: %v", err)
 	}
-	if string(shadowData) != string(payload) {
-		t.Fatalf("shadow binary content mismatch: got %q, want %q", string(shadowData), string(payload))
-	}
-
-	// Verify .version in shadowDir was updated to 0.0.492
-	shadowVer, err := os.ReadFile(shadowBin + ".version")
-	if err != nil {
-		t.Fatalf("failed to read shadow .version: %v", err)
-	}
-	if string(shadowVer) != "0.0.492" {
-		t.Fatalf("shadow .version mismatch: got %q, want 0.0.492", string(shadowVer))
+	if string(shadowData) == string(payload) {
+		t.Fatalf("shadow binary should not be overwritten per AC4/H2")
 	}
 }
 
@@ -1453,14 +1447,15 @@ func TestInstallExecutableSafe_MultiDirSync(t *testing.T) {
 		t.Fatalf("installExecutableSafe failed: %v", err)
 	}
 
-	// Verify all existing alternate dirs have the binary
-	for _, dir := range []string{altDir1, altDir2, altDir3} {
+	// Verify target destPath has the binary and alternate dirs do not per AC4/H2
+	c, err := os.ReadFile(destPath)
+	if err != nil || string(c) != string(payload) {
+		t.Fatalf("expected binary at destPath %s", destPath)
+	}
+	for _, dir := range []string{altDir1, altDir2} {
 		p := filepath.Join(dir, "my-tool")
-		c, err := os.ReadFile(p)
-		if err != nil {
-			t.Errorf("expected binary at %s: %v", p, err)
-		} else if string(c) != string(payload) {
-			t.Errorf("binary content mismatch at %s", p)
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("alternate directory %s should not have duplicate binary", dir)
 		}
 	}
 }

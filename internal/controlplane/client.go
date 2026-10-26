@@ -74,6 +74,7 @@ type Client struct {
 	Spooler               *OfflineReportSpooler
 	EagerUpdateEnabled    bool
 	LastEagerUpdateAt     func() *time.Time
+	DiscoveredDevBinaries func() []string
 }
 
 func (c Client) retryParams() (int, time.Duration) {
@@ -102,6 +103,7 @@ type Tool struct {
 	Name             string   `json:"name"`
 	Path             string   `json:"path"`
 	Version          string   `json:"version"`
+	CommitSHA        string   `json:"commit_sha,omitempty"`
 	Status           string   `json:"status"`
 	ServiceInstalled bool     `json:"service_installed,omitempty"`
 	ServiceType      string   `json:"service_type,omitempty"`
@@ -165,6 +167,11 @@ func (c Client) HeartbeatDetailed(ctx context.Context, hostID string, tools []To
 	if c.LastEagerUpdateAt != nil {
 		if t := c.LastEagerUpdateAt(); t != nil && !t.IsZero() {
 			body["last_eager_update_at"] = t.Format(time.RFC3339)
+		}
+	}
+	if c.DiscoveredDevBinaries != nil {
+		if devBins := c.DiscoveredDevBinaries(); len(devBins) > 0 {
+			body["discovered_dev_binaries"] = devBins
 		}
 	}
 	var res HeartbeatResponse

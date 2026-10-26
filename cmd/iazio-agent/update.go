@@ -558,12 +558,6 @@ func updateSingleTool(
 	if sourceRepo := findToolSourceRepo(tool.Name, envFn); sourceRepo != "" {
 		updated, srcErr := buildToolFromSourceRepo(ctx, tool, sourceRepo, destPath, force, stdout, stderr)
 		if srcErr == nil {
-			if updated && existingShadowPath != "" {
-				if binBytes, readErr := os.ReadFile(destPath); readErr == nil {
-					_ = installExecutableSafe(existingShadowPath, binBytes)
-					inventory.InvalidateVersionCache(existingShadowPath)
-				}
-			}
 			return updated, nil
 		}
 		if stderr != nil {
@@ -627,31 +621,6 @@ func updateSingleTool(
 
 	_ = os.WriteFile(destPath+".version", []byte(latestVer), 0644)
 	inventory.InvalidateVersionCache(destPath)
-
-	if existingShadowPath != "" {
-		if err := installExecutableSafe(existingShadowPath, binBytes); err == nil {
-			_ = os.WriteFile(existingShadowPath+".version", []byte(latestVer), 0644)
-			inventory.InvalidateVersionCache(existingShadowPath)
-			fmt.Fprintf(stdout, "  [+] %s: synchronized active PATH binary at %s\n", tool.Name, existingShadowPath)
-		} else if stderr != nil {
-			fmt.Fprintf(stderr, "  [!] %s: warning: failed to update shadowing binary at %s: %v\n", tool.Name, existingShadowPath, err)
-		}
-	}
-
-	if home := os.Getenv("HOME"); home != "" {
-		for _, altDir := range []string{
-			filepath.Join(home, ".local", "bin"),
-			filepath.Join(home, ".iazio", "bin"),
-			filepath.Join(home, ".gemini", "antigravity-cli", "bin"),
-		} {
-			altPath := filepath.Join(altDir, filepath.Base(destPath))
-			if _, err := os.Stat(altPath); err == nil {
-				_ = installExecutableSafe(altPath, binBytes)
-				_ = os.WriteFile(altPath+".version", []byte(latestVer), 0644)
-				inventory.InvalidateVersionCache(altPath)
-			}
-		}
-	}
 
 	fmt.Fprintf(stdout, "  [+] %s: %s -> %s\n", tool.Name, latestVer, destPath)
 	return true, nil
@@ -1055,17 +1024,26 @@ func buildToolFromSourceRepo(
 	defer fetchCancel()
 	fetchCmd := exec.CommandContext(fetchCtx, "git", "-C", sourceRepo, "fetch", "origin", "--prune", "--quiet")
 	fetchCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	_ = fetchCmd.Run()
+	if fetchErr := fetchCmd.Run(); fetchErr != nil && stderr != nil {
+		fmt.Fprintf(stderr, "  [!] %s: git fetch warning: %v\n", tool.Name, fetchErr)
+	}
 
 	// 2. Resolve remote commit SHA
 	var remoteSHA string
-	for _, ref := range []string{"origin/main", "origin/master", "HEAD"} {
+	for _, ref := range []string{"origin/main", "origin/master"} {
 		revCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", ref)
 		revCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 		out, err := revCmd.Output()
 		if err == nil && len(strings.TrimSpace(string(out))) > 0 {
 			remoteSHA = strings.TrimSpace(string(out))
 			break
+		}
+	}
+	if remoteSHA == "" {
+		revCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "HEAD")
+		revCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		if out, err := revCmd.Output(); err == nil && len(strings.TrimSpace(string(out))) > 0 {
+			remoteSHA = strings.TrimSpace(string(out))
 		}
 	}
 	if remoteSHA == "" {
@@ -1126,6 +1104,29 @@ func buildToolFromSourceRepo(
 				pruneCmd := exec.Command("git", "-C", sourceRepo, "worktree", "prune")
 				pruneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 				_ = pruneCmd.Run()
+			}
+		} else {
+			// Fallback: extract archive from remoteSHA to ensure clean ephemeral build
+			if mkErr := os.MkdirAll(tempDir, 0755); mkErr == nil {
+				archiveCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "archive", remoteSHA)
+				archiveCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+				tarCmd := exec.CommandContext(ctx, "tar", "-x", "-C", tempDir)
+				if pipe, pErr := archiveCmd.StdoutPipe(); pErr == nil {
+					tarCmd.Stdin = pipe
+					if err := tarCmd.Start(); err == nil && archiveCmd.Start() == nil {
+						_ = archiveCmd.Wait()
+						if err := tarCmd.Wait(); err == nil {
+							addWorktreeSucceeded = true
+							buildDir = tempDir
+							cleanupWorktree = func() {
+								_ = os.RemoveAll(tempDir)
+							}
+						}
+					}
+				}
+			}
+			if !addWorktreeSucceeded && !repoIsClean {
+				return false, fmt.Errorf("failed to create isolated worktree or archive from %s for %s; refusing to build in dirty working tree", remoteSHA, tool.Name)
 			}
 		}
 	}

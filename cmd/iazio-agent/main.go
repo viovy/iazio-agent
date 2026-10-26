@@ -237,6 +237,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						Name:             t.Name,
 						Path:             t.Path,
 						Version:          t.Version,
+						CommitSHA:        t.CommitSHA,
 						Status:           t.Status,
 						ServiceInstalled: t.ServiceInstalled,
 						ServiceType:      t.ServiceType,
@@ -640,6 +641,22 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return "ONLINE"
 				},
 				Tools: getTools,
+				DiscoveredDevBinaries: func() []string {
+					home, _ := os.UserHomeDir()
+					searchDirs := inventory.DefaultDirs(getenv("PATH"), home, runtime.GOOS)
+					canonicalBinDir := filepath.Join(home, ".local", "bin")
+					if runtime.GOOS == "windows" {
+						if localApp := getenv("LOCALAPPDATA"); localApp != "" {
+							canonicalBinDir = filepath.Join(localApp, "Programs", "iazio", "bin")
+						}
+					}
+					candidates := inventory.ScanDevAndShadowBinaries(searchDirs, canonicalBinDir)
+					var paths []string
+					for _, c := range candidates {
+						paths = append(paths, c.Path)
+					}
+					return paths
+				},
 				SupportedCapabilities: []string{
 					"user_service_watchdog_v2",
 					"deterministic_resume_4tuple_v1",

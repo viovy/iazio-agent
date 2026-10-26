@@ -649,9 +649,9 @@ func TestInstallExecutableSafe_AlternatePathSync(t *testing.T) {
 	if c, _ := os.ReadFile(target1); string(c) != string(data) {
 		t.Fatalf("primary not updated: %q", string(c))
 	}
-	// Verify alternate was synchronized
-	if c, _ := os.ReadFile(target2); string(c) != string(data) {
-		t.Fatalf("alternate not synchronized: %q", string(c))
+	// Verify alternate was not modified (AC4/H2: no alternate directory duplication)
+	if c, _ := os.ReadFile(target2); string(c) != "old-binary" {
+		t.Fatalf("alternate should remain untouched: %q", string(c))
 	}
 }
 

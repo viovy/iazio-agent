@@ -18,47 +18,7 @@ func installExecutableSafe(destPath string, data []byte) error {
 		return fmt.Errorf("create dest dir: %w", err)
 	}
 
-	if err := installExecutableSafeDirect(destPath, data); err != nil {
-		return err
-	}
-
-	// Synchronize active running process executable on Unix if installed from alternate location
-	if currentExe, err := os.Executable(); err == nil && currentExe != "" {
-		if resolvedCurrent, err := filepath.EvalSymlinks(currentExe); err == nil {
-			currentExe = resolvedCurrent
-		}
-		cleanCurrent := filepath.Clean(currentExe)
-		cleanDest := filepath.Clean(destPath)
-		if filepath.Base(cleanCurrent) == filepath.Base(cleanDest) && cleanCurrent != cleanDest {
-			if err := installExecutableSafeDirect(cleanCurrent, data); err != nil {
-				return fmt.Errorf("failed to synchronize running executable at %s: %w", cleanCurrent, err)
-			}
-		}
-	}
-
-	// Synchronize alternate binary directories on Unix to prevent service / PATH shadowing
-	if home := os.Getenv("HOME"); home != "" {
-		for _, altDir := range []string{
-			filepath.Join(home, ".local", "bin"),
-			filepath.Join(home, ".iazio", "bin"),
-			filepath.Join(home, ".gemini", "antigravity-cli", "bin"),
-		} {
-			altPath := filepath.Join(altDir, filepath.Base(destPath))
-			if filepath.Clean(altPath) == filepath.Clean(destPath) {
-				continue
-			}
-			if _, statErr := os.Stat(altPath); statErr == nil {
-				if err := installExecutableSafeDirect(altPath, data); err != nil {
-					return fmt.Errorf("failed to synchronize existing alternate binary at %s: %w", altPath, err)
-				}
-			} else if _, statErr := os.Stat(altDir); statErr == nil {
-				if err := installExecutableSafeDirect(altPath, data); err != nil {
-					return fmt.Errorf("failed to initialize alternate binary at %s: %w", altPath, err)
-				}
-			}
-		}
-	}
-	return nil
+	return installExecutableSafeDirect(destPath, data)
 }
 
 func installExecutableSafeDirect(destPath string, data []byte) error {

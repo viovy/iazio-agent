@@ -17,44 +17,7 @@ func installExecutableSafe(destPath string, data []byte) error {
 	}
 
 	cleanStaleBackups(dir)
-	if err := installExecutableSafeDirect(destPath, data); err != nil {
-		return err
-	}
-
-	// Synchronize active running process executable if installed from alternate location
-	if currentExe, err := os.Executable(); err == nil && currentExe != "" {
-		if strings.EqualFold(filepath.Base(currentExe), filepath.Base(destPath)) &&
-			!strings.EqualFold(filepath.Clean(currentExe), filepath.Clean(destPath)) {
-			if err := installExecutableSafeDirect(currentExe, data); err != nil {
-				return fmt.Errorf("failed to synchronize running executable at %s: %w", currentExe, err)
-			}
-		}
-	}
-
-	// Synchronize %USERPROFILE%\bin and %USERPROFILE%\.local\bin to prevent PATH shadowing
-	userProfile := os.Getenv("USERPROFILE")
-	if userProfile != "" {
-		binDir1 := filepath.Join(userProfile, "bin")
-		binDir2 := filepath.Join(userProfile, ".local", "bin")
-		var altPath string
-		if strings.HasPrefix(strings.ToLower(destPath), strings.ToLower(binDir1)) {
-			altPath = filepath.Join(binDir2, filepath.Base(destPath))
-		} else if strings.HasPrefix(strings.ToLower(destPath), strings.ToLower(binDir2)) {
-			altPath = filepath.Join(binDir1, filepath.Base(destPath))
-		}
-		if altPath != "" {
-			if _, statErr := os.Stat(altPath); statErr == nil {
-				if err := installExecutableSafeDirect(altPath, data); err != nil {
-					return fmt.Errorf("failed to synchronize existing alternate binary at %s: %w", altPath, err)
-				}
-			} else if _, statErr := os.Stat(filepath.Dir(altPath)); statErr == nil {
-				if err := installExecutableSafeDirect(altPath, data); err != nil {
-					return fmt.Errorf("failed to initialize alternate binary at %s: %w", altPath, err)
-				}
-			}
-		}
-	}
-	return nil
+	return installExecutableSafeDirect(destPath, data)
 }
 
 func installExecutableSafeDirect(destPath string, data []byte) error {
