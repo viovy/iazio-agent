@@ -92,9 +92,10 @@ type Invoker interface {
 
 // CLIInvoker delegates story scaffolding and prompt runs to the iazio-harness binary.
 type CLIInvoker struct {
-	HarnessBinary string
-	WorkDir       string
-	GracePeriod   time.Duration
+	HarnessBinary    string
+	WorkDir          string
+	GracePeriod      time.Duration
+	OnStoryAllocated func(storyID string)
 }
 
 // NewCLIInvoker creates a CLIInvoker with default binary resolution.
@@ -214,8 +215,45 @@ func (c *CLIInvoker) WithWorkDir(workDir string) Invoker {
 	return &clone
 }
 
+// WithStoryCallback returns a shallow copy of the CLIInvoker with the specified story allocation callback.
+func (c *CLIInvoker) WithStoryCallback(cb func(storyID string)) Invoker {
+	clone := *c
+	clone.OnStoryAllocated = cb
+	return &clone
+}
+
+type storyTrackingWriter struct {
+	buf              bytes.Buffer
+	onStoryAllocated func(string)
+}
+
+func (w *storyTrackingWriter) Write(p []byte) (n int, err error) {
+	n, err = w.buf.Write(p)
+	if w.onStoryAllocated != nil && len(p) > 0 {
+		str := string(p)
+		for _, prefix := range []string{"ALLOCATED_STORY_ID:", "STORY_ID:", "Bound active story ID:", "Bound dynamically allocated story ID:"} {
+			if idx := strings.Index(str, prefix); idx != -1 {
+				rem := strings.TrimLeft(str[idx+len(prefix):], " \t")
+				if endIdx := strings.IndexAny(rem, "\r\n ,;()"); endIdx != -1 {
+					rem = rem[:endIdx]
+				}
+				storyID := strings.TrimSpace(rem)
+				if storyID != "" && storyID != "pending-allocation" && storyID != "pending_harness_creation" {
+					w.onStoryAllocated(storyID)
+					break
+				}
+			}
+		}
+	}
+	return n, err
+}
+
 func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []byte) (string, string, error) {
 	cmd := exec.CommandContext(ctx, c.HarnessBinary, args...)
+	setProcGroup(cmd)
+	cmd.Cancel = func() error {
+		return killProcGroup(cmd)
+	}
 	if c.WorkDir != "" {
 		cmd.Dir = c.WorkDir
 	}
@@ -244,12 +282,14 @@ func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []
 	}
 
 	cmd.Stdin = bytes.NewReader(stdinData)
-	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
+	var stdoutWriter storyTrackingWriter
+	stdoutWriter.onStoryAllocated = c.OnStoryAllocated
+	var stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutWriter
 	cmd.Stderr = &stderrBuf
 
 	err := cmd.Run()
-	stdoutStr := stdoutBuf.String()
+	stdoutStr := stdoutWriter.buf.String()
 	stderrStr := stderrBuf.String()
 
 	return stdoutStr, stderrStr, err

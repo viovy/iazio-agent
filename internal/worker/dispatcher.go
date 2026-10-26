@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/controlplane"
@@ -49,6 +50,7 @@ type Job struct {
 	Payload            json.RawMessage `json:"payload"`
 	TraceID            string          `json:"trace_id,omitempty"`
 	ParentID           string          `json:"parent_id,omitempty"`
+	StoryID            string          `json:"story_id,omitempty"`
 	FencingToken       int64           `json:"fencing_token,omitempty"`
 	LeaseToken         string          `json:"lease_token,omitempty"`
 	LeaseAckDeadlineAt string          `json:"lease_ack_deadline_at,omitempty"`
@@ -78,20 +80,22 @@ type CompleteRequest struct {
 type HeartbeatRequest struct {
 	FencingToken int64  `json:"fencing_token,omitempty"`
 	LeaseToken   string `json:"lease_token,omitempty"`
+	StoryID      string `json:"story_id,omitempty"`
 }
 
 // StoryBindingRequest is sent to dynamically bind an allocated story ID to a running job.
 type StoryBindingRequest struct {
-	StoryID    string `json:"story_id"`
-	StoryTitle string `json:"story_title,omitempty"`
-	StoryPath  string `json:"story_path,omitempty"`
+	FencingToken int64  `json:"fencing_token,omitempty"`
+	StoryID      string `json:"story_id"`
+	StoryTitle   string `json:"story_title,omitempty"`
+	StoryPath    string `json:"story_path,omitempty"`
 }
 
 // ControlPlaneClient defines communication with iazio-harness-api for agent jobs.
 type ControlPlaneClient interface {
 	ClaimJob(ctx context.Context, req ClaimRequest) (*Job, error)
 	CompleteJob(ctx context.Context, jobID string, req CompleteRequest) error
-	HeartbeatJob(ctx context.Context, jobID, leaseToken string, fencingToken int64) error
+	HeartbeatJob(ctx context.Context, jobID, leaseToken string, fencingToken int64, storyID ...string) error
 	BindStory(ctx context.Context, jobID string, req StoryBindingRequest) error
 	AckLease(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) error
 	FailoverJob(ctx context.Context, jobID string, req controlplane.AttemptFailure) error
@@ -219,9 +223,13 @@ func (c *HTTPControlPlaneClient) CompleteJob(ctx context.Context, jobID string, 
 }
 
 // HeartbeatJob calls POST /api/v1/agent/jobs/{job_id}/heartbeat.
-func (c *HTTPControlPlaneClient) HeartbeatJob(ctx context.Context, jobID, leaseToken string, fencingToken int64) error {
+func (c *HTTPControlPlaneClient) HeartbeatJob(ctx context.Context, jobID, leaseToken string, fencingToken int64, storyID ...string) error {
 	url := fmt.Sprintf("%s/api/v1/agent/jobs/%s/heartbeat", c.BaseURL, jobID)
-	bodyBytes, err := json.Marshal(HeartbeatRequest{FencingToken: fencingToken, LeaseToken: leaseToken})
+	sid := ""
+	if len(storyID) > 0 {
+		sid = storyID[0]
+	}
+	bodyBytes, err := json.Marshal(HeartbeatRequest{FencingToken: fencingToken, LeaseToken: leaseToken, StoryID: sid})
 	if err != nil {
 		return fmt.Errorf("marshal heartbeat request: %w", err)
 	}
@@ -241,6 +249,10 @@ func (c *HTTPControlPlaneClient) HeartbeatJob(ctx context.Context, jobID, leaseT
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusConflict {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("409 conflict: stale fencing token: %s", string(respBody))
+	}
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("heartbeat returned status %d: %s", resp.StatusCode, string(respBody))
@@ -271,6 +283,10 @@ func (c *HTTPControlPlaneClient) BindStory(ctx context.Context, jobID string, re
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusConflict {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("409 conflict: stale fencing token: %s", string(respBody))
+	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("bind story returned status %d: %s", resp.StatusCode, string(respBody))
@@ -544,6 +560,40 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	}
 	defer execCancel()
 
+	var allocatedStoryMu sync.Mutex
+	currentStoryID := job.StoryID
+	if currentStoryID == "" && len(job.Payload) > 0 {
+		var pMap map[string]any
+		if err := json.Unmarshal(job.Payload, &pMap); err == nil {
+			if sid, ok := pMap["story_id"].(string); ok {
+				currentStoryID = sid
+			}
+		}
+	}
+
+	onStoryDiscovered := func(storyID string) {
+		clean := strings.TrimSpace(storyID)
+		if clean == "" || clean == "pending-allocation" || clean == "pending_harness_creation" {
+			return
+		}
+		allocatedStoryMu.Lock()
+		if currentStoryID == clean {
+			allocatedStoryMu.Unlock()
+			return
+		}
+		currentStoryID = clean
+		allocatedStoryMu.Unlock()
+
+		_ = d.client.BindStory(ctx, job.ID, StoryBindingRequest{
+			FencingToken: job.FencingToken,
+			StoryID:      clean,
+		})
+	}
+
+	if aware, ok := invoker.(interface{ WithStoryCallback(func(string)) harness.Invoker }); ok {
+		invoker = aware.WithStoryCallback(onStoryDiscovered)
+	}
+
 	hbCtx, hbCancel := context.WithCancel(ctx)
 	defer hbCancel()
 	if job.FencingToken > 0 || job.LeaseToken != "" {
@@ -555,7 +605,10 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				case <-hbCtx.Done():
 					return
 				case <-ticker.C:
-					if err := d.client.HeartbeatJob(hbCtx, job.ID, job.LeaseToken, job.FencingToken); err != nil {
+					allocatedStoryMu.Lock()
+					sid := currentStoryID
+					allocatedStoryMu.Unlock()
+					if err := d.client.HeartbeatJob(hbCtx, job.ID, job.LeaseToken, job.FencingToken, sid); err != nil {
 						if strings.Contains(err.Error(), "409") || strings.Contains(err.Error(), "LEASE_FENCED") {
 							execCancel()
 							return
@@ -676,10 +729,14 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				storyID = extractStoryID(res.Summary, res.Output)
 			}
 			if storyID != "" {
+				allocatedStoryMu.Lock()
+				currentStoryID = storyID
+				allocatedStoryMu.Unlock()
 				_ = d.client.BindStory(ctx, job.ID, StoryBindingRequest{
-					StoryID:    storyID,
-					StoryTitle: res.StoryTitle,
-					StoryPath:  res.StoryPath,
+					FencingToken: job.FencingToken,
+					StoryID:      storyID,
+					StoryTitle:   res.StoryTitle,
+					StoryPath:    res.StoryPath,
 				})
 			}
 		}
