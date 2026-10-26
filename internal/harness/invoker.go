@@ -216,6 +216,10 @@ func (c *CLIInvoker) WithWorkDir(workDir string) Invoker {
 
 func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []byte) (string, string, error) {
 	cmd := exec.CommandContext(ctx, c.HarnessBinary, args...)
+	setProcGroup(cmd)
+	cmd.Cancel = func() error {
+		return killProcGroup(cmd)
+	}
 	if c.WorkDir != "" {
 		cmd.Dir = c.WorkDir
 	}

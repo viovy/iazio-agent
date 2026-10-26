@@ -92,7 +92,7 @@ func (m *mockControlPlane) CompleteJob(ctx context.Context, jobID string, req Co
 	return nil
 }
 
-func (m *mockControlPlane) HeartbeatJob(ctx context.Context, jobID, leaseToken string, fencingToken int64) error {
+func (m *mockControlPlane) HeartbeatJob(ctx context.Context, jobID, leaseToken string, fencingToken int64, storyID ...string) error {
 	return nil
 }
 
@@ -1116,12 +1116,17 @@ func TestHTTPControlPlaneClient_BindStory(t *testing.T) {
 
 	client := NewHTTPControlPlaneClient(ts.URL, "test-token", ts.Client())
 	err := client.BindStory(context.Background(), "job-999", StoryBindingRequest{
-		StoryID:    "STORY-GOV-3688",
-		StoryTitle: "Title",
-		StoryPath:  "docs/stories/story.md",
+		FencingToken: 42,
+		StoryID:      "STORY-GOV-3688",
+		StoryTitle:   "Title",
+		StoryPath:    "docs/stories/story.md",
 	})
 	if err != nil {
 		t.Fatalf("BindStory failed: %v", err)
+	}
+
+	if reqBody.FencingToken != 42 {
+		t.Errorf("expected fencing token 42, got %d", reqBody.FencingToken)
 	}
 
 	if receivedMethod != http.MethodPatch {
