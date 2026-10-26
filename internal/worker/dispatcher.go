@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -469,6 +470,12 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		if wt := d.worktreeResolver(job.Repo); wt != "" {
 			worktreeDir = wt
 			invoker = invoker.WithWorkDir(wt)
+		} else if filepath.IsAbs(job.Repo) && (job.Type == JobTypeStoryCreate || job.Type == JobTypePromptExecute) {
+			if fi, err := os.Stat(job.Repo); err != nil || !fi.IsDir() {
+				errMsg := fmt.Sprintf("ERR_WORKSPACE_NOT_FOUND: requested repo %q cannot be resolved to any existing workspace on host %s", job.Repo, d.hostID)
+				_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: errMsg})
+				return true, fmt.Errorf("%s", errMsg)
+			}
 		}
 	}
 

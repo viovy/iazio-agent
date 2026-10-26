@@ -500,6 +500,19 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 		}
 	}
 
+	if job.ConversationID == "" {
+		isResumePrompt := strings.EqualFold(strings.TrimSpace(job.Prompt), "resume") ||
+			strings.HasPrefix(strings.TrimSpace(job.Prompt), "/autonomous-story-execution resume")
+		if isResumePrompt {
+			job.Status = StatusFailed
+			job.CircuitBreakerTripped = true
+			job.LastError = fmt.Sprintf("RESUME_ABORTED_EMPTY_CONVERSATION: cannot resume job %s without captured conversation ID", job.JobID)
+			w.persistStateLocked()
+			w.mu.Unlock()
+			return
+		}
+	}
+
 	job.ResumeCount++
 	job.Status = StatusAutoResuming
 	jobCopy := *job
