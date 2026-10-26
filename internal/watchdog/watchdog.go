@@ -97,6 +97,7 @@ type Spawner func(ctx context.Context, job TrackedJob) (newPID int, err error)
 // Watchdog tracks running harness jobs and autonomously resumes crashed or terminated jobs.
 type Watchdog struct {
 	mu          sync.Mutex
+	guardWG     sync.WaitGroup
 	stateFile   string
 	jobs        map[string]*TrackedJob
 	runner      supervisor.Runner
@@ -593,6 +594,9 @@ func (w *Watchdog) appendResumeLog(job TrackedJob) {
 
 // CheckInterrupted inspects all tracked jobs and restarts any dead or stranded jobs.
 func (w *Watchdog) CheckInterrupted(ctx context.Context) []TrackedJob {
+	if ctx != nil && ctx.Err() != nil {
+		return nil
+	}
 	type resumeReq struct {
 		jobID  string
 		reason string
@@ -687,7 +691,9 @@ func (w *Watchdog) StartWatchguard(ctx context.Context, interval time.Duration) 
 	if interval <= 0 {
 		interval = DefaultTick
 	}
+	w.guardWG.Add(1)
 	go func() {
+		defer w.guardWG.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -695,10 +701,18 @@ func (w *Watchdog) StartWatchguard(ctx context.Context, interval time.Duration) 
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				if ctx.Err() != nil {
+					return
+				}
 				_ = w.CheckInterrupted(ctx)
 			}
 		}
 	}()
+}
+
+// WaitWatchguard blocks until all active watchguard background goroutines have terminated.
+func (w *Watchdog) WaitWatchguard() {
+	w.guardWG.Wait()
 }
 
 // GetJob returns a copy of a tracked job.

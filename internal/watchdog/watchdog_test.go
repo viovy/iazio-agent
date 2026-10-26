@@ -375,6 +375,7 @@ func TestWatchdog_HelperMethods(t *testing.T) {
 	w.StartWatchguard(ctx, 10*time.Millisecond)
 	time.Sleep(25 * time.Millisecond)
 	cancel()
+	w.WaitWatchguard()
 }
 
 func TestDefaultIsProcessAlive(t *testing.T) {
