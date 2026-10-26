@@ -52,6 +52,7 @@ const (
 // Report is the checkout snapshot taken before spawn.
 type Report struct {
 	Kind                   string
+	ParentJobID            string `json:"ParentJobID,omitempty"`
 	FreeBytes              uint64
 	WorkPorcelain          string
 	HubPorcelain           string
@@ -93,8 +94,8 @@ func Decide(r Report) Decision {
 	if r.Kind == KindIntervention {
 		return Decision{}
 	}
-	if r.Kind == KindResume {
-		// Resumption is explicitly intended to recover an in-flight prompt execution
+	if r.Kind == KindResume || r.Kind == "remediation" || r.ParentJobID != "" {
+		// Resumption and remediation are explicitly intended to recover an in-flight prompt execution
 		// that left uncommitted work, modified submodules, or local review reports in the worktree.
 		// It permits dirty porcelain and untracked branches, skipping ReasonDirty and ReasonUntracked.
 		if !r.HeadAttached {

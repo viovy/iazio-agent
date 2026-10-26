@@ -32,6 +32,8 @@ func TestDecideMatrix(t *testing.T) {
 		{name: "loop dirty", edit: func(r *Report) { r.Kind = KindLoop; r.WorkPorcelain = " M a" }, code: ReasonDirty, pause: true},
 		{name: "resume detached", edit: func(r *Report) { r.Kind = KindResume; r.HeadAttached = false }, code: ReasonDetached, pause: true},
 		{name: "resume dirty worktree", edit: func(r *Report) { r.Kind = KindResume; r.WorkPorcelain = " M a\n?? b" }},
+		{name: "remediation dirty worktree", edit: func(r *Report) { r.Kind = "remediation"; r.WorkPorcelain = " M a\n?? b" }},
+		{name: "parent job id dirty worktree", edit: func(r *Report) { r.Kind = KindOrdinary; r.ParentJobID = "job-1447"; r.WorkPorcelain = " M a\n?? b" }},
 		{name: "resume dirty hub and work", edit: func(r *Report) { r.Kind = KindResume; r.HubPorcelain = " M x"; r.WorkPorcelain = " M a" }},
 		{name: "resume feature without upstream", edit: func(r *Report) {
 			r.Kind = KindResume

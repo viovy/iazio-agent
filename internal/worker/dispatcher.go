@@ -478,16 +478,26 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 			telemetry.WithTag("job.id", job.ID),
 			telemetry.WithTag("workspace", worktreeDir),
 		)
-		if sanRes, sanErr := workspace.ResetAndSanitizeFreshWorkspace(ctx, worktreeDir, job.ID); sanErr != nil {
-			fmt.Fprintf(os.Stderr, "[dispatcher] pre-job sanitize warning: %v\n", sanErr)
-		} else if sanRes != nil && len(sanRes.RemovedLockPaths) > 0 {
-			fmt.Fprintf(os.Stderr, "[dispatcher] pre-job sanitize removed %d stale locks\n", len(sanRes.RemovedLockPaths))
-		}
-		if cfgErr := exec.CommandContext(ctx, "git", "-C", worktreeDir, "config", "core.autocrlf", "input").Run(); cfgErr != nil {
-			fmt.Fprintf(os.Stderr, "[dispatcher] git autocrlf config warning: %v\n", cfgErr)
+		isResumeJob := job.ParentID != "" || job.Type == "resume" || strings.Contains(string(job.Payload), `"kind":"resume"`) || strings.Contains(string(job.Payload), `"Kind":"resume"`) || strings.Contains(string(job.Payload), `"parent_job_id"`)
+		if isResumeJob {
+			// For resume / remediation jobs: preserve dirty worktree and branch, only reap stale locks and orphan processes
+			if sanRes, sanErr := workspace.SanitizeWorkspace(ctx, worktreeDir); sanErr != nil {
+				fmt.Fprintf(os.Stderr, "[dispatcher] pre-resume sanitize warning: %v\n", sanErr)
+			} else if sanRes != nil && len(sanRes.RemovedLockPaths) > 0 {
+				fmt.Fprintf(os.Stderr, "[dispatcher] pre-resume sanitize removed %d stale locks\n", len(sanRes.RemovedLockPaths))
+			}
+		} else {
+			if sanRes, sanErr := workspace.ResetAndSanitizeFreshWorkspace(ctx, worktreeDir, job.ID); sanErr != nil {
+				fmt.Fprintf(os.Stderr, "[dispatcher] pre-job sanitize warning: %v\n", sanErr)
+			} else if sanRes != nil && len(sanRes.RemovedLockPaths) > 0 {
+				fmt.Fprintf(os.Stderr, "[dispatcher] pre-job sanitize removed %d stale locks\n", len(sanRes.RemovedLockPaths))
+			}
 		}
 		if wsPrepSpan != nil {
 			wsPrepSpan.End()
+		}
+		if cfgErr := exec.CommandContext(ctx, "git", "-C", worktreeDir, "config", "core.autocrlf", "input").Run(); cfgErr != nil {
+			fmt.Fprintf(os.Stderr, "[dispatcher] git autocrlf config warning: %v\n", cfgErr)
 		}
 	}
 
