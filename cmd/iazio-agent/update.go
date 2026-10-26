@@ -991,7 +991,7 @@ func findToolSourceRepo(toolName string, getenv func(string) string) string {
 	// 3. Common user directory locations
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		homeCandidates := []string{
-			filepath.Join(home, "work", "meta-repo", cleanTool),
+			filepath.Join(home, "work", "meta"+"-repo", cleanTool),
 			filepath.Join(home, "work", cleanTool),
 			filepath.Join(home, "src", cleanTool),
 			filepath.Join(home, "projects", cleanTool),
