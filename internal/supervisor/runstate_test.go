@@ -150,13 +150,16 @@ func TestSup_ScanAndReattachRuns(t *testing.T) {
 		t.Fatalf("expected live worktree PID %d, got %d", livePID, sup.PID(liveWorktree))
 	}
 
-	// Verify dead job was reconciled to COMPLETED and cooling off
+	// Verify dead job was reconciled to FAILED (since exit status was unknown) and cooling off
 	deadState, err := LoadRunState(deadJobID)
 	if err != nil {
 		t.Fatalf("failed loading dead run state: %v", err)
 	}
-	if deadState.Status == RunStatusRunning {
-		t.Fatalf("expected dead job status to be updated from RUNNING, got %s", deadState.Status)
+	if deadState.Status != RunStatusFailed {
+		t.Fatalf("expected dead job status to be FAILED, got %s", deadState.Status)
+	}
+	if deadState.Error == "" {
+		t.Fatalf("expected error message for dead job")
 	}
 	if sup.Lock(deadWorktree) != LockCooling {
 		t.Fatalf("expected dead worktree lock to be COOLING_OFF, got %s", sup.Lock(deadWorktree))

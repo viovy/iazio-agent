@@ -3,6 +3,7 @@ package supervisor
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -388,6 +389,7 @@ func (s *Sup) RunningJobs() []RunningJob {
 func (s *Sup) ScanAndReattachRuns(r Runner) []RunState {
 	states, err := ListRunStates()
 	if err != nil {
+		s.RecordFetch(fmt.Errorf("ScanAndReattachRuns: list run states failed: %w", err))
 		return nil
 	}
 	var reattached []RunState
@@ -408,9 +410,7 @@ func (s *Sup) ScanAndReattachRuns(r Runner) []RunState {
 			s.locks[st.WorktreePath] = LockRunning
 			s.pids[st.WorktreePath] = st.PID
 			s.jobIDs[st.WorktreePath] = st.JobID
-			if DefaultJobDuration > 0 {
-				s.deadline[st.WorktreePath] = now.Add(DefaultJobDuration)
-			}
+			s.deadline[st.WorktreePath] = now.Add(DefaultJobDuration)
 			s.lastProgress[st.WorktreePath] = now
 			if s.signal == nil && r != nil {
 				s.signal = r.Signal
@@ -418,14 +418,21 @@ func (s *Sup) ScanAndReattachRuns(r Runner) []RunState {
 			s.mu.Unlock()
 
 			if ar, ok := r.(interface{ Attach(pid int, jobID string) error }); ok {
-				_ = ar.Attach(st.PID, st.JobID)
+				if attachErr := ar.Attach(st.PID, st.JobID); attachErr != nil {
+					s.RecordFetch(fmt.Errorf("Attach PID %d for job %s: %w", st.PID, st.JobID, attachErr))
+				}
 			}
 			reattached = append(reattached, st)
 		} else {
-			// Process is no longer alive - finished while agent was restarting
-			st.Status = RunStatusCompleted
-			if st.ExitCode != 0 {
+			// Process is no longer alive. If exit was not verified exit 0 by harness,
+			// mark as failed to prevent false COMPLETED on crash mid-run.
+			if st.ExitCode == 0 && st.Error == "" {
 				st.Status = RunStatusFailed
+				st.Error = "process terminated unexpectedly during agent restart"
+			} else if st.ExitCode != 0 {
+				st.Status = RunStatusFailed
+			} else {
+				st.Status = RunStatusCompleted
 			}
 			st.UpdatedAt = now
 			_ = SaveRunState(st)
