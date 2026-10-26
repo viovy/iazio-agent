@@ -13,7 +13,7 @@ func TestScanDevAndShadowBinaries(t *testing.T) {
 
 	canonicalDir := filepath.Join(tmpDir, "canonical")
 	shadowDir := filepath.Join(tmpDir, "shadow")
-	repoDir := filepath.Join(tmpDir, "meta-repo", "iazio-agent")
+	repoDir := filepath.Join(tmpDir, "sample-repo", "iazio-agent")
 
 	if err := os.MkdirAll(canonicalDir, 0755); err != nil {
 		t.Fatal(err)
