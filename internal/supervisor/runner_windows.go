@@ -65,7 +65,12 @@ var (
 	agentJobs  = make(map[int]uintptr)
 )
 
-func setProcGroup(cmd *exec.Cmd) {}
+func setProcGroup(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.CreationFlags |= syscall.CREATE_NEW_PROCESS_GROUP
+}
 
 func postStartProc(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 0 {
@@ -79,7 +84,7 @@ func postStartProc(cmd *exec.Cmd) {
 	jobHandle := r1
 	info := jobObjectExtendedLimitInformation{
 		BasicLimitInformation: jobObjectBasicLimitInformation{
-			LimitFlags: jobObjectLimitKillOnJobClose,
+			LimitFlags: 0, // Do NOT kill child process group when agent closes/restarts mid-run
 		},
 	}
 	rSet, _, errSet := procSetInformationJobObject.Call(
