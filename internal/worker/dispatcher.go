@@ -571,6 +571,29 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		}
 	}
 
+	onStoryDiscovered := func(storyID string) {
+		clean := strings.TrimSpace(storyID)
+		if clean == "" || clean == "pending-allocation" || clean == "pending_harness_creation" {
+			return
+		}
+		allocatedStoryMu.Lock()
+		if currentStoryID == clean {
+			allocatedStoryMu.Unlock()
+			return
+		}
+		currentStoryID = clean
+		allocatedStoryMu.Unlock()
+
+		_ = d.client.BindStory(ctx, job.ID, StoryBindingRequest{
+			FencingToken: job.FencingToken,
+			StoryID:      clean,
+		})
+	}
+
+	if aware, ok := invoker.(interface{ WithStoryCallback(func(string)) harness.Invoker }); ok {
+		invoker = aware.WithStoryCallback(onStoryDiscovered)
+	}
+
 	hbCtx, hbCancel := context.WithCancel(ctx)
 	defer hbCancel()
 	if job.FencingToken > 0 || job.LeaseToken != "" {

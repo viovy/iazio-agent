@@ -16,7 +16,12 @@ func killProcGroup(cmd *exec.Cmd) error {
 		return nil
 	}
 	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
-		return syscall.Kill(cmd.Process.Pid, syscall.SIGKILL)
+		if err == syscall.ESRCH {
+			return nil
+		}
+		if singleErr := syscall.Kill(cmd.Process.Pid, syscall.SIGKILL); singleErr != nil && singleErr != syscall.ESRCH {
+			return singleErr
+		}
 	}
 	return nil
 }

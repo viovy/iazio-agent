@@ -457,3 +457,22 @@ func TestCLIInvoker_WithWorkDir(t *testing.T) {
 		t.Fatalf("expected non-nil clone")
 	}
 }
+
+func TestCLIInvoker_StreamingStoryAllocationCallback(t *testing.T) {
+	var allocated string
+	inv := NewCLIInvoker("/bin/sh", t.TempDir())
+	callbackInv := inv.WithStoryCallback(func(sid string) {
+		allocated = sid
+	})
+
+	// Invoke script that outputs story allocation token
+	payload := json.RawMessage(`{"prompt":"test"}`)
+	_, _, err := callbackInv.(*CLIInvoker).runCommand(context.Background(), []string{"-c", "echo 'ALLOCATED_STORY_ID: STORY-STREAM-123'"}, payload)
+	if err != nil {
+		t.Fatalf("runCommand failed: %v", err)
+	}
+
+	if allocated != "STORY-STREAM-123" {
+		t.Fatalf("expected allocated story STORY-STREAM-123, got %q", allocated)
+	}
+}
