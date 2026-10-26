@@ -3,6 +3,8 @@
 package inventory
 
 import (
+	"os/exec"
+	"strconv"
 	"syscall"
 	"unsafe"
 )
@@ -17,4 +19,12 @@ func scheduleRebootDelete(path string) {
 			_, _, _ = moveFileEx.Call(uintptr(unsafe.Pointer(pathPtr)), 0, uintptr(MOVEFILE_DELAY_UNTIL_REBOOT))
 		}
 	}
+}
+
+func terminatePID(pid int) {
+	_ = exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).Run()
+}
+
+func forceKillPID(pid int) {
+	// On Windows, taskkill /F already force-terminates
 }

@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -379,19 +378,13 @@ func CleanupDevBinaries(ctx context.Context, candidates []DevBinaryCandidate, ca
 		// 1. Terminate any locking processes executing this binary
 		pids := FindPIDsExecutingFile(targetPath)
 		for _, pid := range pids {
-			if runtime.GOOS == "windows" {
-				_ = exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).Run()
-			} else {
-				_ = syscall.Kill(pid, syscall.SIGTERM)
-			}
+			terminatePID(pid)
 			report.KilledPIDs = append(report.KilledPIDs, pid)
 		}
 		if len(pids) > 0 {
 			time.Sleep(100 * time.Millisecond)
 			for _, pid := range pids {
-				if runtime.GOOS != "windows" {
-					_ = syscall.Kill(pid, syscall.SIGKILL)
-				}
+				forceKillPID(pid)
 			}
 		}
 
