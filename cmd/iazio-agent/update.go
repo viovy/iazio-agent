@@ -259,6 +259,20 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 
 	var targets []ManifestToolItem
 	if len(opts.TargetTools) > 0 {
+		hasWildcard := false
+		for _, name := range opts.TargetTools {
+			trimmed := strings.TrimSpace(name)
+			if trimmed == "*" || strings.EqualFold(trimmed, "all") {
+				hasWildcard = true
+				break
+			}
+		}
+		if hasWildcard {
+			opts.Suite = true
+			opts.TargetTools = nil
+		}
+	}
+	if len(opts.TargetTools) > 0 {
 		targetMap := make(map[string]bool)
 		for _, name := range opts.TargetTools {
 			targetMap[strings.ToLower(strings.TrimSpace(name))] = true
@@ -285,6 +299,17 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 		}
 	} else if opts.Suite {
 		targets = manifest.Tools
+		if len(targets) == 0 {
+			for _, name := range inventory.ManagedTools {
+				targets = append(targets, ManifestToolItem{
+					Name:        name,
+					Repository:  "viovy/" + name,
+					BinaryName:  name,
+					Description: name,
+					Tier:        "baseline",
+				})
+			}
+		}
 	} else {
 		for _, t := range manifest.Tools {
 			if t.Name == "iazio-agent" {
@@ -387,6 +412,79 @@ func parseUpdateFlags(args []string) (UpdateOptions, error) {
 	return opts, nil
 }
 
+func runCleanupBinaries(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	jsonOutput := false
+	dryRun := false
+	for _, a := range args {
+		if a == "--json" || a == "-json" {
+			jsonOutput = true
+		}
+		if a == "--dry-run" || a == "-n" {
+			dryRun = true
+		}
+	}
+
+	home := getenv("HOME")
+	if home == "" {
+		home, _ = os.UserHomeDir()
+	}
+	canonicalBinDir := filepath.Join(home, ".local", "bin")
+	if canon := getenv("CANONICAL_BIN_DIR"); canon != "" {
+		canonicalBinDir = canon
+	} else if runtime.GOOS == "windows" {
+		canonicalBinDir = filepath.Join(home, "bin")
+		if localApp := getenv("LOCALAPPDATA"); localApp != "" {
+			canonicalBinDir = filepath.Join(localApp, "Programs", "iazio", "bin")
+		}
+	}
+
+	searchDirs := inventory.DefaultDirs(getenv("PATH"), home, runtime.GOOS)
+	candidates := inventory.ScanDevAndShadowBinaries(searchDirs, canonicalBinDir)
+
+	if dryRun {
+		if jsonOutput {
+			data, _ := json.MarshalIndent(candidates, "", "  ")
+			fmt.Fprintln(stdout, string(data))
+			return nil
+		}
+		fmt.Fprintf(stdout, "Dev binary dry-run scan on %s: %d candidates found\n", runtime.GOOS, len(candidates))
+		for _, c := range candidates {
+			fmt.Fprintf(stdout, "  - %s (%s)\n", c.Path, c.VariantType)
+		}
+		return nil
+	}
+
+	report, err := inventory.CleanupDevBinaries(ctx, candidates, canonicalBinDir)
+	if err != nil {
+		return err
+	}
+
+	if jsonOutput {
+		data, _ := json.MarshalIndent(report, "", "  ")
+		fmt.Fprintln(stdout, string(data))
+		return nil
+	}
+
+	fmt.Fprintf(stdout, "Dev binary cleanup complete on %s:\n", runtime.GOOS)
+	fmt.Fprintf(stdout, "  Deleted: %d\n", len(report.DeletedPaths))
+	for _, p := range report.DeletedPaths {
+		fmt.Fprintf(stdout, "    - %s\n", p)
+	}
+	if len(report.KilledPIDs) > 0 {
+		fmt.Fprintf(stdout, "  Killed PIDs: %v\n", report.KilledPIDs)
+	}
+	if len(report.FailedPaths) > 0 {
+		fmt.Fprintf(stdout, "  Failed: %d\n", len(report.FailedPaths))
+		for _, f := range report.FailedPaths {
+			fmt.Fprintf(stdout, "    - %s\n", f)
+		}
+	}
+	return nil
+}
+
 func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
 	opts, err := parseUpdateFlags(args)
 	if err != nil {
@@ -455,6 +553,22 @@ func updateSingleTool(
 	curVer := inventory.InspectInstalledVersion(destPath)
 	if curVer == "" && existingShadowPath != "" {
 		curVer = inventory.InspectInstalledVersion(existingShadowPath)
+	}
+
+	if sourceRepo := findToolSourceRepo(tool.Name, envFn); sourceRepo != "" {
+		updated, srcErr := buildToolFromSourceRepo(ctx, tool, sourceRepo, destPath, force, stdout, stderr)
+		if srcErr == nil {
+			if updated && existingShadowPath != "" {
+				if binBytes, readErr := os.ReadFile(destPath); readErr == nil {
+					_ = installExecutableSafe(existingShadowPath, binBytes)
+					inventory.InvalidateVersionCache(existingShadowPath)
+				}
+			}
+			return updated, nil
+		}
+		if stderr != nil {
+			fmt.Fprintf(stderr, "  [!] %s: source repo build encountered error (%v), attempting release asset fetch\n", tool.Name, srcErr)
+		}
 	}
 
 	repo := tool.Repository
@@ -857,4 +971,228 @@ func extractBinary(archiveData []byte, archiveName, binaryName, targetOS string)
 
 func inspectInstalledVersion(binaryPath string) string {
 	return inventory.InspectInstalledVersion(binaryPath)
+}
+
+func findToolSourceRepo(toolName string, getenv func(string) string) string {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	cleanTool := strings.ToLower(strings.TrimSpace(toolName))
+	if cleanTool == "" {
+		return ""
+	}
+
+	isGitRepo := func(dir string) bool {
+		fi, err := os.Stat(filepath.Join(dir, ".git"))
+		return err == nil && (fi.IsDir() || fi.Mode().IsRegular())
+	}
+
+	// 1. Check explicit environment overrides
+	for _, envKey := range []string{"IAZIO_FLEET_ROOT", "META_REPO_ROOT", "AUTOPILOT_ROOT"} {
+		if root := strings.TrimSpace(getenv(envKey)); root != "" {
+			cand := filepath.Join(root, cleanTool)
+			if isGitRepo(cand) {
+				return cand
+			}
+			if isGitRepo(root) && strings.EqualFold(filepath.Base(root), cleanTool) {
+				return root
+			}
+		}
+	}
+
+	// 2. Relative to working directory and parent directories
+	if cwd, err := os.Getwd(); err == nil && cwd != "" {
+		curr := cwd
+		for i := 0; i < 4; i++ {
+			cand := filepath.Join(curr, cleanTool)
+			if isGitRepo(cand) {
+				return cand
+			}
+			if isGitRepo(curr) && strings.EqualFold(filepath.Base(curr), cleanTool) {
+				return curr
+			}
+			parent := filepath.Dir(curr)
+			if parent == curr {
+				break
+			}
+			curr = parent
+		}
+	}
+
+	// 3. Common user directory locations
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		homeCandidates := []string{
+			filepath.Join(home, "work", "meta-repo", cleanTool),
+			filepath.Join(home, "work", cleanTool),
+			filepath.Join(home, "src", cleanTool),
+			filepath.Join(home, "projects", cleanTool),
+			filepath.Join(home, cleanTool),
+		}
+		for _, cand := range homeCandidates {
+			if isGitRepo(cand) {
+				return cand
+			}
+		}
+	}
+
+	return ""
+}
+
+func buildToolFromSourceRepo(
+	ctx context.Context,
+	tool ManifestToolItem,
+	sourceRepo, destPath string,
+	force bool,
+	stdout, stderr io.Writer,
+) (bool, error) {
+	toolName := tool.BinaryName
+	if toolName == "" {
+		toolName = tool.Name
+	}
+
+	// 1. Run git fetch origin --prune --quiet (30s timeout, non-interactive)
+	fetchCtx, fetchCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer fetchCancel()
+	fetchCmd := exec.CommandContext(fetchCtx, "git", "-C", sourceRepo, "fetch", "origin", "--prune", "--quiet")
+	fetchCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	_ = fetchCmd.Run()
+
+	// 2. Resolve remote commit SHA
+	var remoteSHA string
+	for _, ref := range []string{"origin/main", "origin/master", "HEAD"} {
+		revCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", ref)
+		revCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		out, err := revCmd.Output()
+		if err == nil && len(strings.TrimSpace(string(out))) > 0 {
+			remoteSHA = strings.TrimSpace(string(out))
+			break
+		}
+	}
+	if remoteSHA == "" {
+		return false, fmt.Errorf("unable to resolve remote commit SHA for %s in %s", tool.Name, sourceRepo)
+	}
+
+	// 3. Resolve installed commit SHA from canonical binary
+	installedSHA := inventory.InspectToolCommitSHA(destPath)
+
+	// 4. Check ONLY specific tool repository tracked cleanliness
+	statusCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "status", "--porcelain", "--untracked-files=no")
+	statusCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	statusOut, _ := statusCmd.Output()
+	repoIsClean := len(strings.TrimSpace(string(statusOut))) == 0
+
+	// 5. Evaluate eager update condition
+	if !force {
+		if !repoIsClean {
+			if stdout != nil {
+				fmt.Fprintf(stdout, "  [!] %s: tool repository has uncommitted tracked changes, skipping autonomous eager update\n", tool.Name)
+			}
+			return false, nil
+		}
+		if installedSHA != "" && (installedSHA == remoteSHA || strings.HasPrefix(remoteSHA, installedSHA) || strings.HasPrefix(installedSHA, remoteSHA)) {
+			short := remoteSHA
+			if len(short) > 7 {
+				short = short[:7]
+			}
+			if stdout != nil {
+				fmt.Fprintf(stdout, "  [=] %s: %s (up-to-date commit %s)\n", tool.Name, installedSHA, short)
+			}
+			return false, nil
+		}
+	}
+
+	// 6. Build from origin/main (using isolated ephemeral worktree if force or dirty)
+	buildDir := sourceRepo
+	var cleanupWorktree func()
+
+	if force || !repoIsClean {
+		tempDir := filepath.Join(os.TempDir(), fmt.Sprintf("iazio-build-%s-%d", tool.Name, time.Now().UnixNano()))
+		var addWorktreeSucceeded bool
+		for _, targetRef := range []string{"origin/main", "origin/master", "HEAD"} {
+			addCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "worktree", "add", "--force", "--detach", tempDir, targetRef)
+			addCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+			if err := addCmd.Run(); err == nil {
+				addWorktreeSucceeded = true
+				break
+			}
+		}
+		if addWorktreeSucceeded {
+			buildDir = tempDir
+			cleanupWorktree = func() {
+				rmCmd := exec.Command("git", "-C", sourceRepo, "worktree", "remove", "--force", tempDir)
+				rmCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+				_ = rmCmd.Run()
+				_ = os.RemoveAll(tempDir)
+				pruneCmd := exec.Command("git", "-C", sourceRepo, "worktree", "prune")
+				pruneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+				_ = pruneCmd.Run()
+			}
+		}
+	}
+
+	if cleanupWorktree != nil {
+		defer cleanupWorktree()
+	}
+
+	stagingBin := filepath.Join(os.TempDir(), fmt.Sprintf("staging-%s-%d", tool.Name, time.Now().UnixNano()))
+	if runtime.GOOS == "windows" {
+		stagingBin += ".exe"
+	}
+	defer func() { _ = os.Remove(stagingBin) }()
+
+	verStr := "0.0.1"
+	if out, err := exec.CommandContext(ctx, "git", "-C", buildDir, "describe", "--tags", "--always").Output(); err == nil {
+		verStr = strings.TrimSpace(string(out))
+	}
+	nowUTC := time.Now().UTC().Format(time.RFC3339)
+	ldflags := fmt.Sprintf("-s -w -X main.version=%s -X main.commit=%s -X main.buildCommitSHA=%s -X main.buildTimeUTC=%s -X main.buildDirty=false", verStr, remoteSHA, remoteSHA, nowUTC)
+
+	cmdPath := fmt.Sprintf("./cmd/%s", toolName)
+	if _, err := os.Stat(filepath.Join(buildDir, "cmd", toolName)); err != nil {
+		cmdPath = "."
+	}
+
+	buildCmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags="+ldflags, "-o", stagingBin, cmdPath)
+	buildCmd.Dir = buildDir
+	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		return false, fmt.Errorf("compile %s: %w: %s", tool.Name, err, string(out))
+	}
+
+	binBytes, err := os.ReadFile(stagingBin)
+	if err != nil {
+		return false, fmt.Errorf("read compiled binary: %w", err)
+	}
+
+	if err := installExecutableSafe(destPath, binBytes); err != nil {
+		return false, fmt.Errorf("install %s: %w", tool.Name, err)
+	}
+
+	_ = os.WriteFile(destPath+".version", []byte(remoteSHA), 0644)
+	inventory.InvalidateVersionCache(destPath)
+
+	if tool.Name == "iazio-agent" || tool.Name == "iazio-harvester" || tool.Name == "iazio-harness" {
+		_ = service.RestartToolService(tool.Name)
+	}
+
+	// Dev binary cleanup
+	home, _ := os.UserHomeDir()
+	searchDirs := inventory.DefaultDirs(os.Getenv("PATH"), home, runtime.GOOS)
+	if sourceRepo != "" {
+		searchDirs = append(searchDirs, sourceRepo, filepath.Dir(sourceRepo))
+	}
+	candidates := inventory.ScanDevAndShadowBinaries(searchDirs, filepath.Dir(destPath))
+	report, _ := inventory.CleanupDevBinaries(ctx, candidates, filepath.Dir(destPath))
+	if len(report.DeletedPaths) > 0 && stdout != nil {
+		fmt.Fprintf(stdout, "  [*] %s: cleaned up %d dev/shadow binaries\n", tool.Name, len(report.DeletedPaths))
+	}
+
+	short := remoteSHA
+	if len(short) > 7 {
+		short = short[:7]
+	}
+	if stdout != nil {
+		fmt.Fprintf(stdout, "  [+] %s: successfully updated to commit %s (%s)\n", tool.Name, short, destPath)
+	}
+	return true, nil
 }

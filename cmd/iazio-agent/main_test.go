@@ -60,6 +60,30 @@ func TestFormatVersion(t *testing.T) {
 	if branchName() != "unknown" {
 		t.Fatalf("expected unknown for empty branch, got %s", branchName())
 	}
+
+	buildCommitSHA = "1234567890abcdef"
+	buildTimeUTC = "2026-10-26T00:00:00Z"
+	buildDirty = "true"
+	jsonStr := formatVersionJSON()
+	var vi VersionInfo
+	if err := json.Unmarshal([]byte(jsonStr), &vi); err != nil {
+		t.Fatalf("unmarshal formatVersionJSON: %v", err)
+	}
+	if vi.Name != "iazio-agent" || vi.CommitSHA != "1234567890abcdef" || vi.BuildTime != "2026-10-26T00:00:00Z" || !vi.Dirty {
+		t.Fatalf("unexpected version info: %+v", vi)
+	}
+
+	var buf bytes.Buffer
+	if err := execute(context.Background(), []string{"--version", "--json"}, &buf, &buf, nil); err != nil {
+		t.Fatalf("execute --version --json: %v", err)
+	}
+	var vi2 VersionInfo
+	if err := json.Unmarshal(buf.Bytes(), &vi2); err != nil {
+		t.Fatalf("unmarshal execute output: %v (buf=%s)", err, buf.String())
+	}
+	if vi2.CommitSHA != "1234567890abcdef" {
+		t.Fatalf("expected commit sha 1234567890abcdef, got %s", vi2.CommitSHA)
+	}
 }
 
 func TestParseSchtasksStatus(t *testing.T) {

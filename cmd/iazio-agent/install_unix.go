@@ -5,7 +5,9 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -68,7 +70,25 @@ func installExecutableSafeDirect(destPath string, data []byte) error {
 	if err := os.WriteFile(tmpPath, data, 0755); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, destPath)
+
+	// Unlink existing destination first on Unix/macOS to ensure inode change
+	// and prevent macOS amfid code-signature cache corruption.
+	_ = os.Remove(destPath)
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		// Fallback to copy if cross-device boundary
+		if writeErr := os.WriteFile(destPath, data, 0755); writeErr != nil {
+			_ = os.Remove(tmpPath)
+			return writeErr
+		}
+		_ = os.Remove(tmpPath)
+	}
+
+	// On macOS Apple Silicon, ad-hoc codesign binary so amfid does not kill it with SIGKILL
+	if runtime.GOOS == "darwin" {
+		_ = exec.Command("codesign", "--force", "--sign", "-", destPath).Run()
+	}
+
+	return nil
 }
 
 func cleanStaleBackups(dir string) {

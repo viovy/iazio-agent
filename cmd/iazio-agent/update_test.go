@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -1461,5 +1462,185 @@ func TestInstallExecutableSafe_MultiDirSync(t *testing.T) {
 		} else if string(c) != string(payload) {
 			t.Errorf("binary content mismatch at %s", p)
 		}
+	}
+}
+
+func TestFindToolSourceRepo(t *testing.T) {
+	tmpDir := t.TempDir()
+	envMap := map[string]string{
+		"IAZIO_FLEET_ROOT": tmpDir,
+	}
+	getenv := func(k string) string { return envMap[k] }
+
+	subrepo := filepath.Join(tmpDir, "custom-tool")
+	if err := os.MkdirAll(subrepo, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Without .git, shouldn't match
+	if found := findToolSourceRepo("custom-tool", getenv); found != "" {
+		t.Errorf("expected empty before .git, got %s", found)
+	}
+
+	if err := os.MkdirAll(filepath.Join(subrepo, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	found := findToolSourceRepo("custom-tool", getenv)
+	if found != subrepo {
+		t.Errorf("expected %s, got %s", subrepo, found)
+	}
+}
+
+func TestRunCleanupBinaries_DryRun(t *testing.T) {
+	tmpDir := t.TempDir()
+	canonDir := filepath.Join(tmpDir, "canon")
+	_ = os.MkdirAll(canonDir, 0755)
+
+	envMap := map[string]string{
+		"PATH":              tmpDir,
+		"HOME":              tmpDir,
+		"CANONICAL_BIN_DIR": canonDir,
+	}
+	getenv := func(k string) string { return envMap[k] }
+
+	// Create dev binary
+	devBin := filepath.Join(tmpDir, "iazio-agent-dev")
+	if err := os.WriteFile(devBin, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	// Run cleanup with dry-run
+	err := runCleanupBinaries(context.Background(), []string{"--dry-run"}, &stdout, &stderr, getenv)
+	if err != nil {
+		t.Fatalf("runCleanupBinaries dry run failed: %v", err)
+	}
+
+	// File should still exist
+	if _, err := os.Stat(devBin); err != nil {
+		t.Errorf("expected dev bin to still exist after dry run: %v", err)
+	}
+
+	// Run cleanup without dry-run
+	err = runCleanupBinaries(context.Background(), []string{}, &stdout, &stderr, getenv)
+	if err != nil {
+		t.Fatalf("runCleanupBinaries live failed: %v", err)
+	}
+
+	// File should now be gone
+	if _, err := os.Stat(devBin); !os.IsNotExist(err) {
+		t.Errorf("expected dev bin to be deleted: %v", err)
+	}
+}
+
+func TestBuildToolFromSourceRepo_Lifecycle(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not installed")
+	}
+
+	tmpDir := t.TempDir()
+	srcRepo := filepath.Join(tmpDir, "repo")
+	if err := os.MkdirAll(srcRepo, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Init git repo
+	runGit := func(args ...string) string {
+		cmd := exec.Command("git", append([]string{"-C", srcRepo}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@test.local",
+			"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@test.local",
+			"GIT_TERMINAL_PROMPT=0",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v: %s", args, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit("init")
+	runGit("config", "user.name", "Test")
+	runGit("config", "user.email", "test@test.local")
+
+	goModContent := "module customtesttool\n\ngo 1.22\n"
+	if err := os.WriteFile(filepath.Join(srcRepo, "go.mod"), []byte(goModContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mainGoContent := "package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"v1\") }\n"
+	if err := os.WriteFile(filepath.Join(srcRepo, "main.go"), []byte(mainGoContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runGit("add", ".")
+	runGit("commit", "-m", "initial commit")
+	headSHA := runGit("rev-parse", "HEAD")
+
+	destBinDir := filepath.Join(tmpDir, "bin")
+	_ = os.MkdirAll(destBinDir, 0755)
+	destPath := filepath.Join(destBinDir, "customtesttool")
+
+	tool := ManifestToolItem{
+		Name:       "customtesttool",
+		BinaryName: "customtesttool",
+	}
+
+	ctx := context.Background()
+
+	// Case A: Clean repo, installed matches HEAD SHA => should skip update
+	_ = os.WriteFile(destPath, []byte("dummy-bin"), 0755)
+	_ = os.WriteFile(destPath+".version", []byte(headSHA), 0644)
+
+	var outA bytes.Buffer
+	updatedA, err := buildToolFromSourceRepo(ctx, tool, srcRepo, destPath, false, &outA, &outA)
+	if err != nil {
+		t.Fatalf("Case A failed: %v", err)
+	}
+	if updatedA {
+		t.Errorf("expected Case A not to update, got true")
+	}
+	if !strings.Contains(outA.String(), "up-to-date") {
+		t.Errorf("expected output to mention up-to-date, got: %s", outA.String())
+	}
+
+	// Case B: Repo has uncommitted tracked modification => eager update should skip
+	if err := os.WriteFile(filepath.Join(srcRepo, "main.go"), []byte("package main\nfunc main() {}\n// dirty edit\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// change destination version so SHA mismatch would otherwise trigger update
+	_ = os.WriteFile(destPath+".version", []byte("oldsha"), 0644)
+
+	var outB bytes.Buffer
+	updatedB, err := buildToolFromSourceRepo(ctx, tool, srcRepo, destPath, false, &outB, &outB)
+	if err != nil {
+		t.Fatalf("Case B failed: %v", err)
+	}
+	if updatedB {
+		t.Errorf("expected Case B to skip update due to dirty repo, got updated=true")
+	}
+	if !strings.Contains(outB.String(), "uncommitted tracked changes") {
+		t.Errorf("expected output to mention uncommitted tracked changes, got: %s", outB.String())
+	}
+
+	// Case C: Force update => should bypass dirty repo and install fresh binary
+	var outC bytes.Buffer
+	updatedC, err := buildToolFromSourceRepo(ctx, tool, srcRepo, destPath, true, &outC, &outC)
+	if err != nil {
+		t.Fatalf("Case C force update failed: %v: %s", err, outC.String())
+	}
+	if !updatedC {
+		t.Errorf("expected Case C to update successfully with force=true")
+	}
+
+	// Verify installed binary and version sidecar
+	verSidecar, err := os.ReadFile(destPath + ".version")
+	if err != nil {
+		t.Fatalf("missing .version sidecar: %v", err)
+	}
+	if string(verSidecar) != headSHA {
+		t.Errorf("expected .version to contain %s, got %s", headSHA, string(verSidecar))
 	}
 }

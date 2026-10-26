@@ -82,6 +82,14 @@ func TestDrift_EvaluateDrift_CleanAndMismatch(t *testing.T) {
 	if err != nil || !drift {
 		t.Fatalf("expected drift for missing binary, got drift=%v, err=%v", drift, err)
 	}
+
+	// 5. "dev" version equality trap: even if both installed and target say "dev", must drift
+	installed["/bin/autopilot"] = "dev"
+	manifest.Tools[0].TargetVersion = "dev"
+	drift, err = EvaluateDrift(manifest, inspector, "/bin", []string{"autopilot"}, "linux")
+	if err != nil || !drift {
+		t.Fatalf("expected drift for dev version equality trap, got drift=%v, err=%v", drift, err)
+	}
 }
 
 func TestDrift_EvaluateDrift_LatestResolution(t *testing.T) {
