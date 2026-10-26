@@ -474,8 +474,6 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 
 	// Pre-job workspace sanitization: non-destructive lock clearing, interrupted git ops recovery, dirty patch archiving, and line ending hygiene
 	if worktreeDir != "" && worktreeDir != "." {
-	// Pre-job workspace sanitization: non-destructive lock clearing, interrupted git ops recovery, dirty patch archiving, and line ending hygiene
-	if worktreeDir != "" && worktreeDir != "." {
 		_, wsPrepSpan := telemetry.StartSpan(ctx, "agent.workspace_prep",
 			telemetry.WithTag("job.id", job.ID),
 			telemetry.WithTag("workspace", worktreeDir),
@@ -500,9 +498,6 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		}
 		if cfgErr := exec.CommandContext(ctx, "git", "-C", worktreeDir, "config", "core.autocrlf", "input").Run(); cfgErr != nil {
 			fmt.Fprintf(os.Stderr, "[dispatcher] git autocrlf config warning: %v\n", cfgErr)
-		}
-		if wsPrepSpan != nil {
-			wsPrepSpan.End()
 		}
 	}
 
