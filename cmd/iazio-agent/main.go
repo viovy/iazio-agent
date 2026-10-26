@@ -1073,6 +1073,22 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			})
 			wd.StartWatchguard(runCtx, 5*time.Second)
 
+			reattached := sup.ScanAndReattachRuns(wdRunner)
+			for _, r := range reattached {
+				if stdout != nil {
+					fmt.Fprintf(stdout, "[supervisor] Re-attached to running job %s (PID %d) in %s\n", r.JobID, r.PID, r.WorktreePath)
+				}
+				wd.Track(watchdog.TrackedJob{
+					JobID:        r.JobID,
+					WorktreePath: r.WorktreePath,
+					DocsHubPath:  r.DocsHubPath,
+					APIURL:       r.APIURL,
+					PID:          r.PID,
+					HarnessPID:   r.PID,
+					Status:       watchdog.StatusRunning,
+				})
+			}
+
 			onJob := func(a controlplane.Assignment) error {
 				if a.ID == "" {
 					return nil

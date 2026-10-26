@@ -251,6 +251,8 @@ func darwinPlist(bin, logPath string) string {
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
+	<key>AbandonProcessGroup</key>
+	<true/>
 	<key>KeepAlive</key>
 	<dict>
 		<key>PathState</key>
@@ -326,6 +328,8 @@ func DarwinWatchdogPlist(bin, logPath string) string {
 	<key>StartInterval</key>
 	<integer>120</integer>
 	<key>RunAtLoad</key>
+	<true/>
+	<key>AbandonProcessGroup</key>
 	<true/>
 	<key>StandardOutPath</key>
 	<string>%s</string>
@@ -470,7 +474,8 @@ StartLimitIntervalSec=0
 Type=simple
 ExecStart=%s run
 Restart=always
-RestartSec=5s
+RestartSec=3s
+KillMode=process
 WatchdogSec=30s
 OOMScoreAdjust=-500
 # Low intrusion: yield CPU/IO to interactive sessions (STORY-GOV-3198 / STORY-GOV-3597).

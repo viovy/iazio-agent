@@ -129,15 +129,27 @@ func (s *Sup) Spawn(r Runner, jobID, apiURL, worktree, docsHub, token string, ex
 			return err
 		}
 	}
+	now := s.now()
 	s.mu.Lock()
 	s.pids[worktree] = pid
 	s.jobIDs[worktree] = jobID
-	s.deadline[worktree] = s.now().Add(DefaultJobDuration)
-	s.lastProgress[worktree] = s.now()
+	s.deadline[worktree] = now.Add(DefaultJobDuration)
+	s.lastProgress[worktree] = now
 	if s.signal == nil && r != nil {
 		s.signal = r.Signal
 	}
 	s.mu.Unlock()
+
+	_ = SaveRunState(RunState{
+		JobID:        jobID,
+		PID:          pid,
+		WorktreePath: worktree,
+		DocsHubPath:  docsHub,
+		APIURL:       apiURL,
+		Status:       RunStatusRunning,
+		StartedAt:    now,
+		UpdatedAt:    now,
+	})
 	return nil
 }
 
@@ -236,12 +248,21 @@ func (s *Sup) Promote() {
 func (s *Sup) Cancel(path, reason string) {
 	s.mu.Lock()
 	pid := s.pids[path]
+	jobID := s.jobIDs[path]
 	state := s.locks[path]
 	signal := s.signal
 	alive := s.alive
 	sleep := s.sleep
 	s.reasons[path] = reason
 	s.mu.Unlock()
+	if jobID != "" {
+		if st, err := LoadRunState(jobID); err == nil {
+			st.Status = RunStatusFailed
+			st.Error = reason
+			st.UpdatedAt = s.now()
+			_ = SaveRunState(*st)
+		}
+	}
 	if state != LockRunning {
 		return
 	}
@@ -359,6 +380,61 @@ func (s *Sup) RunningJobs() []RunningJob {
 		}
 	}
 	return res
+}
+
+// ScanAndReattachRuns inspects ~/.iazio/runs/ for in-flight jobs, re-attaching live processes
+// into active supervisor locks and runner tracking, and reconciling jobs that finished while
+// the agent was restarting or upgrading.
+func (s *Sup) ScanAndReattachRuns(r Runner) []RunState {
+	states, err := ListRunStates()
+	if err != nil {
+		return nil
+	}
+	var reattached []RunState
+	now := s.now()
+	for _, st := range states {
+		if st.Status != RunStatusRunning {
+			continue
+		}
+		if st.PID <= 0 {
+			st.Status = RunStatusFailed
+			st.UpdatedAt = now
+			st.Error = "invalid pid in state"
+			_ = SaveRunState(st)
+			continue
+		}
+		if s.alive != nil && s.alive(st.PID) {
+			s.mu.Lock()
+			s.locks[st.WorktreePath] = LockRunning
+			s.pids[st.WorktreePath] = st.PID
+			s.jobIDs[st.WorktreePath] = st.JobID
+			if DefaultJobDuration > 0 {
+				s.deadline[st.WorktreePath] = now.Add(DefaultJobDuration)
+			}
+			s.lastProgress[st.WorktreePath] = now
+			if s.signal == nil && r != nil {
+				s.signal = r.Signal
+			}
+			s.mu.Unlock()
+
+			if ar, ok := r.(interface{ Attach(pid int, jobID string) error }); ok {
+				_ = ar.Attach(st.PID, st.JobID)
+			}
+			reattached = append(reattached, st)
+		} else {
+			// Process is no longer alive - finished while agent was restarting
+			st.Status = RunStatusCompleted
+			if st.ExitCode != 0 {
+				st.Status = RunStatusFailed
+			}
+			st.UpdatedAt = now
+			_ = SaveRunState(st)
+			if st.WorktreePath != "" {
+				s.BeginCooling(st.WorktreePath)
+			}
+		}
+	}
+	return reattached
 }
 
 // ReapedJob holds details about a reaped job.

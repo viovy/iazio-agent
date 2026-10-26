@@ -8,7 +8,9 @@ import (
 )
 
 func setProcGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true,
+	}
 }
 
 func postStartProc(cmd *exec.Cmd) {}

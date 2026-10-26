@@ -990,6 +990,9 @@ func TestReviveCheckDarwin(t *testing.T) {
 
 func TestDarwinPlistHardening(t *testing.T) {
 	plist := darwinPlist("/opt/iazio/bin/iazio-agent", "/opt/iazio/logs/agent.log")
+	if !strings.Contains(plist, "<key>AbandonProcessGroup</key>\n\t<true/>") {
+		t.Errorf("expected AbandonProcessGroup true in plist, got:\n%s", plist)
+	}
 	if !strings.Contains(plist, "<key>ThrottleInterval</key>\n\t<integer>3</integer>") {
 		t.Errorf("expected ThrottleInterval 3s in plist, got:\n%s", plist)
 	}
@@ -1457,7 +1460,8 @@ func TestLinuxUnitHardening(t *testing.T) {
 		"EnvironmentFile=-%h/.iazio/agent.env",
 		"StandardOutput=journal",
 		"StandardError=journal",
-		"RestartSec=5s",
+		"RestartSec=3s",
+		"KillMode=process",
 		"WatchdogSec=30s",
 		"OOMScoreAdjust=-500",
 	}
