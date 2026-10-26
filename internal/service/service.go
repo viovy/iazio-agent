@@ -1454,3 +1454,31 @@ func cleanStaleBackups(dir string) {
 		}
 	}
 }
+
+// RestartToolService restarts the specified tool's daemon service across Darwin (launchd),
+// Linux (systemd --user), or Windows (schtasks).
+func RestartToolService(toolName string, runner ...func(string, ...string) error) error {
+	run := execCommand
+	if len(runner) > 0 && runner[0] != nil {
+		run = runner[0]
+	}
+
+	label := "io.iazio." + toolName
+	if toolName == "autopilot" {
+		label = "io.autopilot"
+	}
+
+	switch runtime.GOOS {
+	case "darwin":
+		target := fmt.Sprintf("gui/%d/%s", os.Getuid(), label)
+		return run("launchctl", "kickstart", "-k", target)
+	case "linux":
+		if IsSystemdAvailable() {
+			return run("systemctl", "--user", "restart", toolName+".service")
+		}
+	case "windows":
+		_ = run("schtasks", "/End", "/TN", toolName)
+		return run("schtasks", "/Run", "/TN", toolName)
+	}
+	return nil
+}

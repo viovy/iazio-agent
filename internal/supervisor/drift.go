@@ -180,6 +180,13 @@ func EvaluateDrift(
 		cleanCur := NormalizeVersion(curVer)
 		cleanTgt := NormalizeVersion(targetVer)
 
+		// Semver "dev" trap: unversioned or dev builds must always be considered drifted
+		// so that autonomous eager update inspects remote repository/releases and doesn't get stuck.
+		if strings.EqualFold(cleanCur, "dev") || strings.EqualFold(cleanTgt, "dev") ||
+			strings.EqualFold(cleanCur, "0.0.0-dev") || strings.EqualFold(cleanTgt, "0.0.0-dev") {
+			return true, nil
+		}
+
 		// Strict normalized equality comparison (F4)
 		if cleanCur != cleanTgt {
 			return true, nil

@@ -30,6 +30,10 @@ func InvalidateVersionCache(binaryPath string) {
 	verCacheMu.Lock()
 	delete(verCache, binaryPath)
 	verCacheMu.Unlock()
+
+	shaCacheMu.Lock()
+	delete(shaCache, binaryPath)
+	shaCacheMu.Unlock()
 }
 
 // InspectInstalledVersion returns the semantic or release version of a binary.
@@ -124,6 +128,7 @@ type Tool struct {
 	Name             string   `json:"name"`
 	Path             string   `json:"path"`
 	Version          string   `json:"version"`
+	CommitSHA        string   `json:"commit_sha,omitempty"`
 	Status           string   `json:"status"`
 	Executable       bool     `json:"executable"`
 	ServiceInstalled bool     `json:"service_installed,omitempty"`
@@ -297,6 +302,7 @@ func scan(dirs []string, goos string) []Tool {
 		go func(idx int) {
 			defer wg.Done()
 			out[idx].Version = InspectInstalledVersion(out[idx].Path)
+			out[idx].CommitSHA = InspectToolCommitSHA(out[idx].Path)
 			if out[idx].Name == "iazio-agent" || out[idx].Name == "iazio-harvester" || strings.HasPrefix(out[idx].Name, "iazio-") {
 				installed, sType, sStatus, caps := InspectToolService(out[idx].Name, goos)
 				out[idx].ServiceInstalled = installed

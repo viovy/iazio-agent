@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -479,7 +480,7 @@ func TestUpdateSingleTool_Lifecycle(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	ctx := context.Background()
 	binDir := t.TempDir()
-	binPath := filepath.Join(binDir, "iazio-agent")
+	binPath := filepath.Join(binDir, "iazio-dummy")
 	if runtime.GOOS == "windows" {
 		binPath += ".exe"
 	}
@@ -492,7 +493,7 @@ func TestUpdateSingleTool_Lifecycle(t *testing.T) {
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			rel := gitHubRelease{
 				TagName: "v1.0.0",
-				Assets:  []gitHubAsset{{Name: "iazio-agent_1.0.0_darwin_arm64.tar.gz"}},
+				Assets:  []gitHubAsset{{Name: "iazio-dummy_1.0.0_darwin_arm64.tar.gz"}},
 			}
 			b, _ := json.Marshal(rel)
 			return &http.Response{
@@ -506,9 +507,9 @@ func TestUpdateSingleTool_Lifecycle(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	tool := ManifestToolItem{
-		Name:       "iazio-agent",
-		Repository: "viovy/iazio-agent",
-		BinaryName: "iazio-agent",
+		Name:       "iazio-dummy",
+		Repository: "viovy/iazio-dummy",
+		BinaryName: "iazio-dummy",
 	}
 
 	updated, err := updateSingleTool(ctx, client, tool, binDir, "", false, &stdout, &stderr)
@@ -520,9 +521,9 @@ func TestUpdateSingleTool_Lifecycle(t *testing.T) {
 	}
 
 	// 2. Tool out of date -> installs new version
-	tarContent := createTarGz(t, "iazio-agent", []byte("#!/bin/sh\necho updated\n"))
+	tarContent := createTarGz(t, "iazio-dummy", []byte("#!/bin/sh\necho updated\n"))
 	sum := sha256.Sum256(tarContent)
-	sumText := fmt.Sprintf("%s  iazio-agent_2.0.0_%s_%s.tar.gz\n", hex.EncodeToString(sum[:]), runtime.GOOS, runtime.GOARCH)
+	sumText := fmt.Sprintf("%s  iazio-dummy_2.0.0_%s_%s.tar.gz\n", hex.EncodeToString(sum[:]), runtime.GOOS, runtime.GOARCH)
 
 	client2 := &http.Client{
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -533,7 +534,7 @@ func TestUpdateSingleTool_Lifecycle(t *testing.T) {
 					TagName: "v2.0.0",
 					Assets: []gitHubAsset{
 						{
-							Name:               fmt.Sprintf("iazio-agent_2.0.0_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH),
+							Name:               fmt.Sprintf("iazio-dummy_2.0.0_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH),
 							BrowserDownloadURL: "https://example.com/asset.tar.gz",
 						},
 						{
@@ -620,7 +621,7 @@ func TestInstallExecutableSafe_ReverseSync(t *testing.T) {
 	target2 := filepath.Join(binDir2, "iazio-agent")
 
 	data := []byte("reverse-sync-bytes")
-	// Install to binDir2; binDir1 exists as a directory so it initializes altPath
+	// Install to binDir2; target2 is installed exclusively per AC4/H2
 	if err := installExecutableSafe(target2, data); err != nil {
 		t.Fatalf("installExecutableSafe reverse failed: %v", err)
 	}
@@ -628,8 +629,8 @@ func TestInstallExecutableSafe_ReverseSync(t *testing.T) {
 	if c, _ := os.ReadFile(target2); string(c) != string(data) {
 		t.Fatalf("target2 mismatch: %q", string(c))
 	}
-	if c, _ := os.ReadFile(target1); string(c) != string(data) {
-		t.Fatalf("target1 was not initialized: %q", string(c))
+	if _, err := os.Stat(target1); !os.IsNotExist(err) {
+		t.Fatalf("target1 should not be initialized per AC4/H2")
 	}
 }
 
@@ -650,13 +651,16 @@ func TestInstallExecutableSafe_ExistingAltPath(t *testing.T) {
 	_ = os.WriteFile(target2, []byte("old-bytes"), 0755)
 
 	data := []byte("new-sync-bytes")
-	// Install to binDir1; binDir2 file exists so it synchronizes altPath
+	// Install to binDir1; target2 must not be modified per AC4/H2
 	if err := installExecutableSafe(target1, data); err != nil {
 		t.Fatalf("installExecutableSafe failed: %v", err)
 	}
 
-	if c, _ := os.ReadFile(target2); string(c) != string(data) {
-		t.Fatalf("target2 was not updated: %q", string(c))
+	if c, _ := os.ReadFile(target1); string(c) != string(data) {
+		t.Fatalf("target1 mismatch: %q", string(c))
+	}
+	if c, _ := os.ReadFile(target2); string(c) != "old-bytes" {
+		t.Fatalf("target2 should remain untouched per AC4/H2: %q", string(c))
 	}
 }
 
@@ -731,9 +735,9 @@ func TestUpdateSingleTool_ErrorsAndRepoPrefix(t *testing.T) {
 		}),
 	}
 	toolMatchErr := ManifestToolItem{
-		Name:       "iazio-mcp",
+		Name:       "iazio-custom-no-source",
 		Repository: "viovy/iazio-mcp",
-		BinaryName: "iazio-mcp",
+		BinaryName: "iazio-custom-no-source",
 	}
 	updated, err = updateSingleTool(ctx, clientNoAsset, toolMatchErr, binDir, "", true, &stdout, &stderr)
 	if err == nil || updated {
@@ -1319,22 +1323,13 @@ func TestUpdateSingleTool_ShadowingBinarySync(t *testing.T) {
 		t.Fatalf("dest binary content mismatch")
 	}
 
-	// Verify shadowing binary was also updated
+	// Verify shadowing binary was not overwritten (prevent resurrecting shadow duplicates per AC4/H2)
 	shadowData, err := os.ReadFile(shadowBin)
 	if err != nil {
 		t.Fatalf("failed to read shadow binary: %v", err)
 	}
-	if string(shadowData) != string(payload) {
-		t.Fatalf("shadow binary content mismatch: got %q, want %q", string(shadowData), string(payload))
-	}
-
-	// Verify .version in shadowDir was updated to 0.0.492
-	shadowVer, err := os.ReadFile(shadowBin + ".version")
-	if err != nil {
-		t.Fatalf("failed to read shadow .version: %v", err)
-	}
-	if string(shadowVer) != "0.0.492" {
-		t.Fatalf("shadow .version mismatch: got %q, want 0.0.492", string(shadowVer))
+	if string(shadowData) == string(payload) {
+		t.Fatalf("shadow binary should not be overwritten per AC4/H2")
 	}
 }
 
@@ -1452,14 +1447,195 @@ func TestInstallExecutableSafe_MultiDirSync(t *testing.T) {
 		t.Fatalf("installExecutableSafe failed: %v", err)
 	}
 
-	// Verify all existing alternate dirs have the binary
-	for _, dir := range []string{altDir1, altDir2, altDir3} {
+	// Verify target destPath has the binary and alternate dirs do not per AC4/H2
+	c, err := os.ReadFile(destPath)
+	if err != nil || string(c) != string(payload) {
+		t.Fatalf("expected binary at destPath %s", destPath)
+	}
+	for _, dir := range []string{altDir1, altDir2} {
 		p := filepath.Join(dir, "my-tool")
-		c, err := os.ReadFile(p)
-		if err != nil {
-			t.Errorf("expected binary at %s: %v", p, err)
-		} else if string(c) != string(payload) {
-			t.Errorf("binary content mismatch at %s", p)
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("alternate directory %s should not have duplicate binary", dir)
 		}
+	}
+}
+
+func TestFindToolSourceRepo(t *testing.T) {
+	tmpDir := t.TempDir()
+	envMap := map[string]string{
+		"IAZIO_FLEET_ROOT": tmpDir,
+	}
+	getenv := func(k string) string { return envMap[k] }
+
+	subrepo := filepath.Join(tmpDir, "custom-tool")
+	if err := os.MkdirAll(subrepo, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Without .git, shouldn't match
+	if found := findToolSourceRepo("custom-tool", getenv); found != "" {
+		t.Errorf("expected empty before .git, got %s", found)
+	}
+
+	if err := os.MkdirAll(filepath.Join(subrepo, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	found := findToolSourceRepo("custom-tool", getenv)
+	if found != subrepo {
+		t.Errorf("expected %s, got %s", subrepo, found)
+	}
+}
+
+func TestRunCleanupBinaries_DryRun(t *testing.T) {
+	tmpDir := t.TempDir()
+	canonDir := filepath.Join(tmpDir, "canon")
+	_ = os.MkdirAll(canonDir, 0755)
+
+	envMap := map[string]string{
+		"PATH":              tmpDir,
+		"HOME":              tmpDir,
+		"CANONICAL_BIN_DIR": canonDir,
+	}
+	getenv := func(k string) string { return envMap[k] }
+
+	// Create dev binary
+	devBin := filepath.Join(tmpDir, "iazio-agent-dev")
+	if err := os.WriteFile(devBin, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	// Run cleanup with dry-run
+	err := runCleanupBinaries(context.Background(), []string{"--dry-run"}, &stdout, &stderr, getenv)
+	if err != nil {
+		t.Fatalf("runCleanupBinaries dry run failed: %v", err)
+	}
+
+	// File should still exist
+	if _, err := os.Stat(devBin); err != nil {
+		t.Errorf("expected dev bin to still exist after dry run: %v", err)
+	}
+
+	// Run cleanup without dry-run
+	err = runCleanupBinaries(context.Background(), []string{}, &stdout, &stderr, getenv)
+	if err != nil {
+		t.Fatalf("runCleanupBinaries live failed: %v", err)
+	}
+
+	// File should now be gone
+	if _, err := os.Stat(devBin); !os.IsNotExist(err) {
+		t.Errorf("expected dev bin to be deleted: %v", err)
+	}
+}
+
+func TestBuildToolFromSourceRepo_Lifecycle(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not installed")
+	}
+
+	tmpDir := t.TempDir()
+	srcRepo := filepath.Join(tmpDir, "repo")
+	if err := os.MkdirAll(srcRepo, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Init git repo
+	runGit := func(args ...string) string {
+		cmd := exec.Command("git", append([]string{"-C", srcRepo}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@test.local",
+			"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@test.local",
+			"GIT_TERMINAL_PROMPT=0",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v: %s", args, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit("init")
+	runGit("config", "user.name", "Test")
+	runGit("config", "user.email", "test@test.local")
+
+	goModContent := "module customtesttool\n\ngo 1.22\n"
+	if err := os.WriteFile(filepath.Join(srcRepo, "go.mod"), []byte(goModContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mainGoContent := "package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"v1\") }\n"
+	if err := os.WriteFile(filepath.Join(srcRepo, "main.go"), []byte(mainGoContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runGit("add", ".")
+	runGit("commit", "-m", "initial commit")
+	headSHA := runGit("rev-parse", "HEAD")
+
+	destBinDir := filepath.Join(tmpDir, "bin")
+	_ = os.MkdirAll(destBinDir, 0755)
+	destPath := filepath.Join(destBinDir, "customtesttool")
+
+	tool := ManifestToolItem{
+		Name:       "customtesttool",
+		BinaryName: "customtesttool",
+	}
+
+	ctx := context.Background()
+
+	// Case A: Clean repo, installed matches HEAD SHA => should skip update
+	_ = os.WriteFile(destPath, []byte("dummy-bin"), 0755)
+	_ = os.WriteFile(destPath+".version", []byte(headSHA), 0644)
+
+	var outA bytes.Buffer
+	updatedA, err := buildToolFromSourceRepo(ctx, tool, srcRepo, destPath, false, &outA, &outA)
+	if err != nil {
+		t.Fatalf("Case A failed: %v", err)
+	}
+	if updatedA {
+		t.Errorf("expected Case A not to update, got true")
+	}
+	if !strings.Contains(outA.String(), "up-to-date") {
+		t.Errorf("expected output to mention up-to-date, got: %s", outA.String())
+	}
+
+	// Case B: Repo has uncommitted tracked modification => eager update should skip
+	if err := os.WriteFile(filepath.Join(srcRepo, "main.go"), []byte("package main\nfunc main() {}\n// dirty edit\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// change destination version so SHA mismatch would otherwise trigger update
+	_ = os.WriteFile(destPath+".version", []byte("oldsha"), 0644)
+
+	var outB bytes.Buffer
+	updatedB, err := buildToolFromSourceRepo(ctx, tool, srcRepo, destPath, false, &outB, &outB)
+	if err != nil {
+		t.Fatalf("Case B failed: %v", err)
+	}
+	if updatedB {
+		t.Errorf("expected Case B to skip update due to dirty repo, got updated=true")
+	}
+	if !strings.Contains(outB.String(), "uncommitted tracked changes") {
+		t.Errorf("expected output to mention uncommitted tracked changes, got: %s", outB.String())
+	}
+
+	// Case C: Force update => should bypass dirty repo and install fresh binary
+	var outC bytes.Buffer
+	updatedC, err := buildToolFromSourceRepo(ctx, tool, srcRepo, destPath, true, &outC, &outC)
+	if err != nil {
+		t.Fatalf("Case C force update failed: %v: %s", err, outC.String())
+	}
+	if !updatedC {
+		t.Errorf("expected Case C to update successfully with force=true")
+	}
+
+	// Verify installed binary and version sidecar
+	verSidecar, err := os.ReadFile(destPath + ".version")
+	if err != nil {
+		t.Fatalf("missing .version sidecar: %v", err)
+	}
+	if string(verSidecar) != headSHA {
+		t.Errorf("expected .version to contain %s, got %s", headSHA, string(verSidecar))
 	}
 }

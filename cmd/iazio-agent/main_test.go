@@ -60,6 +60,30 @@ func TestFormatVersion(t *testing.T) {
 	if branchName() != "unknown" {
 		t.Fatalf("expected unknown for empty branch, got %s", branchName())
 	}
+
+	buildCommitSHA = "1234567890abcdef"
+	buildTimeUTC = "2026-10-26T00:00:00Z"
+	buildDirty = "true"
+	jsonStr := formatVersionJSON()
+	var vi VersionInfo
+	if err := json.Unmarshal([]byte(jsonStr), &vi); err != nil {
+		t.Fatalf("unmarshal formatVersionJSON: %v", err)
+	}
+	if vi.Name != "iazio-agent" || vi.CommitSHA != "1234567890abcdef" || vi.BuildTime != "2026-10-26T00:00:00Z" || !vi.Dirty {
+		t.Fatalf("unexpected version info: %+v", vi)
+	}
+
+	var buf bytes.Buffer
+	if err := execute(context.Background(), []string{"--version", "--json"}, &buf, &buf, nil); err != nil {
+		t.Fatalf("execute --version --json: %v", err)
+	}
+	var vi2 VersionInfo
+	if err := json.Unmarshal(buf.Bytes(), &vi2); err != nil {
+		t.Fatalf("unmarshal execute output: %v (buf=%s)", err, buf.String())
+	}
+	if vi2.CommitSHA != "1234567890abcdef" {
+		t.Fatalf("expected commit sha 1234567890abcdef, got %s", vi2.CommitSHA)
+	}
 }
 
 func TestParseSchtasksStatus(t *testing.T) {
@@ -625,9 +649,9 @@ func TestInstallExecutableSafe_AlternatePathSync(t *testing.T) {
 	if c, _ := os.ReadFile(target1); string(c) != string(data) {
 		t.Fatalf("primary not updated: %q", string(c))
 	}
-	// Verify alternate was synchronized
-	if c, _ := os.ReadFile(target2); string(c) != string(data) {
-		t.Fatalf("alternate not synchronized: %q", string(c))
+	// Verify alternate was not modified (AC4/H2: no alternate directory duplication)
+	if c, _ := os.ReadFile(target2); string(c) != "old-binary" {
+		t.Fatalf("alternate should remain untouched: %q", string(c))
 	}
 }
 

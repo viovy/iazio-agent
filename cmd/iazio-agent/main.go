@@ -41,6 +41,7 @@ import (
 )
 
 func main() {
+	preflight.HydrateToolchainEnv()
 	flushTracer := telemetry.InitGlobalTracer("iazio-agent", "")
 	defer flushTracer()
 
@@ -67,6 +68,7 @@ func (s *safeWriter) Write(p []byte) (n int, err error) {
 }
 
 func execute(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
+	preflight.HydrateToolchainEnv()
 	if stdout != nil {
 		stdout = &safeWriter{w: stdout}
 	}
@@ -86,6 +88,12 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 	defer span.End()
 	switch args[0] {
 	case "version", "--version", "-v":
+		for _, a := range args[1:] {
+			if a == "--json" || a == "-json" {
+				fmt.Fprintln(stdout, formatVersionJSON())
+				return nil
+			}
+		}
 		fmt.Fprintln(stdout, formatVersion())
 		return nil
 	case "help", "--help", "-h":
@@ -97,6 +105,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		return runAuth(ctx, args[1:], stdout, getenv)
 	case "service":
 		return runService(args[1:], stdout, getenv)
+	case "cleanup-binaries", "clean-dev-binaries", "cleanup":
+		return runCleanupBinaries(ctx, args[1:], stdout, stderr, getenv)
 	case "update":
 		return runUpdate(ctx, args[1:], stdout, stderr, getenv)
 	case "run":
@@ -227,6 +237,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						Name:             t.Name,
 						Path:             t.Path,
 						Version:          t.Version,
+						CommitSHA:        t.CommitSHA,
 						Status:           t.Status,
 						ServiceInstalled: t.ServiceInstalled,
 						ServiceType:      t.ServiceType,
@@ -630,6 +641,22 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return "ONLINE"
 				},
 				Tools: getTools,
+				DiscoveredDevBinaries: func() []string {
+					home, _ := os.UserHomeDir()
+					searchDirs := inventory.DefaultDirs(getenv("PATH"), home, runtime.GOOS)
+					canonicalBinDir := filepath.Join(home, ".local", "bin")
+					if runtime.GOOS == "windows" {
+						if localApp := getenv("LOCALAPPDATA"); localApp != "" {
+							canonicalBinDir = filepath.Join(localApp, "Programs", "iazio", "bin")
+						}
+					}
+					candidates := inventory.ScanDevAndShadowBinaries(searchDirs, canonicalBinDir)
+					var paths []string
+					for _, c := range candidates {
+						paths = append(paths, c.Path)
+					}
+					return paths
+				},
 				SupportedCapabilities: []string{
 					"user_service_watchdog_v2",
 					"deterministic_resume_4tuple_v1",
@@ -694,6 +721,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 								restartOrExecSelf(stdout)
 								cancel()
 							}
+						}()
+					case "CLEANUP_BINARIES", "CLEANUP_DEV_BINARIES":
+						go func() {
+							_ = runCleanupBinaries(runCtx, nil, stdout, stderr, nil)
 						}()
 					case "PING":
 						if stdout != nil {
