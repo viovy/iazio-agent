@@ -146,3 +146,10 @@ func isProcessAlive(pid int) bool {
 	}
 	return exitCode == stillActive
 }
+
+func verifyProcessIdentity(pid int, expectedJobID string, startedAt time.Time) bool {
+	if pid <= 0 || !isProcessAlive(pid) {
+		return false
+	}
+	return !startedAt.IsZero() && time.Since(startedAt) < 24*time.Hour
+}

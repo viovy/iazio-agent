@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 )
 
 type waitResult struct {
@@ -19,10 +20,13 @@ type waitResult struct {
 }
 
 type processEntry struct {
-	cmd  *exec.Cmd
-	done chan struct{}
-	res  waitResult
-	once sync.Once
+	cmd      *exec.Cmd
+	pid      int
+	jobID    string
+	attached bool
+	done     chan struct{}
+	res      waitResult
+	once     sync.Once
 }
 
 // OSRunner executes child processes with their own process group.
@@ -156,8 +160,38 @@ func (r *OSRunner) Start(argv []string) (int, error) {
 	bin := ResolveBinary(argv[0])
 	cmd := exec.Command(bin, argv[1:]...)
 	cmd.Env = AugmentedEnv(os.Environ())
-	cmd.Stdout = r.Stdout
-	cmd.Stderr = r.Stderr
+
+	var jobID string
+	for i := 0; i < len(argv)-1; i++ {
+		if argv[i] == "--job-id" {
+			jobID = argv[i+1]
+			break
+		}
+	}
+
+	stdout := r.Stdout
+	stderr := r.Stderr
+	if jobID != "" {
+		runDir := RunDir(jobID)
+		if err := os.MkdirAll(runDir, 0755); err == nil {
+			logPath := filepath.Join(runDir, "output.log")
+			if logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+				if stdout != nil {
+					stdout = io.MultiWriter(stdout, logFile)
+				} else {
+					stdout = logFile
+				}
+				if stderr != nil {
+					stderr = io.MultiWriter(stderr, logFile)
+				} else {
+					stderr = logFile
+				}
+			}
+		}
+	}
+
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	setProcGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		return 0, err
@@ -169,11 +203,36 @@ func (r *OSRunner) Start(argv []string) (int, error) {
 		r.entries = make(map[int]*processEntry)
 	}
 	r.entries[pid] = &processEntry{
-		cmd:  cmd,
-		done: make(chan struct{}),
+		cmd:   cmd,
+		pid:   pid,
+		jobID: jobID,
+		done:  make(chan struct{}),
 	}
 	r.mu.Unlock()
 	return pid, nil
+}
+
+// Attach registers an existing external or surviving process for waiting/signaling.
+func (r *OSRunner) Attach(pid int, jobID string) error {
+	if pid <= 0 {
+		return errors.New("invalid pid")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.entries == nil {
+		r.entries = make(map[int]*processEntry)
+	}
+	if _, exists := r.entries[pid]; exists {
+		return nil
+	}
+	entry := &processEntry{
+		pid:      pid,
+		jobID:    jobID,
+		attached: true,
+		done:     make(chan struct{}),
+	}
+	r.entries[pid] = entry
+	return nil
 }
 
 // Signal sends a signal (e.g. "TERM", "KILL") to the process group.
@@ -192,17 +251,49 @@ func (r *OSRunner) Wait(pid int) (int, error) {
 	}
 
 	entry.once.Do(func() {
-		err := entry.cmd.Wait()
 		var exitCode int
 		var exitErr *exec.ExitError
-		if err != nil {
-			if errors.As(err, &exitErr) {
-				exitCode = exitErr.ExitCode()
-				err = nil
-			} else {
-				exitCode = -1
+		var err error
+		if entry.cmd != nil {
+			err = entry.cmd.Wait()
+			if err != nil {
+				if errors.As(err, &exitErr) {
+					exitCode = exitErr.ExitCode()
+					err = nil
+				} else {
+					exitCode = -1
+				}
+			}
+		} else if entry.attached {
+			for {
+				if !isProcessAlive(pid) {
+					break
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			if entry.jobID != "" {
+				if st, errLoad := LoadRunState(entry.jobID); errLoad == nil && st.ExitCode != 0 {
+					exitCode = st.ExitCode
+				}
 			}
 		}
+
+		if entry.jobID != "" {
+			if st, loadErr := LoadRunState(entry.jobID); loadErr == nil {
+				if exitCode == 0 && err == nil {
+					st.Status = RunStatusCompleted
+				} else {
+					st.Status = RunStatusFailed
+				}
+				st.ExitCode = exitCode
+				st.UpdatedAt = time.Now()
+				if err != nil {
+					st.Error = err.Error()
+				}
+				_ = SaveRunState(*st)
+			}
+		}
+
 		entry.res = waitResult{exitCode: exitCode, err: err}
 		close(entry.done)
 	})
