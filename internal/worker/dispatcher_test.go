@@ -607,6 +607,90 @@ func TestDispatcher_UnresolvableWorkspaceRefusal(t *testing.T) {
 	}
 }
 
+func TestDispatcher_UnresolvableRelativeWorkspaceRefusal(t *testing.T) {
+	ctx := context.Background()
+	var completedError string
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:      "job-relative-ghost-path",
+			Type:    JobTypeStoryCreate,
+			Repo:    "unknown-repo-relative",
+			Payload: json.RawMessage(`{}`),
+		}, nil
+	}
+	cp.completeFunc = func(ctx context.Context, jobID string, req CompleteRequest) error {
+		completedError = req.Error
+		return nil
+	}
+
+	invokerCalled := false
+	inv := &mockInvokerWithWorkDirCapture{
+		onWithWorkDir: func(dir string) {
+			invokerCalled = true
+		},
+	}
+
+	d := NewDispatcher(cp, inv, "pc1-wsl")
+	d.SetWorktreeResolver(func(repo string) string {
+		return ""
+	})
+
+	processed, err := d.PollAndProcess(ctx)
+	if err == nil {
+		t.Fatal("expected error for unresolvable relative workspace, got nil")
+	}
+	if !processed {
+		t.Fatal("expected job to be processed (handled)")
+	}
+	if invokerCalled {
+		t.Fatal("invoker should not be called when workspace does not exist on disk")
+	}
+	if !strings.Contains(completedError, "ERR_WORKSPACE_NOT_FOUND") {
+		t.Fatalf("expected ERR_WORKSPACE_NOT_FOUND, got %q", completedError)
+	}
+}
+
+func TestDispatcher_ValidExistingAbsoluteWorkspace(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:      "job-valid-abs-path",
+			Type:    JobTypePromptExecute,
+			Repo:    tmpDir,
+			Payload: json.RawMessage(`{}`),
+		}, nil
+	}
+	cp.completeFunc = func(ctx context.Context, jobID string, req CompleteRequest) error {
+		return nil
+	}
+
+	var capturedWorkDir string
+	inv := &mockInvokerWithWorkDirCapture{
+		onWithWorkDir: func(dir string) {
+			capturedWorkDir = dir
+		},
+	}
+
+	d := NewDispatcher(cp, inv, "pc1-wsl")
+	d.SetWorktreeResolver(func(repo string) string {
+		return ""
+	})
+
+	processed, err := d.PollAndProcess(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error for existing directory: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected job to be processed")
+	}
+	if capturedWorkDir != tmpDir {
+		t.Fatalf("expected workdir %q, got %q", tmpDir, capturedWorkDir)
+	}
+}
+
 type mockInvokerWithWorkDirCapture struct {
 	mockInvoker
 	onWithWorkDir func(dir string)
