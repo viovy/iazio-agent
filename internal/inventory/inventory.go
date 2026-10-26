@@ -367,7 +367,10 @@ func toolName(file, goos string) string {
 }
 
 func executable(info os.FileInfo, name, goos string) bool {
-	if info.IsDir() || !info.Mode().IsRegular() {
+	if info.IsDir() {
+		return false
+	}
+	if !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
 		return false
 	}
 	if goos == "windows" {

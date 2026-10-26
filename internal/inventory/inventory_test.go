@@ -292,3 +292,124 @@ func TestInspectToolServiceDarwin(t *testing.T) {
 	}
 }
 
+func TestScanSymlinkDetectionAndRejection(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping symlink test on windows")
+	}
+	dir := t.TempDir()
+	realBin := filepath.Join(dir, "real-autopilot")
+	writeExe(t, realBin)
+
+	symlinkBin := filepath.Join(dir, "autopilot")
+	if err := os.Symlink(realBin, symlinkBin); err != nil {
+		t.Fatal(err)
+	}
+
+	iazioBin := filepath.Join(dir, "iazio-agent")
+	writeExe(t, iazioBin)
+
+	tools := Scan([]string{dir})
+	var foundAutopilot, foundIazio bool
+	for _, tool := range tools {
+		if tool.Name == "autopilot" {
+			foundAutopilot = true
+			if !tool.IsSymlink {
+				t.Errorf("expected autopilot to be marked as symlink")
+			}
+			if tool.Status != "SYMLINK_REJECTED" {
+				t.Errorf("expected autopilot status SYMLINK_REJECTED, got %s", tool.Status)
+			}
+			if tool.Executable {
+				t.Errorf("expected autopilot Executable to be false")
+			}
+		}
+		if tool.Name == "iazio-agent" {
+			foundIazio = true
+			if tool.IsSymlink {
+				t.Errorf("expected iazio-agent not to be marked as symlink")
+			}
+			if tool.Status != "OK" {
+				t.Errorf("expected iazio-agent status OK, got %s", tool.Status)
+			}
+		}
+	}
+	if !foundAutopilot {
+		t.Errorf("autopilot tool not found in scan")
+	}
+	if !foundIazio {
+		t.Errorf("iazio-agent tool not found in scan")
+	}
+
+	// Test InspectInstalledVersion rejects symlink
+	ver := InspectInstalledVersion(symlinkBin)
+	if ver != "" {
+		t.Errorf("expected empty version for symlink, got %s", ver)
+	}
+}
+
+func TestInspectToolCommitSHAFallbacks(t *testing.T) {
+	dir := t.TempDir()
+	binPath := filepath.Join(dir, "tool-with-sha")
+	writeExe(t, binPath)
+
+	// Sidecar with valid hex SHA
+	hexSHA := "abcdef1234567890abcdef1234567890abcdef12"
+	if err := os.WriteFile(binPath+".version", []byte(hexSHA), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sha := InspectToolCommitSHA(binPath)
+	if sha != hexSHA {
+		t.Fatalf("expected sha %s, got %s", hexSHA, sha)
+	}
+
+	// Cached hit
+	shaCached := InspectToolCommitSHA(binPath)
+	if shaCached != hexSHA {
+		t.Fatalf("expected cached sha %s, got %s", hexSHA, shaCached)
+	}
+
+	// Missing binary
+	if shaNone := InspectToolCommitSHA(filepath.Join(dir, "nonexistent")); shaNone != "" {
+		t.Fatalf("expected empty sha for missing file, got %s", shaNone)
+	}
+}
+
+func TestFindPIDsExecutingFile(t *testing.T) {
+	pids := FindPIDsExecutingFile("/nonexistent/file/path")
+	if len(pids) != 0 {
+		t.Fatalf("expected 0 pids for nonexistent file, got %v", pids)
+	}
+}
+
+func TestExecutableVariations(t *testing.T) {
+	dir := t.TempDir()
+	binPath := filepath.Join(dir, "test.exe")
+	if err := os.WriteFile(binPath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(binPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !executable(fi, "test.exe", "windows") {
+		t.Errorf("expected test.exe to be executable on windows")
+	}
+	if !executable(fi, "test.bat", "windows") {
+		t.Errorf("expected test.bat to be executable on windows")
+	}
+	if !executable(fi, "test.cmd", "windows") {
+		t.Errorf("expected test.cmd to be executable on windows")
+	}
+	if executable(fi, "test.txt", "windows") {
+		t.Errorf("expected test.txt not to be executable on windows")
+	}
+
+	dirFi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executable(dirFi, "dir", "linux") {
+		t.Errorf("expected directory not to be executable")
+	}
+}
+
