@@ -587,8 +587,20 @@ func (w *Watchdog) appendResumeLog(job TrackedJob) {
 	}
 	defer f.Close()
 
-	msg := fmt.Sprintf("\n[iazio-watchdog] Detected interruption/stall of job %s (PID %d, exit code %d). Autonomously resuming execution in-place (attempt %d/%d) with conversation %s...\n",
-		job.JobID, job.PID, job.ExitCode, job.ResumeCount, w.maxResumes, job.ConversationID)
+	prevErr := job.LastError
+	if prevErr == "" {
+		prevErr = "none"
+	}
+	cid := job.ConversationID
+	if cid == "" {
+		cid = "none"
+	}
+	msg := fmt.Sprintf("\n================================================================================\n"+
+		"[iazio] Starting Attempt #%d (trigger_reason: watchdog_auto_resume, previous_exit_code: %d, previous_error: %s, conversation_id: %s, timestamp: %s)\n"+
+		"================================================================================\n"+
+		"[iazio-watchdog] Detected interruption/stall of job %s (PID %d, exit code %d). Autonomously resuming execution in-place (attempt %d/%d) with conversation %s...\n",
+		job.ResumeCount+1, job.ExitCode, prevErr, cid, time.Now().UTC().Format(time.RFC3339),
+		job.JobID, job.PID, job.ExitCode, job.ResumeCount+1, w.maxResumes, job.ConversationID)
 	_, _ = f.WriteString(msg)
 }
 
