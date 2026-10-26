@@ -2083,6 +2083,27 @@ func healGitRepo(ctx context.Context, repoPath string) {
 	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "update", "--init", "--recursive").Run()
 }
 
+func stripSlotSuffix(name string) string {
+	base := filepath.Base(strings.TrimSpace(name))
+	base = strings.TrimSuffix(base, "/")
+	base = strings.TrimSuffix(base, "\\")
+	idx := strings.LastIndex(base, "-")
+	if idx > 0 && idx < len(base)-1 {
+		suffix := base[idx+1:]
+		isNum := true
+		for _, c := range suffix {
+			if c < '0' || c > '9' {
+				isNum = false
+				break
+			}
+		}
+		if isNum {
+			return base[:idx]
+		}
+	}
+	return base
+}
+
 // resolveWorktreeFromHostDetail resolves a target worktree from the host's registered repos.
 func resolveWorktreeFromHostDetail(detail controlplane.HostDetail, repoName string) string {
 	clean := strings.TrimSpace(repoName)
@@ -2131,6 +2152,29 @@ func resolveWorktreeFromHostDetail(detail controlplane.HostDetail, repoName stri
 		gmPath := filepath.Join(wt, ".gitmodules")
 		if b, err := os.ReadFile(gmPath); err == nil {
 			if strings.Contains(string(b), clean) {
+				return wt
+			}
+		}
+	}
+	// 4. Slot family fallback: if clean contains a slot suffix or matches umbrella/meta-repo,
+	// match any registered worktree on this host with the same root base name.
+	cleanBase := stripSlotSuffix(clean)
+	if cleanBase != "" && cleanBase != "." && cleanBase != "root" {
+		for _, r := range detail.Repos {
+			wt := r.WorktreePath
+			if wt == "" {
+				wt = r.Path
+			}
+			if wt != "" && stripSlotSuffix(wt) == cleanBase && r.GlobalQueueAllocationEnabled {
+				return wt
+			}
+		}
+		for _, r := range detail.Repos {
+			wt := r.WorktreePath
+			if wt == "" {
+				wt = r.Path
+			}
+			if wt != "" && stripSlotSuffix(wt) == cleanBase {
 				return wt
 			}
 		}
@@ -2206,6 +2250,16 @@ func resolveWorktreeForRepo(ctx context.Context, getter hostDetailGetter, host, 
 			if _, err := os.Stat(filepath.Join(cand, clean)); err == nil {
 				_ = os.Setenv("IAZIO_FLEET_ROOT", cand)
 				return cand
+			}
+		}
+	}
+	if strings.Contains(clean, "meta-repo") {
+		for _, cand := range candidateRoots {
+			if strings.Contains(filepath.Base(cand), "meta-repo") {
+				if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
+					_ = os.Setenv("IAZIO_FLEET_ROOT", cand)
+					return cand
+				}
 			}
 		}
 	}

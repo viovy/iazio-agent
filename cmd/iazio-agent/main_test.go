@@ -1796,6 +1796,11 @@ func TestResolveWorktreeFromHostDetail(t *testing.T) {
 	if wt := resolveWorktreeFromHostDetail(detail, "nonexistent"); wt != "" {
 		t.Fatalf("expected empty for nonexistent, got %s", wt)
 	}
+
+	// 6. Cross-host slot family fallback (e.g. umbrella-root-04 from another host falls back to registered umbrella-root)
+	if wt := resolveWorktreeFromHostDetail(detail, "/Users/romeo/work/umbrella-root-04"); wt != primaryWT {
+		t.Fatalf("expected primaryWT %s for foreign umbrella-root-04 slot, got %s", primaryWT, wt)
+	}
 }
 
 func TestOnJob_RepoBusyRefusal(t *testing.T) {

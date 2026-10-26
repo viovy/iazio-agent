@@ -212,6 +212,55 @@ func TestWatchdog_MaxResumesExceeded(t *testing.T) {
 	}
 }
 
+func TestWatchdog_EmptyConversationResumeGuard(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "watchdog.json")
+	runner := newMockRunner()
+
+	var resumeSpawns atomic.Int32
+	spawner := func(ctx context.Context, job TrackedJob) (int, error) {
+		resumeSpawns.Add(1)
+		return 3001, nil
+	}
+
+	w := New(Options{
+		StateFile:  stateFile,
+		Runner:     runner,
+		Spawner:    spawner,
+		MaxResumes: 5,
+	})
+
+	// Job with empty conversation ID and prompt "resume" (like job-1500)
+	w.Track(TrackedJob{
+		JobID:          "job-empty-conv",
+		PID:            1010,
+		Status:         StatusRunning,
+		Prompt:         "resume",
+		ConversationID: "",
+		WorktreePath:   tmpDir,
+	})
+
+	// Simulate unexpected termination of PID 1010
+	w.CheckInterrupted(context.Background())
+
+	got, err := w.GetJob("job-empty-conv")
+	if err != nil {
+		t.Fatalf("get job error: %v", err)
+	}
+	if got.Status != StatusFailed {
+		t.Fatalf("expected status FAILED, got %s", got.Status)
+	}
+	if !got.CircuitBreakerTripped {
+		t.Fatalf("expected circuit breaker tripped")
+	}
+	if !strings.Contains(got.LastError, "RESUME_ABORTED_EMPTY_CONVERSATION") {
+		t.Fatalf("expected RESUME_ABORTED_EMPTY_CONVERSATION, got %s", got.LastError)
+	}
+	if resumeSpawns.Load() != 0 {
+		t.Fatalf("expected 0 resume spawns when conversation ID is empty, got %d", resumeSpawns.Load())
+	}
+}
+
 func TestWatchdog_DeadPIDDetection(t *testing.T) {
 	tmpDir := t.TempDir()
 	stateFile := filepath.Join(tmpDir, "watchdog.json")
