@@ -1103,3 +1103,45 @@ func TestDispatcher_HostGateLockedBlocksDispatch(t *testing.T) {
 		t.Errorf("expected completedJob to record error")
 	}
 }
+
+func TestDispatcher_SynchronousHarvestFlushOnCompletion(t *testing.T) {
+	client := newMockControlPlane()
+	client.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:           "job-harvest-1",
+			Type:         JobTypePromptExecute,
+			Repo:         "workspace-fleet",
+			FencingToken: 42,
+			Payload:      json.RawMessage(`{"prompt":"test","conversation_id":"conv-test-99"}`),
+		}, nil
+	}
+	invoker := &mockInvoker{
+		executePromptFunc: func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+			return &harness.PromptExecutionResult{Status: "DONE", Summary: "all tests passed"}, nil
+		},
+	}
+	disp := NewDispatcher(client, invoker, "host-1")
+
+	flushedConv := ""
+	disp.SetHarvestFlusher(func(ctx context.Context, conversationID string) (int, string, error) {
+		flushedConv = conversationID
+		return 15, "mock-sha256-hash", nil
+	})
+
+	processed, err := disp.PollAndProcess(context.Background())
+	if !processed || err != nil {
+		t.Fatalf("PollAndProcess failed: processed=%v, err=%v", processed, err)
+	}
+
+	if flushedConv != "conv-test-99" {
+		t.Errorf("expected flushed conversation conv-test-99, got %s", flushedConv)
+	}
+
+	comp := client.completedJobs["job-harvest-1"]
+	if comp.FinalTurnCount != 15 {
+		t.Errorf("expected FinalTurnCount=15, got %d", comp.FinalTurnCount)
+	}
+	if comp.FinalTranscriptSHA256 != "mock-sha256-hash" {
+		t.Errorf("expected FinalTranscriptSHA256=mock-sha256-hash, got %s", comp.FinalTranscriptSHA256)
+	}
+}

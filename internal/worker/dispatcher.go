@@ -66,9 +66,11 @@ type ClaimRequest struct {
 
 // CompleteRequest reports the final outcome of a job.
 type CompleteRequest struct {
-	FencingToken int64           `json:"fencing_token,omitempty"`
-	Result       json.RawMessage `json:"result,omitempty"`
-	Error        string          `json:"error,omitempty"`
+	FencingToken          int64           `json:"fencing_token,omitempty"`
+	Result                json.RawMessage `json:"result,omitempty"`
+	Error                 string          `json:"error,omitempty"`
+	FinalTurnCount        int             `json:"final_turn_count,omitempty"`
+	FinalTranscriptSHA256 string          `json:"final_transcript_sha256,omitempty"`
 }
 
 // HeartbeatRequest extends the lease of an active claimed job.
@@ -358,6 +360,9 @@ type PreDispatchHook func(ctx context.Context, job *Job) error
 // PostJobHook defines a callback invoked after a job finishes execution and cleanup.
 type PostJobHook func(ctx context.Context, job *Job)
 
+// HarvestFlusher abstracts synchronous conversation flushing to iazio-harvester.
+type HarvestFlusher func(ctx context.Context, conversationID string) (turnCount int, sha string, err error)
+
 // HostExecutionGate coordinates shared execution leases and exclusive maintenance leases.
 type HostExecutionGate interface {
 	AcquireExecutionLease(ctx context.Context, jobID, repoPath string, fencingToken ...int64) (release func(), err error)
@@ -376,6 +381,7 @@ type Dispatcher struct {
 	postJobHook      PostJobHook
 	hostGate         HostExecutionGate
 	jobTimeout       time.Duration
+	flusher          HarvestFlusher
 }
 
 // NewDispatcher constructs a new Dispatcher, optionally accepting a RepoSyncer for immediate post-job sync hooks.
@@ -397,6 +403,11 @@ func NewDispatcher(client ControlPlaneClient, invoker harness.Invoker, hostID st
 // SetJobTimeout sets a custom per-job execution timeout for the Dispatcher.
 func (d *Dispatcher) SetJobTimeout(timeout time.Duration) {
 	d.jobTimeout = timeout
+}
+
+// SetHarvestFlusher configures the synchronous harvest flusher.
+func (d *Dispatcher) SetHarvestFlusher(f HarvestFlusher) {
+	d.flusher = f
 }
 
 // SetSyncer sets or updates the RepoSyncer on the Dispatcher.
@@ -565,12 +576,23 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	switch job.Type {
 	case JobTypeStoryCreate:
 		res, err := invoker.CreateStory(execCtx, job.Payload)
+		finalTurns, finalSHA := d.flushConversationHarvest(ctx, job)
 		if err != nil {
-			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: err.Error()})
+			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{
+				FencingToken:          job.FencingToken,
+				Error:                 err.Error(),
+				FinalTurnCount:        finalTurns,
+				FinalTranscriptSHA256: finalSHA,
+			})
 			return true, err
 		}
 		resBytes, _ := json.Marshal(res)
-		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Result: resBytes})
+		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{
+			FencingToken:          job.FencingToken,
+			Result:                resBytes,
+			FinalTurnCount:        finalTurns,
+			FinalTranscriptSHA256: finalSHA,
+		})
 		if compErr == nil && d.syncer != nil {
 			targetRepo := job.Repo
 			if targetRepo == "" && res != nil {
@@ -620,7 +642,13 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 					return true, err
 				}
 			}
-			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: err.Error()})
+			finalTurns, finalSHA := d.flushConversationHarvest(ctx, job)
+			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{
+				FencingToken:          job.FencingToken,
+				Error:                 err.Error(),
+				FinalTurnCount:        finalTurns,
+				FinalTranscriptSHA256: finalSHA,
+			})
 			return true, err
 		}
 		_, gateSpan := telemetry.StartSpan(ctx, "agent.ase_completion_gate",
@@ -639,8 +667,14 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				})
 			}
 		}
+		finalTurns, finalSHA := d.flushConversationHarvest(ctx, job)
 		resBytes, _ := json.Marshal(res)
-		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Result: resBytes})
+		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{
+			FencingToken:          job.FencingToken,
+			Result:                resBytes,
+			FinalTurnCount:        finalTurns,
+			FinalTranscriptSHA256: finalSHA,
+		})
 		if gateSpan != nil {
 			gateSpan.End()
 		}
@@ -710,4 +744,31 @@ func extractStoryID(texts ...string) string {
 		}
 	}
 	return ""
+}
+
+func extractConversationID(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err == nil {
+		for _, key := range []string{"conversation_id", "active_conversation_id", "session_id"} {
+			if v, ok := m[key].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
+			}
+		}
+	}
+	return ""
+}
+
+func (d *Dispatcher) flushConversationHarvest(ctx context.Context, job *Job) (int, string) {
+	if d.flusher == nil || job == nil {
+		return 0, ""
+	}
+	convID := extractConversationID(job.Payload)
+	if convID == "" {
+		return 0, ""
+	}
+	turns, sha, _ := d.flusher(ctx, convID)
+	return turns, sha
 }
