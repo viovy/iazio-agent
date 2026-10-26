@@ -68,6 +68,7 @@ type Sup struct {
 	sleep               func(time.Duration)
 	signal              func(pid int, sig string) error
 	alive               func(pid int) bool
+	verifyProcess       func(pid int, expectedJobID string, startedAt time.Time) bool
 	fetches             []string
 	halted              bool
 	loopDetector        *LoopDetector
@@ -92,9 +93,10 @@ func New(now func() time.Time) *Sup {
 		pids:         map[string]int{},
 		jobIDs:       map[string]string{},
 		reasons:      map[string]string{},
-		now:          now,
-		sleep:        time.Sleep,
-		alive:        isProcessAlive,
+		now:           now,
+		sleep:         time.Sleep,
+		alive:         isProcessAlive,
+		verifyProcess: verifyProcessIdentity,
 	}
 }
 
@@ -405,7 +407,13 @@ func (s *Sup) ScanAndReattachRuns(r Runner) []RunState {
 			_ = SaveRunState(st)
 			continue
 		}
-		if s.alive != nil && s.alive(st.PID) {
+		isAlive := s.alive != nil && s.alive(st.PID)
+		isVerified := isAlive
+		if isAlive && s.verifyProcess != nil {
+			isVerified = s.verifyProcess(st.PID, st.JobID, st.StartedAt)
+		}
+
+		if isAlive && isVerified {
 			s.mu.Lock()
 			s.locks[st.WorktreePath] = LockRunning
 			s.pids[st.WorktreePath] = st.PID
@@ -424,9 +432,11 @@ func (s *Sup) ScanAndReattachRuns(r Runner) []RunState {
 			}
 			reattached = append(reattached, st)
 		} else {
-			// Process is no longer alive. If exit was not verified exit 0 by harness,
-			// mark as failed to prevent false COMPLETED on crash mid-run.
-			if st.ExitCode == 0 && st.Error == "" {
+			// Process is no longer alive or failed process identity verification (e.g. recycled PID).
+			if isAlive && !isVerified {
+				st.Status = RunStatusFailed
+				st.Error = fmt.Sprintf("pid %d was recycled by unrelated process; harness identity check failed", st.PID)
+			} else if st.ExitCode == 0 && st.Error == "" {
 				st.Status = RunStatusFailed
 				st.Error = "process terminated unexpectedly during agent restart"
 			} else if st.ExitCode != 0 {

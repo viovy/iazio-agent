@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -96,8 +97,11 @@ func TestSup_ScanAndReattachRuns(t *testing.T) {
 
 	sup := New(time.Now)
 
-	// Start a real sleep process that will stay alive during reattach test
-	cmd := exec.Command("sleep", "10")
+	liveJobID := "job-reattach-live"
+	liveWorktree := "/test/repo/live"
+
+	// Start a real harness process that will stay alive during reattach test
+	cmd := exec.Command("sh", "-c", "sleep 10", "iazio-harness-"+liveJobID)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("failed starting sleep process: %v", err)
 	}
@@ -107,8 +111,6 @@ func TestSup_ScanAndReattachRuns(t *testing.T) {
 	}()
 
 	livePID := cmd.Process.Pid
-	liveJobID := "job-reattach-live"
-	liveWorktree := "/test/repo/live"
 
 	// Write running state for live process
 	_ = SaveRunState(RunState{
@@ -163,5 +165,53 @@ func TestSup_ScanAndReattachRuns(t *testing.T) {
 	}
 	if sup.Lock(deadWorktree) != LockCooling {
 		t.Fatalf("expected dead worktree lock to be COOLING_OFF, got %s", sup.Lock(deadWorktree))
+	}
+}
+
+func TestSup_ScanAndReattachRuns_PIDRecycleFenced(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("IAZIO_RUNS_DIR", tmpDir)
+
+	sup := New(time.Now)
+
+	// Start an unrelated process (sleep 10) whose command line has no harness/job affinity
+	cmd := exec.Command("sleep", "10")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed starting process: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	recycledPID := cmd.Process.Pid
+	recycledJobID := "job-recycled-unrelated"
+	recycledWorktree := "/test/repo/recycled"
+
+	_ = SaveRunState(RunState{
+		JobID:        recycledJobID,
+		PID:          recycledPID,
+		WorktreePath: recycledWorktree,
+		Status:       RunStatusRunning,
+		StartedAt:    time.Now().Add(-1 * time.Hour),
+		UpdatedAt:    time.Now().Add(-1 * time.Hour),
+	})
+
+	runner := NewOSRunner()
+	reattached := sup.ScanAndReattachRuns(runner)
+
+	if len(reattached) != 0 {
+		t.Fatalf("expected 0 reattached runs due to PID recycle identity fence, got %d", len(reattached))
+	}
+
+	st, err := LoadRunState(recycledJobID)
+	if err != nil {
+		t.Fatalf("failed loading run state: %v", err)
+	}
+	if st.Status != RunStatusFailed {
+		t.Fatalf("expected recycled job status to be FAILED, got %s", st.Status)
+	}
+	if !strings.Contains(st.Error, "recycled") {
+		t.Fatalf("expected error mentioning recycled, got %q", st.Error)
 	}
 }
