@@ -1076,6 +1076,15 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 
 				convID := ResolveDispatchConversationID(a, lockInfo.ConversationID, lockInfo.StoryID, lockInfo.Status)
 
+				// Phase 2 of Two-Phase Lease Handshake: Acknowledge lease to transition from LEASED to RUNNING
+				if a.LeaseToken != "" {
+					if ackErr := client.AckLease(runCtx, a.ID, a.LeaseToken, os.Getpid(), convID); ackErr != nil {
+						if stderr != nil {
+							fmt.Fprintf(stderr, "[agent] Warning: lease ack failed for job %s: %v\n", a.ID, ackErr)
+						}
+					}
+				}
+
 				// Pre-resume workspace & session sanitization pass
 				if a.WorktreePath != "" {
 					reapRes, reapErr := reaper.ReapWorkspaceOrphansAndLocks(runCtx, a.WorktreePath, convID)
