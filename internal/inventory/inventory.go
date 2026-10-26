@@ -38,8 +38,12 @@ func InvalidateVersionCache(binaryPath string) {
 
 // InspectInstalledVersion returns the semantic or release version of a binary.
 // It checks <path>.version first, then falls back to running --version or version,
-// caching results based on file modtime and size.
+// caching results based on file modtime and size. Rejects symlinked binaries.
 func InspectInstalledVersion(binaryPath string) string {
+	lfi, err := os.Lstat(binaryPath)
+	if err != nil || (lfi.Mode()&os.ModeSymlink != 0) {
+		return ""
+	}
 	fi, err := os.Stat(binaryPath)
 	if err != nil {
 		return ""
@@ -131,6 +135,7 @@ type Tool struct {
 	CommitSHA        string   `json:"commit_sha,omitempty"`
 	Status           string   `json:"status"`
 	Executable       bool     `json:"executable"`
+	IsSymlink        bool     `json:"is_symlink,omitempty"`
 	ServiceInstalled bool     `json:"service_installed,omitempty"`
 	ServiceType      string   `json:"service_type,omitempty"`
 	ServiceStatus    string   `json:"service_status,omitempty"`
@@ -287,11 +292,22 @@ func scan(dirs []string, goos string) []Tool {
 			}
 			seen[name] = true
 			binPath := filepath.Join(dir, ent.Name())
+			isSymlink := ent.Type()&os.ModeSymlink != 0
+			if !isSymlink {
+				if lfi, err := os.Lstat(binPath); err == nil && (lfi.Mode()&os.ModeSymlink != 0) {
+					isSymlink = true
+				}
+			}
+			status := "OK"
+			if isSymlink && (strings.HasPrefix(name, "autopilot") || strings.HasPrefix(name, "iazio")) {
+				status = "SYMLINK_REJECTED"
+			}
 			out = append(out, Tool{
 				Name:       name,
 				Path:       binPath,
-				Status:     "OK",
-				Executable: true,
+				Status:     status,
+				Executable: status == "OK",
+				IsSymlink:  isSymlink,
 			})
 		}
 	}
@@ -351,7 +367,10 @@ func toolName(file, goos string) string {
 }
 
 func executable(info os.FileInfo, name, goos string) bool {
-	if info.IsDir() || !info.Mode().IsRegular() {
+	if info.IsDir() {
+		return false
+	}
+	if !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
 		return false
 	}
 	if goos == "windows" {

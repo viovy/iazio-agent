@@ -47,11 +47,22 @@ func NewOSRunner() *OSRunner {
 }
 
 // ResolveBinary finds the binary on PATH or standard user directories.
+// It verifies symlinks and resolves canonical targets to prevent dangling inode execution.
 func ResolveBinary(name string) string {
 	if filepath.IsAbs(name) {
+		if lfi, err := os.Lstat(name); err == nil && (lfi.Mode()&os.ModeSymlink != 0) {
+			if resolved, err := filepath.EvalSymlinks(name); err == nil {
+				return resolved
+			}
+		}
 		return name
 	}
 	if resolved, err := exec.LookPath(name); err == nil {
+		if lfi, err := os.Lstat(resolved); err == nil && (lfi.Mode()&os.ModeSymlink != 0) {
+			if realPath, err := filepath.EvalSymlinks(resolved); err == nil {
+				return realPath
+			}
+		}
 		return resolved
 	}
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
@@ -67,8 +78,18 @@ func ResolveBinary(name string) string {
 			if runtime.GOOS == "windows" && filepath.Ext(target) == "" {
 				target += ".exe"
 			}
-			if fi, err := os.Stat(target); err == nil && !fi.IsDir() {
-				return target
+			if lfi, err := os.Lstat(target); err == nil && !lfi.IsDir() {
+				if lfi.Mode()&os.ModeSymlink != 0 {
+					if realTarget, err := filepath.EvalSymlinks(target); err == nil {
+						if fi, err := os.Stat(realTarget); err == nil && !fi.IsDir() {
+							return realTarget
+						}
+					}
+					continue
+				}
+				if fi, err := os.Stat(target); err == nil && !fi.IsDir() {
+					return target
+				}
 			}
 		}
 	}
