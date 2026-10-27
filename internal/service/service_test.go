@@ -844,13 +844,21 @@ func TestDevInstallHotSwap(t *testing.T) {
 		t.Fatalf("DevInstall failed: %v", err)
 	}
 
-	dest := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+	dest := filepath.Join(home, ".local", "bin", "iazio-agent")
+	if runtime.GOOS == "windows" {
+		dest = filepath.Join(home, "bin", "iazio-agent.exe")
+	}
 	data, err := os.ReadFile(dest)
 	if err != nil {
 		t.Fatalf("installed binary not found: %v", err)
 	}
 	if !strings.Contains(string(data), "echo dev") {
 		t.Fatalf("unexpected content in installed binary: %s", string(data))
+	}
+	// Verify secondary binary in .iazio/bin was purged
+	secondaryDest := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+	if _, err := os.Stat(secondaryDest); !os.IsNotExist(err) {
+		t.Fatalf("expected secondary binary in .iazio/bin to be purged, got: %v", err)
 	}
 	joined := strings.Join(commands, "\n")
 	if runtime.GOOS == "darwin" {
