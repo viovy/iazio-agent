@@ -67,6 +67,7 @@ type TrackedJob struct {
 	WorktreePath            string           `json:"worktree_path"`
 	DocsHubPath             string           `json:"docs_hub_path,omitempty"`
 	APIURL                  string           `json:"api_url"`
+	Kind                    string           `json:"kind,omitempty"`
 	Engine                  string           `json:"engine"`
 	Prompt                  string           `json:"prompt"`
 	StoryID                 string           `json:"story_id,omitempty"`
@@ -515,16 +516,22 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 		isResumePrompt := strings.EqualFold(strings.TrimSpace(job.Prompt), "resume") ||
 			strings.HasPrefix(strings.TrimSpace(job.Prompt), "/autonomous-story-execution resume")
 		if isResumePrompt {
-			job.Status = StatusFailed
-			job.CircuitBreakerTripped = true
-			job.LastError = fmt.Sprintf("RESUME_ABORTED_EMPTY_CONVERSATION: cannot resume job %s without captured conversation ID", job.JobID)
-			jobCopy := *job
-			w.persistStateLocked()
-			w.mu.Unlock()
-			if w.onJobTerminalFailure != nil {
-				w.onJobTerminalFailure(jobCopy, jobCopy.LastError)
+			if repolock.IsWorktreeDirty(job.WorktreePath) {
+				job.Prompt = "resume and complete current /autonomous-story-execution flow, inspecting existing changes, running tests, review scheme, and git flow"
+			} else if job.StoryID != "" {
+				job.Prompt = fmt.Sprintf("Execute story %s end-to-end using /autonomous-story-execution.", job.StoryID)
+			} else {
+				job.Status = StatusFailed
+				job.CircuitBreakerTripped = true
+				job.LastError = fmt.Sprintf("RESUME_ABORTED_EMPTY_CONVERSATION: cannot resume job %s without captured conversation ID", job.JobID)
+				jobCopy := *job
+				w.persistStateLocked()
+				w.mu.Unlock()
+				if w.onJobTerminalFailure != nil {
+					w.onJobTerminalFailure(jobCopy, jobCopy.LastError)
+				}
+				return
 			}
-			return
 		}
 	}
 
@@ -549,8 +556,12 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 	}
 
 	// Inject structured continuation prompt
+	convDesc := jobCopy.ConversationID
+	if convDesc == "" {
+		convDesc = "(none - unanchored)"
+	}
 	continuationDirective := fmt.Sprintf("\n[ASE AUTO-RESUME CONTINUATION: Attempt %d/%d on conversation %s. Interrupted Reason: %s. Unmet Gates: %v. Continue execution from current workspace state without repeating completed steps.]\n\n",
-		jobCopy.ResumeCount, effectiveMaxResumes, jobCopy.ConversationID, reason, unmetGates)
+		jobCopy.ResumeCount, effectiveMaxResumes, convDesc, reason, unmetGates)
 	jobCopy.Prompt = continuationDirective + jobCopy.Prompt
 
 	// Sanitize workspace and release orphan locks before spawning resume

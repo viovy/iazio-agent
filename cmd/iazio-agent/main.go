@@ -1046,10 +1046,19 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					"--api-url", job.APIURL,
 					"--worktree-path", job.WorktreePath,
 					"--docs-hub-path", job.DocsHubPath,
-					"--kind", "resume",
 				}
 				if job.ConversationID != "" {
-					argv = append(argv, "--resume-conversation", job.ConversationID)
+					argv = append(argv, "--kind", "resume", "--resume-conversation", job.ConversationID)
+				} else {
+					if repolock.IsWorktreeDirty(job.WorktreePath) {
+						argv = append(argv, "--kind", "resume")
+					} else {
+						kind := job.Kind
+						if kind == "" || kind == "resume" {
+							kind = "story_execution"
+						}
+						argv = append(argv, "--kind", kind)
+					}
 				}
 				if job.AttachToolPID > 0 {
 					argv = append(argv, "--attach-tool-pid", strconv.Itoa(job.AttachToolPID))
@@ -1063,16 +1072,33 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				OnOrphanTool: func(job watchdog.TrackedJob) {
 					msg := fmt.Sprintf("\n[ASE-SUPERVISOR] [watchdog.orphan_tool_detected] Harness process (PID %d) terminated, but AI tool process (ToolPID %d, engine: %s) is STILL RUNNING for conversation %s in %s. Attaching new supervisor...\n",
 						job.PID, job.ToolPID, job.Engine, job.ConversationID, job.WorktreePath)
+					if stdout != nil {
+						fmt.Fprint(stdout, msg)
+					}
 					_ = client.PostChunk(runCtx, job.JobID, "stdout", msg)
 				},
 				OnAutoResume: func(job watchdog.TrackedJob, reason string, attempt, max int) {
-					msg := fmt.Sprintf("\n[ASE-SUPERVISOR] [watchdog.auto_resume] Harness process (PID %d) and AI tool terminated. Story incomplete. Auto-resuming session (conversation %s, attempt %d/%d) with prompt \"resume\"...\n",
-						job.PID, job.ConversationID, attempt, max)
+					promptDesc := "resume"
+					if job.ConversationID == "" {
+						if repolock.IsWorktreeDirty(job.WorktreePath) {
+							promptDesc = "complete dirty ASE flow"
+						} else {
+							promptDesc = "restart story flow"
+						}
+					}
+					msg := fmt.Sprintf("\n[ASE-SUPERVISOR] [watchdog.auto_resume] Harness process (PID %d) and AI tool terminated. Story incomplete. Auto-resuming session (conversation: %q, attempt %d/%d, reason: %s) with prompt mode %q...\n",
+						job.PID, job.ConversationID, attempt, max, reason, promptDesc)
+					if stdout != nil {
+						fmt.Fprint(stdout, msg)
+					}
 					_ = client.PostChunk(runCtx, job.JobID, "stdout", msg)
 				},
 				OnJobTerminalFailure: func(job watchdog.TrackedJob, reason string) {
 					msg := fmt.Sprintf("\n[ASE-SUPERVISOR] [watchdog.terminal_failure] Execution terminated permanently for job %s: %s\n",
 						job.JobID, reason)
+					if stderr != nil {
+						fmt.Fprint(stderr, msg)
+					}
 					_ = client.PostChunk(runCtx, job.JobID, "stderr", msg)
 					exitOpts := controlplane.ExitOptions{
 						ExitCode:                 1,
@@ -1260,6 +1286,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					WorktreePath:   a.WorktreePath,
 					DocsHubPath:    a.DocsHubPath,
 					APIURL:         api,
+					Kind:           a.Kind,
 					Engine:         a.Engine,
 					Prompt:         a.Prompt,
 					StoryID:        a.StoryID,
