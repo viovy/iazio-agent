@@ -757,16 +757,20 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 	if run == nil {
 		run = execCommand
 	}
-	if bin == "" {
-		bin = filepath.Join(home, ".iazio", "bin", "iazio-agent")
+	if bin == "" || bin == "iazio-agent" || !filepath.IsAbs(bin) {
 		if runtime.GOOS == "windows" {
-			bin += ".exe"
+			bin = filepath.Join(home, "bin", "iazio-agent.exe")
+		} else {
+			bin = filepath.Join(home, ".local", "bin", "iazio-agent")
 		}
 	}
 
 	if runtime.GOOS == "linux" {
 		cleanStaleBackups(filepath.Join(home, ".iazio", "bin"))
 		cleanStaleBackups(filepath.Join(home, ".local", "bin"))
+		// Purge secondary binary from ~/.iazio/bin/
+		_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-agent"))
+		_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-agent.old"))
 		unitDir := filepath.Join(home, ".config", "systemd", "user")
 		if err := os.MkdirAll(unitDir, 0o755); err != nil {
 			return err
@@ -778,7 +782,8 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 		// Check and reconcile primary service unit
 		expectedService := linuxUnit(bin)
 		data, err := os.ReadFile(serviceFile)
-		if err != nil || !strings.Contains(string(data), "WatchdogSec=") || !strings.Contains(string(data), bin) || !strings.Contains(string(data), "IAZIO_AGENT_NONINTERACTIVE=1") {
+		expectedExec := fmt.Sprintf("ExecStart=%s run", bin)
+		if err != nil || !strings.Contains(string(data), "WatchdogSec=") || !strings.Contains(string(data), expectedExec) || !strings.Contains(string(data), "IAZIO_AGENT_NONINTERACTIVE=1") {
 			if err := os.WriteFile(serviceFile, []byte(expectedService), 0o644); err != nil {
 				return fmt.Errorf("write iazio-agent.service: %w", err)
 			}
@@ -853,7 +858,7 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 			_, isActErr := statusCheckCommand("systemctl", "--user", "is-active", "--quiet", "iazio-agent.service")
 			if isActErr != nil {
 				_ = run("systemctl", "--user", "reset-failed", "iazio-agent.service")
-				_ = run("systemctl", "--user", "start", "iazio-agent.service")
+				_ = run("systemctl", "--user", "restart", "iazio-agent.service")
 			}
 		}
 		return nil
@@ -970,7 +975,10 @@ func DevInstall(srcBinary, home string, run func(name string, args ...string) er
 		return fmt.Errorf("invalid candidate binary: %w", err)
 	}
 
-	destDir := filepath.Join(home, ".iazio", "bin")
+	destDir := filepath.Join(home, ".local", "bin")
+	if runtime.GOOS == "windows" {
+		destDir = filepath.Join(home, "bin")
+	}
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return err
 	}
@@ -983,8 +991,9 @@ func DevInstall(srcBinary, home string, run func(name string, args ...string) er
 	if err := copyBinaryAtomic(srcBinary, dest); err != nil {
 		return fmt.Errorf("atomic binary swap failed: %w", err)
 	}
-	localBin := filepath.Join(home, ".local", "bin", binName)
-	_ = copyBinaryAtomic(srcBinary, localBin)
+	// Purge secondary binary from ~/.iazio/bin/
+	_ = os.Remove(filepath.Join(home, ".iazio", "bin", binName))
+	_ = os.Remove(filepath.Join(home, ".iazio", "bin", binName+".old"))
 
 	// Remove maintenance lock if present
 	_ = os.Remove(filepath.Join(home, ".iazio", "maintenance.lock"))
@@ -992,6 +1001,7 @@ func DevInstall(srcBinary, home string, run func(name string, args ...string) er
 	// Ensure resilience units and configuration are active and reconciled
 	if runtime.GOOS == "linux" && IsSystemdAvailable() {
 		_ = ReconcileServiceConfiguration(home, dest, run)
+		_ = run("systemctl", "--user", "reset-failed", "iazio-agent.service")
 		if err := run("systemctl", "--user", "restart", "iazio-agent.service"); err != nil {
 			return fmt.Errorf("restart service: %w", err)
 		}
@@ -1030,17 +1040,17 @@ func ReviveCheck(home string, run func(name string, args ...string) error) error
 			return nil // Maintenance pause intentionally active
 		}
 	}
-	bin := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+	bin := filepath.Join(home, ".local", "bin", "iazio-agent")
 	if runtime.GOOS == "windows" {
-		bin += ".exe"
+		bin = filepath.Join(home, "bin", "iazio-agent.exe")
 	}
 	_ = ReconcileServiceConfiguration(home, bin, run)
 	if runtime.GOOS == "linux" && IsSystemdAvailable() {
 		_, err := statusCheckCommand("systemctl", "--user", "is-active", "--quiet", "iazio-agent.service")
 		if err != nil {
-			// Inactive! Reset failed and start it.
+			// Inactive! Reset failed and restart it.
 			_ = run("systemctl", "--user", "reset-failed", "iazio-agent.service")
-			return run("systemctl", "--user", "start", "iazio-agent.service")
+			return run("systemctl", "--user", "restart", "iazio-agent.service")
 		}
 	} else if runtime.GOOS == "darwin" {
 		domain := "gui/" + strconv.Itoa(os.Getuid())

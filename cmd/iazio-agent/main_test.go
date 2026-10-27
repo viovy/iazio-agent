@@ -943,15 +943,31 @@ func TestInstallCanonicalBinary(t *testing.T) {
 	t.Setenv("HOME", tmpDir)
 	t.Setenv("USERPROFILE", tmpDir)
 
+	// Pre-create secondary binary to test purging
+	legacyIazioBin := filepath.Join(tmpDir, ".iazio", "bin")
+	_ = os.MkdirAll(legacyIazioBin, 0o755)
+	legacyBin := filepath.Join(legacyIazioBin, "iazio-agent")
+	if runtime.GOOS == "windows" {
+		legacyBin += ".exe"
+	}
+	_ = os.WriteFile(legacyBin, []byte("stale"), 0o755)
+
 	dest, err := installCanonicalBinary()
 	if err != nil {
 		t.Fatalf("installCanonicalBinary failed: %v", err)
 	}
-	if !strings.Contains(dest, filepath.Join(tmpDir, ".iazio", "bin")) {
-		t.Fatalf("unexpected destination: %s", dest)
+	expectedDir := filepath.Join(tmpDir, ".local", "bin")
+	if runtime.GOOS == "windows" {
+		expectedDir = filepath.Join(tmpDir, "bin")
+	}
+	if !strings.Contains(dest, expectedDir) {
+		t.Fatalf("unexpected destination: %s, expected to contain %s", dest, expectedDir)
 	}
 	if _, err := os.Stat(dest); err != nil {
 		t.Fatalf("expected installed binary at %s", dest)
+	}
+	if _, err := os.Stat(legacyBin); err == nil {
+		t.Fatalf("expected legacy binary to be purged at %s", legacyBin)
 	}
 
 	// copyBinary edge cases

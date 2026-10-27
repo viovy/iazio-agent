@@ -69,7 +69,7 @@ func (s *safeWriter) Write(p []byte) (n int, err error) {
 
 func execute(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
 	preflight.HydrateToolchainEnv()
-	ensureCanonicalDualHome()
+	ensureCanonicalSingleHome()
 	if stdout != nil {
 		stdout = &safeWriter{w: stdout}
 	}
@@ -1385,13 +1385,13 @@ func runService(args []string, stdout io.Writer, getenv func(string) string) err
 	}
 	bin := "iazio-agent"
 	if home, err := os.UserHomeDir(); err == nil {
-		canonical := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+		canonicalDir := filepath.Join(home, ".local", "bin")
+		binName := "iazio-agent"
 		if runtime.GOOS == "windows" {
-			canonical += ".exe"
+			canonicalDir = filepath.Join(home, "bin")
+			binName += ".exe"
 		}
-		if _, err := os.Stat(canonical); err == nil {
-			bin = canonical
-		}
+		bin = filepath.Join(canonicalDir, binName)
 	}
 	if !dry && (action == "install" || action == "restart") {
 		installed, err := installCanonicalBinary()
@@ -1624,7 +1624,7 @@ func applyWindows(action, _ string, stdout io.Writer) error {
 	}
 }
 
-func ensureCanonicalDualHome() {
+func ensureCanonicalSingleHome() {
 	if isTesting {
 		return
 	}
@@ -1636,21 +1636,20 @@ func ensureCanonicalDualHome() {
 	if runtime.GOOS == "windows" {
 		binName += ".exe"
 	}
-	dest := filepath.Join(home, ".iazio", "bin", binName)
-	local := filepath.Join(home, ".local", "bin", binName)
+	canonicalDir := filepath.Join(home, ".local", "bin")
+	if runtime.GOOS == "windows" {
+		canonicalDir = filepath.Join(home, "bin")
+	}
+	canonicalPath := filepath.Join(canonicalDir, binName)
 
-	needSync := false
-	if _, err := os.Stat(dest); err != nil {
-		needSync = true
-	}
-	if runtime.GOOS != "windows" {
-		if _, err := os.Stat(local); err != nil {
-			needSync = true
-		}
-	}
-	if needSync {
+	if _, err := os.Stat(canonicalPath); err != nil {
 		_, _ = installCanonicalBinary()
 	}
+
+	// Purge secondary installation binary from everywhere ~/.iazio/bin/
+	legacyDir := filepath.Join(home, ".iazio", "bin")
+	_ = os.Remove(filepath.Join(legacyDir, binName))
+	_ = os.Remove(filepath.Join(legacyDir, binName+".old"))
 }
 
 func installCanonicalBinary() (string, error) {
@@ -1669,11 +1668,16 @@ func installCanonicalBinary() (string, error) {
 	if runtime.GOOS == "windows" {
 		binName += ".exe"
 	}
-	dest := filepath.Join(home, ".iazio", "bin", binName)
+	canonicalDir := filepath.Join(home, ".local", "bin")
+	if runtime.GOOS == "windows" {
+		canonicalDir = filepath.Join(home, "bin")
+	}
+	dest := filepath.Join(canonicalDir, binName)
 	if err := copyBinary(src, dest); err != nil {
 		return "", err
 	}
-	_ = copyBinary(src, filepath.Join(home, ".local", "bin", binName))
+	// Purge secondary installation binary from ~/.iazio/bin/
+	_ = os.Remove(filepath.Join(home, ".iazio", "bin", binName))
 	return dest, nil
 }
 
@@ -1684,21 +1688,27 @@ func copyBinary(src, dest string) error {
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return err
 	}
+	// Unlink existing destination if symlink to prevent write-through
+	if lfi, err := os.Lstat(dest); err == nil && (lfi.Mode()&os.ModeSymlink != 0) {
+		_ = os.Remove(dest)
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	tmp := dest + ".tmp"
+	tmp := fmt.Sprintf("%s.tmp.%d", dest, time.Now().UnixNano())
 	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
 	if err != nil {
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {
 		_ = out.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := out.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, dest)
