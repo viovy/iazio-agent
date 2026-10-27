@@ -514,6 +514,12 @@ func (s *Sup) Tick() []ReapedJob {
 	var reaped []ReapedJob
 	for _, path := range dueTimeout {
 		jobID := s.JobID(path)
+		if jobID != "" {
+			if st, err := LoadRunState(jobID); err == nil && (st.Status == RunStatusCompleted || (st.ExitCode == 0 && st.Status != RunStatusRunning)) {
+				s.MarkIdle(path)
+				continue
+			}
+		}
 		s.Cancel(path, ReasonExecutionTimeout)
 		reaped = append(reaped, ReapedJob{
 			JobID:        jobID,
@@ -523,6 +529,12 @@ func (s *Sup) Tick() []ReapedJob {
 	}
 	for _, path := range dueDied {
 		jobID := s.JobID(path)
+		if jobID != "" {
+			if st, err := LoadRunState(jobID); err == nil && (st.Status == RunStatusCompleted || (st.ExitCode == 0 && st.Status != RunStatusRunning)) {
+				s.MarkIdle(path)
+				continue
+			}
+		}
 		s.Cancel(path, ReasonProcessDied)
 		reaped = append(reaped, ReapedJob{
 			JobID:        jobID,

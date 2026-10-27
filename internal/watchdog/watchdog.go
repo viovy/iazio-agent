@@ -111,6 +111,7 @@ type Watchdog struct {
 	sleep                func(time.Duration)
 	onOrphanTool         func(job TrackedJob)
 	onAutoResume         func(job TrackedJob, reason string, attempt, max int)
+	onJobCompleted       func(job TrackedJob)
 	onJobTerminalFailure func(job TrackedJob, reason string)
 }
 
@@ -127,6 +128,7 @@ type Options struct {
 	Sleep                func(time.Duration)
 	OnOrphanTool         func(job TrackedJob)
 	OnAutoResume         func(job TrackedJob, reason string, attempt, max int)
+	OnJobCompleted       func(job TrackedJob)
 	OnJobTerminalFailure func(job TrackedJob, reason string)
 }
 
@@ -150,7 +152,7 @@ func New(opts Options) *Watchdog {
 		opts.Now = time.Now
 	}
 	if opts.Monitor == nil {
-		opts.Monitor = NewConversationLivenessMonitor(300 * time.Second)
+		opts.Monitor = NewConversationLivenessMonitor(0)
 	}
 	if opts.KillProcess == nil {
 		opts.KillProcess = defaultKillProcess
@@ -169,6 +171,7 @@ func New(opts Options) *Watchdog {
 		sleep:                opts.Sleep,
 		onOrphanTool:         opts.OnOrphanTool,
 		onAutoResume:         opts.OnAutoResume,
+		onJobCompleted:       opts.OnJobCompleted,
 		onJobTerminalFailure: opts.OnJobTerminalFailure,
 	}
 
@@ -345,35 +348,43 @@ func (w *Watchdog) OnProcessExit(jobID string, pid, exitCode int, waitErr error)
 
 	// Clean completion check with "Don't Stop Till Done" ASE Completion Gate
 	if exitCode == 0 && waitErr == nil {
-		gateRes := gate.Verify(gate.GateOptions{
-			WorktreePath:           job.WorktreePath,
-			StoryID:                job.StoryID,
-			RequireTestsPassed:     job.AutoResumePolicy.RequireTestsPassed || (job.StoryID != "" && job.AutoResumePolicy.Enabled),
-			RequireReleaseVerified: job.AutoResumePolicy.RequireReleaseVerified || (job.StoryID != "" && job.AutoResumePolicy.Enabled),
-		})
-		job.ASEGateStatus = map[string]any{
-			"passed":           gateRes.Passed,
-			"unmet_gates":      gateRes.UnmetGates,
-			"git_clean":        gateRes.GitClean,
-			"branch_clean":     gateRes.BranchClean,
-			"submodules_clean": gateRes.SubmodulesClean,
-			"story_done":       gateRes.StoryDone,
-			"tests_passed":     gateRes.TestsPassed,
-			"release_verified": gateRes.ReleaseVerified,
-		}
+		isASEJob := job.StoryID != "" || job.Kind == "ase" || job.Kind == "story_execution" || job.Kind == "story_run" || job.Kind == "autonomous-story-execution"
+		if isASEJob {
+			gateRes := gate.Verify(gate.GateOptions{
+				WorktreePath:           job.WorktreePath,
+				StoryID:                job.StoryID,
+				RequireTestsPassed:     job.AutoResumePolicy.RequireTestsPassed || (job.StoryID != "" && job.AutoResumePolicy.Enabled),
+				RequireReleaseVerified: job.AutoResumePolicy.RequireReleaseVerified || (job.StoryID != "" && job.AutoResumePolicy.Enabled),
+			})
+			job.ASEGateStatus = map[string]any{
+				"passed":           gateRes.Passed,
+				"unmet_gates":      gateRes.UnmetGates,
+				"git_clean":        gateRes.GitClean,
+				"branch_clean":     gateRes.BranchClean,
+				"submodules_clean": gateRes.SubmodulesClean,
+				"story_done":       gateRes.StoryDone,
+				"tests_passed":     gateRes.TestsPassed,
+				"release_verified": gateRes.ReleaseVerified,
+			}
 
-		if !gateRes.Passed {
-			job.Status = StatusAutoResuming
-			job.LastError = fmt.Sprintf("incomplete_ase_flow: unmet gates: %v", gateRes.UnmetGates)
-			w.persistStateLocked()
-			w.mu.Unlock()
-			w.attemptResumeWithReason(jobID, "incomplete_ase_flow", gateRes.UnmetGates)
-			return
+			if !gateRes.Passed {
+				job.Status = StatusAutoResuming
+				job.LastError = fmt.Sprintf("incomplete_ase_flow: unmet gates: %v", gateRes.UnmetGates)
+				w.persistStateLocked()
+				w.mu.Unlock()
+				w.attemptResumeWithReason(jobID, "incomplete_ase_flow", gateRes.UnmetGates)
+				return
+			}
 		}
 
 		job.Status = StatusCompleted
+		jobCopy := *job
+		onJobCompleted := w.onJobCompleted
 		w.persistStateLocked()
 		w.mu.Unlock()
+		if onJobCompleted != nil {
+			onJobCompleted(jobCopy)
+		}
 		return
 	}
 
@@ -679,24 +690,23 @@ func (w *Watchdog) CheckInterrupted(ctx context.Context) []TrackedJob {
 
 		// Liveness and stall detection for active processes
 		if job.PID > 0 && w.isAlive(job.PID) && w.monitor != nil {
-			stallSec := job.StallTimeoutSec
-			if stallSec <= 0 {
-				stallSec = int(w.monitor.StallTimeout.Seconds())
-			}
 			mon := *w.monitor
-			mon.StallTimeout = time.Duration(stallSec) * time.Second
+			if job.StallTimeoutSec > 0 {
+				mon.StallTimeout = time.Duration(job.StallTimeoutSec) * time.Second
+			}
 
 			snap := mon.CheckLiveness(job.WorktreePath, job.ConversationID, job.PID, job.StartedAt)
 			job.IdleSeconds = snap.IdleDurationSeconds
 			job.LastActivityAt = snap.LastActivityTime
 
-			if snap.IsStalled {
+			// Only terminate for stall if monitor has a positive stall timeout configured and stall was detected
+			if mon.StallTimeout > 0 && snap.IsStalled {
 				// Capture diagnostics and gracefully terminate hung process
 				if w.killProcess != nil {
 					_ = w.killProcess(job.PID)
 				}
 				job.Status = StatusAutoResuming
-				job.LastError = fmt.Sprintf("conversation_stalled: no activity for %.0fs (exceeded %ds stall timeout)", snap.IdleDurationSeconds, stallSec)
+				job.LastError = fmt.Sprintf("conversation_stalled: no activity for %.0fs (exceeded %ds stall timeout)", snap.IdleDurationSeconds, int(mon.StallTimeout.Seconds()))
 				job.UpdatedAt = now
 				toResume = append(toResume, resumeReq{jobID: id, reason: "conversation_stalled"})
 				continue
@@ -807,6 +817,28 @@ func (w *Watchdog) IsTracked(jobID string) bool {
 	defer w.mu.Unlock()
 	j, ok := w.jobs[jobID]
 	return ok && j != nil && j.Status != StatusCompleted && j.Status != StatusFailed
+}
+
+// JobStatus returns the current status string of a job if known.
+func (w *Watchdog) JobStatus(jobID string) (string, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	j, ok := w.jobs[jobID]
+	if ok && j != nil {
+		return j.Status, true
+	}
+	return "", false
+}
+
+// AbortJob marks a job as permanently failed so watchdog will not auto-resume it.
+func (w *Watchdog) AbortJob(jobID, reason string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if j, ok := w.jobs[jobID]; ok && j != nil {
+		j.Status = StatusFailed
+		j.LastError = reason
+		w.persistStateLocked()
+	}
 }
 
 // NotifyWatchdog pings systemd sd_notify WATCHDOG=1 if NOTIFY_SOCKET is set.

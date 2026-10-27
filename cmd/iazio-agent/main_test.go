@@ -2873,3 +2873,106 @@ func TestAgent_AgyToolDiscoveryAndTerminalExitIntegration(t *testing.T) {
 	}
 }
 
+func TestIntegration_DiscardCommand_CancelsRunningJob_CleansGitRepoAndRepolock(t *testing.T) {
+	repoDir := t.TempDir()
+
+	// 1. Initialize real git repository with initial commit
+	runCmd := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", repoDir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\noutput: %s", args, err, string(out))
+		}
+	}
+	runCmd("init")
+	runCmd("config", "user.email", "test@test.local")
+	runCmd("config", "user.name", "Test User")
+	runCmd("checkout", "-b", "main")
+	trackedFile := filepath.Join(repoDir, "README.md")
+	if err := os.WriteFile(trackedFile, []byte("# Initial\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd("add", "README.md")
+	runCmd("commit", "-m", "initial commit")
+
+	// 2. Dirty the working directory (modified file + untracked file + untracked nested dir)
+	if err := os.WriteFile(trackedFile, []byte("# Modified uncommitted\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	untrackedFile := filepath.Join(repoDir, "untracked.txt")
+	if err := os.WriteFile(untrackedFile, []byte("garbage\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	untrackedDir := filepath.Join(repoDir, "nested-untracked")
+	if err := os.MkdirAll(untrackedDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(untrackedDir, "nested.bin"), []byte("bin"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Acquire repolock
+	lockHandle, err := repolock.Acquire(repoDir, repolock.LockInfo{
+		JobID: "job-discard-test",
+		PID:   os.Getpid(),
+	}, func(int) bool { return true })
+	if err != nil {
+		t.Fatalf("failed to acquire repolock: %v", err)
+	}
+	_ = lockHandle
+
+	// 4. Register running job in supervisor and watchdog
+	sup := supervisor.New(time.Now)
+	if err := sup.Spawn(nil, "job-discard-test", "http://127.0.0.1:8080", repoDir, repoDir, ""); err != nil {
+		t.Fatalf("failed to spawn in supervisor: %v", err)
+	}
+
+	stateFile := filepath.Join(t.TempDir(), "wd-discard.json")
+	wd := watchdog.New(watchdog.Options{
+		StateFile: stateFile,
+		IsAlive:   func(pid int) bool { return pid == os.Getpid() },
+	})
+	wd.Track(watchdog.TrackedJob{
+		JobID:        "job-discard-test",
+		PID:          os.Getpid(),
+		WorktreePath: repoDir,
+	})
+
+	// 5. Execute healGitRepo directly as FORCE_CLEAN_GIT does
+	for _, rj := range sup.RunningJobs() {
+		if rj.WorktreePath == repoDir || filepath.Base(rj.WorktreePath) == filepath.Base(repoDir) {
+			sup.Cancel(rj.WorktreePath, "FORCE_CLEAN_GIT")
+			if wd != nil {
+				wd.AbortJob(rj.JobID, "FORCE_CLEAN_GIT")
+			}
+		}
+	}
+	healGitRepo(context.Background(), repoDir)
+
+	// 6. Verify:
+	// A. Supervisor cancelled
+	if len(sup.RunningJobs()) != 0 {
+		t.Errorf("expected 0 running jobs in supervisor after discard, got %d", len(sup.RunningJobs()))
+	}
+
+	// B. Watchdog aborted
+	st, ok := wd.JobStatus("job-discard-test")
+	if !ok || st != watchdog.StatusFailed {
+		t.Errorf("expected watchdog status FAILED, got %v (ok=%v)", st, ok)
+	}
+
+	// C. Git status is 100% clean
+	cmd := exec.Command("git", "-C", repoDir, "status", "--porcelain")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git status failed: %v", err)
+	}
+	if strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("expected git status --porcelain to be completely empty/clean, got:\n%s", string(out))
+	}
+
+	// D. Repolock released
+	if _, err := repolock.Read(repoDir); err == nil {
+		t.Errorf("expected repolock file to be removed after healGitRepo")
+	}
+}
+

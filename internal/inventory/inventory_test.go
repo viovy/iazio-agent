@@ -316,12 +316,20 @@ func TestInspectToolServiceDarwin(t *testing.T) {
 	plistPath := filepath.Join(launchAgentsDir, "io.iazio.iazio-agent.plist")
 	_ = os.WriteFile(plistPath, []byte("<plist></plist>"), 0644)
 
+	harnessPlistPath := filepath.Join(launchAgentsDir, "io.iazio.iazio-harness.plist")
+	_ = os.WriteFile(harnessPlistPath, []byte("<plist></plist>"), 0644)
+
 	installed, svcType, svcStatus, caps := InspectToolService("iazio-agent", "darwin")
-	if !installed || svcType != "launchd_agent" || svcStatus != "installed" {
-		t.Fatalf("expected launchd_agent, got: %v, %s, %s", installed, svcType, svcStatus)
+	if !installed || svcType != "user_service" || svcStatus != "installed" {
+		t.Fatalf("expected user_service, got: %v, %s, %s", installed, svcType, svcStatus)
 	}
 	if len(caps) == 0 {
 		t.Fatalf("expected non-empty caps on darwin launchd")
+	}
+
+	hInstalled, hType, hStatus, _ := InspectToolService("iazio-harness", "darwin")
+	if !hInstalled || hType != "user_service" || hStatus != "installed" {
+		t.Fatalf("expected iazio-harness user_service, got: %v, %s, %s", hInstalled, hType, hStatus)
 	}
 }
 
@@ -443,6 +451,48 @@ func TestExecutableVariations(t *testing.T) {
 	}
 	if executable(dirFi, "dir", "linux") {
 		t.Errorf("expected directory not to be executable")
+	}
+}
+
+func TestScanSymlinkPrecedence_RealBinaryTakesPrecedenceOverPrecedingSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping symlink test on windows")
+	}
+	dir1 := t.TempDir() // Represents PATH e.g. /usr/local/bin
+	dir2 := t.TempDir() // Represents ~/.iazio/bin
+
+	realBin := filepath.Join(dir2, "iazio-harness")
+	writeExe(t, realBin)
+
+	symlinkBin := filepath.Join(dir1, "iazio-harness")
+	if err := os.Symlink(realBin, symlinkBin); err != nil {
+		t.Fatal(err)
+	}
+
+	tools := Scan([]string{dir1, dir2})
+	var harnessTool *Tool
+	for _, tool := range tools {
+		if tool.Name == "iazio-harness" {
+			h := tool
+			harnessTool = &h
+			break
+		}
+	}
+
+	if harnessTool == nil {
+		t.Fatal("expected iazio-harness to be discovered in scan")
+	}
+	if harnessTool.Status != "OK" {
+		t.Errorf("expected iazio-harness Status OK, got %s", harnessTool.Status)
+	}
+	if !harnessTool.Executable {
+		t.Errorf("expected iazio-harness Executable to be true")
+	}
+	if !harnessTool.Installed {
+		t.Errorf("expected iazio-harness Installed to be true")
+	}
+	if harnessTool.Path != realBin {
+		t.Errorf("expected iazio-harness Path to resolve to real binary %s, got %s", realBin, harnessTool.Path)
 	}
 }
 

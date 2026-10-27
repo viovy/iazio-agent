@@ -190,6 +190,16 @@ func Read(worktree string) (LockInfo, error) {
 	return info, nil
 }
 
+// ForceRelease removes the repository lock file and flock, marking it idle.
+func ForceRelease(worktree string) error {
+	if worktree == "" {
+		return nil
+	}
+	_ = os.Remove(filepath.Join(worktree, ".iazio", "repo.lock"))
+	_ = os.Remove(filepath.Join(worktree, ".iazio", "repo.lock.flock"))
+	return nil
+}
+
 // IsWorktreeDirty checks if a repository worktree has uncommitted modifications or untracked files.
 func IsWorktreeDirty(worktree string) bool {
 	if worktree == "" {
