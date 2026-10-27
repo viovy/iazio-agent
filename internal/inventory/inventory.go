@@ -239,7 +239,7 @@ func InspectToolService(toolName, goos string) (installed bool, svcType string, 
 	return false, "none", "not_installed", nil
 }
 
-// DefaultDirs is the scan order: PATH, ~/.iazio/bin, ~/.local/bin, and on windows the user bin.
+// DefaultDirs is the scan order: PATH, ~/.iazio/bin, ~/.local/bin, ~/.gemini/antigravity-cli/bin, and on windows the user bin.
 func DefaultDirs(pathEnv, home, goos string) []string {
 	var dirs []string
 	if pathEnv != "" {
@@ -249,10 +249,8 @@ func DefaultDirs(pathEnv, home, goos string) []string {
 		dirs = append(dirs,
 			filepath.Join(home, ".iazio", "bin"),
 			filepath.Join(home, ".local", "bin"),
+			filepath.Join(home, ".gemini", "antigravity-cli", "bin"),
 		)
-		if goos == "darwin" {
-			dirs = append(dirs, filepath.Join(home, ".gemini", "antigravity-cli", "bin"))
-		}
 		if goos == "windows" {
 			dirs = append(dirs, filepath.Join(home, "bin"))
 		}
@@ -303,11 +301,15 @@ func scan(dirs []string, goos string) []Tool {
 				status = "SYMLINK_REJECTED"
 			}
 			out = append(out, Tool{
-				Name:       name,
-				Path:       binPath,
-				Status:     status,
-				Executable: status == "OK",
-				IsSymlink:  isSymlink,
+				Name:             name,
+				Path:             binPath,
+				Status:           status,
+				Executable:       status == "OK",
+				IsSymlink:        isSymlink,
+				Installed:        status == "OK",
+				InstallationType: "binary",
+				ActiveState:      "active",
+				ConfigStatus:     "synced",
 			})
 		}
 	}
@@ -386,8 +388,15 @@ func executable(info os.FileInfo, name, goos string) bool {
 
 func match(name string) bool {
 	suite := "meta-" + "repo-tools"
-	return name == "autopilot" || strings.HasPrefix(name, "autopilot-") ||
-		name == "iazio" || strings.HasPrefix(name, "iazio-") || name == suite
+	if name == "autopilot" || strings.HasPrefix(name, "autopilot-") ||
+		name == "iazio" || strings.HasPrefix(name, "iazio-") || name == suite {
+		return true
+	}
+	switch strings.ToLower(name) {
+	case "agy", "mock-agy", "gemini", "cursor-agent", "agent", "opencode", "copilot":
+		return true
+	}
+	return false
 }
 
 // Classify marks OK, BEHIND, or MISSING against expected versions.

@@ -852,3 +852,32 @@ func TestClient_PostEagerReadiness(t *testing.T) {
 		t.Fatalf("expected UP_TO_DATE in payload: %v", receivedBody)
 	}
 }
+
+func TestClient_PostExit(t *testing.T) {
+	var receivedBody map[string]any
+	var receivedPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+
+	c := Client{BaseURL: srv.URL}
+	opts := ExitOptions{
+		ExitCode:                 1,
+		TerminationReasonCode:    "CIRCUIT_BREAKER_TRIPPED",
+		TerminationReasonMessage: "max auto resumes reached",
+	}
+	err := c.PostExit(context.Background(), "job-1537", opts)
+	if err != nil {
+		t.Fatalf("PostExit failed: %v", err)
+	}
+	if receivedPath != "/v1/jobs/job-1537/exit" {
+		t.Fatalf("expected /v1/jobs/job-1537/exit, got %s", receivedPath)
+	}
+	if fmt.Sprintf("%v", receivedBody["termination_reason_code"]) != "CIRCUIT_BREAKER_TRIPPED" {
+		t.Fatalf("expected CIRCUIT_BREAKER_TRIPPED, got %v", receivedBody["termination_reason_code"])
+	}
+}

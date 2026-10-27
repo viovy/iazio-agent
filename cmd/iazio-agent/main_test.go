@@ -21,9 +21,11 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/controlplane"
+	"github.com/viovy/iazio-agent/internal/inventory"
 	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/service"
 	"github.com/viovy/iazio-agent/internal/supervisor"
+	"github.com/viovy/iazio-agent/internal/watchdog"
 	"github.com/viovy/iazio-agent/internal/worker"
 )
 
@@ -2757,6 +2759,117 @@ func TestScanRepoFleetStatus(t *testing.T) {
 	nonGit := t.TempDir()
 	if scanRepoFleetStatus(ctx, nonGit) {
 		t.Errorf("expected non-git dir to return false")
+	}
+}
+
+func TestAgent_AgyToolDiscoveryAndTerminalExitIntegration(t *testing.T) {
+	// 1. Setup mock control plane recording PostExit and Heartbeat
+	var mu sync.Mutex
+	var postedExits []map[string]any
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(controlplane.HeartbeatResponse{Status: "OK"})
+
+		case strings.Contains(r.URL.Path, "/exit"):
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			postedExits = append(postedExits, body)
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	// 2. Setup mock-agy binary in test bin directory
+	binDir := t.TempDir()
+	mockAgyBin := filepath.Join(binDir, "agy")
+	_ = os.WriteFile(mockAgyBin, []byte("#!/bin/sh\necho 'antigravity 1.15.0-mock'\nexit 0\n"), 0755)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// Verify inventory discovers agy
+	home, _ := os.UserHomeDir()
+	dirs := inventory.DefaultDirs(os.Getenv("PATH"), home, runtime.GOOS)
+	found := inventory.Scan(dirs)
+	tools, _ := inventory.Classify(found, nil)
+	foundAgy := false
+	for _, tool := range tools {
+		if tool.Name == "agy" || tool.Name == "mock-agy" {
+			foundAgy = true
+			if !tool.Installed || tool.Status != "OK" {
+				t.Errorf("expected agy tool to be installed and OK, got: %+v", tool)
+			}
+		}
+	}
+	if !foundAgy {
+		t.Errorf("expected inventory to discover agy in %s", binDir)
+	}
+
+	// 3. Verify watchdog terminal failure callback triggers PostExit and frees worktree
+	client := controlplane.Client{BaseURL: srv.URL}
+	sup := supervisor.New(time.Now)
+	repoDir := t.TempDir()
+	if err := sup.Spawn(nil, "job-integration-999", srv.URL, repoDir, "", "token"); err != nil {
+		t.Fatalf("sup.Spawn failed: %v", err)
+	}
+
+	if len(sup.RunningJobs()) != 1 {
+		t.Fatalf("expected 1 running job in supervisor, got %d", len(sup.RunningJobs()))
+	}
+
+	// Create watchdog with OnJobTerminalFailure wired as in main.go
+	stateFile := filepath.Join(t.TempDir(), "wd-state.json")
+	wd := watchdog.New(watchdog.Options{
+		StateFile:  stateFile,
+		IsAlive:    func(pid int) bool { return false },
+		MaxResumes: 2,
+		Spawner: func(ctx context.Context, job watchdog.TrackedJob) (int, error) {
+			return 2000, nil
+		},
+		OnJobTerminalFailure: func(job watchdog.TrackedJob, reason string) {
+			_ = client.PostExit(context.Background(), job.JobID, controlplane.ExitOptions{
+				ExitCode:                 1,
+				Reason:                   "CIRCUIT_BREAKER_TRIPPED",
+				DiagnosticCode:           "CIRCUIT_BREAKER_TRIPPED",
+				ErrorMessage:             "Terminal execution failure: " + reason,
+				TerminationReasonCode:    "CIRCUIT_BREAKER_TRIPPED",
+				TerminationReasonMessage: "Terminal execution failure: " + reason,
+			})
+			sup.MarkIdle(job.WorktreePath)
+		},
+	})
+
+	// Track job and force terminal failure
+	wd.Track(watchdog.TrackedJob{
+		JobID:        "job-integration-999",
+		PID:          1999,
+		WorktreePath: repoDir,
+		ResumeCount:  2, // already at max resumes
+	})
+
+	// Trigger exit: resume count >= max resumes, trips terminal failure
+	wd.OnProcessExit("job-integration-999", 1999, 1, errors.New("fatal crash"))
+
+	// Verify supervisor marked idle
+	if len(sup.RunningJobs()) != 0 {
+		t.Errorf("expected supervisor RunningJobs to be empty after terminal failure, got %d", len(sup.RunningJobs()))
+	}
+
+	// Verify PostExit reached control plane
+	mu.Lock()
+	defer mu.Unlock()
+	if len(postedExits) != 1 {
+		t.Fatalf("expected 1 PostExit call, got %d", len(postedExits))
+	}
+	if postedExits[0]["reason"] != "CIRCUIT_BREAKER_TRIPPED" {
+		t.Errorf("expected reason CIRCUIT_BREAKER_TRIPPED, got %v", postedExits[0]["reason"])
 	}
 }
 

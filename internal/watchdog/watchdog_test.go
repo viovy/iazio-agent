@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -258,6 +259,113 @@ func TestWatchdog_EmptyConversationResumeGuard(t *testing.T) {
 	}
 	if resumeSpawns.Load() != 0 {
 		t.Fatalf("expected 0 resume spawns when conversation ID is empty, got %d", resumeSpawns.Load())
+	}
+}
+
+func TestWatchdog_EmptyConversation_DirtyWorktree_RecoversPrompt(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "watchdog.json")
+	runner := newMockRunner()
+
+	// Init git repo and create uncommitted file
+	_ = exec.Command("git", "init", tmpDir).Run()
+	_ = exec.Command("git", "-C", tmpDir, "config", "user.name", "Test").Run()
+	_ = exec.Command("git", "-C", tmpDir, "config", "user.email", "test@test.local").Run()
+	_ = os.WriteFile(filepath.Join(tmpDir, "dirty.txt"), []byte("dirty content"), 0644)
+
+	var resumeSpawns atomic.Int32
+	var spawnedPrompt string
+	spawner := func(ctx context.Context, job TrackedJob) (int, error) {
+		resumeSpawns.Add(1)
+		spawnedPrompt = job.Prompt
+		return 3002, nil
+	}
+
+	w := New(Options{
+		StateFile:  stateFile,
+		Runner:     runner,
+		Spawner:    spawner,
+		MaxResumes: 5,
+	})
+
+	w.Track(TrackedJob{
+		JobID:          "job-dirty-recovery",
+		PID:            1011,
+		Status:         StatusRunning,
+		Prompt:         "resume",
+		ConversationID: "",
+		WorktreePath:   tmpDir,
+	})
+
+	// Simulate unexpected termination of PID 1011
+	w.CheckInterrupted(context.Background())
+
+	got, err := w.GetJob("job-dirty-recovery")
+	if err != nil {
+		t.Fatalf("get job error: %v", err)
+	}
+	if got.Status != StatusRunning {
+		t.Fatalf("expected status RUNNING after auto-resume, got %s", got.Status)
+	}
+	if got.CircuitBreakerTripped {
+		t.Fatalf("expected circuit breaker NOT tripped for dirty worktree recovery")
+	}
+	if resumeSpawns.Load() != 1 {
+		t.Fatalf("expected 1 resume spawn, got %d", resumeSpawns.Load())
+	}
+	if !strings.Contains(spawnedPrompt, "complete current /autonomous-story-execution flow") {
+		t.Fatalf("expected dirty flow completion prompt, got: %s", spawnedPrompt)
+	}
+}
+
+func TestWatchdog_EmptyConversation_CleanWorktree_StoryID_RecoversPrompt(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "watchdog.json")
+	runner := newMockRunner()
+
+	var resumeSpawns atomic.Int32
+	var spawnedPrompt string
+	spawner := func(ctx context.Context, job TrackedJob) (int, error) {
+		resumeSpawns.Add(1)
+		spawnedPrompt = job.Prompt
+		return 3003, nil
+	}
+
+	w := New(Options{
+		StateFile:  stateFile,
+		Runner:     runner,
+		Spawner:    spawner,
+		MaxResumes: 5,
+	})
+
+	w.Track(TrackedJob{
+		JobID:          "job-clean-story-recovery",
+		PID:            1012,
+		Status:         StatusRunning,
+		Prompt:         "resume",
+		ConversationID: "",
+		StoryID:        "STORY-NONEXISTENT-9999",
+		WorktreePath:   tmpDir,
+	})
+
+	// Simulate unexpected termination of PID 1012
+	w.CheckInterrupted(context.Background())
+
+	got, err := w.GetJob("job-clean-story-recovery")
+	if err != nil {
+		t.Fatalf("get job error: %v", err)
+	}
+	if got.Status != StatusRunning {
+		t.Fatalf("expected status RUNNING after auto-resume, got %s", got.Status)
+	}
+	if got.CircuitBreakerTripped {
+		t.Fatalf("expected circuit breaker NOT tripped for story ID recovery")
+	}
+	if resumeSpawns.Load() != 1 {
+		t.Fatalf("expected 1 resume spawn, got %d", resumeSpawns.Load())
+	}
+	if !strings.Contains(spawnedPrompt, "Execute story STORY-NONEXISTENT-9999 end-to-end") {
+		t.Fatalf("expected story end-to-end execution prompt, got: %s", spawnedPrompt)
 	}
 }
 
@@ -722,6 +830,48 @@ func TestWatchdog_CircuitBreakerOnZeroProgress(t *testing.T) {
 	}
 	if !strings.Contains(j.LastError, "CIRCUIT_BREAKER_TRIPPED") {
 		t.Errorf("expected LastError to contain CIRCUIT_BREAKER_TRIPPED, got %s", j.LastError)
+	}
+}
+
+func TestWatchdog_OnJobTerminalFailureCallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "watchdog-term-fail.json")
+	var termFailedJob TrackedJob
+	var termFailedReason string
+	var termFailedCalled bool
+
+	w := New(Options{
+		StateFile:  stateFile,
+		IsAlive:    func(pid int) bool { return false },
+		MaxResumes: 2,
+		Spawner: func(ctx context.Context, job TrackedJob) (int, error) {
+			return 2000, nil
+		},
+		OnJobTerminalFailure: func(job TrackedJob, reason string) {
+			termFailedCalled = true
+			termFailedJob = job
+			termFailedReason = reason
+		},
+	})
+
+	w.Track(TrackedJob{
+		JobID:        "job-term",
+		PID:          1999,
+		WorktreePath: tmpDir,
+		ResumeCount:  2, // already at max resumes
+	})
+
+	// Trigger exit: resume count >= max resumes, should trip terminal failure
+	w.OnProcessExit("job-term", 1999, 1, errors.New("fatal crash"))
+
+	if !termFailedCalled {
+		t.Fatalf("expected OnJobTerminalFailure to be called")
+	}
+	if termFailedJob.JobID != "job-term" {
+		t.Errorf("expected jobID job-term, got %s", termFailedJob.JobID)
+	}
+	if !strings.Contains(termFailedReason, "CIRCUIT_BREAKER_TRIPPED") {
+		t.Errorf("expected reason to contain CIRCUIT_BREAKER_TRIPPED, got %s", termFailedReason)
 	}
 }
 

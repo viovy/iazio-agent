@@ -589,6 +589,26 @@ func (c Client) DeclineJob(ctx context.Context, jobID, reason string) error {
 	})
 }
 
+// ExitOptions describes process termination details reported to the control plane.
+type ExitOptions struct {
+	ExitCode                 int      `json:"exit_code"`
+	TerminationReasonCode    string   `json:"termination_reason_code,omitempty"`
+	TerminationReasonMessage string   `json:"termination_reason_message,omitempty"`
+	DiagnosticCode           string   `json:"diagnostic_code,omitempty"`
+	Reason                   string   `json:"reason,omitempty"`
+	ErrorMessage             string   `json:"error_message,omitempty"`
+	Remediation              string   `json:"remediation,omitempty"`
+	Resumable                bool     `json:"resumable"`
+	NonResumableReason       string   `json:"non_resumable_reason,omitempty"`
+	WorkspaceDirtyFiles      []string `json:"workspace_dirty_files,omitempty"`
+}
+
+// PostExit reports the terminal exit of a job to POST /v1/jobs/{job_id}/exit.
+func (c Client) PostExit(ctx context.Context, jobID string, opts ExitOptions) error {
+	path := "/v1/jobs/" + strings.TrimSpace(jobID) + "/exit"
+	return c.post(ctx, path, opts)
+}
+
 // AckLease completes Phase 2 of the two-phase lease handshake.
 func (c Client) AckLease(ctx context.Context, jobID, leaseToken string, pid int, activeConvID string) error {
 	payload := map[string]any{

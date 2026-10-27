@@ -88,6 +88,7 @@ func TestDefaultDirsOrder(t *testing.T) {
 		second,
 		filepath.Join(home, ".iazio", "bin"),
 		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, ".gemini", "antigravity-cli", "bin"),
 	}
 	if len(got) != len(wantPrefix) {
 		t.Fatalf("%v", got)
@@ -100,6 +101,38 @@ func TestDefaultDirsOrder(t *testing.T) {
 	win := DefaultDirs("", home, "windows")
 	if win[len(win)-1] != filepath.Join(home, "bin") {
 		t.Fatalf("%v", win)
+	}
+}
+
+func TestScanMatchesAgyAndMockAgy(t *testing.T) {
+	dir := t.TempDir()
+	agyBin := filepath.Join(dir, "agy")
+	mockAgyBin := filepath.Join(dir, "mock-agy")
+	_ = os.WriteFile(agyBin, []byte("#!/bin/sh\necho 1.4.8\n"), 0755)
+	_ = os.WriteFile(mockAgyBin, []byte("#!/bin/sh\necho 0.1.0\n"), 0755)
+
+	tools := Scan([]string{dir})
+	foundAgy := false
+	foundMockAgy := false
+	for _, tool := range tools {
+		if tool.Name == "agy" {
+			foundAgy = true
+			if !tool.Installed {
+				t.Errorf("expected agy tool.Installed to be true")
+			}
+		}
+		if tool.Name == "mock-agy" {
+			foundMockAgy = true
+			if !tool.Installed {
+				t.Errorf("expected mock-agy tool.Installed to be true")
+			}
+		}
+	}
+	if !foundAgy {
+		t.Errorf("expected Scan to discover agy binary")
+	}
+	if !foundMockAgy {
+		t.Errorf("expected Scan to discover mock-agy binary")
 	}
 }
 

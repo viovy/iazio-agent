@@ -67,6 +67,7 @@ type TrackedJob struct {
 	WorktreePath            string           `json:"worktree_path"`
 	DocsHubPath             string           `json:"docs_hub_path,omitempty"`
 	APIURL                  string           `json:"api_url"`
+	Kind                    string           `json:"kind,omitempty"`
 	Engine                  string           `json:"engine"`
 	Prompt                  string           `json:"prompt"`
 	StoryID                 string           `json:"story_id,omitempty"`
@@ -107,24 +108,26 @@ type Watchdog struct {
 	now         func() time.Time
 	monitor     *ConversationLivenessMonitor
 	killProcess  func(pid int) error
-	sleep        func(time.Duration)
-	onOrphanTool func(job TrackedJob)
-	onAutoResume func(job TrackedJob, reason string, attempt, max int)
+	sleep                func(time.Duration)
+	onOrphanTool         func(job TrackedJob)
+	onAutoResume         func(job TrackedJob, reason string, attempt, max int)
+	onJobTerminalFailure func(job TrackedJob, reason string)
 }
 
 // Options configures a Watchdog.
 type Options struct {
-	StateFile    string
-	Runner       supervisor.Runner
-	Spawner      Spawner
-	MaxResumes   int
-	IsAlive      func(pid int) bool
-	Now          func() time.Time
-	Monitor      *ConversationLivenessMonitor
-	KillProcess  func(pid int) error
-	Sleep        func(time.Duration)
-	OnOrphanTool func(job TrackedJob)
-	OnAutoResume func(job TrackedJob, reason string, attempt, max int)
+	StateFile            string
+	Runner               supervisor.Runner
+	Spawner              Spawner
+	MaxResumes           int
+	IsAlive              func(pid int) bool
+	Now                  func() time.Time
+	Monitor              *ConversationLivenessMonitor
+	KillProcess          func(pid int) error
+	Sleep                func(time.Duration)
+	OnOrphanTool         func(job TrackedJob)
+	OnAutoResume         func(job TrackedJob, reason string, attempt, max int)
+	OnJobTerminalFailure func(job TrackedJob, reason string)
 }
 
 // New creates a Watchdog.
@@ -154,18 +157,19 @@ func New(opts Options) *Watchdog {
 	}
 
 	w := &Watchdog{
-		stateFile:   opts.StateFile,
-		jobs:        make(map[string]*TrackedJob),
-		runner:      opts.Runner,
-		spawner:     opts.Spawner,
-		maxResumes:  opts.MaxResumes,
-		isAlive:     opts.IsAlive,
-		now:         opts.Now,
-		monitor:     opts.Monitor,
-		killProcess:  opts.KillProcess,
-		sleep:        opts.Sleep,
-		onOrphanTool: opts.OnOrphanTool,
-		onAutoResume: opts.OnAutoResume,
+		stateFile:            opts.StateFile,
+		jobs:                 make(map[string]*TrackedJob),
+		runner:               opts.Runner,
+		spawner:              opts.Spawner,
+		maxResumes:           opts.MaxResumes,
+		isAlive:              opts.IsAlive,
+		now:                  opts.Now,
+		monitor:              opts.Monitor,
+		killProcess:          opts.KillProcess,
+		sleep:                opts.Sleep,
+		onOrphanTool:         opts.OnOrphanTool,
+		onAutoResume:         opts.OnAutoResume,
+		onJobTerminalFailure: opts.OnJobTerminalFailure,
 	}
 
 	// Load existing persistent state if present
@@ -449,8 +453,12 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 		job.Status = StatusFailed
 		job.CircuitBreakerTripped = true
 		job.LastError = fmt.Sprintf("CIRCUIT_BREAKER_TRIPPED: max auto resumes reached (%d attempts, last reason: %s, last exit code: %d)", job.ResumeCount, reason, job.ExitCode)
+		jobCopy := *job
 		w.persistStateLocked()
 		w.mu.Unlock()
+		if w.onJobTerminalFailure != nil {
+			w.onJobTerminalFailure(jobCopy, jobCopy.LastError)
+		}
 		return
 	}
 
@@ -467,8 +475,12 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 			job.Status = StatusFailed
 			job.CircuitBreakerTripped = true
 			job.LastError = fmt.Sprintf("CIRCUIT_BREAKER_TRIPPED: zero forward progress detected across %d consecutive auto-resumes (fingerprint: %s, reason: %s)", job.ConsecutiveZeroProgress, fp, reason)
+			jobCopy := *job
 			w.persistStateLocked()
 			w.mu.Unlock()
+			if w.onJobTerminalFailure != nil {
+				w.onJobTerminalFailure(jobCopy, jobCopy.LastError)
+			}
 			return
 		}
 	} else if fp != "" {
@@ -504,12 +516,22 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 		isResumePrompt := strings.EqualFold(strings.TrimSpace(job.Prompt), "resume") ||
 			strings.HasPrefix(strings.TrimSpace(job.Prompt), "/autonomous-story-execution resume")
 		if isResumePrompt {
-			job.Status = StatusFailed
-			job.CircuitBreakerTripped = true
-			job.LastError = fmt.Sprintf("RESUME_ABORTED_EMPTY_CONVERSATION: cannot resume job %s without captured conversation ID", job.JobID)
-			w.persistStateLocked()
-			w.mu.Unlock()
-			return
+			if repolock.IsWorktreeDirty(job.WorktreePath) {
+				job.Prompt = "resume and complete current /autonomous-story-execution flow, inspecting existing changes, running tests, review scheme, and git flow"
+			} else if job.StoryID != "" {
+				job.Prompt = fmt.Sprintf("Execute story %s end-to-end using /autonomous-story-execution.", job.StoryID)
+			} else {
+				job.Status = StatusFailed
+				job.CircuitBreakerTripped = true
+				job.LastError = fmt.Sprintf("RESUME_ABORTED_EMPTY_CONVERSATION: cannot resume job %s without captured conversation ID", job.JobID)
+				jobCopy := *job
+				w.persistStateLocked()
+				w.mu.Unlock()
+				if w.onJobTerminalFailure != nil {
+					w.onJobTerminalFailure(jobCopy, jobCopy.LastError)
+				}
+				return
+			}
 		}
 	}
 
@@ -534,8 +556,12 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 	}
 
 	// Inject structured continuation prompt
+	convDesc := jobCopy.ConversationID
+	if convDesc == "" {
+		convDesc = "(none - unanchored)"
+	}
 	continuationDirective := fmt.Sprintf("\n[ASE AUTO-RESUME CONTINUATION: Attempt %d/%d on conversation %s. Interrupted Reason: %s. Unmet Gates: %v. Continue execution from current workspace state without repeating completed steps.]\n\n",
-		jobCopy.ResumeCount, effectiveMaxResumes, jobCopy.ConversationID, reason, unmetGates)
+		jobCopy.ResumeCount, effectiveMaxResumes, convDesc, reason, unmetGates)
 	jobCopy.Prompt = continuationDirective + jobCopy.Prompt
 
 	// Sanitize workspace and release orphan locks before spawning resume

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -186,4 +188,23 @@ func Read(worktree string) (LockInfo, error) {
 		return LockInfo{}, err
 	}
 	return info, nil
+}
+
+// IsWorktreeDirty checks if a repository worktree has uncommitted modifications or untracked files.
+func IsWorktreeDirty(worktree string) bool {
+	if worktree == "" {
+		return false
+	}
+	cmd := exec.Command("git", "-C", worktree, "status", "--porcelain")
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	for _, l := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(l)
+		if len(trimmed) > 3 {
+			return true
+		}
+	}
+	return false
 }
