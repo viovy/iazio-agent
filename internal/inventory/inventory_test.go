@@ -333,6 +333,16 @@ func TestInspectToolServiceDarwin(t *testing.T) {
 	}
 }
 
+func TestInspectToolServiceWindows(t *testing.T) {
+	installed, svcType, svcStatus, _ := InspectToolService("iazio-agent", "windows")
+	if !installed {
+		if svcType != "none" || svcStatus != "not_installed" {
+			t.Fatalf("unexpected windows status: %s, %s", svcType, svcStatus)
+		}
+	}
+}
+
+
 func TestScanSymlinkDetectionAndRejection(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping symlink test on windows")

@@ -1278,3 +1278,47 @@ func TestDispatcher_SynchronousHarvestFlushOnCompletion(t *testing.T) {
 		t.Errorf("expected FinalTranscriptSHA256=mock-sha256-hash, got %s", comp.FinalTranscriptSHA256)
 	}
 }
+
+func TestHTTPControlPlaneClient_AckLeaseAndFailover(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/agent/jobs/job-100/ack-lease", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-tok" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/api/v1/agent/jobs/job-100/failover", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-tok" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cli := NewHTTPControlPlaneClient(srv.URL, "test-tok", srv.Client())
+	err := cli.AckLease(context.Background(), "job-100", "lease-abc", 1234, "conv-99")
+	if err != nil {
+		t.Fatalf("AckLease failed: %v", err)
+	}
+
+	err = cli.FailoverJob(context.Background(), "job-100", controlplane.AttemptFailure{
+		Reason: "test-failure",
+	})
+	if err != nil {
+		t.Fatalf("FailoverJob failed: %v", err)
+	}
+
+	// Test error cases
+	badCli := NewHTTPControlPlaneClient(srv.URL, "wrong-tok", srv.Client())
+	if err := badCli.AckLease(context.Background(), "job-100", "lease-abc", 1234, "conv-99"); err == nil {
+		t.Fatalf("expected AckLease unauthorized error")
+	}
+	if err := badCli.FailoverJob(context.Background(), "job-100", controlplane.AttemptFailure{}); err == nil {
+		t.Fatalf("expected FailoverJob unauthorized error")
+	}
+}
+

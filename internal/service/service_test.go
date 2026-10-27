@@ -1503,3 +1503,51 @@ func TestHarnessServiceUnitAndPlist(t *testing.T) {
 		t.Fatalf("expected Restart=always in linux unit, got:\n%s", unit)
 	}
 }
+
+func TestRestartToolService(t *testing.T) {
+	var cmds []string
+	runner := func(name string, args ...string) error {
+		cmds = append(cmds, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	_ = RestartToolService("iazio-agent", runner)
+	_ = RestartToolService("iazio-harness", runner)
+	_ = RestartToolService("autopilot", runner)
+
+	txt := ActionText("linux", "reconcile", "/bin/iazio-agent", false)
+	if !strings.Contains(txt, "reconcile user service") {
+		t.Fatalf("expected reconcile text, got: %s", txt)
+	}
+}
+
+func TestReconcileServiceConfiguration_AllBranches(t *testing.T) {
+	home := t.TempDir()
+	binDir := filepath.Join(home, ".iazio", "bin")
+	_ = os.MkdirAll(binDir, 0755)
+	agentBin := filepath.Join(binDir, "iazio-agent")
+	_ = os.WriteFile(agentBin, []byte("#!/bin/sh\n"), 0755)
+	harnessBin := filepath.Join(binDir, "iazio-harness")
+	_ = os.WriteFile(harnessBin, []byte("#!/bin/sh\n"), 0755)
+
+	var cmds []string
+	runner := func(name string, args ...string) error {
+		cmds = append(cmds, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	err := ReconcileServiceConfiguration(home, agentBin, runner)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Run again when files already exist
+	err = ReconcileServiceConfiguration(home, agentBin, runner)
+	if err != nil {
+		t.Fatalf("unexpected error on second reconcile: %v", err)
+	}
+
+	// ReviveCheck without maintenance lock
+	_ = ReviveCheck(home, runner)
+}
+
