@@ -725,6 +725,48 @@ func TestWatchdog_CircuitBreakerOnZeroProgress(t *testing.T) {
 	}
 }
 
+func TestWatchdog_OnJobTerminalFailureCallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "watchdog-term-fail.json")
+	var termFailedJob TrackedJob
+	var termFailedReason string
+	var termFailedCalled bool
+
+	w := New(Options{
+		StateFile:  stateFile,
+		IsAlive:    func(pid int) bool { return false },
+		MaxResumes: 2,
+		Spawner: func(ctx context.Context, job TrackedJob) (int, error) {
+			return 2000, nil
+		},
+		OnJobTerminalFailure: func(job TrackedJob, reason string) {
+			termFailedCalled = true
+			termFailedJob = job
+			termFailedReason = reason
+		},
+	})
+
+	w.Track(TrackedJob{
+		JobID:        "job-term",
+		PID:          1999,
+		WorktreePath: tmpDir,
+		ResumeCount:  2, // already at max resumes
+	})
+
+	// Trigger exit: resume count >= max resumes, should trip terminal failure
+	w.OnProcessExit("job-term", 1999, 1, errors.New("fatal crash"))
+
+	if !termFailedCalled {
+		t.Fatalf("expected OnJobTerminalFailure to be called")
+	}
+	if termFailedJob.JobID != "job-term" {
+		t.Errorf("expected jobID job-term, got %s", termFailedJob.JobID)
+	}
+	if !strings.Contains(termFailedReason, "CIRCUIT_BREAKER_TRIPPED") {
+		t.Errorf("expected reason to contain CIRCUIT_BREAKER_TRIPPED, got %s", termFailedReason)
+	}
+}
+
 func TestWatchdog_NoDoubleResumeOnStallTermination(t *testing.T) {
 	tmpDir := t.TempDir()
 	stateFile := filepath.Join(tmpDir, "watchdog-stall-race.json")

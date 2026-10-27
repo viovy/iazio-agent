@@ -1070,6 +1070,22 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						job.PID, job.ConversationID, attempt, max)
 					_ = client.PostChunk(runCtx, job.JobID, "stdout", msg)
 				},
+				OnJobTerminalFailure: func(job watchdog.TrackedJob, reason string) {
+					msg := fmt.Sprintf("\n[ASE-SUPERVISOR] [watchdog.terminal_failure] Execution terminated permanently for job %s: %s\n",
+						job.JobID, reason)
+					_ = client.PostChunk(runCtx, job.JobID, "stderr", msg)
+					exitOpts := controlplane.ExitOptions{
+						ExitCode:                 1,
+						TerminationReasonCode:    "CIRCUIT_BREAKER_TRIPPED",
+						TerminationReasonMessage: reason,
+						Resumable:                false,
+						NonResumableReason:       reason,
+					}
+					_ = client.PostExit(runCtx, job.JobID, exitOpts)
+					if job.WorktreePath != "" {
+						sup.MarkIdle(job.WorktreePath)
+					}
+				},
 			})
 			wd.StartWatchguard(runCtx, 5*time.Second)
 
