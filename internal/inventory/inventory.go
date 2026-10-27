@@ -3,6 +3,7 @@ package inventory
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -171,7 +172,7 @@ func InspectToolService(toolName, goos string) (installed bool, svcType string, 
 				if _, err := os.Stat(watcherPath); err == nil {
 					caps = append(caps, "path_watcher")
 				}
-				if toolName == "iazio-agent" || toolName == "iazio-harvester" {
+				if toolName == "iazio-agent" || toolName == "iazio-harvester" || toolName == "iazio-harness" {
 					caps = append(caps, "self_update", "dev_install", "user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1")
 				}
 
@@ -199,15 +200,117 @@ func InspectToolService(toolName, goos string) (installed bool, svcType string, 
 			return
 		}
 	case "darwin":
+		var userCandidates []string
 		if home != "" {
-			plistPath := filepath.Join(home, "Library", "LaunchAgents", "io.iazio."+toolName+".plist")
-			if _, err := os.Stat(plistPath); err == nil {
-				installed = true
-				svcType = "launchd_agent"
-				svcStatus = "installed"
-				caps = append(caps, "auto_restart", "path_watcher", "self_update", "dev_install", "user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1")
-				return
+			userCandidates = append(userCandidates,
+				filepath.Join(home, "Library", "LaunchAgents", "io.iazio."+toolName+".plist"),
+				filepath.Join(home, "Library", "LaunchAgents", toolName+".plist"),
+			)
+		}
+		var systemCandidates []string
+		systemCandidates = append(systemCandidates,
+			filepath.Join("/Library", "LaunchAgents", "io.iazio."+toolName+".plist"),
+			filepath.Join("/Library", "LaunchAgents", toolName+".plist"),
+			filepath.Join("/Library", "LaunchDaemons", "io.iazio."+toolName+".plist"),
+			filepath.Join("/Library", "LaunchDaemons", toolName+".plist"),
+		)
+		foundUserPlist := false
+		for _, cp := range userCandidates {
+			if _, err := os.Stat(cp); err == nil {
+				foundUserPlist = true
+				break
 			}
+		}
+		foundSystemPlist := false
+		for _, cp := range systemCandidates {
+			if _, err := os.Stat(cp); err == nil {
+				foundSystemPlist = true
+				break
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		domain := fmt.Sprintf("gui/%d", os.Getuid())
+		// 1. Check launchctl print gui/<uid>/io.iazio.<name> or gui/<uid>/<name>
+		for _, label := range []string{"io.iazio." + toolName, toolName} {
+			cmd := exec.CommandContext(ctx, "launchctl", "print", domain+"/"+label)
+			if out, err := cmd.CombinedOutput(); err == nil {
+				installed = true
+				svcType = "user_service"
+				outStr := string(out)
+				if strings.Contains(outStr, "state = running") || strings.Contains(outStr, "pid = ") {
+					svcStatus = "active"
+				} else {
+					svcStatus = "installed"
+				}
+				break
+			}
+		}
+
+		// 2. Check launchctl list <label>
+		if !installed {
+			for _, label := range []string{"io.iazio." + toolName, toolName} {
+				cmd := exec.CommandContext(ctx, "launchctl", "list", label)
+				if out, err := cmd.CombinedOutput(); err == nil {
+					installed = true
+					svcType = "user_service"
+					outStr := string(out)
+					if strings.Contains(outStr, "\"PID\"") {
+						svcStatus = "active"
+					} else {
+						fields := strings.Fields(outStr)
+						if len(fields) > 0 && fields[0] != "-" && fields[0] != "{" && fields[0] != "" {
+							svcStatus = "active"
+						} else {
+							svcStatus = "installed"
+						}
+					}
+					break
+				}
+			}
+		}
+
+		// 3. Check launchctl list table
+		if !installed {
+			cmd := exec.CommandContext(ctx, "launchctl", "list")
+			if out, err := cmd.CombinedOutput(); err == nil {
+				lines := strings.Split(string(out), "\n")
+				for _, line := range lines {
+					fields := strings.Fields(line)
+					if len(fields) >= 3 {
+						label := fields[2]
+						if label == "io.iazio."+toolName || label == toolName {
+							installed = true
+							svcType = "user_service"
+							if fields[0] != "-" && fields[0] != "" {
+								svcStatus = "active"
+							} else {
+								svcStatus = "installed"
+							}
+							break
+						}
+					}
+				}
+			}
+		}
+
+		// 4. Fallback to plist presence if launchctl query failed or was unavailable
+		if !installed {
+			if foundUserPlist {
+				installed = true
+				svcType = "user_service"
+				svcStatus = "installed"
+			} else if foundSystemPlist {
+				installed = true
+				svcType = "system_service"
+				svcStatus = "installed"
+			}
+		}
+		if installed {
+			caps = append(caps, "auto_restart", "path_watcher", "self_update", "dev_install", "user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1")
+			return
 		}
 	case "windows":
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -288,7 +391,6 @@ func scan(dirs []string, goos string) []Tool {
 			if err != nil || !executable(info, ent.Name(), goos) {
 				continue
 			}
-			seen[name] = true
 			binPath := filepath.Join(dir, ent.Name())
 			isSymlink := ent.Type()&os.ModeSymlink != 0
 			if !isSymlink {
@@ -300,17 +402,64 @@ func scan(dirs []string, goos string) []Tool {
 			if isSymlink && (strings.HasPrefix(name, "autopilot") || strings.HasPrefix(name, "iazio")) {
 				status = "SYMLINK_REJECTED"
 			}
-			out = append(out, Tool{
-				Name:             name,
-				Path:             binPath,
-				Status:           status,
-				Executable:       status == "OK",
-				IsSymlink:        isSymlink,
-				Installed:        status == "OK",
-				InstallationType: "binary",
-				ActiveState:      "active",
-				ConfigStatus:     "synced",
-			})
+			if status == "SYMLINK_REJECTED" {
+				// Record rejected symlink as candidate without marking seen[name]=true,
+				// allowing a subsequent directory to supply a valid regular executable.
+				exists := false
+				for _, ex := range out {
+					if ex.Name == name {
+						exists = true
+						break
+					}
+				}
+				if !exists {
+					out = append(out, Tool{
+						Name:             name,
+						Path:             binPath,
+						Status:           status,
+						Executable:       false,
+						IsSymlink:        true,
+						Installed:        false,
+						InstallationType: "binary",
+						ActiveState:      "symlink_rejected",
+						ConfigStatus:     "synced",
+					})
+				}
+				continue
+			}
+
+			seen[name] = true
+			replaced := false
+			for i, ex := range out {
+				if ex.Name == name && ex.Status == "SYMLINK_REJECTED" {
+					out[i] = Tool{
+						Name:             name,
+						Path:             binPath,
+						Status:           "OK",
+						Executable:       true,
+						IsSymlink:        false,
+						Installed:        true,
+						InstallationType: "binary",
+						ActiveState:      "active",
+						ConfigStatus:     "synced",
+					}
+					replaced = true
+					break
+				}
+			}
+			if !replaced {
+				out = append(out, Tool{
+					Name:             name,
+					Path:             binPath,
+					Status:           "OK",
+					Executable:       true,
+					IsSymlink:        false,
+					Installed:        true,
+					InstallationType: "binary",
+					ActiveState:      "active",
+					ConfigStatus:     "synced",
+				})
+			}
 		}
 	}
 
@@ -329,7 +478,13 @@ func scan(dirs []string, goos string) []Tool {
 				out[idx].Capabilities = caps
 				out[idx].Installed = installed || out[idx].Executable || out[idx].Status == "OK"
 				if sType == "user_service" {
-					out[idx].InstallationType = "systemd-user"
+					if goos == "darwin" {
+						out[idx].InstallationType = "launchd-user"
+					} else if goos == "windows" {
+						out[idx].InstallationType = "task-scheduler-user"
+					} else {
+						out[idx].InstallationType = "systemd-user"
+					}
 				} else if sType != "" && sType != "none" {
 					out[idx].InstallationType = sType
 				} else {

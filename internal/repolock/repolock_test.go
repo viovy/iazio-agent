@@ -238,3 +238,25 @@ func TestAcquire_ConcurrentFlockContention(t *testing.T) {
 		t.Fatalf("expected ErrRepoBusy under OS flock conflict, got: %v", err)
 	}
 }
+
+func TestForceRelease(t *testing.T) {
+	wt := t.TempDir()
+	info := LockInfo{
+		JobID: "job-force-rel",
+		PID:   1234,
+	}
+	handle, err := Acquire(wt, info, func(int) bool { return true })
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	_ = handle.Release()
+
+	if err := ForceRelease(wt); err != nil {
+		t.Fatalf("ForceRelease failed: %v", err)
+	}
+
+	_, readErr := Read(wt)
+	if readErr == nil {
+		t.Fatalf("expected Read to fail after ForceRelease")
+	}
+}

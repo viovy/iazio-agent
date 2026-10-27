@@ -69,6 +69,7 @@ func (s *safeWriter) Write(p []byte) (n int, err error) {
 
 func execute(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
 	preflight.HydrateToolchainEnv()
+	ensureCanonicalDualHome()
 	if stdout != nil {
 		stdout = &safeWriter{w: stdout}
 	}
@@ -780,6 +781,15 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 								target = strings.Trim(strings.TrimSpace(string(cmd.Payload)), "\"")
 							}
 							if target != "" {
+								// First cancel and abort any active harness executions on target repo
+								for _, rj := range sup.RunningJobs() {
+									if target == "" || rj.WorktreePath == target || filepath.Base(rj.WorktreePath) == target || rj.JobID == target {
+										sup.Cancel(rj.WorktreePath, "FORCE_CLEAN_GIT")
+										if wd != nil {
+											wd.AbortJob(rj.JobID, "FORCE_CLEAN_GIT")
+										}
+									}
+								}
 								healGitRepo(runCtx, target)
 								st := probeRepoRuntime(runCtx, target, filepath.Base(target))
 								_ = client.PostRepoStatus(runCtx, host, []controlplane.RepoRuntimeStatus{st})
@@ -787,16 +797,19 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						}()
 					case "KILL_BACKGROUND_TASKS":
 						go func() {
-							var jobID string
-							if err := json.Unmarshal(cmd.Payload, &jobID); err != nil {
-								jobID = strings.Trim(strings.TrimSpace(string(cmd.Payload)), "\"")
+							var target string
+							if err := json.Unmarshal(cmd.Payload, &target); err != nil {
+								target = strings.Trim(strings.TrimSpace(string(cmd.Payload)), "\"")
 							}
 							if stderr != nil {
-								fmt.Fprintf(stderr, "[supervisor] remote kill background tasks received: jobID=%s\n", jobID)
+								fmt.Fprintf(stderr, "[supervisor] remote kill background tasks received: target=%s\n", target)
 							}
 							for _, rj := range sup.RunningJobs() {
-								if jobID == "" || rj.JobID == jobID {
+								if target == "" || rj.JobID == target || rj.WorktreePath == target || filepath.Base(rj.WorktreePath) == target {
 									sup.Cancel(rj.WorktreePath, "KILL_BACKGROUND_TASKS")
+									if wd != nil {
+										wd.AbortJob(rj.JobID, "KILL_BACKGROUND_TASKS")
+									}
 								}
 							}
 						}()
@@ -837,9 +850,12 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							fmt.Fprintf(stderr, "[supervisor] reaped stalled or terminated process %q (reason: %s)\n",
 								r.JobID, r.Reason)
 						}
-						// If watchdog is actively managing or resuming this job, do not abandon it to control plane
-						if wd != nil && wd.IsTracked(r.JobID) {
-							continue
+						// If watchdog is actively managing, completed, or auto-resuming this job, do not abandon it to control plane
+						if wd != nil {
+							if status, ok := wd.JobStatus(r.JobID); ok && (status == watchdog.StatusCompleted || status == watchdog.StatusRunning || status == watchdog.StatusAutoResuming) {
+								sup.MarkIdle(r.WorktreePath)
+								continue
+							}
 						}
 						if r.JobID != "" {
 							_ = client.AbandonJob(ctx, r.JobID, r.Reason)
@@ -1092,6 +1108,11 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						fmt.Fprint(stdout, msg)
 					}
 					_ = client.PostChunk(runCtx, job.JobID, "stdout", msg)
+				},
+				OnJobCompleted: func(job watchdog.TrackedJob) {
+					if job.WorktreePath != "" {
+						sup.MarkIdle(job.WorktreePath)
+					}
 				},
 				OnJobTerminalFailure: func(job watchdog.TrackedJob, reason string) {
 					msg := fmt.Sprintf("\n[ASE-SUPERVISOR] [watchdog.terminal_failure] Execution terminated permanently for job %s: %s\n",
@@ -1418,6 +1439,13 @@ func runService(args []string, stdout io.Writer, getenv func(string) string) err
 	case "revive-check":
 		home, _ := os.UserHomeDir()
 		return service.ReviveCheck(home, execCommand)
+	case "reconcile":
+		home, _ := os.UserHomeDir()
+		if err := service.ReconcileServiceConfiguration(home, bin, execCommand); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "iazio-agent user service configuration reconciled")
+		return nil
 	}
 	switch goos {
 	case "darwin":
@@ -1436,7 +1464,7 @@ var isSystemdAvailable = service.IsSystemdAvailable
 
 func applyLinux(action, bin string, stdout io.Writer, force bool) error {
 	switch action {
-	case "install", "start", "stop", "restart", "uninstall", "status", "dev-install", "pause", "resume", "revive-check":
+	case "install", "start", "stop", "restart", "uninstall", "status", "dev-install", "pause", "resume", "revive-check", "reconcile":
 	default:
 		return fmt.Errorf("unknown service action %s", action)
 	}
@@ -1596,6 +1624,35 @@ func applyWindows(action, _ string, stdout io.Writer) error {
 	}
 }
 
+func ensureCanonicalDualHome() {
+	if isTesting {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return
+	}
+	binName := "iazio-agent"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	dest := filepath.Join(home, ".iazio", "bin", binName)
+	local := filepath.Join(home, ".local", "bin", binName)
+
+	needSync := false
+	if _, err := os.Stat(dest); err != nil {
+		needSync = true
+	}
+	if runtime.GOOS != "windows" {
+		if _, err := os.Stat(local); err != nil {
+			needSync = true
+		}
+	}
+	if needSync {
+		_, _ = installCanonicalBinary()
+	}
+}
+
 func installCanonicalBinary() (string, error) {
 	src, err := os.Executable()
 	if err != nil {
@@ -1667,7 +1724,7 @@ func parseService(args []string) (action string, dry, force bool, err error) {
 	}
 	action = args[0]
 	switch action {
-	case "install", "uninstall", "start", "stop", "restart", "status", "dev-install", "pause", "resume", "revive-check":
+	case "install", "uninstall", "start", "stop", "restart", "status", "dev-install", "pause", "resume", "revive-check", "reconcile":
 	default:
 		return "", false, false, fmt.Errorf("unknown service action %s", action)
 	}
@@ -1949,16 +2006,54 @@ func restartOrExecSelf(stdout io.Writer) {
 	}
 	if runtime.GOOS != "windows" {
 		selfBin, err := os.Executable()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[SIR: AUTO_RESTART_FAIL] os.Executable() failed: %v; exiting non-zero for systemd recovery\n", err)
-			os.Exit(1)
+		cleanSelf := ""
+		if err == nil {
+			cleanSelf = strings.TrimSuffix(selfBin, " (deleted)")
 		}
-		if resolved, err := filepath.EvalSymlinks(selfBin); err == nil {
-			selfBin = resolved
+
+		var candidates []string
+		if cleanSelf != "" {
+			candidates = append(candidates, cleanSelf)
+			if resolved, err := filepath.EvalSymlinks(cleanSelf); err == nil && resolved != cleanSelf {
+				candidates = append(candidates, resolved)
+			}
 		}
-		execErr := syscallExec(selfBin, os.Args, os.Environ())
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			candidates = append(candidates,
+				filepath.Join(home, ".iazio", "bin", "iazio-agent"),
+				filepath.Join(home, ".local", "bin", "iazio-agent"),
+			)
+		}
+		if len(os.Args) > 0 && filepath.IsAbs(os.Args[0]) {
+			candidates = append(candidates, os.Args[0])
+		}
+
+		var targetBin string
+		for _, cand := range candidates {
+			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() && fi.Mode()&0111 != 0 {
+				targetBin = cand
+				break
+			}
+		}
+		if targetBin == "" {
+			if cleanSelf != "" {
+				targetBin = cleanSelf
+			} else {
+				targetBin = selfBin
+			}
+		}
+
+		execErr := syscallExec(targetBin, os.Args, os.Environ())
 		if execErr != nil {
-			fmt.Fprintf(os.Stderr, "[SIR: AUTO_RESTART_FAIL] syscall.Exec(%s) failed: %v; exiting non-zero for systemd recovery\n", selfBin, execErr)
+			fmt.Fprintf(os.Stderr, "[SIR: AUTO_RESTART_FAIL] syscall.Exec(%s) failed: %v; attempting background restart and service revive\n", targetBin, execErr)
+			// Fallback: spawn background restart so the host never stays offline
+			cmd := exec.Command(targetBin, os.Args[1:]...)
+			cmd.Env = os.Environ()
+			if startErr := cmd.Start(); startErr == nil {
+				os.Exit(0)
+			}
+			// Attempt to revive via systemd if available
+			_ = exec.Command("systemctl", "--user", "restart", "iazio-agent.service").Run()
 			os.Exit(1)
 		}
 	}
@@ -2122,24 +2217,40 @@ func healGitRepo(ctx context.Context, repoPath string) {
 		return
 	}
 
-	// 1. Remove stale git index lock if present
-	lockFile := filepath.Join(repoPath, ".git", "index.lock")
-	if fi, err := os.Stat(lockFile); err == nil && !fi.IsDir() {
-		_ = os.Remove(lockFile)
+	// 1. Resolve real git directory to remove stale git locks
+	gitDir := filepath.Join(repoPath, ".git")
+	if out, err := exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--git-dir").Output(); err == nil {
+		clean := strings.TrimSpace(string(out))
+		if clean != "" {
+			if filepath.IsAbs(clean) {
+				gitDir = clean
+			} else {
+				gitDir = filepath.Join(repoPath, clean)
+			}
+		}
 	}
+	_ = os.Remove(filepath.Join(gitDir, "index.lock"))
+	_ = os.Remove(filepath.Join(gitDir, "HEAD.lock"))
+	_ = os.Remove(filepath.Join(gitDir, "config.lock"))
 
-	// 2. Remove autopilot / ase locks
+	// 2. Remove autopilot / ase / iazio repo locks
 	_ = os.Remove(filepath.Join(repoPath, ".ase", "active.lock"))
 	_ = os.Remove(filepath.Join(repoPath, ".autopilot", "lock"))
+	_ = repolock.ForceRelease(repoPath)
 
-	// 3. Reset and clean working tree
+	// 3. Abort in-progress git operations
+	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "merge", "--abort").Run()
+	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "rebase", "--abort").Run()
+	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "cherry-pick", "--abort").Run()
+
+	// 4. Reset and clean working tree (double -f cleans untracked directories/repos)
 	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "reset", "--hard", "HEAD").Run()
-	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "clean", "-fd").Run()
+	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "clean", "-ffd").Run()
 
-	// 4. Synchronize submodules
-	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "foreach", "--recursive", "git reset --hard HEAD").Run()
-	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "foreach", "--recursive", "git clean -fd").Run()
-	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "update", "--init", "--recursive").Run()
+	// 5. Synchronize and clean submodules
+	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "foreach", "--recursive", "git reset --hard HEAD || true").Run()
+	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "foreach", "--recursive", "git clean -ffd || true").Run()
+	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "update", "--init", "--recursive", "--force").Run()
 }
 
 func stripSlotSuffix(name string) string {

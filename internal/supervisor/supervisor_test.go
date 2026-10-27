@@ -975,3 +975,39 @@ func TestSupervisor_AcquireToolUpdateForce(t *testing.T) {
 	// duplicate release does not panic or underflow
 	rel()
 }
+
+func TestSupervisor_CompletedJobNotReapedAsTimeoutOrDied(t *testing.T) {
+	tmpDir := t.TempDir()
+	now := time.Now()
+	s := New(func() time.Time { return now })
+	s.alive = func(pid int) bool { return false } // Process is already dead
+	jobID := "job-1539-clean"
+
+	// Save completed runstate on disk
+	_ = SaveRunState(RunState{
+		JobID:        jobID,
+		PID:          8888,
+		WorktreePath: tmpDir,
+		Status:       RunStatusCompleted,
+		ExitCode:     0,
+	})
+
+	s.mu.Lock()
+	s.locks[tmpDir] = LockRunning
+	s.pids[tmpDir] = 8888
+	s.jobIDs[tmpDir] = jobID
+	s.mu.Unlock()
+
+	reaped := s.Tick()
+	if len(reaped) != 0 {
+		t.Fatalf("expected 0 reaped jobs for cleanly completed job, got %d: %+v", len(reaped), reaped)
+	}
+
+	// Verify the worktree was automatically marked idle
+	s.mu.Lock()
+	lockState := s.locks[tmpDir]
+	s.mu.Unlock()
+	if lockState != LockIdle {
+		t.Fatalf("expected lock to transition to LockIdle, got %v", lockState)
+	}
+}

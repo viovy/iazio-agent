@@ -100,6 +100,8 @@ func ActionText(goos, action, bin string, force bool) string {
 	switch action {
 	case "dev-install":
 		return fmt.Sprintf("hot-swap %s and restart supervisor", bin)
+	case "reconcile":
+		return "reconcile user service configuration and watchdog units"
 	case "pause":
 		return "pause supervisor and place maintenance lock"
 	case "resume":
@@ -282,6 +284,68 @@ func darwinPlist(bin, logPath string) string {
 </dict>
 </plist>
 `, agentLabel, bin, maintenancePath, apiXml, homeXml, userXml, pathXml, esXml, logPath, logPath)
+}
+
+func darwinHarnessPlist(bin, logPath string) string {
+	apiXml := ""
+	if apiEnv := resolveHarnessAPIURL(); apiEnv != "" {
+		apiXml = fmt.Sprintf("\n\t\t<key>IAZIO_HARNESS_API_URL</key>\n\t\t<string>%s</string>", apiEnv)
+	}
+	homeXml := ""
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		homeXml = fmt.Sprintf("\n\t\t<key>HOME</key>\n\t\t<string>%s</string>", home)
+	}
+	userXml := ""
+	if u := os.Getenv("USER"); u != "" {
+		userXml = fmt.Sprintf("\n\t\t<key>USER</key>\n\t\t<string>%s</string>", u)
+	} else if curr, err := user.Current(); err == nil && curr.Username != "" {
+		userXml = fmt.Sprintf("\n\t\t<key>USER</key>\n\t\t<string>%s</string>", curr.Username)
+	}
+	pathXml := ""
+	if p := os.Getenv("PATH"); p != "" {
+		pathXml = fmt.Sprintf("\n\t\t<key>PATH</key>\n\t\t<string>%s</string>", p)
+	}
+	maintenancePath := ""
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		maintenancePath = filepath.Join(home, ".iazio", "maintenance.lock")
+	} else {
+		maintenancePath = filepath.Join(".iazio", "maintenance.lock")
+	}
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.iazio.iazio-harness</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>%s</string>
+		<string>daemon</string>
+	</array>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+		<key>PathState</key>
+		<dict>
+			<key>%s</key>
+			<false/>
+		</dict>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>%s</string>
+	<key>StandardErrorPath</key>
+	<string>%s</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>IAZIO_HARNESS_NONINTERACTIVE</key>
+		<string>1</string>%s%s%s%s
+	</dict>
+</dict>
+</plist>
+`, bin, maintenancePath, logPath, logPath, apiXml, homeXml, userXml, pathXml)
 }
 
 // DarwinWatcherPlist returns the LaunchAgent plist definition to monitor binary replacements.
@@ -492,6 +556,29 @@ WantedBy=default.target
 `, bin, apiLine, esLine)
 }
 
+func linuxHarnessUnit(bin string) string {
+	apiLine := ""
+	if apiEnv := resolveHarnessAPIURL(); apiEnv != "" {
+		apiLine = fmt.Sprintf("Environment=IAZIO_HARNESS_API_URL=%s\n", apiEnv)
+	}
+	return fmt.Sprintf(`[Unit]
+Description=iazio-harness daemon and execution supervisor
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%s daemon
+Restart=always
+RestartSec=3s
+StartLimitIntervalSec=0
+OOMScoreAdjust=-500
+Environment=IAZIO_HARNESS_NONINTERACTIVE=1
+%s
+[Install]
+WantedBy=default.target
+`, bin, apiLine)
+}
+
 // LinuxWatcherPath returns the systemd .path unit definition to monitor binary replacements.
 func LinuxWatcherPath(bin string) string {
 	return fmt.Sprintf(`[Unit]
@@ -500,11 +587,12 @@ After=network.target
 
 [Path]
 PathModified=%s
+PathChanged=%s
 Unit=iazio-agent-watcher.service
 
 [Install]
 WantedBy=default.target
-`, bin)
+`, bin, bin)
 }
 
 // LinuxWatcherService returns the oneshot service that restarts the agent on binary changes.
@@ -735,13 +823,92 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 
 		if needsReload {
 			_ = run("systemctl", "--user", "daemon-reload")
-			_ = run("systemctl", "--user", "enable", "--now", "iazio-agent-watcher.path")
-			_ = run("systemctl", "--user", "enable", "--now", "iazio-agent-watchdog.timer")
 		}
+		_ = run("systemctl", "--user", "enable", "iazio-agent.service")
+		_ = run("systemctl", "--user", "enable", "--now", "iazio-agent-watcher.path")
+		_ = run("systemctl", "--user", "enable", "--now", "iazio-agent-watchdog.timer")
 		_ = run("loginctl", "enable-linger")
+
+		// Reconcile iazio-harness user service if harness binary exists
+		harnessBin := filepath.Join(home, ".iazio", "bin", "iazio-harness")
+		if _, err := os.Stat(harnessBin); err != nil {
+			harnessBin = filepath.Join(home, ".local", "bin", "iazio-harness")
+		}
+		if _, err := os.Stat(harnessBin); err == nil {
+			hSvcFile := filepath.Join(unitDir, "iazio-harness.service")
+			hData, err := os.ReadFile(hSvcFile)
+			if err != nil || !strings.Contains(string(hData), harnessBin) {
+				_ = os.WriteFile(hSvcFile, []byte(linuxHarnessUnit(harnessBin)), 0o644)
+				_ = run("systemctl", "--user", "daemon-reload")
+				_ = run("systemctl", "--user", "enable", "iazio-harness.service")
+			}
+		}
+
+		lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
+		inMaintenance := false
+		if info, err := os.Stat(lockFile); err == nil && time.Since(info.ModTime()) <= 2*time.Hour {
+			inMaintenance = true
+		}
+		if !inMaintenance {
+			_, isActErr := statusCheckCommand("systemctl", "--user", "is-active", "--quiet", "iazio-agent.service")
+			if isActErr != nil {
+				_ = run("systemctl", "--user", "reset-failed", "iazio-agent.service")
+				_ = run("systemctl", "--user", "start", "iazio-agent.service")
+			}
+		}
 		return nil
 	} else if runtime.GOOS == "darwin" {
-		return InstallDarwinResilience(home, bin, run)
+		launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
+		_ = os.MkdirAll(launchAgentsDir, 0o755)
+		logDir := filepath.Join(home, ".iazio", "logs")
+		_ = os.MkdirAll(logDir, 0o755)
+		logPath := filepath.Join(logDir, "agent.log")
+
+		// Reconcile primary iazio-agent LaunchAgent
+		agentPlist := filepath.Join(launchAgentsDir, agentLabel+".plist")
+		data, err := os.ReadFile(agentPlist)
+		domain := "gui/" + strconv.Itoa(os.Getuid())
+		target := domain + "/" + agentLabel
+		if err != nil || !strings.Contains(string(data), bin) {
+			_ = os.WriteFile(agentPlist, []byte(darwinPlist(bin, logPath)), 0o644)
+			_ = run("launchctl", "bootout", target)
+			_ = run("launchctl", "bootstrap", domain, agentPlist)
+			_ = run("launchctl", "enable", target)
+		}
+		if err := InstallDarwinResilience(home, bin, run); err != nil {
+			return err
+		}
+
+		// Reconcile iazio-harness LaunchAgent if harness binary exists
+		harnessBin := filepath.Join(home, ".iazio", "bin", "iazio-harness")
+		if _, err := os.Stat(harnessBin); err != nil {
+			harnessBin = filepath.Join(home, ".local", "bin", "iazio-harness")
+		}
+		if _, err := os.Stat(harnessBin); err == nil {
+			harnessPlist := filepath.Join(launchAgentsDir, "io.iazio.iazio-harness.plist")
+			hData, err := os.ReadFile(harnessPlist)
+			hTarget := domain + "/io.iazio.iazio-harness"
+			if err != nil || !strings.Contains(string(hData), harnessBin) {
+				_ = os.WriteFile(harnessPlist, []byte(darwinHarnessPlist(harnessBin, filepath.Join(logDir, "harness.log"))), 0o644)
+				_ = run("launchctl", "bootout", hTarget)
+				_ = run("launchctl", "bootstrap", domain, harnessPlist)
+				_ = run("launchctl", "enable", hTarget)
+			}
+		}
+
+		lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
+		inMaintenance := false
+		if info, err := os.Stat(lockFile); err == nil && time.Since(info.ModTime()) <= 2*time.Hour {
+			inMaintenance = true
+		}
+		if !inMaintenance {
+			out, err := statusCheckCommand("launchctl", "print", target)
+			outStr := string(out)
+			if err != nil || strings.Contains(outStr, "job state = exited") || !strings.Contains(outStr, "pid =") {
+				_ = run("launchctl", "kickstart", "-k", target)
+			}
+		}
+		return nil
 	} else if runtime.GOOS == "windows" {
 		tasksDir := filepath.Join(home, ".iazio", "tasks")
 		cleanStaleBackups(tasksDir)
@@ -863,10 +1030,16 @@ func ReviveCheck(home string, run func(name string, args ...string) error) error
 			return nil // Maintenance pause intentionally active
 		}
 	}
+	bin := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	_ = ReconcileServiceConfiguration(home, bin, run)
 	if runtime.GOOS == "linux" && IsSystemdAvailable() {
 		_, err := statusCheckCommand("systemctl", "--user", "is-active", "--quiet", "iazio-agent.service")
 		if err != nil {
-			// Inactive! Start it.
+			// Inactive! Reset failed and start it.
+			_ = run("systemctl", "--user", "reset-failed", "iazio-agent.service")
 			return run("systemctl", "--user", "start", "iazio-agent.service")
 		}
 	} else if runtime.GOOS == "darwin" {

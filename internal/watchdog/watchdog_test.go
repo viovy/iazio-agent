@@ -1013,4 +1013,42 @@ func TestSystemdWatchdog_WithSocket(t *testing.T) {
 	StartSystemdWatchdog(ctx)
 }
 
+func TestWatchdog_NonStoryOrdinaryPrompt_CompletesImmediatelyWithoutASEGates(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "watchdog-nonstory.json")
+	var completedJob TrackedJob
+	var completedCalled bool
+
+	w := New(Options{
+		StateFile: stateFile,
+		IsAlive:   func(pid int) bool { return false },
+		OnJobCompleted: func(job TrackedJob) {
+			completedCalled = true
+			completedJob = job
+		},
+	})
+
+	w.Track(TrackedJob{
+		JobID:        "job-1539-ordinary",
+		PID:          999,
+		WorktreePath: tmpDir,
+		Kind:         "ordinary",
+		Prompt:       "update tools",
+		StoryID:      "", // No story flow
+	})
+
+	w.OnProcessExit("job-1539-ordinary", 999, 0, nil)
+
+	if !completedCalled {
+		t.Fatalf("expected OnJobCompleted to be called for exit code 0 ordinary prompt")
+	}
+	if completedJob.Status != StatusCompleted {
+		t.Fatalf("expected job status to be COMPLETED, got %s", completedJob.Status)
+	}
+	status, ok := w.JobStatus("job-1539-ordinary")
+	if !ok || status != StatusCompleted {
+		t.Fatalf("expected JobStatus to return StatusCompleted, got %v (ok=%v)", status, ok)
+	}
+}
+
 

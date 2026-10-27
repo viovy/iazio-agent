@@ -1484,3 +1484,70 @@ func TestReviveCheck_MaintenanceLockActive(t *testing.T) {
 		t.Fatalf("expected nil for active maintenance lock, got %v", err)
 	}
 }
+
+func TestHarnessServiceUnitAndPlist(t *testing.T) {
+	harnessBin := "/Users/romeo/.iazio/bin/iazio-harness"
+	plist := darwinHarnessPlist(harnessBin, "/Users/romeo/.iazio/logs/harness.log")
+	if !strings.Contains(plist, "<string>io.iazio.iazio-harness</string>") {
+		t.Fatalf("expected io.iazio.iazio-harness in plist, got:\n%s", plist)
+	}
+	if !strings.Contains(plist, "<string>daemon</string>") {
+		t.Fatalf("expected daemon command in plist, got:\n%s", plist)
+	}
+
+	unit := linuxHarnessUnit("/home/romeo/.iazio/bin/iazio-harness")
+	if !strings.Contains(unit, "ExecStart=/home/romeo/.iazio/bin/iazio-harness daemon") {
+		t.Fatalf("expected ExecStart with daemon in linux unit, got:\n%s", unit)
+	}
+	if !strings.Contains(unit, "Restart=always") {
+		t.Fatalf("expected Restart=always in linux unit, got:\n%s", unit)
+	}
+}
+
+func TestRestartToolService(t *testing.T) {
+	var cmds []string
+	runner := func(name string, args ...string) error {
+		cmds = append(cmds, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	_ = RestartToolService("iazio-agent", runner)
+	_ = RestartToolService("iazio-harness", runner)
+	_ = RestartToolService("autopilot", runner)
+
+	txt := ActionText("linux", "reconcile", "/bin/iazio-agent", false)
+	if !strings.Contains(txt, "reconcile user service") {
+		t.Fatalf("expected reconcile text, got: %s", txt)
+	}
+}
+
+func TestReconcileServiceConfiguration_AllBranches(t *testing.T) {
+	home := t.TempDir()
+	binDir := filepath.Join(home, ".iazio", "bin")
+	_ = os.MkdirAll(binDir, 0755)
+	agentBin := filepath.Join(binDir, "iazio-agent")
+	_ = os.WriteFile(agentBin, []byte("#!/bin/sh\n"), 0755)
+	harnessBin := filepath.Join(binDir, "iazio-harness")
+	_ = os.WriteFile(harnessBin, []byte("#!/bin/sh\n"), 0755)
+
+	var cmds []string
+	runner := func(name string, args ...string) error {
+		cmds = append(cmds, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	err := ReconcileServiceConfiguration(home, agentBin, runner)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Run again when files already exist
+	err = ReconcileServiceConfiguration(home, agentBin, runner)
+	if err != nil {
+		t.Fatalf("unexpected error on second reconcile: %v", err)
+	}
+
+	// ReviveCheck without maintenance lock
+	_ = ReviveCheck(home, runner)
+}
+
