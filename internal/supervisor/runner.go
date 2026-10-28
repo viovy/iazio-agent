@@ -67,7 +67,6 @@ func ResolveBinary(name string) string {
 	}
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		candidates := []string{
-			filepath.Join(home, ".iazio", "bin", name),
 			filepath.Join(home, ".local", "bin", name),
 		}
 		if runtime.GOOS == "windows" {

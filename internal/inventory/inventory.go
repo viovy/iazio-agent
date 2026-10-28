@@ -342,7 +342,7 @@ func InspectToolService(toolName, goos string) (installed bool, svcType string, 
 	return false, "none", "not_installed", nil
 }
 
-// DefaultDirs is the scan order: PATH, ~/.iazio/bin, ~/.local/bin, ~/.gemini/antigravity-cli/bin, and on windows the user bin.
+// DefaultDirs is the scan order: PATH, ~/.local/bin, ~/.gemini/antigravity-cli/bin, and on windows the user bin.
 func DefaultDirs(pathEnv, home, goos string) []string {
 	var dirs []string
 	if pathEnv != "" {
@@ -350,7 +350,6 @@ func DefaultDirs(pathEnv, home, goos string) []string {
 	}
 	if home != "" {
 		dirs = append(dirs,
-			filepath.Join(home, ".iazio", "bin"),
 			filepath.Join(home, ".local", "bin"),
 			filepath.Join(home, ".gemini", "antigravity-cli", "bin"),
 		)

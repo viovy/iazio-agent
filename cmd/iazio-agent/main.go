@@ -205,9 +205,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 
 			watchdog.StartSystemdWatchdog(runCtx)
 			if home, err := os.UserHomeDir(); err == nil && home != "" {
-				binPath := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+				binPath := filepath.Join(home, ".local", "bin", "iazio-agent")
 				if runtime.GOOS == "windows" {
-					binPath += ".exe"
+					binPath = filepath.Join(home, "bin", "iazio-agent.exe")
 				}
 				go func() {
 					_ = service.ReconcileServiceConfiguration(home, binPath, nil)
@@ -425,8 +425,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}
 				getInstallRoots := func(manifest *supervisor.FleetManifest) string {
 					return resolveInstallDir(ManifestInstallRoots{
-						Unix:    ManifestInstallRootPaths{Primary: manifest.InstallRoots.Unix.Primary, Fallback: manifest.InstallRoots.Unix.Fallback},
-						Windows: ManifestInstallRootPaths{Primary: manifest.InstallRoots.Windows.Primary, Fallback: manifest.InstallRoots.Windows.Fallback},
+						Unix:    ManifestInstallRootPaths{Primary: manifest.InstallRoots.Unix.Primary},
+						Windows: ManifestInstallRootPaths{Primary: manifest.InstallRoots.Windows.Primary},
 					}, getenv)
 				}
 				eagerUpdater.CheckDrift, eagerUpdater.ListSuiteTools = buildEagerHooks(
@@ -1568,7 +1568,7 @@ func kickstartDarwin() error {
 		return fmt.Errorf("LaunchAgent is not installed")
 	}
 	_ = execCommand("launchctl", "bootstrap", "gui/"+strconv.Itoa(os.Getuid()), plist)
-	if err := service.InstallDarwinResilience(home, filepath.Join(home, ".iazio", "bin", "iazio-agent"), execCommand); err != nil {
+	if err := service.InstallDarwinResilience(home, filepath.Join(home, ".local", "bin", "iazio-agent"), execCommand); err != nil {
 		return fmt.Errorf("install darwin resilience: %w", err)
 	}
 	return execCommand("launchctl", "kickstart", "-k", darwinTarget())
@@ -2030,9 +2030,11 @@ func restartOrExecSelf(stdout io.Writer) {
 		}
 		if home, err := os.UserHomeDir(); err == nil && home != "" {
 			candidates = append(candidates,
-				filepath.Join(home, ".iazio", "bin", "iazio-agent"),
 				filepath.Join(home, ".local", "bin", "iazio-agent"),
 			)
+			if runtime.GOOS == "windows" {
+				candidates = append(candidates, filepath.Join(home, "bin", "iazio-agent.exe"))
+			}
 		}
 		if len(os.Args) > 0 && filepath.IsAbs(os.Args[0]) {
 			candidates = append(candidates, os.Args[0])

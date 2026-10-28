@@ -24,12 +24,10 @@ type ManifestTool struct {
 // ManifestRoots describes installation directories in the fleet manifest.
 type ManifestRoots struct {
 	Unix struct {
-		Primary  string `json:"primary"`
-		Fallback string `json:"fallback"`
+		Primary string `json:"primary"`
 	} `json:"unix"`
 	Windows struct {
-		Primary  string `json:"primary"`
-		Fallback string `json:"fallback"`
+		Primary string `json:"primary"`
 	} `json:"windows"`
 }
 

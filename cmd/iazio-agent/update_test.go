@@ -240,12 +240,10 @@ func TestFindChecksumsAsset(t *testing.T) {
 func TestResolveInstallDir(t *testing.T) {
 	roots := ManifestInstallRoots{
 		Unix: ManifestInstallRootPaths{
-			Primary:  "~/.custom/bin",
-			Fallback: "~/.iazio/bin",
+			Primary: "~/.custom/bin",
 		},
 		Windows: ManifestInstallRootPaths{
-			Primary:  "%USERPROFILE%/custom/bin",
-			Fallback: "%USERPROFILE%/.iazio/bin",
+			Primary: "%USERPROFILE%/custom/bin",
 		},
 	}
 
@@ -270,18 +268,18 @@ func TestResolveInstallDir(t *testing.T) {
 			t.Fatalf("unexpected unix install dir: %s", dir)
 		}
 
-		// Fallback when empty primary
+		// Canonical default when empty primary
 		rootsEmpty := ManifestInstallRoots{
 			Unix: ManifestInstallRootPaths{Primary: ""},
 		}
-		dirFallback := resolveInstallDir(rootsEmpty, func(k string) string {
+		dirDefault := resolveInstallDir(rootsEmpty, func(k string) string {
 			if k == "HOME" {
 				return "/home/test"
 			}
 			return ""
 		})
-		if dirFallback != "/home/test/.local/bin" {
-			t.Fatalf("expected fallback /home/test/.local/bin, got %s", dirFallback)
+		if dirDefault != "/home/test/.local/bin" {
+			t.Fatalf("expected default /home/test/.local/bin, got %s", dirDefault)
 		}
 	}
 }
@@ -825,19 +823,7 @@ func TestResolveInstallDir_Extended(t *testing.T) {
 		t.Fatalf("expected /usr/local/custom/bin, got %s", got)
 	}
 
-	// 3. empty primary, uses fallback
-	roots = ManifestInstallRoots{
-		Unix: ManifestInstallRootPaths{
-			Fallback: "~/fallback/bin",
-		},
-	}
-	got = resolveInstallDir(roots, getenv)
-	want = filepath.Join(home, "fallback/bin")
-	if got != want {
-		t.Fatalf("expected %s, got %s", want, got)
-	}
-
-	// 4. empty primary and empty fallback, uses default ~/.local/bin
+	// 3. empty primary, uses default ~/.local/bin
 	roots = ManifestInstallRoots{}
 	got = resolveInstallDir(roots, getenv)
 	want = filepath.Join(home, ".local", "bin")
@@ -914,18 +900,7 @@ func TestResolveInstallDir_Variants(t *testing.T) {
 		t.Fatalf("expected /opt/bin, got %s", dirAbs)
 	}
 
-	// 3. Fallback path
-	rootsFallback := ManifestInstallRoots{
-		Unix: ManifestInstallRootPaths{
-			Fallback: "/opt/fallback/bin",
-		},
-	}
-	dirFallback := resolveInstallDir(rootsFallback, getenv)
-	if runtime.GOOS != "windows" && dirFallback != "/opt/fallback/bin" {
-		t.Fatalf("expected /opt/fallback/bin, got %s", dirFallback)
-	}
-
-	// 4. Default empty fallback
+	// 3. Default empty
 	rootsEmpty := ManifestInstallRoots{}
 	dirEmpty := resolveInstallDir(rootsEmpty, getenv)
 	if runtime.GOOS != "windows" {

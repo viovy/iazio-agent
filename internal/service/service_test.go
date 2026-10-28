@@ -27,7 +27,7 @@ func TestInstallDarwinBootstrapsUserAgent(t *testing.T) {
 	t.Setenv("IAZIO_HARNESS_API_URL", "http://127.0.0.1:8090")
 	home := t.TempDir()
 	var got []string
-	err := InstallDarwinAt(home, "/Users/romeo/.iazio/bin/iazio-agent", func(name string, args ...string) error {
+	err := InstallDarwinAt(home, "/Users/romeo/.local/bin/iazio-agent", func(name string, args ...string) error {
 		got = append(got, name+" "+strings.Join(args, " "))
 		return nil
 	})
@@ -1494,7 +1494,7 @@ func TestReviveCheck_MaintenanceLockActive(t *testing.T) {
 }
 
 func TestHarnessServiceUnitAndPlist(t *testing.T) {
-	harnessBin := "/Users/romeo/.iazio/bin/iazio-harness"
+	harnessBin := "/Users/romeo/.local/bin/iazio-harness"
 	plist := darwinHarnessPlist(harnessBin, "/Users/romeo/.iazio/logs/harness.log")
 	if !strings.Contains(plist, "<string>io.iazio.iazio-harness</string>") {
 		t.Fatalf("expected io.iazio.iazio-harness in plist, got:\n%s", plist)
@@ -1503,8 +1503,8 @@ func TestHarnessServiceUnitAndPlist(t *testing.T) {
 		t.Fatalf("expected daemon command in plist, got:\n%s", plist)
 	}
 
-	unit := linuxHarnessUnit("/home/romeo/.iazio/bin/iazio-harness")
-	if !strings.Contains(unit, "ExecStart=/home/romeo/.iazio/bin/iazio-harness daemon") {
+	unit := linuxHarnessUnit("/home/romeo/.local/bin/iazio-harness")
+	if !strings.Contains(unit, "ExecStart=/home/romeo/.local/bin/iazio-harness daemon") {
 		t.Fatalf("expected ExecStart with daemon in linux unit, got:\n%s", unit)
 	}
 	if !strings.Contains(unit, "Restart=always") {
