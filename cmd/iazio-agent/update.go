@@ -1019,16 +1019,32 @@ func buildToolFromSourceRepo(
 		fmt.Fprintf(stderr, "  [!] %s: git fetch warning: %v\n", tool.Name, fetchErr)
 	}
 
-	// 2. Resolve remote commit SHA
+	// 2. Resolve remote commit SHA (honoring explicit TargetVersion when pinned)
 	var remoteSHA string
-	for _, ref := range []string{"origin/main", "origin/master"} {
-		revCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", ref)
+	pinnedTag := cleanTargetVersion(tool.TargetVersion)
+	var candidateRefs []string
+	if pinnedTag != "" {
+		candidateRefs = []string{
+			"refs/tags/" + pinnedTag,
+			"refs/tags/v" + pinnedTag,
+			pinnedTag,
+			"v" + pinnedTag,
+			"origin/" + pinnedTag,
+		}
+	} else {
+		candidateRefs = []string{"origin/main", "origin/master"}
+	}
+	for _, ref := range candidateRefs {
+		revCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", ref+"^{commit}")
 		revCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 		out, err := revCmd.Output()
 		if err == nil && len(strings.TrimSpace(string(out))) > 0 {
 			remoteSHA = strings.TrimSpace(string(out))
 			break
 		}
+	}
+	if remoteSHA == "" && pinnedTag != "" {
+		return false, fmt.Errorf("pinned target version %q not found in local source repo %s; falling back to release asset", tool.TargetVersion, sourceRepo)
 	}
 	if remoteSHA == "" {
 		revCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "HEAD")
@@ -1074,10 +1090,14 @@ func buildToolFromSourceRepo(
 	buildDir := sourceRepo
 	var cleanupWorktree func()
 
-	if force || !repoIsClean {
+	if force || !repoIsClean || pinnedTag != "" {
 		tempDir := filepath.Join(os.TempDir(), fmt.Sprintf("iazio-build-%s-%d", tool.Name, time.Now().UnixNano()))
 		var addWorktreeSucceeded bool
-		for _, targetRef := range []string{"origin/main", "origin/master", "HEAD"} {
+		worktreeRefs := []string{remoteSHA, "origin/main", "origin/master", "HEAD"}
+		if pinnedTag != "" {
+			worktreeRefs = []string{remoteSHA}
+		}
+		for _, targetRef := range worktreeRefs {
 			addCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "worktree", "add", "--force", "--detach", tempDir, targetRef)
 			addCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 			if err := addCmd.Run(); err == nil {

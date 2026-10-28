@@ -27,6 +27,7 @@ import (
 // Supported job types.
 const (
 	JobTypeStoryCreate   = "story.create"
+	JobTypeStoryExecute  = "story.execute"
 	JobTypePromptExecute = "prompt.execute"
 	JobTypeToolsUpdate   = "agent.tools.update"
 )
@@ -411,7 +412,7 @@ func NewDispatcher(client ControlPlaneClient, invoker harness.Invoker, hostID st
 		client:     client,
 		invoker:    invoker,
 		hostID:     hostID,
-		jobTypes:   []string{JobTypeStoryCreate, JobTypePromptExecute, JobTypeToolsUpdate},
+		jobTypes:   []string{JobTypeStoryCreate, JobTypeStoryExecute, JobTypePromptExecute, JobTypeToolsUpdate},
 		syncer:     s,
 		jobTimeout: 0,
 	}
@@ -497,7 +498,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		if wt := d.worktreeResolver(job.Repo); wt != "" {
 			worktreeDir = wt
 			invoker = invoker.WithWorkDir(wt)
-		} else if job.Repo != "" && job.Repo != "." && (job.Type == JobTypeStoryCreate || job.Type == JobTypePromptExecute) {
+		} else if job.Repo != "" && job.Repo != "." && (job.Type == JobTypeStoryCreate || job.Type == JobTypeStoryExecute || job.Type == JobTypePromptExecute) {
 			if filepath.IsAbs(job.Repo) {
 				if fi, err := os.Stat(job.Repo); err == nil && fi.IsDir() {
 					worktreeDir = job.Repo
@@ -530,7 +531,16 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				fmt.Fprintf(os.Stderr, "[dispatcher] pre-resume sanitize removed %d stale locks\n", len(sanRes.RemovedLockPaths))
 			}
 		} else {
-			if sanRes, sanErr := workspace.ResetAndSanitizeFreshWorkspace(ctx, worktreeDir, job.ID); sanErr != nil {
+			var targetBranch string
+			if len(job.Payload) > 0 {
+				var pMap map[string]any
+				if json.Unmarshal(job.Payload, &pMap) == nil {
+					if b, ok := pMap["branch"].(string); ok {
+						targetBranch = strings.TrimSpace(b)
+					}
+				}
+			}
+			if sanRes, sanErr := workspace.ResetAndSanitizeFreshWorkspace(ctx, worktreeDir, job.ID, targetBranch); sanErr != nil {
 				fmt.Fprintf(os.Stderr, "[dispatcher] pre-job sanitize warning: %v\n", sanErr)
 			} else if sanRes != nil && len(sanRes.RemovedLockPaths) > 0 {
 				fmt.Fprintf(os.Stderr, "[dispatcher] pre-job sanitize removed %d stale locks\n", len(sanRes.RemovedLockPaths))
@@ -633,7 +643,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	}
 
 	// Shared execution lease acquisition for harness jobs (prevents collision with binary updates)
-	if d.hostGate != nil && (job.Type == JobTypeStoryCreate || job.Type == JobTypePromptExecute) {
+	if d.hostGate != nil && (job.Type == JobTypeStoryCreate || job.Type == JobTypeStoryExecute || job.Type == JobTypePromptExecute) {
 		relLease, leaseErr := d.hostGate.AcquireExecutionLease(execCtx, job.ID, job.Repo, job.FencingToken)
 		if leaseErr != nil {
 			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: leaseErr.Error()})
@@ -673,7 +683,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		}
 		return true, compErr
 
-	case JobTypePromptExecute:
+	case JobTypePromptExecute, JobTypeStoryExecute:
 		toolName := job.TargetAgent
 		if toolName == "" {
 			toolName = "default"
