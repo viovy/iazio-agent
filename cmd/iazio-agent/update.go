@@ -39,8 +39,7 @@ type ManifestInstallRoots struct {
 }
 
 type ManifestInstallRootPaths struct {
-	Primary  string `json:"primary"`
-	Fallback string `json:"fallback"`
+	Primary string `json:"primary"`
 }
 
 type ManifestResponse struct {
@@ -138,12 +137,10 @@ func defaultBaselineManifest(profile string) ManifestResponse {
 		Profile: profile,
 		InstallRoots: ManifestInstallRoots{
 			Unix: ManifestInstallRootPaths{
-				Primary:  "~/.local/bin",
-				Fallback: "~/.iazio/bin",
+				Primary: "~/.local/bin",
 			},
 			Windows: ManifestInstallRootPaths{
-				Primary:  "%USERPROFILE%/bin",
-				Fallback: "%USERPROFILE%/.iazio/bin",
+				Primary: "%USERPROFILE%/bin",
 			},
 		},
 		Endpoints: map[string]string{
@@ -508,9 +505,9 @@ func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer, get
 	if agentUpdated {
 		fmt.Fprintln(stdout, "iazio-agent updated: service reload required")
 		if home, err := os.UserHomeDir(); err == nil && home != "" {
-			binPath := filepath.Join(home, ".iazio", "bin", "iazio-agent")
+			binPath := filepath.Join(home, ".local", "bin", "iazio-agent")
 			if runtime.GOOS == "windows" {
-				binPath += ".exe"
+				binPath = filepath.Join(home, "bin", "iazio-agent.exe")
 			}
 			_ = service.ReconcileServiceConfiguration(home, binPath, nil)
 		}
@@ -629,9 +626,6 @@ func updateSingleTool(
 func resolveInstallDir(roots ManifestInstallRoots, getenv func(string) string) string {
 	if runtime.GOOS == "windows" {
 		primary := roots.Windows.Primary
-		if primary == "" {
-			primary = roots.Windows.Fallback
-		}
 		userProfile := getenv("USERPROFILE")
 		if userProfile == "" {
 			userProfile = getenv("HOMEDRIVE") + getenv("HOMEPATH")
@@ -641,13 +635,10 @@ func resolveInstallDir(roots ManifestInstallRoots, getenv func(string) string) s
 			primary = strings.ReplaceAll(primary, "/", "\\")
 			return primary
 		}
-		return filepath.Join(userProfile, ".local", "bin")
+		return filepath.Join(userProfile, "bin")
 	}
 
 	primary := roots.Unix.Primary
-	if primary == "" {
-		primary = roots.Unix.Fallback
-	}
 	home := getenv("HOME")
 	if strings.HasPrefix(primary, "~/") {
 		return filepath.Join(home, strings.TrimPrefix(primary, "~/"))

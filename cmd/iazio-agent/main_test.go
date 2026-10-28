@@ -1165,8 +1165,8 @@ func TestExecuteRunAssignmentLifecycle(t *testing.T) {
 	t.Setenv("HOME", tmpDir)
 	t.Setenv("USERPROFILE", tmpDir)
 
-	// 1. Create a fake iazio-harness binary in PATH and ~/.iazio/bin
-	fakeBinDir := filepath.Join(tmpDir, ".iazio", "bin")
+	// 1. Create a fake iazio-harness binary in PATH and ~/.local/bin
+	fakeBinDir := filepath.Join(tmpDir, ".local", "bin")
 	_ = os.MkdirAll(fakeBinDir, 0755)
 	fakeBin := filepath.Join(fakeBinDir, "iazio-harness")
 	if runtime.GOOS == "windows" {

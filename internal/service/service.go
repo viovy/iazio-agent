@@ -757,7 +757,7 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 	if run == nil {
 		run = execCommand
 	}
-	if bin == "" || bin == "iazio-agent" || !filepath.IsAbs(bin) {
+	if bin == "" || bin == "iazio-agent" || !filepath.IsAbs(bin) || strings.Contains(bin, filepath.Join(".iazio", "bin")) {
 		if runtime.GOOS == "windows" {
 			bin = filepath.Join(home, "bin", "iazio-agent.exe")
 		} else {
@@ -771,6 +771,7 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 		// Purge secondary binary from ~/.iazio/bin/
 		_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-agent"))
 		_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-agent.old"))
+		_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-agent.version"))
 		unitDir := filepath.Join(home, ".config", "systemd", "user")
 		if err := os.MkdirAll(unitDir, 0o755); err != nil {
 			return err
@@ -835,9 +836,9 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 		_ = run("loginctl", "enable-linger")
 
 		// Reconcile iazio-harness user service if harness binary exists
-		harnessBin := filepath.Join(home, ".iazio", "bin", "iazio-harness")
+		harnessBin := filepath.Join(home, ".local", "bin", "iazio-harness")
 		if _, err := os.Stat(harnessBin); err != nil {
-			harnessBin = filepath.Join(home, ".local", "bin", "iazio-harness")
+			harnessBin = filepath.Join(home, ".iazio", "bin", "iazio-harness")
 		}
 		if _, err := os.Stat(harnessBin); err == nil {
 			hSvcFile := filepath.Join(unitDir, "iazio-harness.service")
@@ -857,7 +858,7 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 		if !inMaintenance {
 			_, isActErr := statusCheckCommand("systemctl", "--user", "is-active", "--quiet", "iazio-agent.service")
 			if isActErr != nil {
-				_ = run("systemctl", "--user", "reset-failed", "iazio-agent.service")
+				_ = run("systemctl", "--user", "reset-failed", "iazio-agent.service", "iazio-agent-watcher.service", "iazio-agent-watchdog.service")
 				_ = run("systemctl", "--user", "restart", "iazio-agent.service")
 			}
 		}
@@ -885,9 +886,9 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 		}
 
 		// Reconcile iazio-harness LaunchAgent if harness binary exists
-		harnessBin := filepath.Join(home, ".iazio", "bin", "iazio-harness")
+		harnessBin := filepath.Join(home, ".local", "bin", "iazio-harness")
 		if _, err := os.Stat(harnessBin); err != nil {
-			harnessBin = filepath.Join(home, ".local", "bin", "iazio-harness")
+			harnessBin = filepath.Join(home, ".iazio", "bin", "iazio-harness")
 		}
 		if _, err := os.Stat(harnessBin); err == nil {
 			harnessPlist := filepath.Join(launchAgentsDir, "io.iazio.iazio-harness.plist")
@@ -919,6 +920,9 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 		cleanStaleBackups(tasksDir)
 		binDir := filepath.Join(home, ".iazio", "bin")
 		cleanStaleBackups(binDir)
+		_ = os.Remove(filepath.Join(binDir, "iazio-agent.exe"))
+		_ = os.Remove(filepath.Join(binDir, "iazio-agent.old"))
+		_ = os.Remove(filepath.Join(binDir, "iazio-agent.version"))
 
 		batPath := filepath.Join(tasksDir, "iazio-agent.bat")
 		xmlPath := filepath.Join(tasksDir, "iazio-agent.xml")

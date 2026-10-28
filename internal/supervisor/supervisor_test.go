@@ -901,16 +901,16 @@ func TestResolveBinaryAndRunnerSignal(t *testing.T) {
 		t.Fatal("expected absolute path unchanged")
 	}
 
-	// 3. Resolve from fake home .iazio/bin
+	// 3. Resolve from fake home .local/bin
 	fakeHome := t.TempDir()
-	iazioBin := filepath.Join(fakeHome, ".iazio", "bin")
-	_ = os.MkdirAll(iazioBin, 0755)
-	customTool := filepath.Join(iazioBin, "custom-iazio-tool")
+	localBin := filepath.Join(fakeHome, ".local", "bin")
+	_ = os.MkdirAll(localBin, 0755)
+	customTool := filepath.Join(localBin, "custom-iazio-tool")
 	_ = os.WriteFile(customTool, []byte("#!/bin/sh\n"), 0755)
 
 	t.Setenv("HOME", fakeHome)
 	if got := ResolveBinary("custom-iazio-tool"); got != customTool {
-		t.Fatalf("expected custom tool resolved from .iazio/bin, got %s", got)
+		t.Fatalf("expected custom tool resolved from .local/bin, got %s", got)
 	}
 
 	// 4. Fallback when not found

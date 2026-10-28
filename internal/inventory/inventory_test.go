@@ -86,7 +86,6 @@ func TestDefaultDirsOrder(t *testing.T) {
 	wantPrefix := []string{
 		first,
 		second,
-		filepath.Join(home, ".iazio", "bin"),
 		filepath.Join(home, ".local", "bin"),
 		filepath.Join(home, ".gemini", "antigravity-cli", "bin"),
 	}
