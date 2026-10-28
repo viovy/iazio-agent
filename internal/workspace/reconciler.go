@@ -395,14 +395,19 @@ func computeManifest(ctx context.Context, workspacePath string) (WorkspaceManife
 }
 
 // ResetAndSanitizeFreshWorkspace cleans stale locks and recovers dirty state to
-// .autopilot/recovery/<timestamp>-<job_id>.patch before resetting root and submodules to clean origin/main.
-func ResetAndSanitizeFreshWorkspace(ctx context.Context, workspacePath, jobID string) (*WorkspaceSanitizeResult, error) {
+// .autopilot/recovery/<timestamp>-<job_id>.patch before resetting root and submodules to clean origin/main (or optional targetBranch).
+func ResetAndSanitizeFreshWorkspace(ctx context.Context, workspacePath, jobID string, targetBranch ...string) (*WorkspaceSanitizeResult, error) {
 	res, err := SanitizeWorkspace(ctx, workspacePath)
 	if err != nil {
 		return res, err
 	}
 	if workspacePath == "" {
 		return res, nil
+	}
+
+	var requestedBranch string
+	if len(targetBranch) > 0 {
+		requestedBranch = strings.TrimSpace(targetBranch[0])
 	}
 
 	// 1. Check if git status --porcelain is dirty
@@ -429,15 +434,24 @@ func ResetAndSanitizeFreshWorkspace(ctx context.Context, workspacePath, jobID st
 		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "reset", "--hard", "HEAD").Run()
 		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "clean", "-fd").Run()
 
-		// Fetch all remotes and reset to clean origin/main if available
+		// Fetch all remotes and reset to clean origin/main if available (unless a specific target branch is requested)
 		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "fetch", "--all", "--prune").Run()
-		if errOrigin := exec.CommandContext(ctx, "git", "-C", workspacePath, "rev-parse", "--verify", "origin/main").Run(); errOrigin == nil {
-			_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "reset", "--hard", "origin/main").Run()
+		if requestedBranch == "" || requestedBranch == "main" {
+			if errOrigin := exec.CommandContext(ctx, "git", "-C", workspacePath, "rev-parse", "--verify", "origin/main").Run(); errOrigin == nil {
+				_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "reset", "--hard", "origin/main").Run()
+			}
 		}
 
 		// Hard reset and clean recursive submodules
 		submoduleCmd := `rm -f .git/index.lock || true; git reset --hard; git clean -fd`
 		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "submodule", "foreach", "--recursive", submoduleCmd).Run()
+	}
+
+	if requestedBranch != "" {
+		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "fetch", "origin", requestedBranch).Run()
+		if err := exec.CommandContext(ctx, "git", "-C", workspacePath, "checkout", requestedBranch).Run(); err != nil {
+			_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "checkout", "-B", requestedBranch, "origin/"+requestedBranch).Run()
+		}
 	}
 
 	// Re-clean any newly discovered stale locks
