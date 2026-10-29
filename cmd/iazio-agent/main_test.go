@@ -2992,3 +2992,21 @@ func TestIntegration_DiscardCommand_CancelsRunningJob_CleansGitRepoAndRepolock(t
 	}
 }
 
+func TestBuildWindowsSelfRestartCommand(t *testing.T) {
+	spawnCmd, schtasksCmd := buildWindowsSelfRestartCommand(`C:\Users\romeo\.local\bin\iazio-agent.exe`, []string{
+		`C:\Users\romeo\.local\bin\iazio-agent.exe`,
+		"run",
+		"--profile",
+		"workstation",
+	}, []string{"IAZIO_TEST=1"})
+	if spawnCmd == nil || schtasksCmd == nil {
+		t.Fatalf("expected non-nil spawnCmd and schtasksCmd")
+	}
+	if spawnCmd.Path != `C:\Users\romeo\.local\bin\iazio-agent.exe` {
+		t.Fatalf("expected binary path %q, got %q", `C:\Users\romeo\.local\bin\iazio-agent.exe`, spawnCmd.Path)
+	}
+	if len(spawnCmd.Args) != 4 || spawnCmd.Args[1] != "run" || spawnCmd.Args[2] != "--profile" || spawnCmd.Args[3] != "workstation" {
+		t.Fatalf("expected forwarded args [..., run --profile workstation], got %v", spawnCmd.Args)
+	}
+}
+
