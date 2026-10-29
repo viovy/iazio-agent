@@ -718,18 +718,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						}
 					case "FORCE_TOOL_UPDATE":
 						go func() {
-							var p struct {
-								Tools         []string `json:"tools"`
-								Force         *bool    `json:"force"`
-								TargetVersion string   `json:"target_version"`
-							}
-							force := true
-							if len(cmd.Payload) > 0 && json.Unmarshal(cmd.Payload, &p) == nil {
-								if p.Force != nil {
-									force = *p.Force
-								}
-							}
-							if doToolUpdate(runCtx, p.Tools, force, p.TargetVersion) {
+							if doToolUpdate(runCtx, nil, true) {
 								restartOrExecSelf(stdout)
 								cancel()
 							}
@@ -913,14 +902,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 					return nil
 				})
-				var pendingSelfRestart atomic.Bool
 				disp.SetPostJobHook(func(ctx context.Context, job *worker.Job) {
 					if eagerUpdater != nil {
 						eagerUpdater.TriggerEvaluation("post_job_completion")
-					}
-					if pendingSelfRestart.CompareAndSwap(true, false) {
-						restartOrExecSelf(stdout)
-						cancel()
 					}
 				})
 				disp.SetToolUpdater(func(ctx context.Context, tools []string, force bool, targetVersion ...string) error {
@@ -959,7 +943,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						return worker.ErrJobDeferred
 					}
 					if res.AgentUpdated {
-						pendingSelfRestart.Store(true)
+						restartOrExecSelf(stdout)
+						cancel()
 					}
 					return nil
 				})
