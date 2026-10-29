@@ -2025,64 +2025,92 @@ func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Cli
 
 var syscallExec = syscall.Exec
 
+// buildWindowsSelfRestartCommand constructs the detached background command and scheduled-task fallback
+// used on Windows when syscall.Exec is unsupported (EWINDOWS).
+func buildWindowsSelfRestartCommand(targetBin string, args []string, env []string) (*exec.Cmd, *exec.Cmd) {
+	var passArgs []string
+	if len(args) > 1 {
+		passArgs = args[1:]
+	}
+	spawnCmd := exec.Command(targetBin, passArgs...)
+	spawnCmd.Env = env
+	schtasksCmd := exec.Command("schtasks", "/Run", "/TN", "iazio-agent")
+	return spawnCmd, schtasksCmd
+}
+
+func resolveSelfBinaryPath(goos string, selfBin string, home string, args []string) string {
+	cleanSelf := strings.TrimSuffix(selfBin, " (deleted)")
+	if goos == "windows" {
+		cleanSelf = strings.TrimSuffix(cleanSelf, ".old")
+	}
+
+	var candidates []string
+	if cleanSelf != "" {
+		candidates = append(candidates, cleanSelf)
+		if resolved, err := filepath.EvalSymlinks(cleanSelf); err == nil && resolved != cleanSelf {
+			candidates = append(candidates, resolved)
+		}
+	}
+	if home != "" {
+		if goos == "windows" {
+			candidates = append(candidates,
+				filepath.Join(home, ".local", "bin", "iazio-agent.exe"),
+				filepath.Join(home, "bin", "iazio-agent.exe"),
+			)
+		} else {
+			candidates = append(candidates,
+				filepath.Join(home, ".local", "bin", "iazio-agent"),
+			)
+		}
+	}
+	if len(args) > 0 && filepath.IsAbs(args[0]) {
+		candidates = append(candidates, args[0])
+	}
+
+	for _, cand := range candidates {
+		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+			if goos == "windows" || fi.Mode()&0111 != 0 {
+				return cand
+			}
+		}
+	}
+	if cleanSelf != "" {
+		return cleanSelf
+	}
+	return selfBin
+}
+
 func restartOrExecSelf(stdout io.Writer) {
 	if stdout != nil {
 		fmt.Fprintln(stdout, "[supervisor] iazio-agent self-updated; executing in-PID handoff to updated binary...")
 	}
-	if runtime.GOOS != "windows" {
-		selfBin, err := os.Executable()
-		cleanSelf := ""
-		if err == nil {
-			cleanSelf = strings.TrimSuffix(selfBin, " (deleted)")
-		}
+	selfBin, _ := os.Executable()
+	home, _ := os.UserHomeDir()
+	targetBin := resolveSelfBinaryPath(runtime.GOOS, selfBin, home, os.Args)
 
-		var candidates []string
-		if cleanSelf != "" {
-			candidates = append(candidates, cleanSelf)
-			if resolved, err := filepath.EvalSymlinks(cleanSelf); err == nil && resolved != cleanSelf {
-				candidates = append(candidates, resolved)
-			}
+	execErr := syscallExec(targetBin, os.Args, os.Environ())
+	if execErr != nil {
+		if isTesting {
+			return
 		}
-		if home, err := os.UserHomeDir(); err == nil && home != "" {
-			candidates = append(candidates,
-				filepath.Join(home, ".local", "bin", "iazio-agent"),
-			)
-			if runtime.GOOS == "windows" {
-				candidates = append(candidates, filepath.Join(home, "bin", "iazio-agent.exe"))
-			}
-		}
-		if len(os.Args) > 0 && filepath.IsAbs(os.Args[0]) {
-			candidates = append(candidates, os.Args[0])
-		}
-
-		var targetBin string
-		for _, cand := range candidates {
-			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() && fi.Mode()&0111 != 0 {
-				targetBin = cand
-				break
-			}
-		}
-		if targetBin == "" {
-			if cleanSelf != "" {
-				targetBin = cleanSelf
-			} else {
-				targetBin = selfBin
-			}
-		}
-
-		execErr := syscallExec(targetBin, os.Args, os.Environ())
-		if execErr != nil {
-			fmt.Fprintf(os.Stderr, "[SIR: AUTO_RESTART_FAIL] syscall.Exec(%s) failed: %v; attempting background restart and service revive\n", targetBin, execErr)
-			// Fallback: spawn background restart so the host never stays offline
-			cmd := exec.Command(targetBin, os.Args[1:]...)
-			cmd.Env = os.Environ()
-			if startErr := cmd.Start(); startErr == nil {
+		fmt.Fprintf(os.Stderr, "[SIR: AUTO_RESTART_FAIL] syscall.Exec(%s) failed: %v; attempting background restart and service revive\n", targetBin, execErr)
+		if runtime.GOOS == "windows" {
+			spawnCmd, schtasksCmd := buildWindowsSelfRestartCommand(targetBin, os.Args, os.Environ())
+			if startErr := spawnCmd.Start(); startErr == nil {
 				os.Exit(0)
 			}
-			// Attempt to revive via systemd if available
-			_ = exec.Command("systemctl", "--user", "restart", "iazio-agent.service").Run()
-			os.Exit(1)
+			_ = schtasksCmd.Run()
+			os.Exit(0)
 		}
+		// Fallback: spawn background restart so the host never stays offline
+		cmd := exec.Command(targetBin, os.Args[1:]...)
+		cmd.Env = os.Environ()
+		if startErr := cmd.Start(); startErr == nil {
+			os.Exit(0)
+		}
+		// Attempt to revive via systemd if available
+		_ = exec.Command("systemctl", "--user", "restart", "iazio-agent.service").Run()
+		os.Exit(1)
 	}
 }
 
