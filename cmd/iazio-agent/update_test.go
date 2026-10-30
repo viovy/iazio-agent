@@ -1760,3 +1760,54 @@ func TestPerformUpdateWithResult_ForcePartialFailureVsAllFailed(t *testing.T) {
 	}
 }
 
+func TestFindMatchingAsset_PrefixDisambiguationAndBundle(t *testing.T) {
+	rel := &gitHubRelease{
+		TagName: "v0.0.105",
+		Assets: []gitHubAsset{
+			{Name: "autopilot-fleet-exec_0.0.105_linux_amd64.tar.gz"},
+			{Name: "autopilot-fleet-health_0.0.105_linux_amd64.tar.gz"},
+			{Name: "autopilot-fleet_0.0.105_linux_amd64.tar.gz"},
+			{Name: "autopilot-plugins-internal_0.0.105_linux_amd64.tar.gz"},
+			{Name: "checksums.txt"},
+		},
+	}
+
+	asset, err := findMatchingAsset(rel, "autopilot-fleet", "linux", "amd64")
+	if err != nil {
+		t.Fatalf("expected asset for autopilot-fleet, got err: %v", err)
+	}
+	if asset.Name != "autopilot-fleet_0.0.105_linux_amd64.tar.gz" {
+		t.Fatalf("expected autopilot-fleet_0.0.105_linux_amd64.tar.gz, got %s", asset.Name)
+	}
+
+	bundleAsset, err := findMatchingAsset(rel, "autopilot-backlog", "linux", "amd64")
+	if err != nil {
+		t.Fatalf("expected bundle fallback for autopilot-backlog, got err: %v", err)
+	}
+	if bundleAsset.Name != "autopilot-plugins-internal_0.0.105_linux_amd64.tar.gz" {
+		t.Fatalf("expected bundle autopilot-plugins-internal_0.0.105_linux_amd64.tar.gz, got %s", bundleAsset.Name)
+	}
+}
+
+func TestFindToolSourceRepo_PluginMapping(t *testing.T) {
+	tmpRoot := t.TempDir()
+	pluginsRepo := filepath.Join(tmpRoot, "autopilot-plugins-internal")
+	if err := os.MkdirAll(filepath.Join(pluginsRepo, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(pluginsRepo, "cmd", "autopilot-fleet"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	getenv := func(k string) string {
+		if k == "META_REPO_ROOT" {
+			return tmpRoot
+		}
+		return ""
+	}
+
+	got := findToolSourceRepo("autopilot-fleet", getenv, "viovy/autopilot-plugins-internal")
+	if got != pluginsRepo {
+		t.Fatalf("expected %s, got %s", pluginsRepo, got)
+	}
+}

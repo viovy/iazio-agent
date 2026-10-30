@@ -331,6 +331,11 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 		return res, fmt.Errorf("target_version %q can only be specified when exactly one tool is targeted, got %d targets", opts.TargetVersion, len(targets))
 	}
 
+	// Always update iazio-agent last so self-update never interrupts sibling tool updates
+	sort.SliceStable(targets, func(i, j int) bool {
+		return targets[i].Name != "iazio-agent" && targets[j].Name == "iazio-agent"
+	})
+
 	for _, tool := range targets {
 		if opts.TargetVersion != "" {
 			tool.TargetVersion = opts.TargetVersion
@@ -555,7 +560,7 @@ func updateSingleTool(
 		curVer = inventory.InspectInstalledVersion(existingShadowPath)
 	}
 
-	if sourceRepo := findToolSourceRepo(tool.Name, envFn); sourceRepo != "" {
+	if sourceRepo := findToolSourceRepo(tool.Name, envFn, tool.Repository); sourceRepo != "" {
 		updated, srcErr := buildToolFromSourceRepo(ctx, tool, sourceRepo, destPath, force, stdout, stderr)
 		if srcErr == nil {
 			return updated, nil
@@ -621,6 +626,10 @@ func updateSingleTool(
 
 	_ = os.WriteFile(destPath+".version", []byte(latestVer), 0644)
 	inventory.InvalidateVersionCache(destPath)
+
+	if tool.Name == "iazio-harvester" || tool.Name == "iazio-harness" {
+		_ = service.RestartToolService(tool.Name)
+	}
 
 	fmt.Fprintf(stdout, "  [+] %s: %s -> %s\n", tool.Name, latestVer, destPath)
 	return true, nil
@@ -767,7 +776,7 @@ func findMatchingAsset(rel *gitHubRelease, toolName, targetOS, targetArch string
 		return osMatch && archMatch
 	}
 
-	// 1. Exact component prefix: <toolName>_<version>... or <toolName>-<version>...
+	// 1. Exact component prefix: <toolName>_<version>... or <toolName>.<ext>
 	if normTool != "" {
 		for i := range rel.Assets {
 			a := &rel.Assets[i]
@@ -775,20 +784,25 @@ func findMatchingAsset(rel *gitHubRelease, toolName, targetOS, targetArch string
 			if !isPlatformMatch(lower) {
 				continue
 			}
-			if strings.HasPrefix(lower, normTool+"_") || strings.HasPrefix(lower, normTool+"-") || strings.HasPrefix(lower, normTool+".") {
+			if strings.HasPrefix(lower, normTool+"_") || strings.HasPrefix(lower, normTool+".") {
 				return a, nil
 			}
 		}
 
-		// 2. Contains toolName
+		// 2. Hyphen-delimited version/OS suffix: <toolName>-<version> or <toolName>-<os>
+		// Ensures "autopilot-fleet" does NOT match "autopilot-fleet-exec_..."
 		for i := range rel.Assets {
 			a := &rel.Assets[i]
 			lower := strings.ToLower(a.Name)
 			if !isPlatformMatch(lower) {
 				continue
 			}
-			if strings.Contains(lower, normTool) {
-				return a, nil
+			if strings.HasPrefix(lower, normTool+"-") {
+				rest := strings.TrimPrefix(lower, normTool+"-")
+				isVer := len(rest) > 0 && ((rest[0] >= '0' && rest[0] <= '9') || (rest[0] == 'v' && len(rest) > 1 && rest[1] >= '0' && rest[1] <= '9'))
+				if isVer || strings.HasPrefix(rest, targetOS) {
+					return a, nil
+				}
 			}
 		}
 	}
@@ -800,17 +814,28 @@ func findMatchingAsset(rel *gitHubRelease, toolName, targetOS, targetArch string
 		if !isPlatformMatch(lower) {
 			continue
 		}
-		if strings.Contains(lower, "build-release") || strings.Contains(lower, "bundle") || strings.Contains(lower, "plugins") {
+		if strings.Contains(lower, "build-release") || strings.Contains(lower, "bundle") || strings.Contains(lower, "plugins") || strings.HasPrefix(lower, "autopilot-plugins-internal_") {
 			return a, nil
 		}
 	}
 
-	// 4. Default: first platform matching asset
-	for i := range rel.Assets {
-		a := &rel.Assets[i]
-		lower := strings.ToLower(a.Name)
-		if isPlatformMatch(lower) {
-			return a, nil
+	// 4. Fallback for single-tool releases (<= 6 assets)
+	if len(rel.Assets) <= 6 {
+		if normTool != "" {
+			for i := range rel.Assets {
+				a := &rel.Assets[i]
+				lower := strings.ToLower(a.Name)
+				if isPlatformMatch(lower) && strings.Contains(lower, normTool) {
+					return a, nil
+				}
+			}
+		}
+		for i := range rel.Assets {
+			a := &rel.Assets[i]
+			lower := strings.ToLower(a.Name)
+			if isPlatformMatch(lower) {
+				return a, nil
+			}
 		}
 	}
 
@@ -936,7 +961,7 @@ func inspectInstalledVersion(binaryPath string) string {
 	return inventory.InspectInstalledVersion(binaryPath)
 }
 
-func findToolSourceRepo(toolName string, getenv func(string) string) string {
+func findToolSourceRepo(toolName string, getenv func(string) string, repoHint ...string) string {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
@@ -945,26 +970,63 @@ func findToolSourceRepo(toolName string, getenv func(string) string) string {
 		return ""
 	}
 
-	candidateNames := []string{cleanTool}
-	switch cleanTool {
-	case "autopilot-fleet", "autopilot-story", "autopilot-backlog":
-		candidateNames = []string{cleanTool, "autopilot-plugins-internal"}
+	candidateRepoNames := []string{cleanTool}
+	if len(repoHint) > 0 && strings.TrimSpace(repoHint[0]) != "" {
+		rh := strings.ToLower(strings.TrimSpace(repoHint[0]))
+		if idx := strings.LastIndex(rh, "/"); idx != -1 {
+			rh = rh[idx+1:]
+		}
+		switch rh {
+		case "autopilot-plugins":
+			rh = "autopilot-plugins-internal"
+		case "autopilot-core":
+			rh = "autopilot"
+		}
+		if rh != "" && rh != cleanTool {
+			candidateRepoNames = append(candidateRepoNames, rh)
+		}
+	}
+	if strings.HasPrefix(cleanTool, "autopilot-") {
+		hasPluginsCandidate := false
+		for _, c := range candidateRepoNames {
+			if c == "autopilot-plugins-internal" {
+				hasPluginsCandidate = true
+				break
+			}
+		}
+		if !hasPluginsCandidate {
+			candidateRepoNames = append(candidateRepoNames, "autopilot-plugins-internal")
+		}
 	}
 
-	isGitRepo := func(dir string) bool {
+	isGitRepoWithTool := func(dir string) bool {
 		fi, err := os.Stat(filepath.Join(dir, ".git"))
-		return err == nil && (fi.IsDir() || fi.Mode().IsRegular())
+		if err != nil || (!fi.IsDir() && !fi.Mode().IsRegular()) {
+			return false
+		}
+		if strings.EqualFold(filepath.Base(dir), cleanTool) {
+			return true
+		}
+		if st, err := os.Stat(filepath.Join(dir, "cmd", cleanTool)); err == nil && st.IsDir() {
+			return true
+		}
+		if strings.EqualFold(filepath.Base(dir), "autopilot-plugins-internal") && strings.HasPrefix(cleanTool, "autopilot-") {
+			if _, err := os.Stat(filepath.Join(dir, "cmd")); os.IsNotExist(err) {
+				return true
+			}
+		}
+		return false
 	}
 
 	// 1. Check explicit environment overrides
 	for _, envKey := range []string{"IAZIO_FLEET_ROOT", "META_REPO_ROOT", "AUTOPILOT_ROOT"} {
 		if root := strings.TrimSpace(getenv(envKey)); root != "" {
-			for _, candName := range candidateNames {
-				cand := filepath.Join(root, candName)
-				if isGitRepo(cand) {
+			for _, repoDirName := range candidateRepoNames {
+				cand := filepath.Join(root, repoDirName)
+				if isGitRepoWithTool(cand) {
 					return cand
 				}
-				if isGitRepo(root) && strings.EqualFold(filepath.Base(root), candName) {
+				if strings.EqualFold(filepath.Base(root), repoDirName) && isGitRepoWithTool(root) {
 					return root
 				}
 			}
@@ -975,12 +1037,12 @@ func findToolSourceRepo(toolName string, getenv func(string) string) string {
 	if cwd, err := os.Getwd(); err == nil && cwd != "" {
 		curr := cwd
 		for i := 0; i < 4; i++ {
-			for _, candName := range candidateNames {
-				cand := filepath.Join(curr, candName)
-				if isGitRepo(cand) {
+			for _, repoDirName := range candidateRepoNames {
+				cand := filepath.Join(curr, repoDirName)
+				if isGitRepoWithTool(cand) {
 					return cand
 				}
-				if isGitRepo(curr) && strings.EqualFold(filepath.Base(curr), candName) {
+				if strings.EqualFold(filepath.Base(curr), repoDirName) && isGitRepoWithTool(curr) {
 					return curr
 				}
 			}
@@ -1001,22 +1063,22 @@ func findToolSourceRepo(toolName string, getenv func(string) string) string {
 		metaRepos, _ := filepath.Glob(filepath.Join(home, "work", "meta-repo*"))
 		sort.Sort(sort.Reverse(sort.StringSlice(metaRepos)))
 
-		for _, candName := range candidateNames {
+		for _, repoDirName := range candidateRepoNames {
 			for _, mr := range metaRepos {
-				cand := filepath.Join(mr, candName)
-				if isGitRepo(cand) {
+				cand := filepath.Join(mr, repoDirName)
+				if isGitRepoWithTool(cand) {
 					return cand
 				}
 			}
 			homeCandidates := []string{
-				filepath.Join(home, "work", "meta"+"-repo", candName),
-				filepath.Join(home, "work", candName),
-				filepath.Join(home, "src", candName),
-				filepath.Join(home, "projects", candName),
-				filepath.Join(home, candName),
+				filepath.Join(home, "work", "meta"+"-repo", repoDirName),
+				filepath.Join(home, "work", repoDirName),
+				filepath.Join(home, "src", repoDirName),
+				filepath.Join(home, "projects", repoDirName),
+				filepath.Join(home, repoDirName),
 			}
 			for _, cand := range homeCandidates {
-				if isGitRepo(cand) {
+				if isGitRepoWithTool(cand) {
 					return cand
 				}
 			}
@@ -1085,6 +1147,19 @@ func buildToolFromSourceRepo(
 		return false, fmt.Errorf("unable to resolve remote commit SHA for %s in %s", tool.Name, sourceRepo)
 	}
 
+	// Resolve semver tag if available in sourceRepo (or from pinnedTag)
+	semVer := pinnedTag
+	if semVer == "" {
+		tagCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "describe", "--tags", "--abbrev=0", remoteSHA)
+		tagCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		if out, err := tagCmd.Output(); err == nil {
+			candTag := cleanTargetVersion(strings.TrimSpace(string(out)))
+			if candTag != "" {
+				semVer = candTag
+			}
+		}
+	}
+
 	// 3. Resolve installed commit SHA from canonical binary
 	installedSHA := inventory.InspectToolCommitSHA(destPath)
 
@@ -1093,6 +1168,20 @@ func buildToolFromSourceRepo(
 	statusCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	statusOut, _ := statusCmd.Output()
 	repoIsClean := len(strings.TrimSpace(string(statusOut))) == 0
+
+	// If local checkout is clean and unpinned, fast-forward local main/master to remoteSHA so local checkout stays current
+	if repoIsClean && pinnedTag == "" {
+		branchCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "--abbrev-ref", "HEAD")
+		branchCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		if bOut, bErr := branchCmd.Output(); bErr == nil {
+			br := strings.TrimSpace(string(bOut))
+			if br == "main" || br == "master" {
+				ffCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "merge", "--ff-only", remoteSHA)
+				ffCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+				_ = ffCmd.Run()
+			}
+		}
+	}
 
 	// 5. Evaluate eager update condition
 	if !force {
@@ -1103,6 +1192,13 @@ func buildToolFromSourceRepo(
 			return false, nil
 		}
 		if installedSHA != "" && (installedSHA == remoteSHA || strings.HasPrefix(remoteSHA, installedSHA) || strings.HasPrefix(installedSHA, remoteSHA)) {
+			if semVer != "" {
+				sidecarBytes, _ := os.ReadFile(destPath + ".version")
+				if !strings.Contains(string(sidecarBytes), semVer) {
+					_ = os.WriteFile(destPath+".version", []byte(semVer+"+"+remoteSHA), 0644)
+					inventory.InvalidateVersionCache(destPath)
+				}
+			}
 			short := remoteSHA
 			if len(short) > 7 {
 				short = short[:7]
@@ -1114,11 +1210,17 @@ func buildToolFromSourceRepo(
 		}
 	}
 
-	// 6. Build from origin/main (using isolated ephemeral worktree if force or dirty)
+	// Check whether sourceRepo HEAD equals remoteSHA
+	var localHeadSHA string
+	if headOut, err := exec.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "HEAD").Output(); err == nil {
+		localHeadSHA = strings.TrimSpace(string(headOut))
+	}
+
+	// 6. Build from remoteSHA (using isolated ephemeral worktree if force, dirty, pinned, or local HEAD != remoteSHA)
 	buildDir := sourceRepo
 	var cleanupWorktree func()
 
-	if force || !repoIsClean || pinnedTag != "" {
+	if force || !repoIsClean || pinnedTag != "" || localHeadSHA != remoteSHA {
 		tempDir := filepath.Join(os.TempDir(), fmt.Sprintf("iazio-build-%s-%d", tool.Name, time.Now().UnixNano()))
 		var addWorktreeSucceeded bool
 		worktreeRefs := []string{remoteSHA, "origin/main", "origin/master", "HEAD"}
@@ -1181,11 +1283,13 @@ func buildToolFromSourceRepo(
 	defer func() { _ = os.Remove(stagingBin) }()
 
 	verStr := "0.0.1"
-	if out, err := exec.CommandContext(ctx, "git", "-C", buildDir, "describe", "--tags", "--always").Output(); err == nil {
+	if semVer != "" {
+		verStr = semVer
+	} else if out, err := exec.CommandContext(ctx, "git", "-C", buildDir, "describe", "--tags", "--always").Output(); err == nil {
 		verStr = strings.TrimSpace(string(out))
 	}
 	nowUTC := time.Now().UTC().Format(time.RFC3339)
-	ldflags := fmt.Sprintf("-s -w -X main.version=%s -X main.commit=%s -X main.buildCommitSHA=%s -X main.buildTimeUTC=%s -X main.buildDirty=false", verStr, remoteSHA, remoteSHA, nowUTC)
+	ldflags := fmt.Sprintf("-s -w -X main.version=%s -X github.com/viovy/autopilot-plugins-internal/pkg/pluginsdk.Version=%s -X main.commit=%s -X main.buildCommitSHA=%s -X main.buildTimeUTC=%s -X main.buildDirty=false", verStr, verStr, remoteSHA, remoteSHA, nowUTC)
 
 	cmdPath := fmt.Sprintf("./cmd/%s", toolName)
 	if _, err := os.Stat(filepath.Join(buildDir, "cmd", toolName)); err != nil {
@@ -1208,10 +1312,15 @@ func buildToolFromSourceRepo(
 		return false, fmt.Errorf("install %s: %w", tool.Name, err)
 	}
 
-	_ = os.WriteFile(destPath+".version", []byte(remoteSHA), 0644)
+	sidecarContent := remoteSHA
+	if semVer != "" {
+		sidecarContent = semVer + "+" + remoteSHA
+	}
+	_ = os.WriteFile(destPath+".version", []byte(sidecarContent), 0644)
 	inventory.InvalidateVersionCache(destPath)
 
-	if tool.Name == "iazio-agent" || tool.Name == "iazio-harvester" || tool.Name == "iazio-harness" {
+	// Restart companion daemons immediately; iazio-agent restarts itself after completing the update pass and reporting job completion
+	if tool.Name == "iazio-harvester" || tool.Name == "iazio-harness" {
 		_ = service.RestartToolService(tool.Name)
 	}
 

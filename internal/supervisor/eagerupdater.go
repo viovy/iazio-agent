@@ -678,6 +678,7 @@ func (u *EagerToolUpdater) EvaluateAndTriggerWithOpts(ctx context.Context, opts 
 			u.hasPending = false
 			u.mu.Unlock()
 			if passDeferred && !curForce && !curBypassDirty {
+				_ = u.EvaluateReadiness(ctx)
 				return aggregateRes, true, lastErr
 			}
 			break
@@ -698,6 +699,7 @@ func (u *EagerToolUpdater) EvaluateAndTriggerWithOpts(ctx context.Context, opts 
 		curBypassDirty = nextReq.BypassDirty
 	}
 
+	_ = u.EvaluateReadiness(ctx)
 	return aggregateRes, false, lastErr
 }
 

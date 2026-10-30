@@ -162,6 +162,21 @@ func TestInspectInstalledVersion(t *testing.T) {
 	if ver2 != "2.0.0" {
 		t.Fatalf("expected version file 2.0.0, got: %s", ver2)
 	}
+
+	// With raw hex SHA in .version, should execute binary --version and preserve +<sha> in .version
+	InvalidateVersionCache(binPath)
+	rawSHA := "d979f6fc623a6dcdf3fa70b0f712f2db2c179ff7"
+	if err := os.WriteFile(binPath+".version", []byte(rawSHA), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ver3 := InspectInstalledVersion(binPath)
+	if ver3 != "1.4.2" {
+		t.Fatalf("expected version 1.4.2 when .version held raw SHA, got: %s", ver3)
+	}
+	sha3 := InspectToolCommitSHA(binPath)
+	if sha3 != rawSHA {
+		t.Fatalf("expected commit SHA %s to be preserved in .version, got: %s", rawSHA, sha3)
+	}
 }
 
 func TestScanWindowsUserBin(t *testing.T) {

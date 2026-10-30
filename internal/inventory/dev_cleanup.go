@@ -78,9 +78,12 @@ func InspectToolCommitSHA(binaryPath string) string {
 		return result
 	}
 
-	// Fast path: check .version sidecar if present and contains hex SHA
+	// Fast path: check .version sidecar if present and contains hex SHA or <semver>+<hexSHA>
 	if sidecar, err := os.ReadFile(binaryPath + ".version"); err == nil {
 		s := strings.TrimSpace(string(sidecar))
+		if idx := strings.LastIndex(s, "+"); idx != -1 {
+			s = strings.TrimSpace(s[idx+1:])
+		}
 		if len(s) >= 7 && len(s) <= 40 {
 			isHex := true
 			for _, r := range s {
