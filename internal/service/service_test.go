@@ -1595,22 +1595,36 @@ func TestReviveCheck_MaintenanceLockActive(t *testing.T) {
 	}
 }
 
-func TestHarnessServiceUnitAndPlist(t *testing.T) {
-	harnessBin := "/Users/romeo/.local/bin/iazio-harness"
-	plist := darwinHarnessPlist(harnessBin, "/Users/romeo/.iazio/logs/harness.log")
-	if !strings.Contains(plist, "<string>io.iazio.iazio-harness</string>") {
-		t.Fatalf("expected io.iazio.iazio-harness in plist, got:\n%s", plist)
+func TestLegacyHarnessUnitsPurgedOnLinuxReconcile(t *testing.T) {
+	home := t.TempDir()
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(plist, "<string>daemon</string>") {
-		t.Fatalf("expected daemon command in plist, got:\n%s", plist)
+	legacyUnits := []string{
+		"iazio-harness.service",
+		"iazio-harness-watchdog.timer",
+		"iazio-harness-watchdog.service",
+		"iazio-harness-watcher.path",
+		"iazio-harness-watcher.service",
 	}
-
-	unit := linuxHarnessUnit("/home/romeo/.local/bin/iazio-harness")
-	if !strings.Contains(unit, "ExecStart=/home/romeo/.local/bin/iazio-harness daemon") {
-		t.Fatalf("expected ExecStart with daemon in linux unit, got:\n%s", unit)
+	for _, u := range legacyUnits {
+		if err := os.WriteFile(filepath.Join(unitDir, u), []byte("[Unit]\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if !strings.Contains(unit, "Restart=always") {
-		t.Fatalf("expected Restart=always in linux unit, got:\n%s", unit)
+	var cmds []string
+	runner := func(name string, args ...string) error {
+		cmds = append(cmds, name+" "+strings.Join(args, " "))
+		return nil
+	}
+	if err := reconcileLinuxServiceConfiguration(home, filepath.Join(home, ".local", "bin", "iazio-agent"), runner); err != nil {
+		t.Fatalf("reconcileLinuxServiceConfiguration failed: %v", err)
+	}
+	for _, u := range legacyUnits {
+		if _, err := os.Stat(filepath.Join(unitDir, u)); !os.IsNotExist(err) {
+			t.Fatalf("expected legacy unit %s to be deleted, got err=%v", u, err)
+		}
 	}
 }
 

@@ -1363,16 +1363,19 @@ func buildToolFromSourceRepo(
 		_ = service.RestartToolService(tool.Name)
 	}
 
-	// Dev binary cleanup
-	home, _ := os.UserHomeDir()
-	searchDirs := inventory.DefaultDirs(os.Getenv("PATH"), home, runtime.GOOS)
-	if sourceRepo != "" {
-		searchDirs = append(searchDirs, sourceRepo, filepath.Dir(sourceRepo))
-	}
-	candidates := inventory.ScanDevAndShadowBinaries(searchDirs, filepath.Dir(destPath))
-	report, _ := inventory.CleanupDevBinaries(ctx, candidates, filepath.Dir(destPath))
-	if len(report.DeletedPaths) > 0 && stdout != nil {
-		fmt.Fprintf(stdout, "  [*] %s: cleaned up %d dev/shadow binaries\n", tool.Name, len(report.DeletedPaths))
+	// Dev binary cleanup (only when installing into a real canonical ~/.local/bin directory outside unit tests)
+	destDirClean := filepath.Clean(filepath.Dir(destPath))
+	if !isTestBinary() && filepath.Base(destDirClean) == "bin" && filepath.Base(filepath.Dir(destDirClean)) == ".local" {
+		home := filepath.Dir(filepath.Dir(destDirClean))
+		searchDirs := []string{destDirClean, filepath.Join(home, ".iazio", "bin")}
+		if sourceRepo != "" {
+			searchDirs = append(searchDirs, sourceRepo, filepath.Dir(sourceRepo))
+		}
+		candidates := inventory.ScanDevAndShadowBinaries(searchDirs, destDirClean)
+		report, _ := inventory.CleanupDevBinaries(ctx, candidates, destDirClean)
+		if len(report.DeletedPaths) > 0 && stdout != nil {
+			fmt.Fprintf(stdout, "  [*] %s: cleaned up %d dev/shadow binaries\n", tool.Name, len(report.DeletedPaths))
+		}
 	}
 
 	short := remoteSHA

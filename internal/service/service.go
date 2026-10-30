@@ -290,68 +290,6 @@ func darwinPlist(bin, logPath string) string {
 `, agentLabel, bin, maintenancePath, apiXml, homeXml, userXml, pathXml, esXml, logPath, logPath)
 }
 
-func darwinHarnessPlist(bin, logPath string) string {
-	apiXml := ""
-	if apiEnv := resolveHarnessAPIURL(); apiEnv != "" {
-		apiXml = fmt.Sprintf("\n\t\t<key>IAZIO_HARNESS_API_URL</key>\n\t\t<string>%s</string>", apiEnv)
-	}
-	homeXml := ""
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		homeXml = fmt.Sprintf("\n\t\t<key>HOME</key>\n\t\t<string>%s</string>", home)
-	}
-	userXml := ""
-	if u := os.Getenv("USER"); u != "" {
-		userXml = fmt.Sprintf("\n\t\t<key>USER</key>\n\t\t<string>%s</string>", u)
-	} else if curr, err := user.Current(); err == nil && curr.Username != "" {
-		userXml = fmt.Sprintf("\n\t\t<key>USER</key>\n\t\t<string>%s</string>", curr.Username)
-	}
-	pathXml := ""
-	if p := os.Getenv("PATH"); p != "" {
-		pathXml = fmt.Sprintf("\n\t\t<key>PATH</key>\n\t\t<string>%s</string>", p)
-	}
-	maintenancePath := ""
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		maintenancePath = filepath.Join(home, ".iazio", "maintenance.lock")
-	} else {
-		maintenancePath = filepath.Join(".iazio", "maintenance.lock")
-	}
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>io.iazio.iazio-harness</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>%s</string>
-		<string>daemon</string>
-	</array>
-	<key>KeepAlive</key>
-	<dict>
-		<key>SuccessfulExit</key>
-		<false/>
-		<key>PathState</key>
-		<dict>
-			<key>%s</key>
-			<false/>
-		</dict>
-	</dict>
-	<key>RunAtLoad</key>
-	<true/>
-	<key>StandardOutPath</key>
-	<string>%s</string>
-	<key>StandardErrorPath</key>
-	<string>%s</string>
-	<key>EnvironmentVariables</key>
-	<dict>
-		<key>IAZIO_HARNESS_NONINTERACTIVE</key>
-		<string>1</string>%s%s%s%s
-	</dict>
-</dict>
-</plist>
-`, bin, maintenancePath, logPath, logPath, apiXml, homeXml, userXml, pathXml)
-}
-
 // DarwinWatcherPlist returns the LaunchAgent plist definition to monitor binary replacements.
 func DarwinWatcherPlist(bin, logPath string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
@@ -594,29 +532,6 @@ Environment=IAZIO_AGENT_NONINTERACTIVE=1
 [Install]
 WantedBy=default.target
 `, bin, apiLine, esLine)
-}
-
-func linuxHarnessUnit(bin string) string {
-	apiLine := ""
-	if apiEnv := resolveHarnessAPIURL(); apiEnv != "" {
-		apiLine = fmt.Sprintf("Environment=IAZIO_HARNESS_API_URL=%s\n", apiEnv)
-	}
-	return fmt.Sprintf(`[Unit]
-Description=iazio-harness daemon and execution supervisor
-After=network.target
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-ExecStart=%s daemon
-Restart=always
-RestartSec=3s
-OOMScoreAdjust=-500
-Environment=IAZIO_HARNESS_NONINTERACTIVE=1
-%s
-[Install]
-WantedBy=default.target
-`, bin, apiLine)
 }
 
 // LinuxWatcherPath returns the systemd .path unit definition to monitor binary replacements.
@@ -1061,7 +976,7 @@ func reconcileDarwinServiceConfiguration(home, bin string, run func(name string,
 	// Purge any legacy iazio-harness LaunchAgent plists if present.
 	_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-harness"))
 	_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-harvester"))
-	for _, legacyLabel := range []string{"io.iazio.iazio-harness", "io.iazio.iazio-harness.watcher", "io.iazio.iazio-harness.watchdog"} {
+	for _, legacyLabel := range []string{"io.iazio.iazio-harness", "io.iazio.iazio-harness.watcher", "io.iazio.iazio-harness.watchdog", "io.iazio.iazio-harness-watcher", "io.iazio.iazio-harness-watchdog"} {
 		legacyPlist := filepath.Join(launchAgentsDir, legacyLabel+".plist")
 		if _, err := os.Stat(legacyPlist); err == nil {
 			_ = run("launchctl", "bootout", domain+"/"+legacyLabel)
