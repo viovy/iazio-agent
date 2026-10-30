@@ -204,14 +204,16 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			defer cancel()
 
 			watchdog.StartSystemdWatchdog(runCtx)
-			if home, err := os.UserHomeDir(); err == nil && home != "" {
-				binPath := filepath.Join(home, ".local", "bin", "iazio-agent")
-				if runtime.GOOS == "windows" {
-					binPath = filepath.Join(home, "bin", "iazio-agent.exe")
+			if !isTesting {
+				if home, err := os.UserHomeDir(); err == nil && home != "" {
+					binPath := filepath.Join(home, ".local", "bin", "iazio-agent")
+					if runtime.GOOS == "windows" {
+						binPath = filepath.Join(home, "bin", "iazio-agent.exe")
+					}
+					go func() {
+						_ = service.ReconcileServiceConfiguration(home, binPath, nil)
+					}()
 				}
-				go func() {
-					_ = service.ReconcileServiceConfiguration(home, binPath, nil)
-				}()
 			}
 
 			sup := supervisor.New(time.Now)
@@ -370,8 +372,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				var aggregateErr error
 				if err != nil {
 					aggregateErr = err
-				} else if force && len(res.Errors) > 0 {
-					aggregateErr = res.Errors[0]
 				}
 				return supervisor.UpdateResult{
 					UpdatedTools: res.UpdatedTools,
@@ -621,6 +621,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}()
 			}
 			var wd *watchdog.Watchdog
+			var inFlightPrepMu sync.Mutex
+			inFlightPrepJobs := make(map[string]controlplane.ActiveJob)
+			var lastHarvesterCheckMu sync.Mutex
+			var lastHarvesterCheck time.Time
 			spooler, _ := controlplane.NewOfflineReportSpooler("", nil)
 			client = controlplane.Client{
 				BaseURL:            api,
@@ -852,6 +856,14 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							}
 						}
 					}
+					inFlightPrepMu.Lock()
+					for _, pj := range inFlightPrepJobs {
+						if pj.JobID != "" && !seen[pj.JobID] {
+							seen[pj.JobID] = true
+							jobs = append(jobs, pj)
+						}
+					}
+					inFlightPrepMu.Unlock()
 					return jobs
 				},
 				OnTick: func(ctx context.Context, hostID string) error {
@@ -875,6 +887,20 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					// Host resource telemetry check
 					if home, err := os.UserHomeDir(); err == nil && home != "" {
 						_, _ = preflight.FreeSpace(home)
+					}
+					// Periodically inspect and self-heal iazio-harvester service on darwin/linux
+					lastHarvesterCheckMu.Lock()
+					shouldCheckHarvester := lastHarvesterCheck.IsZero() || time.Since(lastHarvesterCheck) >= harvesterHealInterval
+					if shouldCheckHarvester {
+						lastHarvesterCheck = time.Now()
+					}
+					lastHarvesterCheckMu.Unlock()
+					if shouldCheckHarvester {
+						homeDir := strings.TrimSpace(getenv("HOME"))
+						if homeDir == "" {
+							homeDir, _ = os.UserHomeDir()
+						}
+						healHarvesterServiceIfNeeded(ctx, homeDir, runtime.GOOS)
 					}
 					// If harness finished and idle, trigger eager update check if fleet clean
 					if len(reaped) > 0 && eagerUpdater != nil && !updatingTools.Load() {
@@ -1201,6 +1227,38 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 
 				convID := ResolveDispatchConversationID(a, lockInfo.ConversationID, lockInfo.StoryID, lockInfo.Status)
 
+				inFlightPrepMu.Lock()
+				inFlightPrepJobs[a.ID] = controlplane.ActiveJob{
+					JobID:        a.ID,
+					WorktreePath: a.WorktreePath,
+					PID:          os.Getpid(),
+				}
+				inFlightPrepMu.Unlock()
+				defer func() {
+					inFlightPrepMu.Lock()
+					delete(inFlightPrepJobs, a.ID)
+					inFlightPrepMu.Unlock()
+				}()
+
+				prepCtx, prepCancel := context.WithCancel(runCtx)
+				defer prepCancel()
+				go func() {
+					interval := prepHeartbeatInterval
+					if interval <= 0 {
+						interval = 10 * time.Second
+					}
+					ticker := time.NewTicker(interval)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-prepCtx.Done():
+							return
+						case <-ticker.C:
+							_ = client.HeartbeatJob(prepCtx, a.ID, a.LeaseToken)
+						}
+					}
+				}()
+
 				// Phase 2 of Two-Phase Lease Handshake: Acknowledge lease to transition from LEASED to RUNNING
 				if a.LeaseToken != "" {
 					if ackErr := client.AckLease(runCtx, a.ID, a.LeaseToken, os.Getpid(), convID); ackErr != nil {
@@ -1307,7 +1365,11 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 				}
 
+				prepCancel()
 				err := sup.Spawn(wdRunner, a.ID, api, a.WorktreePath, a.DocsHubPath, "", spawnExtras...)
+				inFlightPrepMu.Lock()
+				delete(inFlightPrepJobs, a.ID)
+				inFlightPrepMu.Unlock()
 				if err != nil {
 					if strings.Contains(err.Error(), "busy") {
 						_ = client.AbandonJob(runCtx, a.ID, "REPO_BUSY")
@@ -1639,12 +1701,54 @@ func applyWindows(action, _ string, stdout io.Writer) error {
 	}
 }
 
+var (
+	prepHeartbeatInterval = 10 * time.Second
+	harvesterHealInterval = 60 * time.Second
+	inspectToolServiceFn  = func(toolName, goos string) (bool, string) {
+		installed, _, status, _ := inventory.InspectToolService(toolName, goos, nil)
+		return installed, status
+	}
+	reconcileHarvesterServiceFn = func(ctx context.Context, harvesterBin string) error {
+		return exec.CommandContext(ctx, harvesterBin, "service", "reconcile").Run()
+	}
+	restartToolServiceFn = service.RestartToolService
+)
+
+func healHarvesterServiceIfNeeded(ctx context.Context, home, goos string) {
+	if goos != "darwin" && goos != "linux" {
+		return
+	}
+	if home == "" {
+		var err error
+		home, err = os.UserHomeDir()
+		if err != nil || home == "" {
+			return
+		}
+	}
+	harvesterBin := filepath.Join(home, ".local", "bin", "iazio-harvester")
+	if _, err := os.Stat(harvesterBin); err != nil {
+		return
+	}
+	_, svcStatus := inspectToolServiceFn("iazio-harvester", goos)
+	if svcStatus == "failed" || svcStatus == "inactive" || svcStatus == "installed" {
+		_ = reconcileHarvesterServiceFn(ctx, harvesterBin)
+		_ = restartToolServiceFn("iazio-harvester")
+	}
+}
+
 func ensureCanonicalSingleHome() {
 	if isTesting {
 		return
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
+		return
+	}
+	ensureCanonicalSingleHomeAt(home, service.ReconcileServiceConfiguration)
+}
+
+func ensureCanonicalSingleHomeAt(home string, reconcileFn func(string, string, func(string, ...string) error) error) {
+	if home == "" {
 		return
 	}
 	binName := "iazio-agent"
@@ -1661,10 +1765,30 @@ func ensureCanonicalSingleHome() {
 		_, _ = installCanonicalBinary()
 	}
 
-	// Purge secondary installation binary from everywhere ~/.iazio/bin/
+	if reconcileFn == nil {
+		reconcileFn = service.ReconcileServiceConfiguration
+	}
+	_ = reconcileFn(home, canonicalPath, nil)
+
+	// Purge secondary installation binary and stale staged files from ~/.iazio/bin/
 	legacyDir := filepath.Join(home, ".iazio", "bin")
-	_ = os.Remove(filepath.Join(legacyDir, binName))
-	_ = os.Remove(filepath.Join(legacyDir, binName+".old"))
+	shadowPath := filepath.Join(legacyDir, binName)
+	_ = os.Remove(shadowPath)
+	_ = os.Remove(shadowPath + ".old")
+	_ = os.Remove(shadowPath + ".next")
+	_ = os.Remove(filepath.Join(legacyDir, "iazio-harvester.next"))
+	if entries, err := os.ReadDir(legacyDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			lower := strings.ToLower(name)
+			if strings.HasSuffix(lower, ".next") || strings.HasSuffix(lower, ".old") || strings.HasSuffix(lower, ".tmp") || strings.HasSuffix(lower, ".bak") {
+				_ = os.Remove(filepath.Join(legacyDir, name))
+			}
+		}
+	}
 }
 
 func installCanonicalBinary() (string, error) {
@@ -1691,6 +1815,7 @@ func installCanonicalBinary() (string, error) {
 	if err := copyBinary(src, dest); err != nil {
 		return "", err
 	}
+	_ = service.ReconcileServiceConfiguration(home, dest, nil)
 	// Purge secondary installation binary from ~/.iazio/bin/
 	_ = os.Remove(filepath.Join(home, ".iazio", "bin", binName))
 	return dest, nil
@@ -1859,7 +1984,7 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 	// Try iazio-harness fleet-status --repo <repoPath> --json first
 	harnessBin := "iazio-harness"
 	if home, err := os.UserHomeDir(); err == nil {
-		p := filepath.Join(home, ".iazio", "bin", "iazio-harness")
+		p := filepath.Join(home, ".local", "bin", "iazio-harness")
 		if _, err := os.Stat(p); err == nil {
 			harnessBin = p
 		}
@@ -2125,7 +2250,7 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 	// Try iazio-harness fleet-status --json first
 	harnessBin := "iazio-harness"
 	if home, err := os.UserHomeDir(); err == nil {
-		p := filepath.Join(home, ".iazio", "bin", "iazio-harness")
+		p := filepath.Join(home, ".local", "bin", "iazio-harness")
 		if _, err := os.Stat(p); err == nil {
 			harnessBin = p
 		}

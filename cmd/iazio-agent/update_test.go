@@ -1025,6 +1025,7 @@ func TestUpdateSingleTool_MissingChecksumsAssetFailsClosed(t *testing.T) {
 	_ = os.MkdirAll(binDir, 0755)
 
 	tarData := createTarGz(t, "my-tool", []byte("#!/bin/sh\necho hello\n"))
+	assetName := fmt.Sprintf("my-tool-%s-%s.tar.gz", runtime.GOOS, runtime.GOARCH)
 
 	// Mock release has only the binary tarball, NO checksums asset
 	client := &http.Client{
@@ -1034,8 +1035,8 @@ func TestUpdateSingleTool_MissingChecksumsAssetFailsClosed(t *testing.T) {
 					TagName: "0.2.0",
 					Assets: []gitHubAsset{
 						{
-							Name:               "my-tool-linux-amd64.tar.gz",
-							BrowserDownloadURL: "https://github.com/viovy/my-tool/releases/download/0.2.0/my-tool-linux-amd64.tar.gz",
+							Name:               assetName,
+							BrowserDownloadURL: "https://github.com/viovy/my-tool/releases/download/0.2.0/" + assetName,
 						},
 					},
 				}
@@ -1196,6 +1197,10 @@ func TestFindMatchingAsset_MacOS_ArchitectureAliases(t *testing.T) {
 func TestUpdateSingleTool_ShadowingBinarySync(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	tempDir := t.TempDir()
+	origWd, _ := os.Getwd()
+	if err := os.Chdir(tempDir); err == nil {
+		t.Cleanup(func() { _ = os.Chdir(origWd) })
+	}
 	binDir := filepath.Join(tempDir, "bin")
 	shadowDir := filepath.Join(tempDir, "shadow")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
@@ -1220,7 +1225,8 @@ func TestUpdateSingleTool_ShadowingBinarySync(t *testing.T) {
 	tarData := createTarGz(t, toolName, payload)
 	sum := sha256.Sum256(tarData)
 	hashStr := hex.EncodeToString(sum[:])
-	checksumsData := fmt.Sprintf("%s  %s_0.0.492_linux_amd64.tar.gz\n", hashStr, toolName)
+	assetName := fmt.Sprintf("%s_0.0.492_%s_%s.tar.gz", toolName, runtime.GOOS, runtime.GOARCH)
+	checksumsData := fmt.Sprintf("%s  %s\n", hashStr, assetName)
 
 	client := &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -1229,8 +1235,8 @@ func TestUpdateSingleTool_ShadowingBinarySync(t *testing.T) {
 					TagName: "0.0.492",
 					Assets: []gitHubAsset{
 						{
-							Name:               fmt.Sprintf("%s_0.0.492_linux_amd64.tar.gz", toolName),
-							BrowserDownloadURL: fmt.Sprintf("https://github.com/viovy/%s/releases/download/0.0.492/%s_0.0.492_linux_amd64.tar.gz", toolName, toolName),
+							Name:               assetName,
+							BrowserDownloadURL: fmt.Sprintf("https://github.com/viovy/%s/releases/download/0.0.492/%s", toolName, assetName),
 						},
 						{
 							Name:               "checksums.txt",
@@ -1614,3 +1620,143 @@ func TestBuildToolFromSourceRepo_Lifecycle(t *testing.T) {
 		t.Errorf("expected .version to contain %s, got %s", headSHA, string(verSidecar))
 	}
 }
+
+func TestFindToolSourceRepo_AutopilotPluginsAndReverseMetaRepo(t *testing.T) {
+	home := t.TempDir()
+	origWd, _ := os.Getwd()
+	if err := os.Chdir(home); err == nil {
+		t.Cleanup(func() { _ = os.Chdir(origWd) })
+	}
+	mr03 := filepath.Join(home, "work", "meta-repo-03", "autopilot-plugins-internal")
+	mr04 := filepath.Join(home, "work", "meta-repo-04", "autopilot-plugins-internal")
+	if err := os.MkdirAll(filepath.Join(mr03, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(mr04, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	getenv := func(k string) string {
+		if k == "HOME" {
+			return home
+		}
+		return ""
+	}
+
+	for _, tool := range []string{"autopilot-fleet", "autopilot-story", "autopilot-backlog"} {
+		got := findToolSourceRepo(tool, getenv)
+		if got != mr04 {
+			t.Fatalf("expected %s to resolve to reverse-sorted %s, got %s", tool, mr04, got)
+		}
+	}
+}
+
+func TestPerformUpdateWithResult_ForcePartialFailureVsAllFailed(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	origWd, _ := os.Getwd()
+	if err := os.Chdir(home); err == nil {
+		t.Cleanup(func() { _ = os.Chdir(origWd) })
+	}
+	binDir := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tarContent := createTarGz(t, "primary-core-tool", []byte("#!/bin/sh\necho primary-core-tool\n"))
+	sum := sha256.Sum256(tarContent)
+	assetName := fmt.Sprintf("primary-core-tool_1.2.3_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
+	sumText := fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), assetName)
+
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/fleet/manifest") {
+			manifest := ManifestResponse{
+				Profile: "workstation",
+				Tools: []ManifestToolItem{
+					{Name: "primary-core-tool", Repository: "viovy/primary-core-tool", BinaryName: "primary-core-tool"},
+					{Name: "secondary-broken-tool", Repository: "viovy/secondary-broken-tool", BinaryName: "secondary-broken-tool"},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(manifest)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	origTransport := http.DefaultTransport
+	defer func() { http.DefaultTransport = origTransport }()
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if strings.HasPrefix(r.URL.String(), srv.URL) {
+			return origTransport.RoundTrip(r)
+		}
+		path := r.URL.Path
+		switch {
+		case strings.Contains(path, "/repos/viovy/primary-core-tool/releases/latest"):
+			rel := gitHubRelease{
+				TagName: "v1.2.3",
+				Assets: []gitHubAsset{
+					{Name: assetName, BrowserDownloadURL: "https://example.com/" + assetName},
+					{Name: "checksums.txt", BrowserDownloadURL: "https://example.com/checksums.txt"},
+				},
+			}
+			b, _ := json.Marshal(rel)
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(b)), Header: make(http.Header)}, nil
+		case strings.HasSuffix(path, "checksums.txt"):
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader([]byte(sumText))), Header: make(http.Header)}, nil
+		case strings.HasSuffix(path, assetName):
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(tarContent)), Header: make(http.Header)}, nil
+		default:
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Status:     "404 Not Found",
+				Body:       io.NopCloser(strings.NewReader("not found")),
+				Header:     make(http.Header),
+			}, nil
+		}
+	})
+
+	// 1. Suite forced update where primary-core-tool updates and secondary-broken-tool fails -> returns nil error with FailedTools populated
+	var stdout, stderr bytes.Buffer
+	res, err := performUpdateWithResult(context.Background(), UpdateOptions{
+		Suite:   true,
+		Force:   true,
+		API:     srv.URL,
+		Profile: "workstation",
+		BinDir:  binDir,
+	}, &stdout, &stderr, func(k string) string {
+		if k == "HOME" {
+			return home
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("expected nil error on partial forced suite update, got: %v", err)
+	}
+	if len(res.UpdatedTools) != 1 || res.UpdatedTools[0] != "primary-core-tool" {
+		t.Fatalf("expected primary-core-tool in UpdatedTools, got: %+v", res.UpdatedTools)
+	}
+	if len(res.FailedTools) != 1 || res.FailedTools[0] != "secondary-broken-tool" {
+		t.Fatalf("expected secondary-broken-tool in FailedTools, got: %+v", res.FailedTools)
+	}
+
+	// 2. Single-tool forced update that fails -> returns non-nil error
+	_, errSingle := performUpdateWithResult(context.Background(), UpdateOptions{
+		Force:       true,
+		API:         srv.URL,
+		Profile:     "workstation",
+		BinDir:      binDir,
+		TargetTools: []string{"secondary-broken-tool"},
+	}, &stdout, &stderr, func(k string) string {
+		if k == "HOME" {
+			return home
+		}
+		return ""
+	})
+	if errSingle == nil {
+		t.Fatal("expected non-nil error when single targeted forced tool update fails")
+	}
+}
+

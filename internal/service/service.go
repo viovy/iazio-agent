@@ -19,9 +19,13 @@ import (
 	"unicode/utf16"
 )
 
-const agentLabel = "io.iazio.iazio-agent"
-const watcherLabel = "io.iazio.iazio-agent-watcher"
-const watchdogLabel = "io.iazio.iazio-agent-watchdog"
+const DarwinLabel = "io.iazio.iazio-agent"
+const DarwinWatcherLabel = "io.iazio.iazio-agent-watcher"
+const DarwinWatchdogLabel = "io.iazio.iazio-agent-watchdog"
+
+const agentLabel = DarwinLabel
+const watcherLabel = DarwinWatcherLabel
+const watchdogLabel = DarwinWatchdogLabel
 
 // DefaultFleetAPI is the default canonical fleet control plane API URL.
 const DefaultFleetAPI = ""
@@ -419,34 +423,70 @@ func InstallDarwinResilience(home, bin string, run func(name string, args ...str
 		return fmt.Errorf("create log directory: %w", err)
 	}
 
-	watcherPlistPath := filepath.Join(launchAgentsDir, watcherLabel+".plist")
-	if err := os.WriteFile(watcherPlistPath, []byte(DarwinWatcherPlist(bin, logPath)), 0o644); err != nil {
-		return fmt.Errorf("write watcher plist: %w", err)
-	}
-
-	watchdogPlistPath := filepath.Join(launchAgentsDir, watchdogLabel+".plist")
-	if err := os.WriteFile(watchdogPlistPath, []byte(DarwinWatchdogPlist(bin, logPath)), 0o644); err != nil {
-		return fmt.Errorf("write watchdog plist: %w", err)
-	}
-
 	domain := "gui/" + strconv.Itoa(os.Getuid())
 	watcherTarget := domain + "/" + watcherLabel
 	watchdogTarget := domain + "/" + watchdogLabel
 
-	_ = run("launchctl", "bootout", watcherTarget)
-	if err := run("launchctl", "bootstrap", domain, watcherPlistPath); err != nil {
-		return fmt.Errorf("launchctl bootstrap watcher: %w", err)
+	watcherPlistPath := filepath.Join(launchAgentsDir, watcherLabel+".plist")
+	expectedWatcher := DarwinWatcherPlist(bin, logPath)
+	existingWatcher, wErr := os.ReadFile(watcherPlistPath)
+	watcherChanged := wErr != nil || string(existingWatcher) != expectedWatcher
+	if watcherChanged {
+		if err := os.WriteFile(watcherPlistPath, []byte(expectedWatcher), 0o644); err != nil {
+			return fmt.Errorf("write watcher plist: %w", err)
+		}
 	}
-	if err := run("launchctl", "enable", watcherTarget); err != nil {
-		return fmt.Errorf("launchctl enable watcher: %w", err)
+	_, watcherLoadedErr := statusCheckCommand("launchctl", "print", watcherTarget)
+	watcherLoaded := watcherLoadedErr == nil
+	if watcherChanged || !watcherLoaded {
+		if watcherChanged {
+			_ = run("launchctl", "bootout", watcherTarget)
+		}
+		if err := run("launchctl", "bootstrap", domain, watcherPlistPath); err != nil {
+			_ = os.Remove(watcherPlistPath)
+			return fmt.Errorf("launchctl bootstrap watcher: %w", err)
+		}
+		if err := run("launchctl", "enable", watcherTarget); err != nil {
+			_ = os.Remove(watcherPlistPath)
+			return fmt.Errorf("launchctl enable watcher: %w", err)
+		}
 	}
 
-	_ = run("launchctl", "bootout", watchdogTarget)
-	if err := run("launchctl", "bootstrap", domain, watchdogPlistPath); err != nil {
-		return fmt.Errorf("launchctl bootstrap watchdog: %w", err)
+	watchdogPlistPath := filepath.Join(launchAgentsDir, watchdogLabel+".plist")
+	expectedWatchdog := DarwinWatchdogPlist(bin, logPath)
+	existingWatchdog, wdErr := os.ReadFile(watchdogPlistPath)
+	watchdogChanged := wdErr != nil || string(existingWatchdog) != expectedWatchdog
+	if watchdogChanged {
+		if err := os.WriteFile(watchdogPlistPath, []byte(expectedWatchdog), 0o644); err != nil {
+			return fmt.Errorf("write watchdog plist: %w", err)
+		}
 	}
-	if err := run("launchctl", "enable", watchdogTarget); err != nil {
-		return fmt.Errorf("launchctl enable watchdog: %w", err)
+	insideWatchdog := os.Getenv("XPC_SERVICE_NAME") == DarwinWatchdogLabel
+	_, watchdogLoadedErr := statusCheckCommand("launchctl", "print", watchdogTarget)
+	watchdogLoaded := watchdogLoadedErr == nil
+	if insideWatchdog {
+		if !watchdogLoaded {
+			if err := run("launchctl", "bootstrap", domain, watchdogPlistPath); err != nil {
+				_ = os.Remove(watchdogPlistPath)
+				return fmt.Errorf("launchctl bootstrap watchdog: %w", err)
+			}
+			if err := run("launchctl", "enable", watchdogTarget); err != nil {
+				_ = os.Remove(watchdogPlistPath)
+				return fmt.Errorf("launchctl enable watchdog: %w", err)
+			}
+		}
+	} else if watchdogChanged || !watchdogLoaded {
+		if watchdogChanged {
+			_ = run("launchctl", "bootout", watchdogTarget)
+		}
+		if err := run("launchctl", "bootstrap", domain, watchdogPlistPath); err != nil {
+			_ = os.Remove(watchdogPlistPath)
+			return fmt.Errorf("launchctl bootstrap watchdog: %w", err)
+		}
+		if err := run("launchctl", "enable", watchdogTarget); err != nil {
+			_ = os.Remove(watchdogPlistPath)
+			return fmt.Errorf("launchctl enable watchdog: %w", err)
+		}
 	}
 	return nil
 }
@@ -766,158 +806,13 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 	}
 
 	if runtime.GOOS == "linux" {
-		cleanStaleBackups(filepath.Join(home, ".iazio", "bin"))
-		cleanStaleBackups(filepath.Join(home, ".local", "bin"))
-		// Purge secondary binary from ~/.iazio/bin/
-		_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-agent"))
-		_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-agent.old"))
-		_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-agent.version"))
-		unitDir := filepath.Join(home, ".config", "systemd", "user")
-		if err := os.MkdirAll(unitDir, 0o755); err != nil {
-			return err
-		}
-
-		serviceFile := filepath.Join(unitDir, "iazio-agent.service")
-		needsReload := false
-
-		// Check and reconcile primary service unit
-		expectedService := linuxUnit(bin)
-		data, err := os.ReadFile(serviceFile)
-		expectedExec := fmt.Sprintf("ExecStart=%s run", bin)
-		if err != nil || !strings.Contains(string(data), "WatchdogSec=") || !strings.Contains(string(data), expectedExec) || !strings.Contains(string(data), "IAZIO_AGENT_NONINTERACTIVE=1") {
-			if err := os.WriteFile(serviceFile, []byte(expectedService), 0o644); err != nil {
-				return fmt.Errorf("write iazio-agent.service: %w", err)
-			}
-			needsReload = true
-		}
-
-		// Check and reconcile watcher .path and .service
-		pathFile := filepath.Join(unitDir, "iazio-agent-watcher.path")
-		expectedPath := LinuxWatcherPath(bin)
-		if pData, err := os.ReadFile(pathFile); err != nil || !strings.Contains(string(pData), bin) {
-			if err := os.WriteFile(pathFile, []byte(expectedPath), 0o644); err != nil {
-				return fmt.Errorf("write iazio-agent-watcher.path: %w", err)
-			}
-			needsReload = true
-		}
-
-		watcherSvcFile := filepath.Join(unitDir, "iazio-agent-watcher.service")
-		if _, err := os.Stat(watcherSvcFile); err != nil {
-			if err := os.WriteFile(watcherSvcFile, []byte(LinuxWatcherService()), 0o644); err != nil {
-				return fmt.Errorf("write iazio-agent-watcher.service: %w", err)
-			}
-			needsReload = true
-		}
-
-		// Check and reconcile watchdog .timer and .service
-		timerFile := filepath.Join(unitDir, "iazio-agent-watchdog.timer")
-		if _, err := os.Stat(timerFile); err != nil {
-			if err := os.WriteFile(timerFile, []byte(LinuxWatchdogTimer()), 0o644); err != nil {
-				return fmt.Errorf("write iazio-agent-watchdog.timer: %w", err)
-			}
-			needsReload = true
-		}
-
-		watchdogSvcFile := filepath.Join(unitDir, "iazio-agent-watchdog.service")
-		expectedWatchdogSvc := LinuxWatchdogService(bin)
-		if wData, err := os.ReadFile(watchdogSvcFile); err != nil || !strings.Contains(string(wData), bin) {
-			if err := os.WriteFile(watchdogSvcFile, []byte(expectedWatchdogSvc), 0o644); err != nil {
-				return fmt.Errorf("write iazio-agent-watchdog.service: %w", err)
-			}
-			needsReload = true
-		}
-
-		if needsReload {
-			_ = run("systemctl", "--user", "daemon-reload")
-		}
-		_ = run("systemctl", "--user", "enable", "iazio-agent.service")
-		_ = run("systemctl", "--user", "enable", "--now", "iazio-agent-watcher.path")
-		_ = run("systemctl", "--user", "enable", "--now", "iazio-agent-watchdog.timer")
-		_ = run("loginctl", "enable-linger")
-
-		// Reconcile iazio-harness user service if harness binary exists
-		harnessBin := filepath.Join(home, ".local", "bin", "iazio-harness")
-		if _, err := os.Stat(harnessBin); err != nil {
-			harnessBin = filepath.Join(home, ".iazio", "bin", "iazio-harness")
-		}
-		if _, err := os.Stat(harnessBin); err == nil {
-			hSvcFile := filepath.Join(unitDir, "iazio-harness.service")
-			hData, err := os.ReadFile(hSvcFile)
-			if err != nil || !strings.Contains(string(hData), harnessBin) {
-				_ = os.WriteFile(hSvcFile, []byte(linuxHarnessUnit(harnessBin)), 0o644)
-				_ = run("systemctl", "--user", "daemon-reload")
-				_ = run("systemctl", "--user", "enable", "iazio-harness.service")
-			}
-		}
-
-		lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
-		inMaintenance := false
-		if info, err := os.Stat(lockFile); err == nil && time.Since(info.ModTime()) <= 2*time.Hour {
-			inMaintenance = true
-		}
-		if !inMaintenance {
-			_, isActErr := statusCheckCommand("systemctl", "--user", "is-active", "--quiet", "iazio-agent.service")
-			if isActErr != nil {
-				_ = run("systemctl", "--user", "reset-failed", "iazio-agent.service", "iazio-agent-watcher.service", "iazio-agent-watchdog.service")
-				_ = run("systemctl", "--user", "restart", "iazio-agent.service")
-			}
-		}
-		return nil
+		return reconcileLinuxServiceConfiguration(home, bin, run)
 	} else if runtime.GOOS == "darwin" {
-		launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
-		_ = os.MkdirAll(launchAgentsDir, 0o755)
-		logDir := filepath.Join(home, ".iazio", "logs")
-		_ = os.MkdirAll(logDir, 0o755)
-		logPath := filepath.Join(logDir, "agent.log")
-
-		// Reconcile primary iazio-agent LaunchAgent
-		agentPlist := filepath.Join(launchAgentsDir, agentLabel+".plist")
-		data, err := os.ReadFile(agentPlist)
-		domain := "gui/" + strconv.Itoa(os.Getuid())
-		target := domain + "/" + agentLabel
-		if err != nil || !strings.Contains(string(data), bin) {
-			_ = os.WriteFile(agentPlist, []byte(darwinPlist(bin, logPath)), 0o644)
-			_ = run("launchctl", "bootout", target)
-			_ = run("launchctl", "bootstrap", domain, agentPlist)
-			_ = run("launchctl", "enable", target)
-		}
-		if err := InstallDarwinResilience(home, bin, run); err != nil {
-			return err
-		}
-
-		// Reconcile iazio-harness LaunchAgent if harness binary exists
-		harnessBin := filepath.Join(home, ".local", "bin", "iazio-harness")
-		if _, err := os.Stat(harnessBin); err != nil {
-			harnessBin = filepath.Join(home, ".iazio", "bin", "iazio-harness")
-		}
-		if _, err := os.Stat(harnessBin); err == nil {
-			harnessPlist := filepath.Join(launchAgentsDir, "io.iazio.iazio-harness.plist")
-			hData, err := os.ReadFile(harnessPlist)
-			hTarget := domain + "/io.iazio.iazio-harness"
-			if err != nil || !strings.Contains(string(hData), harnessBin) {
-				_ = os.WriteFile(harnessPlist, []byte(darwinHarnessPlist(harnessBin, filepath.Join(logDir, "harness.log"))), 0o644)
-				_ = run("launchctl", "bootout", hTarget)
-				_ = run("launchctl", "bootstrap", domain, harnessPlist)
-				_ = run("launchctl", "enable", hTarget)
-			}
-		}
-
-		lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
-		inMaintenance := false
-		if info, err := os.Stat(lockFile); err == nil && time.Since(info.ModTime()) <= 2*time.Hour {
-			inMaintenance = true
-		}
-		if !inMaintenance {
-			out, err := statusCheckCommand("launchctl", "print", target)
-			outStr := string(out)
-			if err != nil || strings.Contains(outStr, "job state = exited") || !strings.Contains(outStr, "pid =") {
-				_ = run("launchctl", "kickstart", "-k", target)
-			}
-		}
-		return nil
+		return reconcileDarwinServiceConfiguration(home, bin, run)
 	} else if runtime.GOOS == "windows" {
 		tasksDir := filepath.Join(home, ".iazio", "tasks")
 		cleanStaleBackups(tasksDir)
+		cleanStaleBackups(filepath.Join(home, ".local", "bin"))
 		binDir := filepath.Join(home, ".iazio", "bin")
 		cleanStaleBackups(binDir)
 		_ = os.Remove(filepath.Join(binDir, "iazio-agent.exe"))
@@ -937,6 +832,190 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 		}
 		_ = ReviveCheck(home, run)
 		return nil
+	}
+	return nil
+}
+
+func reconcileLinuxServiceConfiguration(home, bin string, run func(name string, args ...string) error) error {
+	if run == nil {
+		run = execCommand
+	}
+	if bin == "" || bin == "iazio-agent" || !filepath.IsAbs(bin) || strings.Contains(bin, filepath.Join(".iazio", "bin")) {
+		bin = filepath.Join(home, ".local", "bin", "iazio-agent")
+	}
+	cleanStaleBackups(filepath.Join(home, ".iazio", "bin"))
+	cleanStaleBackups(filepath.Join(home, ".local", "bin"))
+	// Purge secondary binary from ~/.iazio/bin/
+	_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-agent"))
+	_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-agent.old"))
+	_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-agent.version"))
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		return err
+	}
+
+	serviceFile := filepath.Join(unitDir, "iazio-agent.service")
+	needsReload := false
+
+	// Check and reconcile primary service unit
+	expectedService := linuxUnit(bin)
+	data, err := os.ReadFile(serviceFile)
+	expectedExec := fmt.Sprintf("ExecStart=%s run", bin)
+	if err != nil || !strings.Contains(string(data), "WatchdogSec=") || !strings.Contains(string(data), expectedExec) || !strings.Contains(string(data), "IAZIO_AGENT_NONINTERACTIVE=1") {
+		if err := os.WriteFile(serviceFile, []byte(expectedService), 0o644); err != nil {
+			return fmt.Errorf("write iazio-agent.service: %w", err)
+		}
+		needsReload = true
+	}
+
+	// Check and reconcile watcher .path and .service
+	pathFile := filepath.Join(unitDir, "iazio-agent-watcher.path")
+	expectedPath := LinuxWatcherPath(bin)
+	if pData, err := os.ReadFile(pathFile); err != nil || !strings.Contains(string(pData), bin) {
+		if err := os.WriteFile(pathFile, []byte(expectedPath), 0o644); err != nil {
+			return fmt.Errorf("write iazio-agent-watcher.path: %w", err)
+		}
+		needsReload = true
+	}
+
+	watcherSvcFile := filepath.Join(unitDir, "iazio-agent-watcher.service")
+	if _, err := os.Stat(watcherSvcFile); err != nil {
+		if err := os.WriteFile(watcherSvcFile, []byte(LinuxWatcherService()), 0o644); err != nil {
+			return fmt.Errorf("write iazio-agent-watcher.service: %w", err)
+		}
+		needsReload = true
+	}
+
+	// Check and reconcile watchdog .timer and .service
+	timerFile := filepath.Join(unitDir, "iazio-agent-watchdog.timer")
+	if _, err := os.Stat(timerFile); err != nil {
+		if err := os.WriteFile(timerFile, []byte(LinuxWatchdogTimer()), 0o644); err != nil {
+			return fmt.Errorf("write iazio-agent-watchdog.timer: %w", err)
+		}
+		needsReload = true
+	}
+
+	watchdogSvcFile := filepath.Join(unitDir, "iazio-agent-watchdog.service")
+	expectedWatchdogSvc := LinuxWatchdogService(bin)
+	if wData, err := os.ReadFile(watchdogSvcFile); err != nil || !strings.Contains(string(wData), bin) {
+		if err := os.WriteFile(watchdogSvcFile, []byte(expectedWatchdogSvc), 0o644); err != nil {
+			return fmt.Errorf("write iazio-agent-watchdog.service: %w", err)
+		}
+		needsReload = true
+	}
+
+	if needsReload {
+		_ = run("systemctl", "--user", "daemon-reload")
+	}
+	_ = run("systemctl", "--user", "enable", "iazio-agent.service")
+	_ = run("systemctl", "--user", "enable", "--now", "iazio-agent-watcher.path")
+	_ = run("systemctl", "--user", "enable", "--now", "iazio-agent-watchdog.timer")
+	_ = run("loginctl", "enable-linger")
+
+	// Reconcile iazio-harness user service if harness binary exists
+	harnessBin := filepath.Join(home, ".local", "bin", "iazio-harness")
+	if _, err := os.Stat(harnessBin); err == nil {
+		hSvcFile := filepath.Join(unitDir, "iazio-harness.service")
+		hData, err := os.ReadFile(hSvcFile)
+		if err != nil || !strings.Contains(string(hData), harnessBin) {
+			_ = os.WriteFile(hSvcFile, []byte(linuxHarnessUnit(harnessBin)), 0o644)
+			_ = run("systemctl", "--user", "daemon-reload")
+			_ = run("systemctl", "--user", "enable", "iazio-harness.service")
+		}
+	}
+
+	lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
+	inMaintenance := false
+	if info, err := os.Stat(lockFile); err == nil && time.Since(info.ModTime()) <= 2*time.Hour {
+		inMaintenance = true
+	}
+	if !inMaintenance {
+		_, isActErr := statusCheckCommand("systemctl", "--user", "is-active", "--quiet", "iazio-agent.service")
+		if isActErr != nil {
+			_ = run("systemctl", "--user", "reset-failed", "iazio-agent.service", "iazio-agent-watcher.service", "iazio-agent-watchdog.service")
+			_ = run("systemctl", "--user", "restart", "iazio-agent.service")
+		}
+	}
+	return nil
+}
+
+func isRunningInsideDarwinAgentService(target string) bool {
+	if os.Getenv("XPC_SERVICE_NAME") == DarwinLabel || os.Getenv("IAZIO_AGENT_SERVICE") == "1" {
+		return true
+	}
+	if out, err := statusCheckCommand("launchctl", "print", target); err == nil {
+		outStr := string(out)
+		pidStr := fmt.Sprintf("pid = %d", os.Getpid())
+		if strings.Contains(outStr, "state = running") && strings.Contains(outStr, pidStr) {
+			return true
+		}
+	}
+	return false
+}
+
+func reconcileDarwinServiceConfiguration(home, bin string, run func(name string, args ...string) error) error {
+	if run == nil {
+		run = execCommand
+	}
+	if bin == "" || bin == "iazio-agent" || !filepath.IsAbs(bin) || strings.Contains(bin, filepath.Join(".iazio", "bin")) {
+		bin = filepath.Join(home, ".local", "bin", "iazio-agent")
+	}
+	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
+	_ = os.MkdirAll(launchAgentsDir, 0o755)
+	logDir := filepath.Join(home, ".iazio", "logs")
+	_ = os.MkdirAll(logDir, 0o755)
+	logPath := filepath.Join(logDir, "agent.log")
+
+	domain := "gui/" + strconv.Itoa(os.Getuid())
+	target := domain + "/" + agentLabel
+	insideService := isRunningInsideDarwinAgentService(target)
+
+	// Reconcile primary iazio-agent LaunchAgent
+	agentPlist := filepath.Join(launchAgentsDir, agentLabel+".plist")
+	expectedPlist := darwinPlist(bin, logPath)
+	data, err := os.ReadFile(agentPlist)
+	existingStr := string(data)
+	if err != nil || existingStr != expectedPlist {
+		_ = os.WriteFile(agentPlist, []byte(expectedPlist), 0o644)
+		if !insideService {
+			_ = run("launchctl", "bootout", target)
+			_ = run("launchctl", "bootstrap", domain, agentPlist)
+			_ = run("launchctl", "enable", target)
+		}
+	}
+	if err := InstallDarwinResilience(home, bin, run); err != nil {
+		return err
+	}
+
+	// Reconcile iazio-harness LaunchAgent if harness binary exists
+	harnessBin := filepath.Join(home, ".local", "bin", "iazio-harness")
+	if _, err := os.Stat(harnessBin); err == nil {
+		harnessPlist := filepath.Join(launchAgentsDir, "io.iazio.iazio-harness.plist")
+		expectedHarnessPlist := darwinHarnessPlist(harnessBin, filepath.Join(logDir, "harness.log"))
+		hData, err := os.ReadFile(harnessPlist)
+		hTarget := domain + "/io.iazio.iazio-harness"
+		if err != nil || string(hData) != expectedHarnessPlist {
+			_ = os.WriteFile(harnessPlist, []byte(expectedHarnessPlist), 0o644)
+			_ = run("launchctl", "bootout", hTarget)
+			_ = run("launchctl", "bootstrap", domain, harnessPlist)
+			_ = run("launchctl", "enable", hTarget)
+		}
+	}
+
+	lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
+	inMaintenance := false
+	if info, err := os.Stat(lockFile); err == nil && time.Since(info.ModTime()) <= 2*time.Hour {
+		inMaintenance = true
+	}
+	if !inMaintenance && !insideService {
+		out, err := statusCheckCommand("launchctl", "print", target)
+		outStr := string(out)
+		if err != nil || strings.Contains(outStr, "job state = exited") || !strings.Contains(outStr, "pid =") {
+			if err != nil {
+				_ = run("launchctl", "bootstrap", domain, agentPlist)
+			}
+			_ = run("launchctl", "kickstart", "-k", target)
+		}
 	}
 	return nil
 }

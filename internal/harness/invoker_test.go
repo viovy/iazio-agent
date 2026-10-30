@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -313,6 +314,8 @@ func TestCLIInvoker_ListLocalRepos_And_ExportRepoDelta(t *testing.T) {
 }
 
 func TestNewInvokers_EnvDefaults(t *testing.T) {
+	emptyHome := t.TempDir()
+	t.Setenv("HOME", emptyHome)
 	t.Setenv("IAZIO_HARNESS_BIN", "/custom/bin/iazio-harness")
 	inv := NewCLIInvoker("", "/tmp/work")
 	if inv.HarnessBinary != "/custom/bin/iazio-harness" {
@@ -323,6 +326,24 @@ func TestNewInvokers_EnvDefaults(t *testing.T) {
 	invDef := NewCLIInvoker("", "")
 	if invDef.HarnessBinary != "iazio-harness" {
 		t.Fatalf("expected default binary iazio-harness, got %s", invDef.HarnessBinary)
+	}
+
+	// When ~/.local/bin/iazio-harness exists, NewCLIInvoker("", "") resolves it directly
+	localBinDir := filepath.Join(emptyHome, ".local", "bin")
+	if err := os.MkdirAll(localBinDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binName := "iazio-harness"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	localHarnessPath := filepath.Join(localBinDir, binName)
+	if err := os.WriteFile(localHarnessPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	invLocal := NewCLIInvoker("", "")
+	if invLocal.HarnessBinary != localHarnessPath {
+		t.Fatalf("expected %s from ~/.local/bin, got %s", localHarnessPath, invLocal.HarnessBinary)
 	}
 
 	t.Setenv("IAZIO_HARNESS_BIN", "/custom/bin/harness")

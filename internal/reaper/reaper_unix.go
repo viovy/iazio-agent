@@ -70,7 +70,17 @@ func isPIDAlive(pid int) bool {
 		return true
 	}
 	err := syscall.Kill(pid, 0)
-	return err == nil
+	if err != nil {
+		return false
+	}
+	// On macOS / BSD without /proc, check ps state for zombie ('Z')
+	if out, psErr := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output(); psErr == nil {
+		st := strings.TrimSpace(string(out))
+		if st == "" || strings.HasPrefix(st, "Z") {
+			return false
+		}
+	}
+	return true
 }
 
 // findOrphanPIDs searches running processes whose cwd is inside workspacePath,

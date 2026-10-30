@@ -505,3 +505,59 @@ func TestScanSymlinkPrecedence_RealBinaryTakesPrecedenceOverPrecedingSymlink(t *
 	}
 }
 
+func TestMatch_RejectsStagingAndSidecarSuffixes(t *testing.T) {
+	rejected := []string{
+		"iazio-harvester.next",
+		"iazio-agent.next",
+		"iazio-agent.old",
+		"iazio-agent.tmp",
+		"iazio-agent.bak",
+		"iazio-agent.version",
+		"iazio-agent.sha256",
+		"iazio-agent.sig",
+	}
+	for _, name := range rejected {
+		if match(name) {
+			t.Errorf("expected match(%q) to be false, got true", name)
+		}
+	}
+	if !match("iazio-harvester") {
+		t.Errorf("expected match(\"iazio-harvester\") to be true")
+	}
+}
+
+func TestInspectToolService_DarwinExitCodesAndRunningState(t *testing.T) {
+	// 1. state = running -> active
+	installed, _, status, _ := InspectToolService("iazio-harvester", "darwin", func(name string, args ...string) ([]byte, error) {
+		return []byte("{\n\tstate = running\n\tpid = 4321\n}\n"), nil
+	})
+	if !installed || status != "active" {
+		t.Fatalf("expected installed=true, status=active, got installed=%v, status=%q", installed, status)
+	}
+
+	// 2. non-zero last exit code (e.g. 78 EX_CONFIG) -> failed
+	installed, _, status, _ = InspectToolService("iazio-harvester", "darwin", func(name string, args ...string) ([]byte, error) {
+		return []byte("{\n\tstate = spawn scheduled\n\tlast exit code = 78: EX_CONFIG\n}\n"), nil
+	})
+	if !installed || status != "failed" {
+		t.Fatalf("expected installed=true, status=failed for exit code 78, got installed=%v, status=%q", installed, status)
+	}
+
+	// 3. last exit code = 0 -> installed
+	installed, _, status, _ = InspectToolService("iazio-harvester", "darwin", func(name string, args ...string) ([]byte, error) {
+		return []byte("{\n\tstate = not running\n\tlast exit code = 0\n}\n"), nil
+	})
+	if !installed || status != "installed" {
+		t.Fatalf("expected installed=true, status=installed for exit code 0, got installed=%v, status=%q", installed, status)
+	}
+
+	// 4. last exit code = (never exited) -> installed
+	installed, _, status, _ = InspectToolService("iazio-harvester", "darwin", func(name string, args ...string) ([]byte, error) {
+		return []byte("{\n\tstate = not running\n\tlast exit code = (never exited)\n}\n"), nil
+	})
+	if !installed || status != "installed" {
+		t.Fatalf("expected installed=true, status=installed for (never exited), got installed=%v, status=%q", installed, status)
+	}
+}
+
+

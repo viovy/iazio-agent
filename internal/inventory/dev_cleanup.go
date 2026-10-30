@@ -171,11 +171,20 @@ func ScanDevAndShadowBinaries(searchDirs []string, canonicalBinDir string) []Dev
 
 	for _, t := range ManagedTools {
 		devSuffixRegexes[t] = regexp.MustCompile(fmt.Sprintf(`(?i)^%s[-_](dev|test|debug|local|old|bak|copy|v[0-9]|darwin|linux|windows|arm64|amd64).*`, regexp.QuoteMeta(t)))
-		stagingExtRegexes[t] = regexp.MustCompile(fmt.Sprintf(`(?i)^%s\.(old|bak|new|tmp|del|exe\.old|exe\.bak).*`, regexp.QuoteMeta(t)))
+		stagingExtRegexes[t] = regexp.MustCompile(fmt.Sprintf(`(?i)^%s\.(next|old|bak|new|tmp|del|exe\.next|exe\.old|exe\.bak).*`, regexp.QuoteMeta(t)))
 	}
 	dotIazioRegex := regexp.MustCompile(`(?i)^\.iazio-.*`)
 
-	for _, dir := range searchDirs {
+	scanList := append([]string{}, searchDirs...)
+	if canonicalBinDir != "" {
+		cleanCanon := filepath.Clean(canonicalBinDir)
+		if filepath.Base(cleanCanon) == "bin" && filepath.Base(filepath.Dir(cleanCanon)) == ".local" {
+			homeDir := filepath.Dir(filepath.Dir(cleanCanon))
+			scanList = append(scanList, filepath.Join(homeDir, ".iazio", "bin"))
+		}
+	}
+
+	for _, dir := range scanList {
 		cleanDir := filepath.Clean(dir)
 		if cleanDir == "" || cleanDir == "." {
 			continue
@@ -326,6 +335,30 @@ func FindPIDsExecutingFile(filePath string) []int {
 	return pids
 }
 
+// RewriteDarwinLaunchAgentPlists rewrites any /.iazio/bin/ references to /.local/bin/
+// in ~/Library/LaunchAgents/io.iazio.*.plist so launchd never hits 78: EX_CONFIG (ENOENT).
+func RewriteDarwinLaunchAgentPlists(home string) {
+	if home == "" {
+		return
+	}
+	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
+	matches, err := filepath.Glob(filepath.Join(launchAgentsDir, "io.iazio.*.plist"))
+	if err != nil {
+		return
+	}
+	for _, plistPath := range matches {
+		data, err := os.ReadFile(plistPath)
+		if err != nil {
+			continue
+		}
+		content := string(data)
+		if strings.Contains(content, "/.iazio/bin/") {
+			updated := strings.ReplaceAll(content, "/.iazio/bin/", "/.local/bin/")
+			_ = os.WriteFile(plistPath, []byte(updated), 0o644)
+		}
+	}
+}
+
 // CleanupDevBinaries unlocks, terminates running processes for, and removes dev/shadow binaries.
 func CleanupDevBinaries(ctx context.Context, candidates []DevBinaryCandidate, canonicalBinDir string) (CleanupReport, error) {
 	report := CleanupReport{
@@ -341,6 +374,38 @@ func CleanupDevBinaries(ctx context.Context, candidates []DevBinaryCandidate, ca
 		if runtime.GOOS == "windows" {
 			cleanCanonical = strings.ToLower(cleanCanonical)
 		}
+	}
+
+	// Collect candidate home directories so we can rewrite LaunchAgent plists BEFORE unlinking ~/.iazio/bin/*
+	// and purge any remaining ~/.iazio/bin/*.next files.
+	homesSeen := make(map[string]bool)
+	var homes []string
+	addHome := func(h string) {
+		h = filepath.Clean(strings.TrimSpace(h))
+		if h == "" || h == "." || homesSeen[h] {
+			return
+		}
+		homesSeen[h] = true
+		homes = append(homes, h)
+	}
+	if canonicalBinDir != "" {
+		cleanCanon := filepath.Clean(canonicalBinDir)
+		if filepath.Base(cleanCanon) == "bin" && filepath.Base(filepath.Dir(cleanCanon)) == ".local" {
+			addHome(filepath.Dir(filepath.Dir(cleanCanon)))
+		}
+	}
+	for _, cand := range candidates {
+		dir := filepath.Dir(filepath.Clean(cand.Path))
+		if filepath.Base(dir) == "bin" && filepath.Base(filepath.Dir(dir)) == ".iazio" {
+			addHome(filepath.Dir(filepath.Dir(dir)))
+		}
+	}
+	if userHome, err := os.UserHomeDir(); err == nil && userHome != "" {
+		addHome(userHome)
+	}
+
+	for _, h := range homes {
+		RewriteDarwinLaunchAgentPlists(h)
 	}
 
 	// Record canonical binaries verified
@@ -410,6 +475,23 @@ func CleanupDevBinaries(ctx context.Context, candidates []DevBinaryCandidate, ca
 			_ = os.Remove(targetPath + ".version")
 		} else {
 			report.FailedPaths = append(report.FailedPaths, fmt.Sprintf("%s: %v", targetPath, err))
+		}
+	}
+
+	deletedSet := make(map[string]bool, len(report.DeletedPaths))
+	for _, p := range report.DeletedPaths {
+		deletedSet[filepath.Clean(p)] = true
+	}
+	for _, h := range homes {
+		nextMatches, _ := filepath.Glob(filepath.Join(h, ".iazio", "bin", "*.next"))
+		for _, np := range nextMatches {
+			cleanNP := filepath.Clean(np)
+			if err := os.Remove(cleanNP); err == nil {
+				if !deletedSet[cleanNP] {
+					deletedSet[cleanNP] = true
+					report.DeletedPaths = append(report.DeletedPaths, cleanNP)
+				}
+			}
 		}
 	}
 

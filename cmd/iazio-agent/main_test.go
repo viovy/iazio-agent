@@ -2319,7 +2319,7 @@ func TestProbeRepoRuntime_HarnessAndFallback(t *testing.T) {
 
 	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)
-	fakeBin := filepath.Join(fakeHome, ".iazio", "bin")
+	fakeBin := filepath.Join(fakeHome, ".local", "bin")
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -2398,7 +2398,7 @@ func TestScanRepoFleetStatus_HarnessJSON(t *testing.T) {
 
 	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)
-	fakeBin := filepath.Join(fakeHome, ".iazio", "bin")
+	fakeBin := filepath.Join(fakeHome, ".local", "bin")
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -3009,4 +3009,204 @@ func TestBuildWindowsSelfRestartCommand(t *testing.T) {
 		t.Fatalf("expected forwarded args [..., run --profile workstation], got %v", spawnCmd.Args)
 	}
 }
+
+func TestEnsureCanonicalSingleHomeAt_ReconcilesBeforeUnlinkAndCleansStagedFiles(t *testing.T) {
+	home := t.TempDir()
+	binName := "iazio-agent"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	canonicalDir := filepath.Join(home, ".local", "bin")
+	if runtime.GOOS == "windows" {
+		canonicalDir = filepath.Join(home, "bin")
+	}
+	if err := os.MkdirAll(canonicalDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	canonicalPath := filepath.Join(canonicalDir, binName)
+	if err := os.WriteFile(canonicalPath, []byte("canonical"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	legacyDir := filepath.Join(home, ".iazio", "bin")
+	if err := os.MkdirAll(legacyDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	shadowPath := filepath.Join(legacyDir, binName)
+	stagedFiles := []string{
+		shadowPath,
+		shadowPath + ".old",
+		shadowPath + ".next",
+		filepath.Join(legacyDir, "iazio-harvester.next"),
+	}
+	for _, f := range stagedFiles {
+		if err := os.WriteFile(f, []byte("staged"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reconcileCalledBeforeUnlink := false
+	ensureCanonicalSingleHomeAt(home, func(h, cPath string, _ func(string, ...string) error) error {
+		if _, err := os.Stat(shadowPath); err == nil {
+			reconcileCalledBeforeUnlink = true
+		}
+		return nil
+	})
+
+	if !reconcileCalledBeforeUnlink {
+		t.Fatal("expected ReconcileServiceConfiguration to be called BEFORE ~/.iazio/bin/iazio-agent was unlinked")
+	}
+	for _, f := range stagedFiles {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be removed, got err=%v", f, err)
+		}
+	}
+}
+
+func TestHealHarvesterServiceIfNeeded(t *testing.T) {
+	home := t.TempDir()
+	localBin := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(localBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	harvesterBin := filepath.Join(localBin, "iazio-harvester")
+	if err := os.WriteFile(harvesterBin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	origInspect := inspectToolServiceFn
+	origReconcile := reconcileHarvesterServiceFn
+	origRestart := restartToolServiceFn
+	defer func() {
+		inspectToolServiceFn = origInspect
+		reconcileHarvesterServiceFn = origReconcile
+		restartToolServiceFn = origRestart
+	}()
+
+	for _, status := range []string{"failed", "inactive", "installed"} {
+		var reconciledBin string
+		var restartedTool string
+		inspectToolServiceFn = func(toolName, goos string) (bool, string) {
+			return true, status
+		}
+		reconcileHarvesterServiceFn = func(ctx context.Context, bin string) error {
+			reconciledBin = bin
+			return nil
+		}
+		restartToolServiceFn = func(toolName string, _ ...func(name string, args ...string) error) error {
+			restartedTool = toolName
+			return nil
+		}
+
+		healHarvesterServiceIfNeeded(context.Background(), home, "darwin")
+		if reconciledBin != harvesterBin {
+			t.Fatalf("status=%s: expected reconcile on %s, got %q", status, harvesterBin, reconciledBin)
+		}
+		if restartedTool != "iazio-harvester" {
+			t.Fatalf("status=%s: expected RestartToolService(\"iazio-harvester\"), got %q", status, restartedTool)
+		}
+	}
+
+	// Active status must not trigger reconcile or restart
+	reconcileCalled := false
+	inspectToolServiceFn = func(toolName, goos string) (bool, string) {
+		return true, "active"
+	}
+	reconcileHarvesterServiceFn = func(ctx context.Context, bin string) error {
+		reconcileCalled = true
+		return nil
+	}
+	healHarvesterServiceIfNeeded(context.Background(), home, "darwin")
+	if reconcileCalled {
+		t.Fatal("expected active harvester service not to trigger reconcile")
+	}
+}
+
+func TestExecuteRun_InFlightPrepActiveJobsAndHeartbeat(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	origInterval := prepHeartbeatInterval
+	prepHeartbeatInterval = 15 * time.Millisecond
+	defer func() { prepHeartbeatInterval = origInterval }()
+
+	var jobHeartbeatCount atomic.Int32
+	var polledOnce atomic.Bool
+
+	wt := t.TempDir()
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/register"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"registered":true}`))
+		case strings.HasSuffix(r.URL.Path, "/heartbeat") && !strings.Contains(r.URL.Path, "/jobs/"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case strings.Contains(r.URL.Path, "/jobs/job-prep-1/heartbeat"):
+			jobHeartbeatCount.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case strings.Contains(r.URL.Path, "/jobs/job-prep-1/ack"):
+			// Hold pre-spawn preparation long enough for prepHeartbeatInterval to tick
+			time.Sleep(60 * time.Millisecond)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case strings.HasSuffix(r.URL.Path, "/poll"):
+			if !polledOnce.Swap(true) {
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id":            "job-prep-1",
+					"worktree_path": wt,
+					"lease_token":   "lease-tok-1",
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case strings.HasSuffix(r.URL.Path, "/jobs/claim"):
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		for i := 0; i < 80; i++ {
+			if jobHeartbeatCount.Load() > 0 {
+				cancel()
+				return
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}()
+
+	var stdout, stderr bytes.Buffer
+	_ = execute(ctx, []string{"run", "--update-suite=false"}, &stdout, &stderr, func(k string) string {
+		switch k {
+		case "HOME":
+			return fakeHome
+		case "PATH":
+			return fakeHome
+		case "IAZIO_HARNESS_API_URL":
+			return srv.URL
+		case "IAZIO_AGENT_HOST_ID":
+			return "test-host-prep"
+		case "IAZIO_AGENT_NONINTERACTIVE":
+			return "1"
+		default:
+			return ""
+		}
+	})
+
+	if jobHeartbeatCount.Load() == 0 {
+		t.Fatal("expected HeartbeatJob to be called during onJob pre-spawn preparation")
+	}
+}
+
+
 

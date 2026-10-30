@@ -229,6 +229,7 @@ func TestWatchdog_EmptyConversationResumeGuard(t *testing.T) {
 		Runner:     runner,
 		Spawner:    spawner,
 		MaxResumes: 5,
+		IsAlive:    func(pid int) bool { return pid == 3003 },
 	})
 
 	// Job with empty conversation ID and prompt "resume" (like job-1500)
@@ -286,6 +287,7 @@ func TestWatchdog_EmptyConversation_DirtyWorktree_RecoversPrompt(t *testing.T) {
 		Runner:     runner,
 		Spawner:    spawner,
 		MaxResumes: 5,
+		IsAlive:    func(pid int) bool { return pid == 3003 },
 	})
 
 	w.Track(TrackedJob{
@@ -336,6 +338,7 @@ func TestWatchdog_EmptyConversation_CleanWorktree_StoryID_RecoversPrompt(t *test
 		Runner:     runner,
 		Spawner:    spawner,
 		MaxResumes: 5,
+		IsAlive:    func(pid int) bool { return pid == 3003 },
 	})
 
 	w.Track(TrackedJob{
@@ -975,8 +978,13 @@ func TestWatchdog_CoverageHelpers(t *testing.T) {
 }
 
 func TestSystemdWatchdog_WithSocket(t *testing.T) {
-	sockDir := t.TempDir()
-	sockPath := filepath.Join(sockDir, "notify.sock")
+	sockDir, err := os.MkdirTemp("/tmp", "wd-sock-*")
+	if err != nil {
+		sockDir = t.TempDir()
+	} else {
+		t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	}
+	sockPath := filepath.Join(sockDir, "n.sock")
 	addr, err := net.ResolveUnixAddr("unixgram", sockPath)
 	if err != nil {
 		t.Fatal(err)

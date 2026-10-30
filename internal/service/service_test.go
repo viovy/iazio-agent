@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1432,9 +1433,9 @@ func TestReconcileServiceConfiguration(t *testing.T) {
 		return nil
 	}
 
-	// 1. Initial reconcile: writes missing files
-	if err := ReconcileServiceConfiguration(home, bin, run); err != nil {
-		t.Fatalf("ReconcileServiceConfiguration failed: %v", err)
+	// 1. Initial Linux reconcile: writes missing files and rewrites .iazio/bin -> .local/bin
+	if err := reconcileLinuxServiceConfiguration(home, bin, run); err != nil {
+		t.Fatalf("reconcileLinuxServiceConfiguration failed: %v", err)
 	}
 
 	unitFile := filepath.Join(home, ".config", "systemd", "user", "iazio-agent.service")
@@ -1449,12 +1450,114 @@ func TestReconcileServiceConfiguration(t *testing.T) {
 	// 2. Corrupted unit without WatchdogSec
 	_ = os.WriteFile(unitFile, []byte("[Service]\nExecStart=/some/bin\n"), 0644)
 	cmds = nil
-	if err := ReconcileServiceConfiguration(home, bin, run); err != nil {
-		t.Fatalf("ReconcileServiceConfiguration failed: %v", err)
+	if err := reconcileLinuxServiceConfiguration(home, bin, run); err != nil {
+		t.Fatalf("reconcileLinuxServiceConfiguration failed: %v", err)
 	}
 	data, _ = os.ReadFile(unitFile)
 	if !strings.Contains(string(data), "WatchdogSec=30s") {
 		t.Fatalf("expected WatchdogSec=30s after healing, got:\n%s", string(data))
+	}
+}
+
+func TestReconcileDarwinServiceConfiguration_SelfBootoutGuard(t *testing.T) {
+	home := t.TempDir()
+	canonicalBin := filepath.Join(home, ".local", "bin", "iazio-agent")
+	harnessBin := filepath.Join(home, ".local", "bin", "iazio-harness")
+	if err := os.MkdirAll(filepath.Dir(canonicalBin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(canonicalBin, []byte("#!/bin/sh\n"), 0o755)
+	_ = os.WriteFile(harnessBin, []byte("#!/bin/sh\n"), 0o755)
+
+	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
+	if err := os.MkdirAll(launchAgentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plistPath := filepath.Join(launchAgentsDir, DarwinLabel+".plist")
+	// Write a drifted plist pointing to ~/.iazio/bin/iazio-agent
+	_ = os.WriteFile(plistPath, []byte("<plist><string>"+filepath.Join(home, ".iazio", "bin", "iazio-agent")+"</string></plist>"), 0o644)
+
+	origStatusCheck := statusCheckCommand
+	defer func() { statusCheckCommand = origStatusCheck }()
+	statusCheckCommand = func(name string, args ...string) ([]byte, error) {
+		return []byte(fmt.Sprintf("state = running\npid = %d\n", os.Getpid())), nil
+	}
+
+	t.Setenv("XPC_SERVICE_NAME", DarwinLabel)
+	var cmds []string
+	run := func(name string, args ...string) error {
+		cmds = append(cmds, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	if err := reconcileDarwinServiceConfiguration(home, filepath.Join(home, ".iazio", "bin", "iazio-agent"), run); err != nil {
+		t.Fatalf("reconcileDarwinServiceConfiguration failed: %v", err)
+	}
+
+	// Verify plist on disk was updated to canonical .local/bin/iazio-agent
+	updatedPlist, err := os.ReadFile(plistPath)
+	if err != nil {
+		t.Fatalf("read updated plist: %v", err)
+	}
+	if !strings.Contains(string(updatedPlist), canonicalBin) {
+		t.Fatalf("expected updated plist to reference %s, got:\n%s", canonicalBin, string(updatedPlist))
+	}
+
+	// Verify launchctl bootout was NEVER called on io.iazio.iazio-agent
+	for _, c := range cmds {
+		if strings.Contains(c, "bootout") && strings.Contains(c, DarwinLabel) && !strings.Contains(c, DarwinWatcherLabel) && !strings.Contains(c, DarwinWatchdogLabel) {
+			t.Fatalf("must NEVER call launchctl bootout on %s when running inside the service, got command: %s", DarwinLabel, c)
+		}
+	}
+
+	// Verify iazio-harness plist was also reconciled to .local/bin/iazio-harness
+	harnessPlistPath := filepath.Join(launchAgentsDir, "io.iazio.iazio-harness.plist")
+	harnessPlistData, err := os.ReadFile(harnessPlistPath)
+	if err != nil {
+		t.Fatalf("expected harness plist to be written at %s: %v", harnessPlistPath, err)
+	}
+	if !strings.Contains(string(harnessPlistData), harnessBin) {
+		t.Fatalf("expected harness plist to contain %s, got:\n%s", harnessBin, string(harnessPlistData))
+	}
+}
+
+func TestInstallDarwinResilience_WatchdogSelfBootoutGuard(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, ".local", "bin", "iazio-agent")
+
+	origStatusCheck := statusCheckCommand
+	defer func() { statusCheckCommand = origStatusCheck }()
+	statusCheckCommand = func(name string, args ...string) ([]byte, error) {
+		return []byte("state = running\n"), nil
+	}
+
+	t.Setenv("XPC_SERVICE_NAME", DarwinWatchdogLabel)
+	var cmds []string
+	run := func(name string, args ...string) error {
+		cmds = append(cmds, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	// First call writes plists, must NOT bootout watchdog when XPC_SERVICE_NAME == DarwinWatchdogLabel
+	if err := InstallDarwinResilience(home, bin, run); err != nil {
+		t.Fatalf("InstallDarwinResilience failed: %v", err)
+	}
+	for _, c := range cmds {
+		if strings.Contains(c, "bootout") && strings.Contains(c, DarwinWatchdogLabel) {
+			t.Fatalf("must not bootout %s when XPC_SERVICE_NAME == %s, got: %s", DarwinWatchdogLabel, DarwinWatchdogLabel, c)
+		}
+	}
+
+	// Second call with unchanged plists and already loaded services should not call bootout at all
+	cmds = nil
+	t.Setenv("XPC_SERVICE_NAME", "")
+	if err := InstallDarwinResilience(home, bin, run); err != nil {
+		t.Fatalf("second InstallDarwinResilience failed: %v", err)
+	}
+	for _, c := range cmds {
+		if strings.Contains(c, "bootout") {
+			t.Fatalf("expected no bootout when plists unchanged and already loaded, got: %s", c)
+		}
 	}
 }
 

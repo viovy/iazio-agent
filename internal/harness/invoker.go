@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -104,7 +105,19 @@ func NewCLIInvoker(binaryPath, workDir string) *CLIInvoker {
 		if env := os.Getenv("IAZIO_HARNESS_BIN"); env != "" {
 			binaryPath = env
 		} else {
-			binaryPath = "iazio-harness"
+			binName := "iazio-harness"
+			if runtime.GOOS == "windows" {
+				binName += ".exe"
+			}
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				cand := filepath.Join(home, ".local", "bin", binName)
+				if _, err := os.Stat(cand); err == nil {
+					binaryPath = cand
+				}
+			}
+			if binaryPath == "" {
+				binaryPath = "iazio-harness"
+			}
 		}
 	}
 	return &CLIInvoker{
