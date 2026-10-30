@@ -1231,19 +1231,20 @@ func buildToolFromSourceRepo(
 			return false, nil
 		}
 		if installedSHA != "" && (installedSHA == remoteSHA || strings.HasPrefix(remoteSHA, installedSHA) || strings.HasPrefix(installedSHA, remoteSHA)) {
-			if semVer != "" {
-				sidecarBytes, _ := os.ReadFile(destPath + ".version")
-				if !strings.Contains(string(sidecarBytes), semVer) {
-					_ = os.WriteFile(destPath+".version", []byte(semVer+"+"+remoteSHA), 0644)
-					inventory.InvalidateVersionCache(destPath)
-				}
-			}
 			short := remoteSHA
 			if len(short) > 7 {
 				short = short[:7]
 			}
+			if semVer != "" {
+				expectedSidecar := semVer + "+" + short
+				sidecarBytes, _ := os.ReadFile(destPath + ".version")
+				if strings.TrimSpace(string(sidecarBytes)) != expectedSidecar {
+					_ = os.WriteFile(destPath+".version", []byte(expectedSidecar), 0644)
+					inventory.InvalidateVersionCache(destPath)
+				}
+			}
 			if stdout != nil {
-				fmt.Fprintf(stdout, "  [=] %s: %s (up-to-date commit %s)\n", tool.Name, installedSHA, short)
+				fmt.Fprintf(stdout, "  [=] %s: %s (up-to-date commit %s)\n", tool.Name, short, short)
 			}
 			return false, nil
 		}
@@ -1327,8 +1328,12 @@ func buildToolFromSourceRepo(
 	} else if out, err := exec.CommandContext(ctx, "git", "-C", buildDir, "describe", "--tags", "--always").Output(); err == nil {
 		verStr = strings.TrimSpace(string(out))
 	}
+	shortSHA := remoteSHA
+	if len(shortSHA) > 7 {
+		shortSHA = shortSHA[:7]
+	}
 	nowUTC := time.Now().UTC().Format(time.RFC3339)
-	ldflags := fmt.Sprintf("-s -w -X main.version=%s -X github.com/viovy/autopilot-plugins-internal/pkg/pluginsdk.Version=%s -X main.commit=%s -X main.buildCommitSHA=%s -X main.buildTimeUTC=%s -X main.buildDirty=false", verStr, verStr, remoteSHA, remoteSHA, nowUTC)
+	ldflags := fmt.Sprintf("-s -w -X main.version=%s -X github.com/viovy/autopilot-plugins-internal/pkg/pluginsdk.Version=%s -X main.commit=%s -X main.buildCommitSHA=%s -X main.buildTimeUTC=%s -X main.buildDirty=false", verStr, verStr, shortSHA, shortSHA, nowUTC)
 
 	cmdPath := fmt.Sprintf("./cmd/%s", toolName)
 	if _, err := os.Stat(filepath.Join(buildDir, "cmd", toolName)); err != nil {
@@ -1351,9 +1356,9 @@ func buildToolFromSourceRepo(
 		return false, fmt.Errorf("install %s: %w", tool.Name, err)
 	}
 
-	sidecarContent := remoteSHA
+	sidecarContent := shortSHA
 	if semVer != "" {
-		sidecarContent = semVer + "+" + remoteSHA
+		sidecarContent = semVer + "+" + shortSHA
 	}
 	_ = os.WriteFile(destPath+".version", []byte(sidecarContent), 0644)
 	inventory.InvalidateVersionCache(destPath)

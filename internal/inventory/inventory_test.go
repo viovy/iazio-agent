@@ -178,8 +178,8 @@ func TestInspectInstalledVersion(t *testing.T) {
 		t.Fatalf("expected version 1.4.2 when .version held raw SHA, got: %s", ver3)
 	}
 	sha3 := InspectToolCommitSHA(binPath)
-	if sha3 != rawSHA {
-		t.Fatalf("expected commit SHA %s to be preserved in .version, got: %s", rawSHA, sha3)
+	if sha3 != rawSHA[:7] {
+		t.Fatalf("expected 7-char short commit SHA %s to be preserved in .version, got: %s", rawSHA[:7], sha3)
 	}
 }
 
@@ -430,20 +430,21 @@ func TestInspectToolCommitSHAFallbacks(t *testing.T) {
 	binPath := filepath.Join(dir, "tool-with-sha")
 	writeExe(t, binPath)
 
-	// Sidecar with valid hex SHA
+	// Sidecar with valid hex SHA (normalized to 7-char short SHA)
 	hexSHA := "abcdef1234567890abcdef1234567890abcdef12"
+	expectedShortSHA := "abcdef1"
 	if err := os.WriteFile(binPath+".version", []byte(hexSHA), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	sha := InspectToolCommitSHA(binPath)
-	if sha != hexSHA {
-		t.Fatalf("expected sha %s, got %s", hexSHA, sha)
+	if sha != expectedShortSHA {
+		t.Fatalf("expected sha %s, got %s", expectedShortSHA, sha)
 	}
 
 	// Cached hit
 	shaCached := InspectToolCommitSHA(binPath)
-	if shaCached != hexSHA {
-		t.Fatalf("expected cached sha %s, got %s", hexSHA, shaCached)
+	if shaCached != expectedShortSHA {
+		t.Fatalf("expected cached sha %s, got %s", expectedShortSHA, shaCached)
 	}
 
 	// Missing binary
