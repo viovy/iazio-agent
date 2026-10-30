@@ -1,0 +1,66 @@
+{
+  "version": "1.0",
+  "generatedAt": "2026-10-30T23:00:02Z",
+  "repository": "viovy/meta-repo",
+  "pr": {
+    "number": 0,
+    "url": "",
+    "state": "MERGED",
+    "headRef": "main",
+    "baseRef": "main"
+  },
+  "requiredChecks": {
+    "contexts": [
+      "gate-story",
+      "validate-local",
+      "review-scheme"
+    ],
+    "preMerge": [
+      {
+        "name": "gate-story",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "validate-local",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "review-scheme",
+        "status": "completed",
+        "conclusion": "success"
+      }
+    ],
+    "mergeSha": [
+      {
+        "name": "gate-story",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "validate-local",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "review-scheme",
+        "status": "completed",
+        "conclusion": "success"
+      }
+    ]
+  },
+  "merge": {
+    "method": "squash",
+    "merged": true,
+    "sha": "5ae730a00fd22d8aba298461a3eff4b3c6c1875d",
+    "shaVerified": true
+  },
+  "cleanup": {
+    "remoteBranchDeleted": false,
+    "localBranchDeleted": false,
+    "localReconciled": true,
+    "details": "Successfully finalized local main on main (0 branches pruned)"
+  },
+  "status": "success"
+}
