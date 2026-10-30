@@ -55,7 +55,11 @@ func InspectInstalledVersion(binaryPath string) string {
 		if v != "" {
 			re := regexp.MustCompile(`v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?)|([0-9]+\.[0-9]+\.[0-9]+)`)
 			if match := re.FindString(v); match != "" {
-				return strings.TrimPrefix(match, "v")
+				norm := normalizeShortBuildSHA(strings.TrimPrefix(match, "v"))
+				if norm != v {
+					_ = os.WriteFile(binaryPath+".version", []byte(norm), 0644)
+				}
+				return norm
 			}
 			isHex := len(v) >= 7 && len(v) <= 40
 			if isHex {
@@ -67,7 +71,11 @@ func InspectInstalledVersion(binaryPath string) string {
 				}
 			}
 			if isHex {
-				prevHexSHA = v
+				if len(v) > 7 {
+					prevHexSHA = v[:7]
+				} else {
+					prevHexSHA = v
+				}
 			} else if !strings.Contains(v, "\n") && !strings.Contains(strings.ToLower(v), "dev") {
 				return strings.TrimPrefix(v, "v")
 			}
@@ -94,7 +102,7 @@ func InspectInstalledVersion(binaryPath string) string {
 	reSemver := regexp.MustCompile(`v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?)|([0-9]+\.[0-9]+\.[0-9]+)`)
 	if err == nil {
 		if match := reSemver.FindString(string(out)); match != "" {
-			ver = strings.TrimPrefix(match, "v")
+			ver = normalizeShortBuildSHA(strings.TrimPrefix(match, "v"))
 		} else {
 			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 			if len(lines) > 0 && strings.TrimSpace(lines[0]) != "" {
@@ -125,6 +133,27 @@ func InspectInstalledVersion(binaryPath string) string {
 	}
 	verCacheMu.Unlock()
 
+	return ver
+}
+
+func normalizeShortBuildSHA(ver string) string {
+	idx := strings.LastIndex(ver, "+")
+	if idx == -1 {
+		return ver
+	}
+	meta := ver[idx+1:]
+	if len(meta) > 7 {
+		isHex := true
+		for _, r := range meta {
+			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+				isHex = false
+				break
+			}
+		}
+		if isHex {
+			return ver[:idx+1] + meta[:7]
+		}
+	}
 	return ver
 }
 

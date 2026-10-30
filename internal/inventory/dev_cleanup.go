@@ -68,6 +68,18 @@ func InspectToolCommitSHA(binaryPath string) string {
 	}
 
 	setCache := func(result string) string {
+		if len(result) > 7 && len(result) <= 40 {
+			isHex := true
+			for _, r := range result {
+				if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+					isHex = false
+					break
+				}
+			}
+			if isHex {
+				result = result[:7]
+			}
+		}
 		shaCacheMu.Lock()
 		shaCache[binaryPath] = shaCacheEntry{
 			modTime:   fi.ModTime(),

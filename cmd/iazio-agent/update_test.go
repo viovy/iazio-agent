@@ -1615,13 +1615,17 @@ func TestBuildToolFromSourceRepo_Lifecycle(t *testing.T) {
 		t.Errorf("expected Case C to update successfully with force=true")
 	}
 
-	// Verify installed binary and version sidecar
+	// Verify installed binary and version sidecar (7-char short SHA)
 	verSidecar, err := os.ReadFile(destPath + ".version")
 	if err != nil {
 		t.Fatalf("missing .version sidecar: %v", err)
 	}
-	if string(verSidecar) != headSHA {
-		t.Errorf("expected .version to contain %s, got %s", headSHA, string(verSidecar))
+	wantShort := headSHA
+	if len(wantShort) > 7 {
+		wantShort = wantShort[:7]
+	}
+	if string(verSidecar) != wantShort {
+		t.Errorf("expected .version to contain %s, got %s", wantShort, string(verSidecar))
 	}
 }
 

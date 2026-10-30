@@ -679,7 +679,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					"background_task_watchdog_v1",
 				},
 				Version:   formatVersion(),
-				CommitSHA: commit,
+				CommitSHA: resolveCommit(),
 				OnToolUpdate: func(ctx context.Context, tools []string, force bool, targetVersion ...string) error {
 					var tv string
 					if len(targetVersion) > 0 {

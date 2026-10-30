@@ -25,14 +25,23 @@ var (
 
 func resolveCommit() string {
 	if c := strings.TrimSpace(buildCommitSHA); c != "" && c != "unknown" {
+		if sha, ok := shortCommit(c); ok {
+			return sha
+		}
 		return c
 	}
 	if c := strings.TrimSpace(commit); c != "" && c != "unknown" {
+		if sha, ok := shortCommit(c); ok {
+			return sha
+		}
 		return c
 	}
 	if bi, ok := debug.ReadBuildInfo(); ok {
 		for _, s := range bi.Settings {
 			if s.Key == "vcs.revision" && strings.TrimSpace(s.Value) != "" {
+				if sha, ok := shortCommit(s.Value); ok {
+					return sha
+				}
 				return s.Value
 			}
 		}
