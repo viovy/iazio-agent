@@ -811,6 +811,7 @@ func (c Client) postJSON(ctx context.Context, path string, body any, out any) er
 	}
 	maxRetries, backoff := c.retryParams()
 	var lastErr error
+	shouldSpool := false
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+path, bytes.NewReader(raw))
 		if err != nil {
@@ -823,8 +824,9 @@ func (c Client) postJSON(ctx context.Context, path string, body any, out any) er
 		resp, err := c.http().Do(req)
 		if err != nil {
 			lastErr = err
+			shouldSpool = true
 			if !IsTransientError(err) || attempt == maxRetries {
-				return lastErr
+				break
 			}
 		} else {
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -841,8 +843,11 @@ func (c Client) postJSON(ctx context.Context, path string, body any, out any) er
 			}
 			_ = resp.Body.Close()
 			lastErr = fmt.Errorf("control plane %s: %s", path, resp.Status)
+			if IsTransientStatus(resp.StatusCode) || resp.StatusCode >= 500 {
+				shouldSpool = true
+			}
 			if !IsTransientStatus(resp.StatusCode) || attempt == maxRetries {
-				return lastErr
+				break
 			}
 		}
 		jitter := time.Duration(0)
@@ -856,7 +861,7 @@ func (c Client) postJSON(ctx context.Context, path string, body any, out any) er
 		}
 		backoff *= 2
 	}
-	if lastErr != nil && c.Spooler != nil && out == nil {
+	if lastErr != nil && shouldSpool && c.Spooler != nil && out == nil {
 		headers := map[string]string{"Content-Type": "application/json"}
 		if c.Token != "" {
 			headers["Authorization"] = "Bearer " + c.Token

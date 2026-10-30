@@ -426,13 +426,13 @@ func DefaultDirs(pathEnv, home, goos string) []string {
 		dirs = append(dirs, filepath.SplitList(pathEnv)...)
 	}
 	if home != "" {
+		if goos == "windows" {
+			dirs = append(dirs, filepath.Join(home, "bin"))
+		}
 		dirs = append(dirs,
 			filepath.Join(home, ".local", "bin"),
 			filepath.Join(home, ".gemini", "antigravity-cli", "bin"),
 		)
-		if goos == "windows" {
-			dirs = append(dirs, filepath.Join(home, "bin"))
-		}
 	}
 	return dedupe(dirs)
 }

@@ -1576,7 +1576,7 @@ func TestLinuxUnitHardening(t *testing.T) {
 		"OOMScoreAdjust=-500",
 	}
 	for _, needle := range needles {
-	if !strings.Contains(text, needle) {
+		if !strings.Contains(text, needle) {
 			t.Errorf("missing %q in linux unit:\n%s", needle, text)
 		}
 	}
@@ -1674,4 +1674,3 @@ func TestReconcileServiceConfiguration_AllBranches(t *testing.T) {
 	// ReviveCheck without maintenance lock
 	_ = ReviveCheck(home, runner)
 }
-

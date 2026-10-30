@@ -447,6 +447,12 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					getInstallRoots,
 					runtime.GOOS,
 				)
+				eagerUpdater.InspectOutdatedTools = buildInspectOutdatedHook(
+					updateSuite,
+					driftFetcher,
+					getInstallRoots,
+					runtime.GOOS,
+				)
 			}
 
 			// Start repoMonitor AFTER eagerUpdater is fully constructed to eliminate initialization race
@@ -595,16 +601,22 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						f := pendingRemoteForce
 						v := pendingRemoteTargetVersion
 						isRemote := hasPendingRemote
-						if isRemote {
-							hasPendingRemote = false
-							pendingRemoteTools = nil
-							pendingRemoteForce = false
-							pendingRemoteTargetVersion = ""
-						}
 						pendingRemoteMu.Unlock()
 
 						if isRemote {
-							return doToolUpdate(runCtx, t, f, v)
+							res, deferred, err := doToolUpdateDetailed(runCtx, t, f, v)
+							if !deferred {
+								pendingRemoteMu.Lock()
+								hasPendingRemote = false
+								pendingRemoteTools = nil
+								pendingRemoteForce = false
+								pendingRemoteTargetVersion = ""
+								pendingRemoteMu.Unlock()
+							}
+							if err != nil || deferred {
+								return false
+							}
+							return res.AgentUpdated
 						}
 						return doToolUpdate(runCtx, nil, false)
 					}
@@ -637,8 +649,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			var lastHarvesterCheckMu sync.Mutex
 			var lastHarvesterCheck time.Time
 			spooler, _ := controlplane.NewOfflineReportSpooler("", nil)
+			authToken := resolveControlPlaneToken(getenv)
 			client = controlplane.Client{
 				BaseURL:            api,
+				Token:              authToken,
 				Spooler:            spooler,
 				EagerUpdateEnabled: updateInterval > 0 || eagerUpdater != nil,
 				LastEagerUpdateAt: func() *time.Time {
@@ -706,13 +720,18 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						t := pendingRemoteTools
 						f := pendingRemoteForce
 						v := pendingRemoteTargetVersion
-						pendingRemoteTools = nil
-						pendingRemoteForce = false
-						pendingRemoteTargetVersion = ""
-						hasPendingRemote = false
 						pendingRemoteMu.Unlock()
 
-						if doToolUpdate(runCtx, t, f, v) {
+						res, deferred, err := doToolUpdateDetailed(runCtx, t, f, v)
+						if !deferred {
+							pendingRemoteMu.Lock()
+							pendingRemoteTools = nil
+							pendingRemoteForce = false
+							pendingRemoteTargetVersion = ""
+							hasPendingRemote = false
+							pendingRemoteMu.Unlock()
+						}
+						if err == nil && !deferred && res.AgentUpdated {
 							restartOrExecSelf(stdout)
 							cancel()
 						}
@@ -931,11 +950,18 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 
 			if api != "" {
 				cpSpooler, _ := controlplane.NewOfflineReportSpooler("", nil)
-				cpClient := worker.NewHTTPControlPlaneClient(api, "", nil, cpSpooler)
+				cpClient := worker.NewHTTPControlPlaneClient(api, authToken, nil, cpSpooler)
 				cliInvoker := harness.NewCLIInvoker("", "")
 				disp := worker.NewDispatcher(cpClient, cliInvoker, host)
 				disp.SetHostGate(hostGate)
+				disp.SetHarvestFlusher(func(hCtx context.Context, convID string) (int, string, error) {
+					return flushHarvestConversationDetailed(hCtx, convID)
+				})
+				var pendingSelfRestart atomic.Bool
 				disp.SetPreDispatchHook(func(ctx context.Context, job *worker.Job) error {
+					if job != nil && job.Type == worker.JobTypeToolsUpdate {
+						return nil
+					}
 					if eagerUpdater != nil && !updatingTools.Load() {
 						rep := eagerUpdater.EvaluateReadiness(ctx)
 						if rep.EagerUpdateState == supervisor.StateUpToDate {
@@ -944,17 +970,35 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 								Force:       false,
 							})
 							if err == nil && res.AgentUpdated {
-								restartOrExecSelf(stdout)
-								cancel()
+								pendingSelfRestart.Store(true)
 							}
 						}
 					}
 					return nil
 				})
-				var pendingSelfRestart atomic.Bool
 				disp.SetPostJobHook(func(ctx context.Context, job *worker.Job) {
 					if eagerUpdater != nil {
 						eagerUpdater.TriggerEvaluation("post_job_completion")
+					}
+					pendingRemoteMu.Lock()
+					rem := hasPendingRemote
+					t := pendingRemoteTools
+					f := pendingRemoteForce
+					v := pendingRemoteTargetVersion
+					pendingRemoteMu.Unlock()
+					if rem {
+						res, deferred, err := doToolUpdateDetailed(runCtx, t, f, v)
+						if !deferred {
+							pendingRemoteMu.Lock()
+							hasPendingRemote = false
+							pendingRemoteTools = nil
+							pendingRemoteForce = false
+							pendingRemoteTargetVersion = ""
+							pendingRemoteMu.Unlock()
+						}
+						if err == nil && !deferred && res.AgentUpdated {
+							pendingSelfRestart.Store(true)
+						}
 					}
 					if pendingSelfRestart.CompareAndSwap(true, false) {
 						restartOrExecSelf(stdout)
@@ -1078,13 +1122,16 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 										pendingRemoteMu.Unlock()
 
 										if rem {
-											if doToolUpdate(runCtx, t, f, v) {
+											res, deferred, err := doToolUpdateDetailed(runCtx, t, f, v)
+											if !deferred {
 												pendingRemoteMu.Lock()
 												hasPendingRemote = false
 												pendingRemoteTools = nil
 												pendingRemoteForce = false
 												pendingRemoteTargetVersion = ""
 												pendingRemoteMu.Unlock()
+											}
+											if err == nil && !deferred && res.AgentUpdated {
 												restartOrExecSelf(stdout)
 												cancel()
 											}
@@ -1418,9 +1465,38 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 	}
 }
 
-func flushHarvestConversation(ctx context.Context, conversationID string) error {
+func resolveControlPlaneToken(getenv func(string) string) string {
+	if getenv != nil {
+		for _, k := range []string{"IAZIO_AUTH_TOKEN", "IAZIO_HARNESS_API_TOKEN", "HARNESS_AUTH_TOKEN"} {
+			if v := strings.TrimSpace(getenv(k)); v != "" {
+				return v
+			}
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		for _, fn := range []string{"agent.json", "config.json"} {
+			if data, err := os.ReadFile(filepath.Join(home, ".iazio", fn)); err == nil {
+				var cfg struct {
+					AuthToken string `json:"auth_token"`
+					Token     string `json:"token"`
+				}
+				if json.Unmarshal(data, &cfg) == nil {
+					if v := strings.TrimSpace(cfg.AuthToken); v != "" {
+						return v
+					}
+					if v := strings.TrimSpace(cfg.Token); v != "" {
+						return v
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func flushHarvestConversationDetailed(ctx context.Context, conversationID string) (int, string, error) {
 	if strings.TrimSpace(conversationID) == "" {
-		return nil
+		return 0, "", nil
 	}
 	fCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -1431,9 +1507,31 @@ func flushHarvestConversation(ctx context.Context, conversationID string) error 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[agent] Warning: harvest flush for conversation %s failed: %v (output: %s)\n",
 			conversationID, err, strings.TrimSpace(string(out)))
-		return err
+		return 0, "", err
 	}
-	return nil
+	var parsed struct {
+		TurnCount             int    `json:"turn_count"`
+		FinalTurnCount        int    `json:"final_turn_count"`
+		TranscriptSHA256      string `json:"transcript_sha256"`
+		FinalTranscriptSHA256 string `json:"final_transcript_sha256"`
+	}
+	if len(out) > 0 && json.Unmarshal(out, &parsed) == nil {
+		turns := parsed.FinalTurnCount
+		if turns == 0 {
+			turns = parsed.TurnCount
+		}
+		sha := parsed.FinalTranscriptSHA256
+		if sha == "" {
+			sha = parsed.TranscriptSHA256
+		}
+		return turns, sha, nil
+	}
+	return 0, "", nil
+}
+
+func flushHarvestConversation(ctx context.Context, conversationID string) error {
+	_, _, err := flushHarvestConversationDetailed(ctx, conversationID)
+	return err
 }
 
 func runAuth(ctx context.Context, args []string, stdout io.Writer, getenv func(string) string) error {
@@ -2196,8 +2294,8 @@ func resolveSelfBinaryPath(goos string, selfBin string, home string, args []stri
 	if home != "" {
 		if goos == "windows" {
 			candidates = append(candidates,
-				filepath.Join(home, ".local", "bin", "iazio-agent.exe"),
 				filepath.Join(home, "bin", "iazio-agent.exe"),
+				filepath.Join(home, ".local", "bin", "iazio-agent.exe"),
 			)
 		} else {
 			candidates = append(candidates,
@@ -2743,4 +2841,30 @@ func buildEagerHooks(
 	}
 
 	return checkDrift, listSuiteTools
+}
+
+func buildInspectOutdatedHook(
+	updateSuite bool,
+	driftFetcher supervisor.DriftFetcher,
+	getInstallRoots func(*supervisor.FleetManifest) string,
+	targetOS string,
+) func(context.Context) ([]supervisor.OutdatedToolInfo, error) {
+	return func(ctx context.Context) ([]supervisor.OutdatedToolInfo, error) {
+		if driftFetcher == nil {
+			return nil, nil
+		}
+		manifest, err := driftFetcher.FetchManifest(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var binDir string
+		if getInstallRoots != nil {
+			binDir = getInstallRoots(manifest)
+		}
+		var checkTools []string
+		if !updateSuite {
+			checkTools = []string{"iazio-agent"}
+		}
+		return supervisor.FindOutdatedTools(manifest, inventory.InspectInstalledVersion, binDir, checkTools, targetOS)
+	}
 }

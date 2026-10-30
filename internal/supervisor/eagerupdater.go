@@ -109,6 +109,8 @@ type EagerToolUpdater struct {
 	postReadiness         func(ctx context.Context, hostID string, report EagerUpdateReadinessReport) error
 	CheckDrift            func(ctx context.Context, targetTools []string) (bool, error)
 	ListSuiteTools        func(ctx context.Context) ([]string, error)
+	InspectOutdatedTools  func(ctx context.Context) ([]OutdatedToolInfo, error)
+	QueueDeferredUpdate   func(tools []string)
 	lastDeferredKey       string
 	lastPartialFailureKey string
 	updating              bool
@@ -194,6 +196,12 @@ func (u *EagerToolUpdater) EvaluateReadiness(ctx context.Context) EagerUpdateRea
 		LastEvaluatedAt:           now,
 		NextScheduledEvaluationAt: now.Add(90 * time.Second),
 		EagerUpdateState:          StateUpToDate,
+	}
+
+	if u.InspectOutdatedTools != nil {
+		if outdated, err := u.InspectOutdatedTools(ctx); err == nil && len(outdated) > 0 {
+			rep.OutdatedTools = outdated
+		}
 	}
 
 	u.mu.Lock()
@@ -646,8 +654,11 @@ func (u *EagerToolUpdater) EvaluateAndTriggerWithOpts(ctx context.Context, opts 
 			lastErr = passErr
 		}
 
-		if passDeferred && (curForce || curVersion != "" || curBypassDirty) {
+		if passDeferred && (len(curTools) > 0 || curForce || curVersion != "" || curBypassDirty) {
 			// R4, N5: Re-queue deferred forced/targeted/dispatched requests so they are not dropped when harness is active
+			if len(curTools) > 0 && u.QueueDeferredUpdate != nil {
+				u.QueueDeferredUpdate(curTools)
+			}
 			u.mu.Lock()
 			var reqs []PendingToolRequest
 			if len(curTools) > 0 {
@@ -674,6 +685,22 @@ func (u *EagerToolUpdater) EvaluateAndTriggerWithOpts(ctx context.Context, opts 
 		}
 
 		u.mu.Lock()
+		if !passDeferred && len(u.pendingRequests) > 0 {
+			curToolSet := make(map[string]bool, len(curTools))
+			for _, ct := range curTools {
+				curToolSet[strings.ToLower(strings.TrimSpace(ct))] = true
+			}
+			filtered := u.pendingRequests[:0]
+			for _, p := range u.pendingRequests {
+				pTool := strings.ToLower(strings.TrimSpace(p.Tool))
+				if p.Force == curForce && p.TargetVersion == curVersion && p.BypassDirty == curBypassDirty &&
+					((len(curTools) == 0 && pTool == "") || curToolSet[pTool]) {
+					continue
+				}
+				filtered = append(filtered, p)
+			}
+			u.pendingRequests = filtered
+		}
 		if len(u.pendingRequests) == 0 {
 			u.hasPending = false
 			u.mu.Unlock()

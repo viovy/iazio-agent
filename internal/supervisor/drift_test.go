@@ -235,3 +235,68 @@ func TestHTTPDriftFetcher_TTLCache(t *testing.T) {
 		t.Fatalf("expected recovery after server error, err=%v", errRecover)
 	}
 }
+
+func TestEagerToolUpdater_ReadinessOutdatedToolsAndDeferredCurTools(t *testing.T) {
+	sup := New(time.Now)
+	tempDir := t.TempDir()
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.lastSnapshot = FleetStateSnapshot{FleetGitClean: true}
+
+	var executedTools [][]string
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
+		executedTools = append(executedTools, append([]string(nil), targetTools...))
+		return UpdateResult{UpdatedTools: targetTools}, nil
+	}, nil)
+
+	manifest := &FleetManifest{
+		Tools: []ManifestTool{
+			{Name: "autopilot", BinaryName: "autopilot", TargetVersion: "0.0.500"},
+			{Name: "iazio-agent", BinaryName: "iazio-agent", TargetVersion: "0.0.500"},
+		},
+	}
+	updater.InspectOutdatedTools = func(ctx context.Context) ([]OutdatedToolInfo, error) {
+		return FindOutdatedTools(manifest, func(path string) string {
+			if path == "/bin/autopilot" || path == `\bin\autopilot` {
+				return "0.0.490"
+			}
+			return "0.0.500"
+		}, "/bin", nil, "linux")
+	}
+
+	rep := updater.EvaluateReadiness(context.Background())
+	if len(rep.OutdatedTools) != 1 || rep.OutdatedTools[0].ToolName != "autopilot" {
+		t.Fatalf("expected OutdatedTools to contain autopilot, got %+v", rep.OutdatedTools)
+	}
+
+	// Verify unforced targeted tool update queues when deferred by active harness
+	var queuedDeferred [][]string
+	updater.QueueDeferredUpdate = func(tools []string) {
+		queuedDeferred = append(queuedDeferred, append([]string(nil), tools...))
+	}
+	if err := sup.TrySpawn(tempDir); err != nil {
+		t.Fatalf("TrySpawn: %v", err)
+	}
+	_, deferred, err := updater.EvaluateAndTrigger(context.Background(), []string{"autopilot"}, false)
+	if err != nil || !deferred {
+		t.Fatalf("expected deferred=true while harness active, got deferred=%v err=%v", deferred, err)
+	}
+	if len(queuedDeferred) != 1 || queuedDeferred[0][0] != "autopilot" {
+		t.Fatalf("expected QueueDeferredUpdate to be called with [autopilot], got %v", queuedDeferred)
+	}
+
+	// Mark harness idle and trigger suite check (nil targetTools): queued "autopilot" must drain!
+	sup.MarkIdle(tempDir)
+	_, deferred2, err2 := updater.EvaluateAndTrigger(context.Background(), nil, false)
+	if err2 != nil || deferred2 {
+		t.Fatalf("expected clean drain pass to succeed, got deferred=%v err=%v", deferred2, err2)
+	}
+	foundAutopilot := false
+	for _, et := range executedTools {
+		if len(et) == 1 && et[0] == "autopilot" {
+			foundAutopilot = true
+		}
+	}
+	if !foundAutopilot {
+		t.Fatalf("expected deferred targeted tool [autopilot] to be executed after harness became idle, got %v", executedTools)
+	}
+}

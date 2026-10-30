@@ -3208,5 +3208,42 @@ func TestExecuteRun_InFlightPrepActiveJobsAndHeartbeat(t *testing.T) {
 	}
 }
 
+func TestResolveControlPlaneToken_And_WindowsBinaryPathPrecedence(t *testing.T) {
+	tok := resolveControlPlaneToken(func(k string) string {
+		if k == "IAZIO_HARNESS_API_TOKEN" {
+			return "env-harness-token-99"
+		}
+		return ""
+	})
+	if tok != "env-harness-token-99" {
+		t.Fatalf("expected env-harness-token-99, got %q", tok)
+	}
 
+	tokPrimary := resolveControlPlaneToken(func(k string) string {
+		if k == "IAZIO_AUTH_TOKEN" {
+			return "primary-auth-token"
+		}
+		if k == "IAZIO_HARNESS_API_TOKEN" {
+			return "fallback-token"
+		}
+		return ""
+	})
+	if tokPrimary != "primary-auth-token" {
+		t.Fatalf("expected primary-auth-token, got %q", tokPrimary)
+	}
 
+	tmpHome := t.TempDir()
+	winBinDir := filepath.Join(tmpHome, "bin")
+	localBinDir := filepath.Join(tmpHome, ".local", "bin")
+	_ = os.MkdirAll(winBinDir, 0755)
+	_ = os.MkdirAll(localBinDir, 0755)
+	winExe := filepath.Join(winBinDir, "iazio-agent.exe")
+	localExe := filepath.Join(localBinDir, "iazio-agent.exe")
+	_ = os.WriteFile(winExe, []byte("win-canonical"), 0755)
+	_ = os.WriteFile(localExe, []byte("local-shadow"), 0755)
+
+	resolved := resolveSelfBinaryPath("windows", "", tmpHome, nil)
+	if resolved != winExe {
+		t.Fatalf("expected ~/bin/iazio-agent.exe (%s) to take precedence over ~/.local/bin on Windows, got %s", winExe, resolved)
+	}
+}

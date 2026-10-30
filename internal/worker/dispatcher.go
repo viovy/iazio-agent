@@ -43,23 +43,25 @@ const DefaultJobExecutionTimeout = 7 * 24 * time.Hour
 
 // Job describes a unit of work received from the control plane.
 type Job struct {
-	ID                 string          `json:"id"`
-	Type               string          `json:"type"`
-	Repo               string          `json:"repo"`
-	TargetHost         string          `json:"target_host,omitempty"`
-	TargetAgent        string          `json:"target_agent,omitempty"`
-	Payload            json.RawMessage `json:"payload"`
-	TraceID            string          `json:"trace_id,omitempty"`
-	ParentID           string          `json:"parent_id,omitempty"`
-	StoryID            string          `json:"story_id,omitempty"`
-	FencingToken       int64           `json:"fencing_token,omitempty"`
-	LeaseToken         string          `json:"lease_token,omitempty"`
-	LeaseAckDeadlineAt string          `json:"lease_ack_deadline_at,omitempty"`
-	Traceparent        string          `json:"traceparent,omitempty"`
-	ZipkinTraceID      string          `json:"zipkin_trace_id,omitempty"`
-	ZipkinTraceURL     string          `json:"zipkin_trace_url,omitempty"`
-	InfraRequeueCount  int             `json:"infra_requeue_count,omitempty"`
-	FailureCategory    string          `json:"failure_category,omitempty"`
+	ID                   string          `json:"id"`
+	Type                 string          `json:"type"`
+	Repo                 string          `json:"repo"`
+	TargetHost           string          `json:"target_host,omitempty"`
+	TargetAgent          string          `json:"target_agent,omitempty"`
+	Payload              json.RawMessage `json:"payload"`
+	TraceID              string          `json:"trace_id,omitempty"`
+	ParentID             string          `json:"parent_id,omitempty"`
+	StoryID              string          `json:"story_id,omitempty"`
+	FencingToken         int64           `json:"fencing_token,omitempty"`
+	LeaseToken           string          `json:"lease_token,omitempty"`
+	LeaseAckDeadlineAt   string          `json:"lease_ack_deadline_at,omitempty"`
+	Traceparent          string          `json:"traceparent,omitempty"`
+	ZipkinTraceID        string          `json:"zipkin_trace_id,omitempty"`
+	ZipkinTraceURL       string          `json:"zipkin_trace_url,omitempty"`
+	InfraRequeueCount    int             `json:"infra_requeue_count,omitempty"`
+	FailureCategory      string          `json:"failure_category,omitempty"`
+	ActiveConversationID string          `json:"active_conversation_id,omitempty"`
+	ConversationID       string          `json:"conversation_id,omitempty"`
 }
 
 // ClaimRequest is sent to claim pending jobs.
@@ -600,7 +602,9 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		})
 	}
 
-	if aware, ok := invoker.(interface{ WithStoryCallback(func(string)) harness.Invoker }); ok {
+	if aware, ok := invoker.(interface {
+		WithStoryCallback(func(string)) harness.Invoker
+	}); ok {
 		invoker = aware.WithStoryCallback(onStoryDiscovered)
 	}
 
@@ -655,7 +659,11 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	switch job.Type {
 	case JobTypeStoryCreate:
 		res, err := invoker.CreateStory(execCtx, job.Payload)
-		finalTurns, finalSHA := d.flushConversationHarvest(ctx, job)
+		var storyConvIDs []string
+		if res != nil {
+			storyConvIDs = append(storyConvIDs, res.ConversationID, res.ActiveConversationID)
+		}
+		finalTurns, finalSHA := d.flushConversationHarvest(ctx, job, storyConvIDs...)
 		if err != nil {
 			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{
 				FencingToken:          job.FencingToken,
@@ -724,7 +732,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 					return true, err
 				}
 			}
-			finalTurns, finalSHA := d.flushConversationHarvest(ctx, job)
+			finalTurns, finalSHA := d.flushConversationHarvest(ctx, job, extractConversationIDFromResult(res)...)
 			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{
 				FencingToken:          job.FencingToken,
 				Error:                 err.Error(),
@@ -753,7 +761,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				})
 			}
 		}
-		finalTurns, finalSHA := d.flushConversationHarvest(ctx, job)
+		finalTurns, finalSHA := d.flushConversationHarvest(ctx, job, extractConversationIDFromResult(res)...)
 		resBytes, _ := json.Marshal(res)
 		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{
 			FencingToken:          job.FencingToken,
@@ -847,11 +855,50 @@ func extractConversationID(raw json.RawMessage) string {
 	return ""
 }
 
-func (d *Dispatcher) flushConversationHarvest(ctx context.Context, job *Job) (int, string) {
+var convIDTextRegex = regexp.MustCompile(`(?i)"?(?:active_)?conversation_id"?\s*[:=]\s*"?([a-zA-Z0-9_-]{4,})"?`)
+
+func extractConversationIDFromResult(res *harness.PromptExecutionResult) []string {
+	if res == nil {
+		return nil
+	}
+	var out []string
+	for _, v := range []string{res.ConversationID, res.ActiveConversationID} {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	for _, txt := range []string{res.Output, res.Summary} {
+		if trimmed := strings.TrimSpace(txt); trimmed != "" {
+			if cid := extractConversationID([]byte(trimmed)); cid != "" {
+				out = append(out, cid)
+			} else if m := convIDTextRegex.FindStringSubmatch(trimmed); len(m) > 1 && strings.TrimSpace(m[1]) != "" {
+				out = append(out, strings.TrimSpace(m[1]))
+			}
+		}
+	}
+	return out
+}
+
+func (d *Dispatcher) flushConversationHarvest(ctx context.Context, job *Job, extraConvIDs ...string) (int, string) {
 	if d.flusher == nil || job == nil {
 		return 0, ""
 	}
-	convID := extractConversationID(job.Payload)
+	var convID string
+	for _, cand := range extraConvIDs {
+		if trimmed := strings.TrimSpace(cand); trimmed != "" {
+			convID = trimmed
+			break
+		}
+	}
+	if convID == "" {
+		convID = strings.TrimSpace(job.ActiveConversationID)
+	}
+	if convID == "" {
+		convID = strings.TrimSpace(job.ConversationID)
+	}
+	if convID == "" {
+		convID = extractConversationID(job.Payload)
+	}
 	if convID == "" {
 		return 0, ""
 	}
