@@ -692,7 +692,10 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 			telemetry.WithTag("job.id", job.ID),
 			telemetry.WithTag("tool", toolName),
 		)
-		payload := EnsurePromptIDWithTrace(job.ID, job.TraceID, job.Payload)
+		allocatedStoryMu.Lock()
+		sidForPayload := currentStoryID
+		allocatedStoryMu.Unlock()
+		payload := harness.EnsurePromptPayloadWithJob(job.ID, job.TraceID, job.TargetAgent, job.Repo, sidForPayload, job.Payload)
 		startTime := time.Now()
 		res, err := invoker.ExecutePrompt(execCtx, payload)
 		if toolSpan != nil {
@@ -835,7 +838,7 @@ func extractConversationID(raw json.RawMessage) string {
 	}
 	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err == nil {
-		for _, key := range []string{"conversation_id", "active_conversation_id", "session_id"} {
+		for _, key := range []string{"conversation_id", "active_conversation_id", "resume_conversation_id", "initial_conversation_id", "session_id"} {
 			if v, ok := m[key].(string); ok && strings.TrimSpace(v) != "" {
 				return strings.TrimSpace(v)
 			}

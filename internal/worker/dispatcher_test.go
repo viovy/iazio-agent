@@ -1371,4 +1371,57 @@ func TestGov3782_DispatcherStoryExecuteAndPostJobHookAfterComplete(t *testing.T)
 	}
 }
 
+func TestDispatcher_SyncsFailoverTargetAgentIntoPayload(t *testing.T) {
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:          "job-failover-sync-1",
+			Type:        JobTypePromptExecute,
+			Repo:        "iazio-agent",
+			TargetAgent: "opencode",
+			StoryID:     "STORY-GOV-3799",
+			TraceID:     "trace-failover-1",
+			Payload:     json.RawMessage(`{"prompt":"fix bug","target_agent":"agy"}`),
+		}, nil
+	}
+
+	var capturedPayload json.RawMessage
+	inv := &mockInvoker{
+		executePromptFunc: func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+			capturedPayload = payload
+			return &harness.PromptExecutionResult{Status: "completed"}, nil
+		},
+	}
+
+	d := NewDispatcher(cp, inv, "host-1")
+	processed, err := d.PollAndProcess(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("PollAndProcess failed: processed=%v err=%v", processed, err)
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal(capturedPayload, &m); err != nil {
+		t.Fatalf("failed to unmarshal captured payload: %v", err)
+	}
+	if m["target_agent"] != "opencode" {
+		t.Fatalf("expected payload target_agent to be synchronized to 'opencode', got %v", m["target_agent"])
+	}
+	if m["story_id"] != "STORY-GOV-3799" {
+		t.Fatalf("expected payload story_id to be 'STORY-GOV-3799', got %v", m["story_id"])
+	}
+	if m["repo"] != "iazio-agent" {
+		t.Fatalf("expected payload repo to be 'iazio-agent', got %v", m["repo"])
+	}
+}
+
+func TestExtractConversationID_ResumeAndInitialKeys(t *testing.T) {
+	if got := extractConversationID(json.RawMessage(`{"resume_conversation_id":"conv-resume-123"}`)); got != "conv-resume-123" {
+		t.Fatalf("expected conv-resume-123, got %q", got)
+	}
+	if got := extractConversationID(json.RawMessage(`{"initial_conversation_id":"conv-initial-456"}`)); got != "conv-initial-456" {
+		t.Fatalf("expected conv-initial-456, got %q", got)
+	}
+}
+
+
 

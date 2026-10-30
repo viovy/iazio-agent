@@ -302,19 +302,28 @@ func EnsurePromptPayload(jobID string, raw json.RawMessage) json.RawMessage {
 
 // EnsurePromptPayloadWithTrace ensures that a prompt payload JSON contains a valid prompt_id and trace_id.
 func EnsurePromptPayloadWithTrace(jobID, traceID string, raw json.RawMessage) json.RawMessage {
+	return EnsurePromptPayloadWithJob(jobID, traceID, "", "", "", raw)
+}
+
+// EnsurePromptPayloadWithJob synchronizes authoritative job envelope attributes (prompt_id, trace_id,
+// target_agent, repo, story_id) into the stdin prompt payload JSON before invoking iazio-harness.
+func EnsurePromptPayloadWithJob(jobID, traceID, targetAgent, repo, storyID string, raw json.RawMessage) json.RawMessage {
 	if len(raw) == 0 {
 		return raw
 	}
 	var m map[string]any
-	if err := json.Unmarshal(raw, &m); err != nil {
+	if err := json.Unmarshal(raw, &m); err != nil || m == nil {
 		return raw
 	}
 	changed := false
 	promptID, _ := m["prompt_id"].(string)
 	if strings.TrimSpace(promptID) == "" {
-		storyID, _ := m["story_id"].(string)
-		if strings.TrimSpace(storyID) != "" {
-			m["prompt_id"] = "prompt-" + strings.TrimSpace(storyID)
+		existingStoryID, _ := m["story_id"].(string)
+		if strings.TrimSpace(existingStoryID) == "" {
+			existingStoryID = strings.TrimSpace(storyID)
+		}
+		if strings.TrimSpace(existingStoryID) != "" {
+			m["prompt_id"] = "prompt-" + strings.TrimSpace(existingStoryID)
 		} else if strings.TrimSpace(jobID) != "" {
 			m["prompt_id"] = "prompt-" + strings.TrimSpace(jobID)
 		} else {
@@ -326,6 +335,27 @@ func EnsurePromptPayloadWithTrace(jobID, traceID string, raw json.RawMessage) js
 	if strings.TrimSpace(pTraceID) == "" && strings.TrimSpace(traceID) != "" {
 		m["trace_id"] = strings.TrimSpace(traceID)
 		changed = true
+	}
+	cleanAgent := strings.TrimSpace(targetAgent)
+	if cleanAgent != "" && !strings.EqualFold(cleanAgent, "auto") {
+		if existingAgent, _ := m["target_agent"].(string); strings.TrimSpace(existingAgent) != cleanAgent {
+			m["target_agent"] = cleanAgent
+			changed = true
+		}
+	}
+	cleanRepo := strings.TrimSpace(repo)
+	if cleanRepo != "" {
+		if existingRepo, _ := m["repo"].(string); strings.TrimSpace(existingRepo) == "" {
+			m["repo"] = cleanRepo
+			changed = true
+		}
+	}
+	cleanStory := strings.TrimSpace(storyID)
+	if cleanStory != "" && cleanStory != "pending-allocation" && cleanStory != "pending_harness_creation" {
+		if existingStory, _ := m["story_id"].(string); strings.TrimSpace(existingStory) == "" {
+			m["story_id"] = cleanStory
+			changed = true
+		}
 	}
 	if changed {
 		if updated, err := json.Marshal(m); err == nil {
