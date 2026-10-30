@@ -1030,8 +1030,8 @@ func findToolSourceRepo(toolName string, getenv func(string) string, repoHint ..
 		}
 	}
 
-	// 2. Relative to working directory and parent directories
-	if cwd, err := os.Getwd(); err == nil && cwd != "" {
+	// 2. Relative to working directory and parent directories (in unit tests, only when cwd is inside TempDir)
+	if cwd, err := os.Getwd(); err == nil && cwd != "" && (!isTestBinary() || isPathWithinTempDir(cwd)) {
 		curr := cwd
 		for i := 0; i < 4; i++ {
 			for _, repoDirName := range candidateRepoNames {
@@ -1051,12 +1051,12 @@ func findToolSourceRepo(toolName string, getenv func(string) string, repoHint ..
 		}
 	}
 
-	// 3. Common user directory locations
+	// 3. Common user directory locations (in unit tests, never fall back to host UserHomeDir)
 	home := strings.TrimSpace(getenv("HOME"))
-	if home == "" {
+	if home == "" && !isTestBinary() {
 		home, _ = os.UserHomeDir()
 	}
-	if home != "" {
+	if home != "" && (!isTestBinary() || isPathWithinTempDir(home)) {
 		metaRepos, _ := filepath.Glob(filepath.Join(home, "work", "meta-repo*"))
 		sort.Sort(sort.Reverse(sort.StringSlice(metaRepos)))
 
@@ -1075,7 +1075,7 @@ func findToolSourceRepo(toolName string, getenv func(string) string, repoHint ..
 				filepath.Join(home, "projects", repoDirName),
 				filepath.Join(home, repoDirName),
 			}
-			if runtime.GOOS == "windows" {
+			if runtime.GOOS == "windows" && !isTestBinary() {
 				homeCandidates = append(homeCandidates,
 					filepath.Join(`C:\work`, "meta"+"-repo-02", repoDirName),
 					filepath.Join(`C:\work`, "meta"+"-repo", repoDirName),
@@ -1091,6 +1091,97 @@ func findToolSourceRepo(toolName string, getenv func(string) string, repoHint ..
 	}
 
 	return ""
+}
+
+func isPathWithinTempDir(p string) bool {
+	if p == "" {
+		return false
+	}
+	cleanP := filepath.Clean(p)
+	if evalP, err := filepath.EvalSymlinks(cleanP); err == nil {
+		cleanP = evalP
+	}
+	tmpBase := filepath.Clean(os.TempDir())
+	if evalTmp, err := filepath.EvalSymlinks(tmpBase); err == nil {
+		tmpBase = evalTmp
+	}
+	if strings.HasPrefix(cleanP, tmpBase+string(filepath.Separator)) || cleanP == tmpBase {
+		return true
+	}
+	slash := filepath.ToSlash(cleanP)
+	return strings.HasPrefix(slash, "/tmp/") || strings.HasPrefix(slash, "/private/tmp/") ||
+		strings.HasPrefix(slash, "/var/folders/") || strings.HasPrefix(slash, "/private/var/folders/")
+}
+
+// pruneStaleBuildWorktrees evicts any leftover ephemeral iazio-build-* git worktrees and temp directories
+// from previous interrupted or timed-out source builds before starting a new source build.
+func pruneStaleBuildWorktrees(sourceRepo, toolName string) {
+	if sourceRepo == "" {
+		return
+	}
+	cleanCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cleanSource := filepath.Clean(sourceRepo)
+	if evalSource, err := filepath.EvalSymlinks(cleanSource); err == nil {
+		cleanSource = evalSource
+	}
+
+	listCmd := exec.CommandContext(cleanCtx, "git", "-C", sourceRepo, "worktree", "list", "--porcelain")
+	listCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if out, err := listCmd.Output(); err == nil {
+		for idx, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "worktree ") {
+				continue
+			}
+			wtPath := strings.TrimSpace(strings.TrimPrefix(line, "worktree "))
+			if wtPath == "" || idx == 0 {
+				continue
+			}
+			cleanWT := filepath.Clean(wtPath)
+			if evalWT, err := filepath.EvalSymlinks(cleanWT); err == nil {
+				cleanWT = evalWT
+			}
+			if cleanWT == cleanSource {
+				continue
+			}
+			base := filepath.Base(cleanWT)
+			if strings.HasPrefix(base, "iazio-build-") {
+				rmCmd := exec.CommandContext(cleanCtx, "git", "-C", sourceRepo, "worktree", "remove", "--force", wtPath)
+				rmCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+				_ = rmCmd.Run()
+				_ = os.RemoveAll(wtPath)
+			}
+		}
+	}
+
+	tmpDir := os.TempDir()
+	if entries, err := os.ReadDir(tmpDir); err == nil {
+		toolBuildPrefix := fmt.Sprintf("iazio-build-%s-", toolName)
+		toolStagePrefix := fmt.Sprintf("staging-%s-", toolName)
+		cutoff := time.Now().Add(-15 * time.Minute)
+		for _, entry := range entries {
+			name := entry.Name()
+			isToolMatch := toolName != "" && (strings.HasPrefix(name, toolBuildPrefix) || strings.HasPrefix(name, toolStagePrefix))
+			isAnyBuild := strings.HasPrefix(name, "iazio-build-") || strings.HasPrefix(name, "staging-")
+			if !isToolMatch && !isAnyBuild {
+				continue
+			}
+			fullPath := filepath.Join(tmpDir, name)
+			if isToolMatch {
+				_ = os.RemoveAll(fullPath)
+				continue
+			}
+			if info, statErr := entry.Info(); statErr == nil && info.ModTime().Before(cutoff) {
+				_ = os.RemoveAll(fullPath)
+			}
+		}
+	}
+
+	pruneCmd := exec.CommandContext(cleanCtx, "git", "-C", sourceRepo, "worktree", "prune")
+	pruneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	_ = pruneCmd.Run()
 }
 
 // isInstalledVersionNewerOrEqual returns true when curVer is a valid semver that is >= latestVer.
@@ -1138,6 +1229,9 @@ func buildToolFromSourceRepo(
 	if toolName == "" {
 		toolName = tool.Name
 	}
+
+	// 0. Sweep any orphaned ephemeral iazio-build-* worktrees or temp directories from prior interrupted runs
+	pruneStaleBuildWorktrees(sourceRepo, tool.Name)
 
 	// 1. Run git fetch origin --prune --quiet (30s timeout, non-interactive)
 	fetchCtx, fetchCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -1258,10 +1352,23 @@ func buildToolFromSourceRepo(
 
 	// 6. Build from remoteSHA (using isolated ephemeral worktree if force, dirty, pinned, or local HEAD != remoteSHA)
 	buildDir := sourceRepo
-	var cleanupWorktree func()
 
 	if force || !repoIsClean || pinnedTag != "" || localHeadSHA != remoteSHA {
 		tempDir := filepath.Join(os.TempDir(), fmt.Sprintf("iazio-build-%s-%d", tool.Name, time.Now().UnixNano()))
+		removeTempWorktree := func() {
+			cleanCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			rmCmd := exec.CommandContext(cleanCtx, "git", "-C", sourceRepo, "worktree", "remove", "--force", tempDir)
+			rmCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+			_ = rmCmd.Run()
+			_ = os.RemoveAll(tempDir)
+			pruneCmd := exec.CommandContext(cleanCtx, "git", "-C", sourceRepo, "worktree", "prune")
+			pruneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+			_ = pruneCmd.Run()
+		}
+		// Register unconditional cleanup before provisioning so cancelled/timed-out git worktree add or git archive never leaks tempDir or .git/worktrees entries
+		defer removeTempWorktree()
+
 		var addWorktreeSucceeded bool
 		worktreeRefs := []string{remoteSHA, "origin/main", "origin/master", "HEAD"}
 		if pinnedTag != "" {
@@ -1274,18 +1381,11 @@ func buildToolFromSourceRepo(
 				addWorktreeSucceeded = true
 				break
 			}
+			// Clean any partial worktree/directory created before retrying next ref or archive fallback
+			removeTempWorktree()
 		}
 		if addWorktreeSucceeded {
 			buildDir = tempDir
-			cleanupWorktree = func() {
-				rmCmd := exec.Command("git", "-C", sourceRepo, "worktree", "remove", "--force", tempDir)
-				rmCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-				_ = rmCmd.Run()
-				_ = os.RemoveAll(tempDir)
-				pruneCmd := exec.Command("git", "-C", sourceRepo, "worktree", "prune")
-				pruneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-				_ = pruneCmd.Run()
-			}
 		} else {
 			// Fallback: extract archive from remoteSHA to ensure clean ephemeral build
 			if mkErr := os.MkdirAll(tempDir, 0755); mkErr == nil {
@@ -1299,21 +1399,17 @@ func buildToolFromSourceRepo(
 						if err := tarCmd.Wait(); err == nil {
 							addWorktreeSucceeded = true
 							buildDir = tempDir
-							cleanupWorktree = func() {
-								_ = os.RemoveAll(tempDir)
-							}
 						}
 					}
 				}
 			}
-			if !addWorktreeSucceeded && !repoIsClean {
-				return false, fmt.Errorf("failed to create isolated worktree or archive from %s for %s; refusing to build in dirty working tree", remoteSHA, tool.Name)
+			if !addWorktreeSucceeded {
+				removeTempWorktree()
+				if !repoIsClean {
+					return false, fmt.Errorf("failed to create isolated worktree or archive from %s for %s; refusing to build in dirty working tree", remoteSHA, tool.Name)
+				}
 			}
 		}
-	}
-
-	if cleanupWorktree != nil {
-		defer cleanupWorktree()
 	}
 
 	stagingBin := filepath.Join(os.TempDir(), fmt.Sprintf("staging-%s-%d", tool.Name, time.Now().UnixNano()))
