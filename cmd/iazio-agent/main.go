@@ -56,6 +56,24 @@ func main() {
 var initialUpdateDelay = 5 * time.Second
 var isTesting = false
 
+func isTestBinary() bool {
+	if isTesting || os.Getenv("IAZIO_TEST_MODE") == "1" {
+		return true
+	}
+	if len(os.Args) > 0 {
+		base := strings.ToLower(filepath.Base(os.Args[0]))
+		if strings.HasSuffix(base, ".test") || strings.HasSuffix(base, ".test.exe") || strings.HasPrefix(base, "___test") {
+			return true
+		}
+		for _, a := range os.Args[1:] {
+			if strings.HasPrefix(a, "-test.") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 type safeWriter struct {
 	mu sync.Mutex
 	w  io.Writer
@@ -112,8 +130,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		return runUpdate(ctx, args[1:], stdout, stderr, getenv)
 	case "run":
 		defer func() {
-			if !isTesting && getenv("IAZIO_AGENT_NONINTERACTIVE") != "1" {
-				if (runtime.GOOS == "linux" && service.IsSystemdAvailable()) || runtime.GOOS == "darwin" {
+			if !isTestBinary() && getenv("IAZIO_AGENT_NONINTERACTIVE") != "1" {
+				if (runtime.GOOS == "linux" && service.IsSystemdAvailable()) || runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 					home, _ := os.UserHomeDir()
 					_ = service.ReviveCheck(home, execCommand)
 				}
@@ -204,7 +222,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			defer cancel()
 
 			watchdog.StartSystemdWatchdog(runCtx)
-			if !isTesting {
+			if !isTestBinary() {
 				if home, err := os.UserHomeDir(); err == nil && home != "" {
 					binPath := filepath.Join(home, ".local", "bin", "iazio-agent")
 					if runtime.GOOS == "windows" {
@@ -644,9 +662,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					searchDirs := inventory.DefaultDirs(getenv("PATH"), home, runtime.GOOS)
 					canonicalBinDir := filepath.Join(home, ".local", "bin")
 					if runtime.GOOS == "windows" {
-						if localApp := getenv("LOCALAPPDATA"); localApp != "" {
-							canonicalBinDir = filepath.Join(localApp, "Programs", "iazio", "bin")
-						}
+						canonicalBinDir = filepath.Join(home, "bin")
 					}
 					candidates := inventory.ScanDevAndShadowBinaries(searchDirs, canonicalBinDir)
 					var paths []string
@@ -1005,11 +1021,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						}
 					}
 				}()
-
-				if runtime.GOOS == "windows" {
-					wslSupervisor := service.NewWSLCompanionSupervisor("")
-					wslSupervisor.StartSupervisor(runCtx, 60*time.Second)
-				}
 
 				go func() {
 					defer func() {
@@ -1711,7 +1722,7 @@ var (
 )
 
 func healHarvesterServiceIfNeeded(ctx context.Context, home, goos string) {
-	if goos != "darwin" && goos != "linux" {
+	if goos != "darwin" && goos != "linux" && goos != "windows" {
 		return
 	}
 	if home == "" {
@@ -1722,18 +1733,21 @@ func healHarvesterServiceIfNeeded(ctx context.Context, home, goos string) {
 		}
 	}
 	harvesterBin := filepath.Join(home, ".local", "bin", "iazio-harvester")
+	if goos == "windows" {
+		harvesterBin = filepath.Join(home, "bin", "iazio-harvester.exe")
+	}
 	if _, err := os.Stat(harvesterBin); err != nil {
 		return
 	}
 	_, svcStatus := inspectToolServiceFn("iazio-harvester", goos)
-	if svcStatus == "failed" || svcStatus == "inactive" || svcStatus == "installed" {
+	if svcStatus == "failed" || svcStatus == "inactive" || svcStatus == "installed" || svcStatus == "ready" || svcStatus == "not_installed" {
 		_ = reconcileHarvesterServiceFn(ctx, harvesterBin)
 		_ = restartToolServiceFn("iazio-harvester")
 	}
 }
 
 func ensureCanonicalSingleHome() {
-	if isTesting {
+	if isTestBinary() {
 		return
 	}
 	home, err := os.UserHomeDir()
@@ -1847,7 +1861,20 @@ func copyBinary(src, dest string) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, dest)
+	if err := os.Rename(tmp, dest); err != nil {
+		if runtime.GOOS == "windows" {
+			oldPath := dest + ".old"
+			_ = os.Remove(oldPath)
+			if renErr := os.Rename(dest, oldPath); renErr == nil {
+				if err2 := os.Rename(tmp, dest); err2 == nil {
+					_ = os.Remove(oldPath)
+					return nil
+				}
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 var execCommand = func(name string, args ...string) error {
@@ -1978,18 +2005,7 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 	}
 
 	// Try iazio-harness fleet-status --repo <repoPath> --json first
-	harnessBin := "iazio-harness"
-	if home, err := os.UserHomeDir(); err == nil {
-		for _, cand := range []string{
-			filepath.Join(home, ".local", "bin", "iazio-harness"),
-			filepath.Join(home, ".iazio", "bin", "iazio-harness"),
-		} {
-			if _, err := os.Stat(cand); err == nil {
-				harnessBin = cand
-				break
-			}
-		}
-	}
+	harnessBin := resolveHarnessBinaryPath()
 	harnessCmd := exec.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--json")
 	if out, err := harnessCmd.Output(); err == nil && len(out) > 0 {
 		var res struct {
@@ -2240,6 +2256,36 @@ func restartOrExecSelf(stdout io.Writer) {
 	}
 }
 
+func resolveHarnessBinaryPath() string {
+	binName := "iazio-harness"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		candidates := []string{
+			filepath.Join(home, ".local", "bin", binName),
+			filepath.Join(home, "bin", binName),
+			filepath.Join(home, ".iazio", "bin", binName),
+		}
+		if runtime.GOOS == "windows" {
+			candidates = []string{
+				filepath.Join(home, "bin", binName),
+				filepath.Join(home, ".local", "bin", binName),
+				filepath.Join(home, ".iazio", "bin", binName),
+			}
+		}
+		for _, p := range candidates {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+	}
+	if lp, err := exec.LookPath(binName); err == nil && lp != "" {
+		return lp
+	}
+	return binName
+}
+
 func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.RepoRuntimeStatus {
 	st := controlplane.RepoRuntimeStatus{
 		RepoPath:      repoPath,
@@ -2249,18 +2295,7 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 	}
 
 	// Try iazio-harness fleet-status --json first
-	harnessBin := "iazio-harness"
-	if home, err := os.UserHomeDir(); err == nil {
-		for _, cand := range []string{
-			filepath.Join(home, ".local", "bin", "iazio-harness"),
-			filepath.Join(home, ".iazio", "bin", "iazio-harness"),
-		} {
-			if _, err := os.Stat(cand); err == nil {
-				harnessBin = cand
-				break
-			}
-		}
-	}
+	harnessBin := resolveHarnessBinaryPath()
 	harnessCmd := exec.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--json")
 	if out, err := harnessCmd.Output(); err == nil && len(out) > 0 {
 		var res struct {

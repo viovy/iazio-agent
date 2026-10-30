@@ -519,7 +519,11 @@ func TestUpdateSingleTool_Lifecycle(t *testing.T) {
 	}
 
 	// 2. Tool out of date -> installs new version
-	tarContent := createTarGz(t, "iazio-dummy", []byte("#!/bin/sh\necho updated\n"))
+	archiveBinName := "iazio-dummy"
+	if runtime.GOOS == "windows" {
+		archiveBinName = "iazio-dummy.exe"
+	}
+	tarContent := createTarGz(t, archiveBinName, []byte("#!/bin/sh\necho updated\n"))
 	sum := sha256.Sum256(tarContent)
 	sumText := fmt.Sprintf("%s  iazio-dummy_2.0.0_%s_%s.tar.gz\n", hex.EncodeToString(sum[:]), runtime.GOOS, runtime.GOARCH)
 

@@ -186,8 +186,9 @@ func TestCleanupDevBinaries_RewritesDarwinLaunchAgentPlistsAndRemovesNext(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(rewritten), "/.iazio/bin/") || !strings.Contains(string(rewritten), "/.local/bin/") {
-		t.Fatalf("expected plist to rewrite /.iazio/bin/ to /.local/bin/, got: %s", string(rewritten))
+	expectedRewritten := filepath.Join(home, ".local", "bin", "iazio-harvester")
+	if !strings.Contains(string(rewritten), expectedRewritten) {
+		t.Fatalf("expected plist to rewrite .iazio/bin to .local/bin (%s), got: %s", expectedRewritten, string(rewritten))
 	}
 
 	// Restore /.iazio/bin/ in plist and verify CleanupDevBinaries rewrites plist on darwin and removes *.next

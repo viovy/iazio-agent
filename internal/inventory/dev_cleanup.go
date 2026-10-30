@@ -355,8 +355,9 @@ func RewriteDarwinLaunchAgentPlists(home string) {
 			continue
 		}
 		content := string(data)
-		if strings.Contains(content, "/.iazio/bin/") {
+		if strings.Contains(content, "/.iazio/bin/") || strings.Contains(content, `\.iazio\bin\`) {
 			updated := strings.ReplaceAll(content, "/.iazio/bin/", "/.local/bin/")
+			updated = strings.ReplaceAll(updated, `\.iazio\bin\`, `\.local\bin\`)
 			_ = os.WriteFile(plistPath, []byte(updated), 0o644)
 		}
 	}

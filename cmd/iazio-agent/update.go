@@ -441,9 +441,6 @@ func runCleanupBinaries(ctx context.Context, args []string, stdout, stderr io.Wr
 		canonicalBinDir = canon
 	} else if runtime.GOOS == "windows" {
 		canonicalBinDir = filepath.Join(home, "bin")
-		if localApp := getenv("LOCALAPPDATA"); localApp != "" {
-			canonicalBinDir = filepath.Join(localApp, "Programs", "iazio", "bin")
-		}
 	}
 
 	searchDirs := inventory.DefaultDirs(getenv("PATH"), home, runtime.GOOS)
@@ -581,7 +578,7 @@ func updateSingleTool(
 	}
 
 	latestVer := strings.TrimPrefix(rel.TagName, "v")
-	if curVer != "" && (curVer == latestVer || strings.Contains(curVer, latestVer)) && !force {
+	if curVer != "" && (curVer == latestVer || strings.Contains(curVer, latestVer) || isInstalledVersionNewerOrEqual(curVer, latestVer)) && !force {
 		fmt.Fprintf(stdout, "  [=] %s: %s (up-to-date)\n", tool.Name, latestVer)
 		return false, nil
 	}
@@ -627,7 +624,7 @@ func updateSingleTool(
 	_ = os.WriteFile(destPath+".version", []byte(latestVer), 0644)
 	inventory.InvalidateVersionCache(destPath)
 
-	if tool.Name == "iazio-harvester" || tool.Name == "iazio-harness" {
+	if tool.Name == "iazio-harvester" {
 		_ = service.RestartToolService(tool.Name)
 	}
 
@@ -1071,11 +1068,19 @@ func findToolSourceRepo(toolName string, getenv func(string) string, repoHint ..
 				}
 			}
 			homeCandidates := []string{
+				filepath.Join(home, "work", "meta"+"-repo-02", repoDirName),
 				filepath.Join(home, "work", "meta"+"-repo", repoDirName),
 				filepath.Join(home, "work", repoDirName),
 				filepath.Join(home, "src", repoDirName),
 				filepath.Join(home, "projects", repoDirName),
 				filepath.Join(home, repoDirName),
+			}
+			if runtime.GOOS == "windows" {
+				homeCandidates = append(homeCandidates,
+					filepath.Join(`C:\work`, "meta"+"-repo-02", repoDirName),
+					filepath.Join(`C:\work`, "meta"+"-repo", repoDirName),
+					filepath.Join(`C:\work`, repoDirName),
+				)
 			}
 			for _, cand := range homeCandidates {
 				if isGitRepoWithTool(cand) {
@@ -1086,6 +1091,40 @@ func findToolSourceRepo(toolName string, getenv func(string) string, repoHint ..
 	}
 
 	return ""
+}
+
+// isInstalledVersionNewerOrEqual returns true when curVer is a valid semver that is >= latestVer.
+func isInstalledVersionNewerOrEqual(curVer, latestVer string) bool {
+	parseTriple := func(v string) (int, int, int, bool) {
+		c := cleanTargetVersion(v)
+		if c == "" {
+			return 0, 0, 0, false
+		}
+		if idx := strings.IndexAny(c, "-+"); idx >= 0 {
+			c = c[:idx]
+		}
+		parts := strings.Split(c, ".")
+		if len(parts) < 3 {
+			return 0, 0, 0, false
+		}
+		var maj, min, pat int
+		if _, err := fmt.Sscanf(parts[0]+"."+parts[1]+"."+parts[2], "%d.%d.%d", &maj, &min, &pat); err != nil {
+			return 0, 0, 0, false
+		}
+		return maj, min, pat, true
+	}
+	cMaj, cMin, cPat, ok1 := parseTriple(curVer)
+	lMaj, lMin, lPat, ok2 := parseTriple(latestVer)
+	if !ok1 || !ok2 {
+		return false
+	}
+	if cMaj != lMaj {
+		return cMaj > lMaj
+	}
+	if cMin != lMin {
+		return cMin > lMin
+	}
+	return cPat >= lPat
 }
 
 func buildToolFromSourceRepo(
@@ -1320,7 +1359,7 @@ func buildToolFromSourceRepo(
 	inventory.InvalidateVersionCache(destPath)
 
 	// Restart companion daemons immediately; iazio-agent restarts itself after completing the update pass and reporting job completion
-	if tool.Name == "iazio-harvester" || tool.Name == "iazio-harness" {
+	if tool.Name == "iazio-harvester" {
 		_ = service.RestartToolService(tool.Name)
 	}
 
