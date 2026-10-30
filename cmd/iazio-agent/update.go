@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -352,7 +353,9 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 	}
 
 	if len(res.Errors) > 0 && opts.Force {
-		return res, fmt.Errorf("forced tool update failed: %w", res.Errors[0])
+		if len(targets) == 1 || (len(res.UpdatedTools) == 0 && len(res.Errors) == len(targets)) {
+			return res, fmt.Errorf("forced tool update failed: %w", res.Errors[0])
+		}
 	}
 
 	return res, nil
@@ -942,6 +945,12 @@ func findToolSourceRepo(toolName string, getenv func(string) string) string {
 		return ""
 	}
 
+	candidateNames := []string{cleanTool}
+	switch cleanTool {
+	case "autopilot-fleet", "autopilot-story", "autopilot-backlog":
+		candidateNames = []string{cleanTool, "autopilot-plugins-internal"}
+	}
+
 	isGitRepo := func(dir string) bool {
 		fi, err := os.Stat(filepath.Join(dir, ".git"))
 		return err == nil && (fi.IsDir() || fi.Mode().IsRegular())
@@ -950,12 +959,14 @@ func findToolSourceRepo(toolName string, getenv func(string) string) string {
 	// 1. Check explicit environment overrides
 	for _, envKey := range []string{"IAZIO_FLEET_ROOT", "META_REPO_ROOT", "AUTOPILOT_ROOT"} {
 		if root := strings.TrimSpace(getenv(envKey)); root != "" {
-			cand := filepath.Join(root, cleanTool)
-			if isGitRepo(cand) {
-				return cand
-			}
-			if isGitRepo(root) && strings.EqualFold(filepath.Base(root), cleanTool) {
-				return root
+			for _, candName := range candidateNames {
+				cand := filepath.Join(root, candName)
+				if isGitRepo(cand) {
+					return cand
+				}
+				if isGitRepo(root) && strings.EqualFold(filepath.Base(root), candName) {
+					return root
+				}
 			}
 		}
 	}
@@ -964,12 +975,14 @@ func findToolSourceRepo(toolName string, getenv func(string) string) string {
 	if cwd, err := os.Getwd(); err == nil && cwd != "" {
 		curr := cwd
 		for i := 0; i < 4; i++ {
-			cand := filepath.Join(curr, cleanTool)
-			if isGitRepo(cand) {
-				return cand
-			}
-			if isGitRepo(curr) && strings.EqualFold(filepath.Base(curr), cleanTool) {
-				return curr
+			for _, candName := range candidateNames {
+				cand := filepath.Join(curr, candName)
+				if isGitRepo(cand) {
+					return cand
+				}
+				if isGitRepo(curr) && strings.EqualFold(filepath.Base(curr), candName) {
+					return curr
+				}
 			}
 			parent := filepath.Dir(curr)
 			if parent == curr {
@@ -980,17 +993,32 @@ func findToolSourceRepo(toolName string, getenv func(string) string) string {
 	}
 
 	// 3. Common user directory locations
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		homeCandidates := []string{
-			filepath.Join(home, "work", "meta"+"-repo", cleanTool),
-			filepath.Join(home, "work", cleanTool),
-			filepath.Join(home, "src", cleanTool),
-			filepath.Join(home, "projects", cleanTool),
-			filepath.Join(home, cleanTool),
-		}
-		for _, cand := range homeCandidates {
-			if isGitRepo(cand) {
-				return cand
+	home := strings.TrimSpace(getenv("HOME"))
+	if home == "" {
+		home, _ = os.UserHomeDir()
+	}
+	if home != "" {
+		metaRepos, _ := filepath.Glob(filepath.Join(home, "work", "meta-repo*"))
+		sort.Sort(sort.Reverse(sort.StringSlice(metaRepos)))
+
+		for _, candName := range candidateNames {
+			for _, mr := range metaRepos {
+				cand := filepath.Join(mr, candName)
+				if isGitRepo(cand) {
+					return cand
+				}
+			}
+			homeCandidates := []string{
+				filepath.Join(home, "work", "meta"+"-repo", candName),
+				filepath.Join(home, "work", candName),
+				filepath.Join(home, "src", candName),
+				filepath.Join(home, "projects", candName),
+				filepath.Join(home, candName),
+			}
+			for _, cand := range homeCandidates {
+				if isGitRepo(cand) {
+					return cand
+				}
 			}
 		}
 	}

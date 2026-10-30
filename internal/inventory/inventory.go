@@ -150,7 +150,11 @@ type Tool struct {
 
 // InspectToolService probes whether a tool is installed as an OS service (e.g. systemd user service),
 // its installation type, runtime status, and supported capabilities.
-func InspectToolService(toolName, goos string) (installed bool, svcType string, svcStatus string, caps []string) {
+func InspectToolService(toolName, goos string, runner ...func(name string, args ...string) ([]byte, error)) (installed bool, svcType string, svcStatus string, caps []string) {
+	var customRun func(name string, args ...string) ([]byte, error)
+	if len(runner) > 0 && runner[0] != nil {
+		customRun = runner[0]
+	}
 	home, _ := os.UserHomeDir()
 	switch goos {
 	case "linux":
@@ -179,8 +183,13 @@ func InspectToolService(toolName, goos string) (installed bool, svcType string, 
 				// Check runtime status via systemctl
 				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 				defer cancel()
-				cmd := exec.CommandContext(ctx, "systemctl", "--user", "is-active", toolName+".service")
-				out, _ := cmd.Output()
+				var out []byte
+				if customRun != nil {
+					out, _ = customRun("systemctl", "--user", "is-active", toolName+".service")
+				} else {
+					cmd := exec.CommandContext(ctx, "systemctl", "--user", "is-active", toolName+".service")
+					out, _ = cmd.Output()
+				}
 				s := strings.TrimSpace(string(out))
 				if s != "" {
 					svcStatus = s
@@ -232,16 +241,31 @@ func InspectToolService(toolName, goos string) (installed bool, svcType string, 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
+		runCmd := func(name string, args ...string) ([]byte, error) {
+			if customRun != nil {
+				return customRun(name, args...)
+			}
+			return exec.CommandContext(ctx, name, args...).CombinedOutput()
+		}
+
 		domain := fmt.Sprintf("gui/%d", os.Getuid())
+		hostSessionMismatch := false
 		// 1. Check launchctl print gui/<uid>/io.iazio.<name> or gui/<uid>/<name>
 		for _, label := range []string{"io.iazio." + toolName, toolName} {
-			cmd := exec.CommandContext(ctx, "launchctl", "print", domain+"/"+label)
-			if out, err := cmd.CombinedOutput(); err == nil {
+			if out, err := runCmd("launchctl", "print", domain+"/"+label); err == nil {
+				outStr := string(out)
+				if customRun == nil && home != "" && strings.Contains(outStr, "path = ") && !strings.Contains(outStr, home) {
+					hostSessionMismatch = true
+					break
+				}
 				installed = true
 				svcType = "user_service"
-				outStr := string(out)
-				if strings.Contains(outStr, "state = running") || strings.Contains(outStr, "pid = ") {
+				if strings.Contains(outStr, "state = running") {
 					svcStatus = "active"
+				} else if strings.Contains(outStr, "last exit code =") &&
+					!strings.Contains(outStr, "last exit code = 0") &&
+					!strings.Contains(outStr, "last exit code = (never exited)") {
+					svcStatus = "failed"
 				} else {
 					svcStatus = "installed"
 				}
@@ -250,10 +274,9 @@ func InspectToolService(toolName, goos string) (installed bool, svcType string, 
 		}
 
 		// 2. Check launchctl list <label>
-		if !installed {
+		if !installed && !hostSessionMismatch {
 			for _, label := range []string{"io.iazio." + toolName, toolName} {
-				cmd := exec.CommandContext(ctx, "launchctl", "list", label)
-				if out, err := cmd.CombinedOutput(); err == nil {
+				if out, err := runCmd("launchctl", "list", label); err == nil {
 					installed = true
 					svcType = "user_service"
 					outStr := string(out)
@@ -273,9 +296,8 @@ func InspectToolService(toolName, goos string) (installed bool, svcType string, 
 		}
 
 		// 3. Check launchctl list table
-		if !installed {
-			cmd := exec.CommandContext(ctx, "launchctl", "list")
-			if out, err := cmd.CombinedOutput(); err == nil {
+		if !installed && !hostSessionMismatch {
+			if out, err := runCmd("launchctl", "list"); err == nil {
 				lines := strings.Split(string(out), "\n")
 				for _, line := range lines {
 					fields := strings.Fields(line)
@@ -541,12 +563,18 @@ func executable(info os.FileInfo, name, goos string) bool {
 }
 
 func match(name string) bool {
+	lower := strings.ToLower(name)
+	for _, badSuffix := range []string{".next", ".old", ".tmp", ".bak", ".version", ".sha256", ".sig"} {
+		if strings.HasSuffix(lower, badSuffix) {
+			return false
+		}
+	}
 	suite := "meta-" + "repo-tools"
 	if name == "autopilot" || strings.HasPrefix(name, "autopilot-") ||
 		name == "iazio" || strings.HasPrefix(name, "iazio-") || name == suite {
 		return true
 	}
-	switch strings.ToLower(name) {
+	switch lower {
 	case "agy", "mock-agy", "gemini", "cursor-agent", "agent", "opencode", "copilot":
 		return true
 	}

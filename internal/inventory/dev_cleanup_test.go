@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -146,3 +147,69 @@ func TestInspectToolCommitSHA_Fallback(t *testing.T) {
 		t.Errorf("expected non-empty commit sha or fingerprint fallback, got empty")
 	}
 }
+
+func TestCleanupDevBinaries_RewritesDarwinLaunchAgentPlistsAndRemovesNext(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	canonicalDir := filepath.Join(home, ".local", "bin")
+	shadowDir := filepath.Join(home, ".iazio", "bin")
+	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
+	if err := os.MkdirAll(canonicalDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(shadowDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(launchAgentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	plistPath := filepath.Join(launchAgentsDir, "io.iazio.iazio-harvester.plist")
+	plistContent := "<plist><string>" + filepath.Join(home, ".iazio", "bin", "iazio-harvester") + "</string></plist>"
+	if err := os.WriteFile(plistPath, []byte(plistContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	shadowBin := filepath.Join(shadowDir, "iazio-harvester")
+	nextBin := filepath.Join(shadowDir, "iazio-harvester.next")
+	if err := os.WriteFile(shadowBin, []byte("shadow"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nextBin, []byte("next"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Explicitly verify RewriteDarwinLaunchAgentPlists rewrites /.iazio/bin/ -> /.local/bin/
+	RewriteDarwinLaunchAgentPlists(home)
+	rewritten, err := os.ReadFile(plistPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rewritten), "/.iazio/bin/") || !strings.Contains(string(rewritten), "/.local/bin/") {
+		t.Fatalf("expected plist to rewrite /.iazio/bin/ to /.local/bin/, got: %s", string(rewritten))
+	}
+
+	// Restore /.iazio/bin/ in plist and verify CleanupDevBinaries rewrites plist on darwin and removes *.next
+	_ = os.WriteFile(plistPath, []byte(plistContent), 0o644)
+	candidates := ScanDevAndShadowBinaries([]string{canonicalDir}, canonicalDir)
+	report, err := CleanupDevBinaries(context.Background(), candidates, canonicalDir)
+	if err != nil {
+		t.Fatalf("CleanupDevBinaries failed: %v", err)
+	}
+	_ = report
+
+	if _, err := os.Stat(nextBin); !os.IsNotExist(err) {
+		t.Fatalf("expected stale %s to be removed, got err=%v", nextBin, err)
+	}
+	if runtime.GOOS == "darwin" {
+		afterCleanup, err := os.ReadFile(plistPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(afterCleanup), "/.iazio/bin/") {
+			t.Fatalf("expected darwin LaunchAgent plist to be rewritten before shadow binary deletion, got: %s", string(afterCleanup))
+		}
+	}
+}
+

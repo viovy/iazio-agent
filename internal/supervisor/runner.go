@@ -101,7 +101,7 @@ func AugmentedEnv(base []string) []string {
 	home, _ := os.UserHomeDir()
 	var userDirs []string
 	if home != "" {
-		userDirs = append(userDirs, filepath.Join(home, ".iazio", "bin"), filepath.Join(home, ".local", "bin"))
+		userDirs = append(userDirs, filepath.Join(home, ".local", "bin"))
 		if runtime.GOOS == "windows" {
 			userDirs = append(userDirs, filepath.Join(home, "bin"))
 		}
