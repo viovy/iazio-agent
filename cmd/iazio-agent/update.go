@@ -62,6 +62,15 @@ type gitHubAsset struct {
 	URL                string `json:"url"`
 }
 
+func defaultRepositoryForTool(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "autopilot-git-flow", "autopilot-infra-ops", "autopilot-quality-gate", "autopilot-plugins-internal":
+		return "viovy/autopilot-plugins-internal"
+	default:
+		return "viovy/" + strings.TrimSpace(name)
+	}
+}
+
 // syncLocalEndpoints writes or updates endpoints in ~/.iazio/config.json.
 func syncLocalEndpoints(endpoints map[string]string, profile string) error {
 	if len(endpoints) == 0 {
@@ -275,25 +284,35 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 		for _, name := range opts.TargetTools {
 			targetMap[strings.ToLower(strings.TrimSpace(name))] = true
 		}
+		matchedTargets := make(map[string]bool)
 		for _, t := range manifest.Tools {
-			if targetMap[strings.ToLower(t.Name)] || targetMap[strings.ToLower(t.BinaryName)] {
+			nLower := strings.ToLower(t.Name)
+			bLower := strings.ToLower(t.BinaryName)
+			if targetMap[nLower] || targetMap[bLower] {
 				targets = append(targets, t)
+				matchedTargets[nLower] = true
+				if bLower != "" {
+					matchedTargets[bLower] = true
+				}
 			}
 		}
-		if len(targets) == 0 {
-			for _, name := range opts.TargetTools {
-				cleanName := strings.TrimSpace(name)
-				if cleanName == "" {
-					continue
-				}
-				targets = append(targets, ManifestToolItem{
-					Name:        cleanName,
-					Repository:  "viovy/" + cleanName,
-					BinaryName:  cleanName,
-					Description: cleanName,
-					Tier:        "baseline",
-				})
+		for _, name := range opts.TargetTools {
+			cleanName := strings.TrimSpace(name)
+			if cleanName == "" {
+				continue
 			}
+			lowerName := strings.ToLower(cleanName)
+			if matchedTargets[lowerName] {
+				continue
+			}
+			matchedTargets[lowerName] = true
+			targets = append(targets, ManifestToolItem{
+				Name:        cleanName,
+				Repository:  defaultRepositoryForTool(cleanName),
+				BinaryName:  cleanName,
+				Description: cleanName,
+				Tier:        "baseline",
+			})
 		}
 	} else if opts.Suite {
 		targets = manifest.Tools
@@ -301,7 +320,7 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 			for _, name := range inventory.ManagedTools {
 				targets = append(targets, ManifestToolItem{
 					Name:        name,
-					Repository:  "viovy/" + name,
+					Repository:  defaultRepositoryForTool(name),
 					BinaryName:  name,
 					Description: name,
 					Tier:        "baseline",

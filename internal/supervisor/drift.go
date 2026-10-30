@@ -123,20 +123,20 @@ func NormalizeVersion(v string) string {
 	return strings.TrimSpace(v)
 }
 
-// EvaluateDrift checks whether any of targetTools (or all manifest tools if targetTools is empty)
-// have drifted from their expected versions.
-func EvaluateDrift(
+// FindOutdatedTools returns the list of tools in manifest that are missing or whose installed version
+// differs from the target manifest version.
+func FindOutdatedTools(
 	manifest *FleetManifest,
 	inspectVersion func(path string) string,
 	installDir string,
 	targetTools []string,
 	targetOS string,
-) (bool, error) {
+) ([]OutdatedToolInfo, error) {
 	if manifest == nil {
-		return false, fmt.Errorf("nil manifest provided")
+		return nil, fmt.Errorf("nil manifest provided")
 	}
 	if inspectVersion == nil {
-		return false, fmt.Errorf("nil inspectVersion function provided")
+		return nil, fmt.Errorf("nil inspectVersion function provided")
 	}
 
 	targetMap := make(map[string]bool)
@@ -144,6 +144,7 @@ func EvaluateDrift(
 		targetMap[strings.ToLower(strings.TrimSpace(name))] = true
 	}
 
+	var outdated []OutdatedToolInfo
 	for _, tool := range manifest.Tools {
 		if len(targetMap) > 0 && !targetMap[strings.ToLower(tool.Name)] && !targetMap[strings.ToLower(tool.BinaryName)] {
 			continue
@@ -159,20 +160,33 @@ func EvaluateDrift(
 
 		destPath := filepath.Join(installDir, binName)
 		curVer := inspectVersion(destPath)
-		// Missing binary represents immediate drift
-		if curVer == "" {
-			return true, nil
+		if curVer == "" && strings.HasPrefix(installDir, "/") {
+			curVer = inspectVersion(strings.TrimRight(installDir, "/") + "/" + binName)
 		}
 
 		targetVer := tool.TargetVersion
-		// If target version is empty or "latest", resolve from LatestAvailableVersion (F3)
 		if targetVer == "" || targetVer == "latest" {
 			if tool.LatestAvailableVersion != "" {
 				targetVer = tool.LatestAvailableVersion
-			} else {
-				// Target is unpinned latest and upstream hasn't published a concrete string: treat as drift-unknown -> update
-				return true, nil
 			}
+		}
+
+		if curVer == "" {
+			outdated = append(outdated, OutdatedToolInfo{
+				ToolName:         tool.Name,
+				InstalledVersion: "",
+				TargetVersion:    targetVer,
+			})
+			continue
+		}
+
+		if targetVer == "" || targetVer == "latest" {
+			outdated = append(outdated, OutdatedToolInfo{
+				ToolName:         tool.Name,
+				InstalledVersion: curVer,
+				TargetVersion:    "latest",
+			})
+			continue
 		}
 
 		cleanCur := NormalizeVersion(curVer)
@@ -184,20 +198,34 @@ func EvaluateDrift(
 			cleanTgt = strings.TrimSpace(cleanTgt[:idx])
 		}
 
-		// Semver "dev" trap: unversioned or dev builds must always be considered drifted
-		// so that autonomous eager update inspects remote repository/releases and doesn't get stuck.
 		if strings.EqualFold(cleanCur, "dev") || strings.EqualFold(cleanTgt, "dev") ||
-			strings.EqualFold(cleanCur, "0.0.0-dev") || strings.EqualFold(cleanTgt, "0.0.0-dev") {
-			return true, nil
-		}
-
-		// Strict normalized equality comparison (F4)
-		if cleanCur != cleanTgt {
-			return true, nil
+			strings.EqualFold(cleanCur, "0.0.0-dev") || strings.EqualFold(cleanTgt, "0.0.0-dev") ||
+			cleanCur != cleanTgt {
+			outdated = append(outdated, OutdatedToolInfo{
+				ToolName:         tool.Name,
+				InstalledVersion: curVer,
+				TargetVersion:    targetVer,
+			})
 		}
 	}
 
-	return false, nil
+	return outdated, nil
+}
+
+// EvaluateDrift checks whether any of targetTools (or all manifest tools if targetTools is empty)
+// have drifted from their expected versions.
+func EvaluateDrift(
+	manifest *FleetManifest,
+	inspectVersion func(path string) string,
+	installDir string,
+	targetTools []string,
+	targetOS string,
+) (bool, error) {
+	outdated, err := FindOutdatedTools(manifest, inspectVersion, installDir, targetTools, targetOS)
+	if err != nil {
+		return false, err
+	}
+	return len(outdated) > 0, nil
 }
 
 // CheckDrift inspects drift against a DriftFetcher, returning (false, err) on fetch/parse failure

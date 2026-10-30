@@ -571,7 +571,7 @@ func TestDispatcher_UnresolvableWorkspaceRefusal(t *testing.T) {
 		return &Job{
 			ID:      "job-ghost-path",
 			Type:    JobTypePromptExecute,
-			Repo:    "/home/romeo/work/meta-repo-04",
+			Repo:    "/nonexistent/ghost/work/meta-repo-04",
 			Payload: json.RawMessage(`{}`),
 		}, nil
 	}
@@ -1423,5 +1423,68 @@ func TestExtractConversationID_ResumeAndInitialKeys(t *testing.T) {
 	}
 }
 
+func TestDispatcher_FlushHarvestFromResultAndSpoolerReachable(t *testing.T) {
+	var flushedConvIDs []string
+	cp := newMockControlPlane()
+	jobs := []*Job{
+		{
+			ID:                   "job-harvest-active-conv",
+			Type:                 JobTypePromptExecute,
+			Repo:                 "iazio-agent",
+			FencingToken:         11,
+			ActiveConversationID: "conv-from-job-active-1",
+			Payload:              json.RawMessage(`{"prompt":"hello"}`),
+		},
+		{
+			ID:           "job-harvest-result-conv",
+			Type:         JobTypePromptExecute,
+			Repo:         "iazio-agent",
+			FencingToken: 12,
+			Payload:      json.RawMessage(`{"prompt":"hello"}`),
+		},
+	}
+	idx := 0
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		if idx >= len(jobs) {
+			return nil, nil
+		}
+		j := jobs[idx]
+		idx++
+		return j, nil
+	}
 
+	inv := &mockInvoker{
+		executePromptFunc: func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+			if idx == 2 {
+				return &harness.PromptExecutionResult{
+					Status:         "completed",
+					ConversationID: "conv-from-result-2",
+				}, nil
+			}
+			return &harness.PromptExecutionResult{Status: "completed"}, nil
+		},
+	}
 
+	d := NewDispatcher(cp, inv, "host-1")
+	d.SetHarvestFlusher(func(ctx context.Context, convID string) (int, string, error) {
+		flushedConvIDs = append(flushedConvIDs, convID)
+		return 7, "sha256-harvest-ok", nil
+	})
+
+	for i := 0; i < 2; i++ {
+		processed, err := d.PollAndProcess(context.Background())
+		if err != nil || !processed {
+			t.Fatalf("PollAndProcess pass %d failed: processed=%v err=%v", i, processed, err)
+		}
+	}
+
+	if len(flushedConvIDs) != 2 {
+		t.Fatalf("expected 2 harvest flushes, got %v", flushedConvIDs)
+	}
+	if flushedConvIDs[0] != "conv-from-job-active-1" {
+		t.Fatalf("expected conv-from-job-active-1, got %q", flushedConvIDs[0])
+	}
+	if flushedConvIDs[1] != "conv-from-result-2" {
+		t.Fatalf("expected conv-from-result-2, got %q", flushedConvIDs[1])
+	}
+}

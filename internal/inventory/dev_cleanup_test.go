@@ -214,3 +214,36 @@ func TestCleanupDevBinaries_RewritesDarwinLaunchAgentPlistsAndRemovesNext(t *tes
 	}
 }
 
+func TestDevCleanup_CanonicalHomeBinScansLocalAndIazioDirs(t *testing.T) {
+	home := t.TempDir()
+	canonicalWinBin := filepath.Join(home, "bin")
+	iazioBin := filepath.Join(home, ".iazio", "bin")
+	if err := os.MkdirAll(canonicalWinBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(iazioBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	canonPath := filepath.Join(canonicalWinBin, "iazio-agent"+ext)
+	shadowPath := filepath.Join(iazioBin, "iazio-agent"+ext)
+	_ = os.WriteFile(canonPath, []byte("canonical"), 0o755)
+	_ = os.WriteFile(shadowPath, []byte("shadow"), 0o755)
+
+	candidates := ScanDevAndShadowBinaries([]string{canonicalWinBin}, canonicalWinBin)
+	foundShadow := false
+	for _, c := range candidates {
+		if c.Path == shadowPath && c.VariantType == "shadow_duplicate" {
+			foundShadow = true
+		}
+		if c.Path == canonPath {
+			t.Fatalf("canonical binary %s must not be marked as candidate", canonPath)
+		}
+	}
+	if !foundShadow {
+		t.Fatalf("expected shadow binary %s in ~/.iazio/bin to be detected when ~/bin is canonical, got %+v", shadowPath, candidates)
+	}
+}

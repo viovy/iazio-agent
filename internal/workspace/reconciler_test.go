@@ -168,4 +168,3 @@ func TestIsLockFileHeld_OpenFD(t *testing.T) {
 
 	_ = isLockFileHeld(lockPath)
 }
-

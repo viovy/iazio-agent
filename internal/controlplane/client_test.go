@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -879,5 +880,47 @@ func TestClient_PostExit(t *testing.T) {
 	}
 	if fmt.Sprintf("%v", receivedBody["termination_reason_code"]) != "CIRCUIT_BREAKER_TRIPPED" {
 		t.Fatalf("expected CIRCUIT_BREAKER_TRIPPED, got %v", receivedBody["termination_reason_code"])
+	}
+}
+
+func TestClient_PostJSON_SpoolerReachableOnRetryExhaustion(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	spoolDir := t.TempDir()
+	spooler, err := NewOfflineReportSpooler(spoolDir, nil)
+	if err != nil {
+		t.Fatalf("NewOfflineReportSpooler: %v", err)
+	}
+
+	c := Client{
+		BaseURL:        srv.URL,
+		Token:          "secret-token-77",
+		Spooler:        spooler,
+		MaxRetries:     1,
+		InitialBackoff: 1 * time.Millisecond,
+	}
+
+	err = c.PostExit(context.Background(), "job-spool-1", ExitOptions{
+		ExitCode:              1,
+		TerminationReasonCode: "RETRY_EXHAUSTED",
+	})
+	if err == nil {
+		t.Fatal("expected error after retry exhaustion")
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("expected 2 attempts (initial + 1 retry), got %d", attempts.Load())
+	}
+
+	entries, err := os.ReadDir(spoolDir)
+	if err != nil {
+		t.Fatalf("ReadDir(spoolDir): %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 spooled request after retry exhaustion, got %d", len(entries))
 	}
 }

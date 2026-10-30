@@ -692,11 +692,11 @@ func TestWatchdog_SilentHangStallDetection(t *testing.T) {
 	})
 
 	w.Track(TrackedJob{
-		JobID:          "job-1311",
-		PID:            8888,
-		ConversationID: convID,
-		WorktreePath:   tmpDir,
-		StartedAt:      pastTime,
+		JobID:           "job-1311",
+		PID:             8888,
+		ConversationID:  convID,
+		WorktreePath:    tmpDir,
+		StartedAt:       pastTime,
 		StallTimeoutSec: 300,
 		AutoResumePolicy: AutoResumePolicy{
 			Enabled:        true,
@@ -1058,5 +1058,3 @@ func TestWatchdog_NonStoryOrdinaryPrompt_CompletesImmediatelyWithoutASEGates(t *
 		t.Fatalf("expected JobStatus to return StatusCompleted, got %v (ok=%v)", status, ok)
 	}
 }
-
-

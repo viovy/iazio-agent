@@ -1906,3 +1906,46 @@ func TestBuildToolFromSourceRepo_PrunesStaleAndCancelledBuildWorktrees(t *testin
 	}
 }
 
+func TestPerformUpdateWithResult_UnmatchedTargetToolRecordedInFailedTools(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/fleet/manifest" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"profile": "generic",
+				"tools": [
+					{"name": "known-tool", "repository": "viovy/known-tool", "binary_name": "known-tool", "tier": "baseline"}
+				]
+			}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
+
+	var stdout, stderr bytes.Buffer
+	res, _ := performUpdateWithResult(context.Background(), UpdateOptions{
+		API:         srv.URL,
+		TargetTools: []string{"known-tool", "unmatched-missing-tool"},
+		Force:       false,
+	}, &stdout, &stderr, func(k string) string {
+		if k == "HOME" || k == "USERPROFILE" {
+			return tmpHome
+		}
+		return ""
+	})
+
+	foundUnmatched := false
+	for _, ft := range res.FailedTools {
+		if ft == "unmatched-missing-tool" {
+			foundUnmatched = true
+			break
+		}
+	}
+	if !foundUnmatched {
+		t.Fatalf("expected unmatched-missing-tool to be attempted and recorded in FailedTools, got FailedTools=%v Errors=%v", res.FailedTools, res.Errors)
+	}
+}

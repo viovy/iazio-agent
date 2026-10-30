@@ -296,11 +296,11 @@ func detectInterruptedGitOps(workspacePath, gitDir string, isDir bool) (string, 
 
 	interruptedOp := ""
 	checkPaths := map[string]string{
-		"rebase-merge":    filepath.Join(targetGitDir, "rebase-merge"),
-		"rebase-apply":    filepath.Join(targetGitDir, "rebase-apply"),
-		"MERGE_HEAD":      filepath.Join(targetGitDir, "MERGE_HEAD"),
+		"rebase-merge":     filepath.Join(targetGitDir, "rebase-merge"),
+		"rebase-apply":     filepath.Join(targetGitDir, "rebase-apply"),
+		"MERGE_HEAD":       filepath.Join(targetGitDir, "MERGE_HEAD"),
 		"CHERRY_PICK_HEAD": filepath.Join(targetGitDir, "CHERRY_PICK_HEAD"),
-		"BISECT_LOG":      filepath.Join(targetGitDir, "BISECT_LOG"),
+		"BISECT_LOG":       filepath.Join(targetGitDir, "BISECT_LOG"),
 	}
 
 	for op, p := range checkPaths {

@@ -321,4 +321,3 @@ func TestNewZipkinExporter_EnvBranches(t *testing.T) {
 		t.Errorf("expected empty spoolDir with none, got: %s", exp.spoolDir)
 	}
 }
-

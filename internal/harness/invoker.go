@@ -21,28 +21,32 @@ const defaultGracePeriod = 2 * time.Second
 
 // StoryExecutionResult represents the output from iazio-harness story create.
 type StoryExecutionResult struct {
-	StoryID      string `json:"story_id"`
-	Submodule    string `json:"submodule"`
-	StoryPath    string `json:"story_path"`
-	IndexUpdated bool   `json:"index_updated"`
+	StoryID              string `json:"story_id"`
+	Submodule            string `json:"submodule"`
+	StoryPath            string `json:"story_path"`
+	IndexUpdated         bool   `json:"index_updated"`
+	ConversationID       string `json:"conversation_id,omitempty"`
+	ActiveConversationID string `json:"active_conversation_id,omitempty"`
 }
 
 // PromptExecutionResult represents the output from iazio-harness prompt execution.
 type PromptExecutionResult struct {
-	PromptID      string   `json:"prompt_id,omitempty"`
-	Repo          string   `json:"repo,omitempty"`
-	TargetAgent   string   `json:"target_agent,omitempty"`
-	StoryID       string   `json:"story_id,omitempty"`
-	StoryTitle    string   `json:"story_title,omitempty"`
-	StoryPath     string   `json:"story_path,omitempty"`
-	Status        string   `json:"status"`
-	ExitCode      int      `json:"exit_code,omitempty"`
-	GitHeadSHA    string   `json:"git_head_sha,omitempty"`
-	GitTreeSHA    string   `json:"git_tree_sha,omitempty"`
-	ModifiedFiles []string `json:"modified_files,omitempty"`
-	Summary       string   `json:"summary,omitempty"`
-	DurationMs    int64    `json:"duration_ms,omitempty"`
-	Output        string   `json:"output,omitempty"`
+	PromptID             string   `json:"prompt_id,omitempty"`
+	Repo                 string   `json:"repo,omitempty"`
+	TargetAgent          string   `json:"target_agent,omitempty"`
+	StoryID              string   `json:"story_id,omitempty"`
+	StoryTitle           string   `json:"story_title,omitempty"`
+	StoryPath            string   `json:"story_path,omitempty"`
+	ConversationID       string   `json:"conversation_id,omitempty"`
+	ActiveConversationID string   `json:"active_conversation_id,omitempty"`
+	Status               string   `json:"status"`
+	ExitCode             int      `json:"exit_code,omitempty"`
+	GitHeadSHA           string   `json:"git_head_sha,omitempty"`
+	GitTreeSHA           string   `json:"git_tree_sha,omitempty"`
+	ModifiedFiles        []string `json:"modified_files,omitempty"`
+	Summary              string   `json:"summary,omitempty"`
+	DurationMs           int64    `json:"duration_ms,omitempty"`
+	Output               string   `json:"output,omitempty"`
 }
 
 // CodebaseRepoInfo describes a repository returned by codebase repos.
@@ -110,9 +114,18 @@ func NewCLIInvoker(binaryPath, workDir string) *CLIInvoker {
 				binName += ".exe"
 			}
 			if home, err := os.UserHomeDir(); err == nil && home != "" {
-				cand := filepath.Join(home, ".local", "bin", binName)
-				if _, err := os.Stat(cand); err == nil {
-					binaryPath = cand
+				cands := []string{filepath.Join(home, ".local", "bin", binName)}
+				if runtime.GOOS == "windows" {
+					cands = []string{
+						filepath.Join(home, "bin", binName),
+						filepath.Join(home, ".local", "bin", binName),
+					}
+				}
+				for _, cand := range cands {
+					if _, err := os.Stat(cand); err == nil {
+						binaryPath = cand
+						break
+					}
 				}
 			}
 			if binaryPath == "" {

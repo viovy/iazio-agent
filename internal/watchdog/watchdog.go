@@ -97,17 +97,17 @@ type Spawner func(ctx context.Context, job TrackedJob) (newPID int, err error)
 
 // Watchdog tracks running harness jobs and autonomously resumes crashed or terminated jobs.
 type Watchdog struct {
-	mu          sync.Mutex
-	guardWG     sync.WaitGroup
-	stateFile   string
-	jobs        map[string]*TrackedJob
-	runner      supervisor.Runner
-	spawner     Spawner
-	maxResumes  int
-	isAlive     func(pid int) bool
-	now         func() time.Time
-	monitor     *ConversationLivenessMonitor
-	killProcess  func(pid int) error
+	mu                   sync.Mutex
+	guardWG              sync.WaitGroup
+	stateFile            string
+	jobs                 map[string]*TrackedJob
+	runner               supervisor.Runner
+	spawner              Spawner
+	maxResumes           int
+	isAlive              func(pid int) bool
+	now                  func() time.Time
+	monitor              *ConversationLivenessMonitor
+	killProcess          func(pid int) error
 	sleep                func(time.Duration)
 	onOrphanTool         func(job TrackedJob)
 	onAutoResume         func(job TrackedJob, reason string, attempt, max int)
@@ -577,8 +577,10 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 
 	// Sanitize workspace and release orphan locks before spawning resume
 	if jobCopy.WorktreePath != "" {
-		_, _ = reaper.ReapWorkspaceOrphansAndLocks(context.Background(), jobCopy.WorktreePath, jobCopy.ConversationID)
-		_, _ = workspace.SanitizeWorkspace(context.Background(), jobCopy.WorktreePath)
+		if fi, statErr := os.Stat(jobCopy.WorktreePath); statErr == nil && fi.IsDir() {
+			_, _ = reaper.ReapWorkspaceOrphansAndLocks(context.Background(), jobCopy.WorktreePath, jobCopy.ConversationID)
+			_, _ = workspace.SanitizeWorkspace(context.Background(), jobCopy.WorktreePath)
+		}
 	}
 
 	if spawner != nil {

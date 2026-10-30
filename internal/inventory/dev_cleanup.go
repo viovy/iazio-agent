@@ -196,6 +196,12 @@ func ScanDevAndShadowBinaries(searchDirs []string, canonicalBinDir string) []Dev
 		if filepath.Base(cleanCanon) == "bin" && filepath.Base(filepath.Dir(cleanCanon)) == ".local" {
 			homeDir := filepath.Dir(filepath.Dir(cleanCanon))
 			scanList = append(scanList, filepath.Join(homeDir, ".iazio", "bin"))
+		} else if filepath.Base(cleanCanon) == "bin" {
+			homeDir := filepath.Dir(cleanCanon)
+			scanList = append(scanList,
+				filepath.Join(homeDir, ".local", "bin"),
+				filepath.Join(homeDir, ".iazio", "bin"),
+			)
 		}
 	}
 
@@ -245,7 +251,7 @@ func ScanDevAndShadowBinaries(searchDirs []string, canonicalBinDir string) []Dev
 
 				// 1. Exact canonical name match
 				if strings.EqualFold(baseWithoutExt, t) {
-					isLocalBinDir := filepath.Base(cleanDir) == "bin" && filepath.Base(filepath.Dir(cleanDir)) == ".local"
+					isLocalBinDir := runtime.GOOS != "windows" && filepath.Base(cleanDir) == "bin" && filepath.Base(filepath.Dir(cleanDir)) == ".local"
 					if !isCanonicalDir && !isLocalBinDir {
 						matched = true
 						variant = "shadow_duplicate"
@@ -453,7 +459,7 @@ func CleanupDevBinaries(ctx context.Context, candidates []DevBinaryCandidate, ca
 		if runtime.GOOS == "windows" && strings.HasSuffix(strings.ToLower(baseName), ".exe") {
 			baseName = baseName[:len(baseName)-4]
 		}
-		isLocalBinTarget := filepath.Base(targetDirKey) == "bin" && filepath.Base(filepath.Dir(targetDirKey)) == ".local"
+		isLocalBinTarget := runtime.GOOS != "windows" && filepath.Base(targetDirKey) == "bin" && filepath.Base(filepath.Dir(targetDirKey)) == ".local"
 		if (cleanCanonical != "" && targetDirKey == cleanCanonical && strings.EqualFold(baseName, cand.ToolName)) ||
 			(isLocalBinTarget && strings.EqualFold(baseName, cand.ToolName)) {
 			continue // skip canonical

@@ -85,14 +85,14 @@ func New(now func() time.Time) *Sup {
 		now = time.Now
 	}
 	return &Sup{
-		gates:        map[string]*sync.Mutex{},
-		locks:        map[string]string{},
-		until:        map[string]time.Time{},
-		deadline:     map[string]time.Time{},
-		lastProgress: map[string]time.Time{},
-		pids:         map[string]int{},
-		jobIDs:       map[string]string{},
-		reasons:      map[string]string{},
+		gates:         map[string]*sync.Mutex{},
+		locks:         map[string]string{},
+		until:         map[string]time.Time{},
+		deadline:      map[string]time.Time{},
+		lastProgress:  map[string]time.Time{},
+		pids:          map[string]int{},
+		jobIDs:        map[string]string{},
+		reasons:       map[string]string{},
 		now:           now,
 		sleep:         time.Sleep,
 		alive:         isProcessAlive,
@@ -425,7 +425,9 @@ func (s *Sup) ScanAndReattachRuns(r Runner) []RunState {
 			}
 			s.mu.Unlock()
 
-			if ar, ok := r.(interface{ Attach(pid int, jobID string) error }); ok {
+			if ar, ok := r.(interface {
+				Attach(pid int, jobID string) error
+			}); ok {
 				if attachErr := ar.Attach(st.PID, st.JobID); attachErr != nil {
 					s.RecordFetch(fmt.Errorf("Attach PID %d for job %s: %w", st.PID, st.JobID, attachErr))
 				}

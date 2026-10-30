@@ -98,7 +98,7 @@ func TestDefaultDirsOrder(t *testing.T) {
 		}
 	}
 	win := DefaultDirs("", home, "windows")
-	if win[len(win)-1] != filepath.Join(home, "bin") {
+	if win[0] != filepath.Join(home, "bin") {
 		t.Fatalf("%v", win)
 	}
 }
@@ -369,7 +369,6 @@ func TestInspectToolServiceWindows(t *testing.T) {
 	}
 }
 
-
 func TestScanSymlinkDetectionAndRejection(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping symlink test on windows")
@@ -588,5 +587,3 @@ func TestInspectToolService_DarwinExitCodesAndRunningState(t *testing.T) {
 		t.Fatalf("expected installed=true, status=installed for (never exited), got installed=%v, status=%q", installed, status)
 	}
 }
-
-

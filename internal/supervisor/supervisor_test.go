@@ -419,7 +419,6 @@ func TestTick_ProgressAwareStallReaping_DefaultZeroDuration(t *testing.T) {
 	}
 }
 
-
 func TestReconcileHostCheckouts(t *testing.T) {
 	var discarded []string
 	var resumed []string
