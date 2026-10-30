@@ -604,13 +604,13 @@ func linuxHarnessUnit(bin string) string {
 	return fmt.Sprintf(`[Unit]
 Description=iazio-harness daemon and execution supervisor
 After=network.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=%s daemon
 Restart=always
 RestartSec=3s
-StartLimitIntervalSec=0
 OOMScoreAdjust=-500
 Environment=IAZIO_HARNESS_NONINTERACTIVE=1
 %s
@@ -914,13 +914,30 @@ func reconcileLinuxServiceConfiguration(home, bin string, run func(name string, 
 
 	// Reconcile iazio-harness user service if harness binary exists
 	harnessBin := filepath.Join(home, ".local", "bin", "iazio-harness")
+	if _, err := os.Stat(harnessBin); err != nil {
+		harnessBin = filepath.Join(home, ".iazio", "bin", "iazio-harness")
+	}
 	if _, err := os.Stat(harnessBin); err == nil {
+		hUpdated := false
 		hSvcFile := filepath.Join(unitDir, "iazio-harness.service")
 		hData, err := os.ReadFile(hSvcFile)
-		if err != nil || !strings.Contains(string(hData), harnessBin) {
+		if err != nil || !strings.Contains(string(hData), harnessBin) || strings.Contains(string(hData), "\n[Service]\nType=simple\nExecStart="+harnessBin+" daemon\nRestart=always\nRestartSec=3s\nStartLimitIntervalSec=0") {
 			_ = os.WriteFile(hSvcFile, []byte(linuxHarnessUnit(harnessBin)), 0o644)
+			hUpdated = true
+		}
+		legacyHarnessBin := filepath.Join(home, ".iazio", "bin", "iazio-harness")
+		for _, extraUnit := range []string{"iazio-harness-watchdog.service", "iazio-harness-watcher.path"} {
+			uPath := filepath.Join(unitDir, extraUnit)
+			if uData, uErr := os.ReadFile(uPath); uErr == nil && strings.Contains(string(uData), legacyHarnessBin) && harnessBin != legacyHarnessBin {
+				replaced := strings.ReplaceAll(string(uData), legacyHarnessBin, harnessBin)
+				_ = os.WriteFile(uPath, []byte(replaced), 0o644)
+				hUpdated = true
+			}
+		}
+		if hUpdated {
 			_ = run("systemctl", "--user", "daemon-reload")
 			_ = run("systemctl", "--user", "enable", "iazio-harness.service")
+			_ = run("systemctl", "--user", "reset-failed", "iazio-harness-watchdog.service")
 		}
 	}
 

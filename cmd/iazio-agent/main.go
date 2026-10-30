@@ -321,13 +321,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				func(snap supervisor.FleetStateSnapshot) {
 					if eagerUpdater != nil && !updatingTools.Load() {
 						eagerUpdater.TriggerEvaluation("periodic_fleet_clean")
-						go func() {
-							agentUpdated, _, _ := eagerUpdater.EvaluateAndTrigger(runCtx, nil, false)
-							if agentUpdated {
-								restartOrExecSelf(stdout)
-								cancel()
-							}
-						}()
 					}
 				},
 			)
@@ -681,6 +674,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 					if eagerUpdater != nil {
 						eagerUpdater.TriggerEvaluation("control_plane_broadcast")
+						if !force && len(tools) == 0 && tv == "" {
+							return nil
+						}
 					}
 					pendingRemoteMu.Lock()
 					pendingRemoteTools = tools
@@ -1984,9 +1980,14 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 	// Try iazio-harness fleet-status --repo <repoPath> --json first
 	harnessBin := "iazio-harness"
 	if home, err := os.UserHomeDir(); err == nil {
-		p := filepath.Join(home, ".local", "bin", "iazio-harness")
-		if _, err := os.Stat(p); err == nil {
-			harnessBin = p
+		for _, cand := range []string{
+			filepath.Join(home, ".local", "bin", "iazio-harness"),
+			filepath.Join(home, ".iazio", "bin", "iazio-harness"),
+		} {
+			if _, err := os.Stat(cand); err == nil {
+				harnessBin = cand
+				break
+			}
 		}
 	}
 	harnessCmd := exec.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--json")
@@ -2250,9 +2251,14 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 	// Try iazio-harness fleet-status --json first
 	harnessBin := "iazio-harness"
 	if home, err := os.UserHomeDir(); err == nil {
-		p := filepath.Join(home, ".local", "bin", "iazio-harness")
-		if _, err := os.Stat(p); err == nil {
-			harnessBin = p
+		for _, cand := range []string{
+			filepath.Join(home, ".local", "bin", "iazio-harness"),
+			filepath.Join(home, ".iazio", "bin", "iazio-harness"),
+		} {
+			if _, err := os.Stat(cand); err == nil {
+				harnessBin = cand
+				break
+			}
 		}
 	}
 	harnessCmd := exec.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--json")

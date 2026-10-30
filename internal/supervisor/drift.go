@@ -177,6 +177,12 @@ func EvaluateDrift(
 
 		cleanCur := NormalizeVersion(curVer)
 		cleanTgt := NormalizeVersion(targetVer)
+		if idx := strings.Index(cleanCur, "+"); idx != -1 {
+			cleanCur = strings.TrimSpace(cleanCur[:idx])
+		}
+		if idx := strings.Index(cleanTgt, "+"); idx != -1 {
+			cleanTgt = strings.TrimSpace(cleanTgt[:idx])
+		}
 
 		// Semver "dev" trap: unversioned or dev builds must always be considered drifted
 		// so that autonomous eager update inspects remote repository/releases and doesn't get stuck.

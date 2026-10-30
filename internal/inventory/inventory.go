@@ -49,6 +49,7 @@ func InspectInstalledVersion(binaryPath string) string {
 	if err != nil {
 		return ""
 	}
+	var prevHexSHA string
 	if data, err := os.ReadFile(binaryPath + ".version"); err == nil {
 		v := strings.TrimSpace(string(data))
 		if v != "" {
@@ -56,7 +57,18 @@ func InspectInstalledVersion(binaryPath string) string {
 			if match := re.FindString(v); match != "" {
 				return strings.TrimPrefix(match, "v")
 			}
-			if !strings.Contains(strings.ToLower(v), "dev") {
+			isHex := len(v) >= 7 && len(v) <= 40
+			if isHex {
+				for _, r := range v {
+					if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+						isHex = false
+						break
+					}
+				}
+			}
+			if isHex {
+				prevHexSHA = v
+			} else if !strings.Contains(v, "\n") && !strings.Contains(strings.ToLower(v), "dev") {
 				return strings.TrimPrefix(v, "v")
 			}
 		}
@@ -79,9 +91,9 @@ func InspectInstalledVersion(binaryPath string) string {
 		out, err = cmd.Output()
 	}
 	ver := "installed"
+	reSemver := regexp.MustCompile(`v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?)|([0-9]+\.[0-9]+\.[0-9]+)`)
 	if err == nil {
-		re := regexp.MustCompile(`v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?)|([0-9]+\.[0-9]+\.[0-9]+)`)
-		if match := re.FindString(string(out)); match != "" {
+		if match := reSemver.FindString(string(out)); match != "" {
 			ver = strings.TrimPrefix(match, "v")
 		} else {
 			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
@@ -92,7 +104,17 @@ func InspectInstalledVersion(binaryPath string) string {
 	}
 
 	if ver != "installed" && ver != "" {
-		_ = os.WriteFile(binaryPath+".version", []byte(ver), 0644)
+		sidecarVer := ver
+		if prevHexSHA != "" {
+			if reSemver.FindString(ver) != "" && !strings.Contains(ver, "+") {
+				sidecarVer = ver + "+" + prevHexSHA
+			} else if reSemver.FindString(ver) == "" {
+				sidecarVer = ""
+			}
+		}
+		if sidecarVer != "" {
+			_ = os.WriteFile(binaryPath+".version", []byte(sidecarVer), 0644)
+		}
 	}
 
 	verCacheMu.Lock()
