@@ -856,6 +856,7 @@ func TestPerformUpdateWithResult_FallbackToSingleAgent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
+	tmpHome := t.TempDir()
 	opts := UpdateOptions{
 		Suite:   false,
 		API:     srv.URL,
@@ -863,7 +864,12 @@ func TestPerformUpdateWithResult_FallbackToSingleAgent(t *testing.T) {
 		BinDir:  t.TempDir(),
 	}
 	var stdout, stderr bytes.Buffer
-	_, _ = performUpdateWithResult(ctx, opts, &stdout, &stderr, func(string) string { return "" })
+	_, _ = performUpdateWithResult(ctx, opts, &stdout, &stderr, func(k string) string {
+		if k == "HOME" {
+			return tmpHome
+		}
+		return ""
+	})
 }
 
 func TestResolveInstallDir_Variants(t *testing.T) {
@@ -1819,3 +1825,84 @@ func TestFindToolSourceRepo_PluginMapping(t *testing.T) {
 		t.Fatalf("expected %s, got %s", pluginsRepo, got)
 	}
 }
+
+func TestBuildToolFromSourceRepo_PrunesStaleAndCancelledBuildWorktrees(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not installed")
+	}
+
+	tmpDir := t.TempDir()
+	srcRepo := filepath.Join(tmpDir, "repo")
+	if err := os.MkdirAll(srcRepo, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	runGit := func(args ...string) string {
+		cmd := exec.Command("git", append([]string{"-C", srcRepo}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@test.local",
+			"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@test.local",
+			"GIT_TERMINAL_PROMPT=0",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v: %s", args, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit("init")
+	runGit("config", "user.name", "Test")
+	runGit("config", "user.email", "test@test.local")
+
+	if err := os.WriteFile(filepath.Join(srcRepo, "go.mod"), []byte("module stalewttest\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcRepo, "main.go"), []byte("package main\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "initial commit")
+
+	// 1. Create a lingering detached worktree in os.TempDir() simulating an interrupted prior build
+	staleWT := filepath.Join(os.TempDir(), fmt.Sprintf("iazio-build-stalewttest-%d", time.Now().UnixNano()))
+	t.Cleanup(func() {
+		_ = exec.Command("git", "-C", srcRepo, "worktree", "remove", "--force", staleWT).Run()
+		_ = os.RemoveAll(staleWT)
+	})
+	runGit("worktree", "add", "--force", "--detach", staleWT, "HEAD")
+
+	// Dirty srcRepo so buildToolFromSourceRepo uses the isolated worktree path
+	if err := os.WriteFile(filepath.Join(srcRepo, "main.go"), []byte("package main\nfunc main() {}\n// dirty\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	destPath := filepath.Join(tmpDir, "bin", "stalewttest")
+	_ = os.MkdirAll(filepath.Dir(destPath), 0755)
+	tool := ManifestToolItem{Name: "stalewttest", BinaryName: "stalewttest"}
+
+	// 2. Run with an already-cancelled context: must clean up both the pre-existing stale worktree AND its own tempDir
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var outBuf bytes.Buffer
+	_, _ = buildToolFromSourceRepo(cancelledCtx, tool, srcRepo, destPath, true, &outBuf, &outBuf)
+
+	if _, err := os.Stat(staleWT); !os.IsNotExist(err) {
+		t.Fatalf("expected pre-existing stale worktree dir %s to be removed, stat err: %v", staleWT, err)
+	}
+
+	wtList := runGit("worktree", "list", "--porcelain")
+	wtCount := 0
+	for _, line := range strings.Split(wtList, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "worktree ") {
+			wtCount++
+		}
+	}
+	if wtCount != 1 {
+		t.Fatalf("expected exactly 1 worktree (primary checkout) after cancelled build cleanup, got %d:\n%s", wtCount, wtList)
+	}
+}
+
