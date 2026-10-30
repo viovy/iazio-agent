@@ -743,7 +743,20 @@ func copyBinaryAtomic(src, dest string) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, dest)
+	if err := os.Rename(tmp, dest); err != nil {
+		if runtime.GOOS == "windows" {
+			oldPath := dest + ".old"
+			_ = os.Remove(oldPath)
+			if renErr := os.Rename(dest, oldPath); renErr == nil {
+				if err2 := os.Rename(tmp, dest); err2 == nil {
+					_ = os.Remove(oldPath)
+					return nil
+				}
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 func validateCandidateBinary(src string, info os.FileInfo) error {
@@ -813,11 +826,24 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 		tasksDir := filepath.Join(home, ".iazio", "tasks")
 		cleanStaleBackups(tasksDir)
 		cleanStaleBackups(filepath.Join(home, ".local", "bin"))
+		cleanStaleBackups(filepath.Join(home, "bin"))
 		binDir := filepath.Join(home, ".iazio", "bin")
 		cleanStaleBackups(binDir)
-		_ = os.Remove(filepath.Join(binDir, "iazio-agent.exe"))
-		_ = os.Remove(filepath.Join(binDir, "iazio-agent.old"))
-		_ = os.Remove(filepath.Join(binDir, "iazio-agent.version"))
+		for _, legacyBin := range []string{"iazio-agent", "iazio-harvester", "iazio-harness"} {
+			_ = os.Remove(filepath.Join(binDir, legacyBin+".exe"))
+			_ = os.Remove(filepath.Join(binDir, legacyBin+".old"))
+			_ = os.Remove(filepath.Join(binDir, legacyBin+".version"))
+		}
+
+		// Per ADR-002, iazio-harness must NEVER be installed as a user or system service.
+		harnessBat := filepath.Join(tasksDir, "iazio-harness.bat")
+		harnessXML := filepath.Join(tasksDir, "iazio-harness.xml")
+		if _, err := os.Stat(harnessBat); err == nil {
+			_ = run("schtasks", "/End", "/TN", "iazio-harness")
+			_ = run("schtasks", "/Delete", "/TN", "iazio-harness", "/F")
+			_ = os.Remove(harnessBat)
+			_ = os.Remove(harnessXML)
+		}
 
 		batPath := filepath.Join(tasksDir, "iazio-agent.bat")
 		xmlPath := filepath.Join(tasksDir, "iazio-agent.xml")
@@ -826,11 +852,37 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 			needsInstall = true
 		} else if xData, err := os.ReadFile(xmlPath); err != nil || (!strings.Contains(string(xData), "PT1M") && !bytes.Contains(xData, []byte{'P', 0, 'T', 0, '1', 0, 'M', 0})) {
 			needsInstall = true
+		} else {
+			if qOut, qErr := statusCheckCommand("schtasks", "/Query", "/TN", "iazio-agent", "/V", "/FO", "LIST"); qErr != nil {
+				needsInstall = true
+			} else if len(qOut) > 0 && strings.Contains(string(qOut), "Task To Run:") && !strings.Contains(strings.ToLower(string(qOut)), strings.ToLower(batPath)) {
+				needsInstall = true
+			}
 		}
 		if needsInstall {
-			return InstallWindowsAt(home, bin, windowsLogonUser(), run)
+			if err := InstallWindowsAt(home, bin, windowsLogonUser(), run); err != nil {
+				return err
+			}
+		} else {
+			lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
+			inMaintenance := false
+			if info, err := os.Stat(lockFile); err == nil && time.Since(info.ModTime()) <= 2*time.Hour {
+				inMaintenance = true
+			}
+			if !inMaintenance {
+				if out, err := statusCheckCommand("schtasks", "/Query", "/TN", "iazio-agent", "/FO", "LIST"); err == nil {
+					if running, _, ok := ParseSchtasksStatus(string(out)); ok && !running {
+						_ = run("schtasks", "/Run", "/TN", "iazio-agent")
+					}
+				}
+			}
 		}
-		_ = ReviveCheck(home, run)
+
+		// Reconcile companion iazio-harvester Windows user service if installed in canonical ~/bin
+		harvesterBin := filepath.Join(home, "bin", "iazio-harvester.exe")
+		if _, err := os.Stat(harvesterBin); err == nil && !isTestProcess() {
+			_ = exec.Command(harvesterBin, "service", "reconcile").Run()
+		}
 		return nil
 	}
 	return nil
@@ -912,33 +964,34 @@ func reconcileLinuxServiceConfiguration(home, bin string, run func(name string, 
 	_ = run("systemctl", "--user", "enable", "--now", "iazio-agent-watchdog.timer")
 	_ = run("loginctl", "enable-linger")
 
-	// Reconcile iazio-harness user service if harness binary exists
-	harnessBin := filepath.Join(home, ".local", "bin", "iazio-harness")
-	if _, err := os.Stat(harnessBin); err != nil {
-		harnessBin = filepath.Join(home, ".iazio", "bin", "iazio-harness")
+	// Per ADR-002, iazio-harness must NEVER be installed as a user or system service.
+	// Purge any legacy iazio-harness systemd user units if present.
+	_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-harness"))
+	_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-harvester"))
+	legacyHarnessUnits := []string{
+		"iazio-harness.service",
+		"iazio-harness-watcher.path",
+		"iazio-harness-watcher.service",
+		"iazio-harness-watchdog.timer",
+		"iazio-harness-watchdog.service",
 	}
-	if _, err := os.Stat(harnessBin); err == nil {
-		hUpdated := false
-		hSvcFile := filepath.Join(unitDir, "iazio-harness.service")
-		hData, err := os.ReadFile(hSvcFile)
-		if err != nil || !strings.Contains(string(hData), harnessBin) || strings.Contains(string(hData), "\n[Service]\nType=simple\nExecStart="+harnessBin+" daemon\nRestart=always\nRestartSec=3s\nStartLimitIntervalSec=0") {
-			_ = os.WriteFile(hSvcFile, []byte(linuxHarnessUnit(harnessBin)), 0o644)
-			hUpdated = true
+	purgedHarness := false
+	for _, u := range legacyHarnessUnits {
+		uPath := filepath.Join(unitDir, u)
+		if _, err := os.Stat(uPath); err == nil {
+			_ = run("systemctl", "--user", "disable", "--now", u)
+			_ = os.Remove(uPath)
+			purgedHarness = true
 		}
-		legacyHarnessBin := filepath.Join(home, ".iazio", "bin", "iazio-harness")
-		for _, extraUnit := range []string{"iazio-harness-watchdog.service", "iazio-harness-watcher.path"} {
-			uPath := filepath.Join(unitDir, extraUnit)
-			if uData, uErr := os.ReadFile(uPath); uErr == nil && strings.Contains(string(uData), legacyHarnessBin) && harnessBin != legacyHarnessBin {
-				replaced := strings.ReplaceAll(string(uData), legacyHarnessBin, harnessBin)
-				_ = os.WriteFile(uPath, []byte(replaced), 0o644)
-				hUpdated = true
-			}
-		}
-		if hUpdated {
-			_ = run("systemctl", "--user", "daemon-reload")
-			_ = run("systemctl", "--user", "enable", "iazio-harness.service")
-			_ = run("systemctl", "--user", "reset-failed", "iazio-harness-watchdog.service")
-		}
+	}
+	if purgedHarness {
+		_ = run("systemctl", "--user", "daemon-reload")
+	}
+
+	// Reconcile companion iazio-harvester user service if harvester binary exists in canonical ~/.local/bin
+	harvesterBin := filepath.Join(home, ".local", "bin", "iazio-harvester")
+	if _, err := os.Stat(harvesterBin); err == nil && !isTestProcess() {
+		_ = exec.Command(harvesterBin, "service", "reconcile").Run()
 	}
 
 	lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
@@ -1004,19 +1057,22 @@ func reconcileDarwinServiceConfiguration(home, bin string, run func(name string,
 		return err
 	}
 
-	// Reconcile iazio-harness LaunchAgent if harness binary exists
-	harnessBin := filepath.Join(home, ".local", "bin", "iazio-harness")
-	if _, err := os.Stat(harnessBin); err == nil {
-		harnessPlist := filepath.Join(launchAgentsDir, "io.iazio.iazio-harness.plist")
-		expectedHarnessPlist := darwinHarnessPlist(harnessBin, filepath.Join(logDir, "harness.log"))
-		hData, err := os.ReadFile(harnessPlist)
-		hTarget := domain + "/io.iazio.iazio-harness"
-		if err != nil || string(hData) != expectedHarnessPlist {
-			_ = os.WriteFile(harnessPlist, []byte(expectedHarnessPlist), 0o644)
-			_ = run("launchctl", "bootout", hTarget)
-			_ = run("launchctl", "bootstrap", domain, harnessPlist)
-			_ = run("launchctl", "enable", hTarget)
+	// Per ADR-002, iazio-harness must NEVER be installed as a user or system service.
+	// Purge any legacy iazio-harness LaunchAgent plists if present.
+	_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-harness"))
+	_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-harvester"))
+	for _, legacyLabel := range []string{"io.iazio.iazio-harness", "io.iazio.iazio-harness.watcher", "io.iazio.iazio-harness.watchdog"} {
+		legacyPlist := filepath.Join(launchAgentsDir, legacyLabel+".plist")
+		if _, err := os.Stat(legacyPlist); err == nil {
+			_ = run("launchctl", "bootout", domain+"/"+legacyLabel)
+			_ = os.Remove(legacyPlist)
 		}
+	}
+
+	// Reconcile companion iazio-harvester LaunchAgent if harvester binary exists in canonical ~/.local/bin
+	harvesterBin := filepath.Join(home, ".local", "bin", "iazio-harvester")
+	if _, err := os.Stat(harvesterBin); err == nil && !isTestProcess() {
+		_ = exec.Command(harvesterBin, "service", "reconcile").Run()
 	}
 
 	lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
@@ -1478,11 +1534,7 @@ func StatusUserDaemonAt(home string) (bool, int) {
 	if err != nil || pid <= 0 {
 		return false, 0
 	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false, 0
-	}
-	if err := proc.Signal(syscall.Signal(0)); err == nil {
+	if checkPIDAlive(pid) {
 		return true, pid
 	}
 	return false, 0
@@ -1526,9 +1578,26 @@ func isDaemonPIDAlive(pidPath string) bool {
 	if err != nil || pid <= 0 {
 		return false
 	}
+	return checkPIDAlive(pid)
+}
+
+func checkPIDAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	if pid == os.Getpid() {
+		return true
+	}
 	proc, err := os.FindProcess(pid)
 	if err != nil {
 		return false
+	}
+	if runtime.GOOS == "windows" {
+		out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/NH").Output()
+		if err != nil {
+			return false
+		}
+		return strings.Contains(string(out), strconv.Itoa(pid))
 	}
 	return proc.Signal(syscall.Signal(0)) == nil
 }
@@ -1669,7 +1738,36 @@ func windowsLogonUser() string {
 	return strings.TrimSpace(current.Username)
 }
 
+func isTestProcess() bool {
+	for _, arg := range os.Args {
+		if strings.HasPrefix(arg, "-test.") {
+			return true
+		}
+	}
+	exe, err := os.Executable()
+	if err == nil {
+		base := strings.ToLower(filepath.Base(exe))
+		if strings.HasSuffix(base, ".test") || strings.HasSuffix(base, ".test.exe") {
+			return true
+		}
+	}
+	return false
+}
+
+func isServiceControlCommand(name string) bool {
+	base := strings.ToLower(strings.TrimSuffix(filepath.Base(name), ".exe"))
+	switch base {
+	case "schtasks", "systemctl", "launchctl", "loginctl", "crontab", "taskkill":
+		return true
+	default:
+		return false
+	}
+}
+
 var execCommand = func(name string, args ...string) error {
+	if isTestProcess() && isServiceControlCommand(name) {
+		return nil
+	}
 	cmd := exec.Command(name, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1679,6 +1777,9 @@ var execCommand = func(name string, args ...string) error {
 }
 
 var statusCheckCommand = func(name string, args ...string) ([]byte, error) {
+	if isTestProcess() && isServiceControlCommand(name) {
+		return nil, errors.New("service control command disabled in test process")
+	}
 	cmd := exec.Command(name, args...)
 	return cmd.CombinedOutput()
 }
@@ -1745,7 +1846,11 @@ func cleanStaleBackups(dir string) {
 
 // RestartToolService restarts the specified tool's daemon service across Darwin (launchd),
 // Linux (systemd --user), or Windows (schtasks).
+// Per ADR-002, iazio-harness is strictly an on-demand CLI and must never be restarted as an OS service.
 func RestartToolService(toolName string, runner ...func(string, ...string) error) error {
+	if toolName == "iazio-harness" {
+		return nil
+	}
 	run := execCommand
 	if len(runner) > 0 && runner[0] != nil {
 		run = runner[0]

@@ -105,8 +105,12 @@ func TestDefaultDirsOrder(t *testing.T) {
 
 func TestScanMatchesAgyAndMockAgy(t *testing.T) {
 	dir := t.TempDir()
-	agyBin := filepath.Join(dir, "agy")
-	mockAgyBin := filepath.Join(dir, "mock-agy")
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	agyBin := filepath.Join(dir, "agy"+ext)
+	mockAgyBin := filepath.Join(dir, "mock-agy"+ext)
 	_ = os.WriteFile(agyBin, []byte("#!/bin/sh\necho 1.4.8\n"), 0755)
 	_ = os.WriteFile(mockAgyBin, []byte("#!/bin/sh\necho 0.1.0\n"), 0755)
 
@@ -330,6 +334,9 @@ func TestInspectToolServiceDarwin(t *testing.T) {
 	plistPath := filepath.Join(launchAgentsDir, "io.iazio.iazio-agent.plist")
 	_ = os.WriteFile(plistPath, []byte("<plist></plist>"), 0644)
 
+	harvesterPlistPath := filepath.Join(launchAgentsDir, "io.iazio.iazio-harvester.plist")
+	_ = os.WriteFile(harvesterPlistPath, []byte("<plist></plist>"), 0644)
+
 	harnessPlistPath := filepath.Join(launchAgentsDir, "io.iazio.iazio-harness.plist")
 	_ = os.WriteFile(harnessPlistPath, []byte("<plist></plist>"), 0644)
 
@@ -341,9 +348,15 @@ func TestInspectToolServiceDarwin(t *testing.T) {
 		t.Fatalf("expected non-empty caps on darwin launchd")
 	}
 
+	hvInstalled, hvType, hvStatus, _ := InspectToolService("iazio-harvester", "darwin")
+	if !hvInstalled || hvType != "user_service" || hvStatus != "installed" {
+		t.Fatalf("expected iazio-harvester user_service, got: %v, %s, %s", hvInstalled, hvType, hvStatus)
+	}
+
+	// ADR-002: iazio-harness must never be reported as an OS service even if a legacy plist exists on disk.
 	hInstalled, hType, hStatus, _ := InspectToolService("iazio-harness", "darwin")
-	if !hInstalled || hType != "user_service" || hStatus != "installed" {
-		t.Fatalf("expected iazio-harness user_service, got: %v, %s, %s", hInstalled, hType, hStatus)
+	if hInstalled || hType != "none" || hStatus != "not_installed" {
+		t.Fatalf("expected iazio-harness never to be a service per ADR-002, got: %v, %s, %s", hInstalled, hType, hStatus)
 	}
 }
 

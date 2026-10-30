@@ -1227,6 +1227,9 @@ func TestSetupUserCrontab_DefaultRunner(t *testing.T) {
 }
 
 func TestStartUserDaemonAt_DirectExec(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("user daemon shell runner uses /bin/sh on unix")
+	}
 	home := t.TempDir()
 	daemonDir := filepath.Join(home, ".iazio", "daemon")
 	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
@@ -1510,14 +1513,10 @@ func TestReconcileDarwinServiceConfiguration_SelfBootoutGuard(t *testing.T) {
 		}
 	}
 
-	// Verify iazio-harness plist was also reconciled to .local/bin/iazio-harness
+	// Verify any legacy iazio-harness plist is purged per ADR-002
 	harnessPlistPath := filepath.Join(launchAgentsDir, "io.iazio.iazio-harness.plist")
-	harnessPlistData, err := os.ReadFile(harnessPlistPath)
-	if err != nil {
-		t.Fatalf("expected harness plist to be written at %s: %v", harnessPlistPath, err)
-	}
-	if !strings.Contains(string(harnessPlistData), harnessBin) {
-		t.Fatalf("expected harness plist to contain %s, got:\n%s", harnessBin, string(harnessPlistData))
+	if _, err := os.Stat(harnessPlistPath); !os.IsNotExist(err) {
+		t.Fatalf("ADR-002 violation: expected harness plist %s not to be installed, err=%v", harnessPlistPath, err)
 	}
 }
 

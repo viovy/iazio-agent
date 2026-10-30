@@ -172,7 +172,11 @@ type Tool struct {
 
 // InspectToolService probes whether a tool is installed as an OS service (e.g. systemd user service),
 // its installation type, runtime status, and supported capabilities.
+// Per ADR-002, iazio-harness is strictly an on-demand CLI and must never be installed or reported as an OS service.
 func InspectToolService(toolName, goos string, runner ...func(name string, args ...string) ([]byte, error)) (installed bool, svcType string, svcStatus string, caps []string) {
+	if toolName == "iazio-harness" {
+		return false, "none", "not_installed", nil
+	}
 	var customRun func(name string, args ...string) ([]byte, error)
 	if len(runner) > 0 && runner[0] != nil {
 		customRun = runner[0]
@@ -198,7 +202,7 @@ func InspectToolService(toolName, goos string, runner ...func(name string, args 
 				if _, err := os.Stat(watcherPath); err == nil {
 					caps = append(caps, "path_watcher")
 				}
-				if toolName == "iazio-agent" || toolName == "iazio-harvester" || toolName == "iazio-harness" {
+				if toolName == "iazio-agent" || toolName == "iazio-harvester" {
 					caps = append(caps, "self_update", "dev_install", "user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1")
 				}
 
@@ -513,7 +517,8 @@ func scan(dirs []string, goos string) []Tool {
 			defer wg.Done()
 			out[idx].Version = InspectInstalledVersion(out[idx].Path)
 			out[idx].CommitSHA = InspectToolCommitSHA(out[idx].Path)
-			if out[idx].Name == "iazio-agent" || out[idx].Name == "iazio-harvester" || strings.HasPrefix(out[idx].Name, "iazio-") {
+			// Per ADR-002, only iazio-agent and iazio-harvester are persistent user services.
+			if out[idx].Name == "iazio-agent" || out[idx].Name == "iazio-harvester" {
 				installed, sType, sStatus, caps := InspectToolService(out[idx].Name, goos)
 				out[idx].ServiceInstalled = installed
 				out[idx].ServiceType = sType
