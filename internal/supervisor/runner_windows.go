@@ -65,11 +65,14 @@ var (
 	agentJobs  = make(map[int]uintptr)
 )
 
+const createNoWindow = 0x08000000
+
 func setProcGroup(cmd *exec.Cmd) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	cmd.SysProcAttr.CreationFlags |= syscall.CREATE_NEW_PROCESS_GROUP
+	cmd.SysProcAttr.CreationFlags |= syscall.CREATE_NEW_PROCESS_GROUP | createNoWindow
+	cmd.SysProcAttr.HideWindow = true
 }
 
 func postStartProc(cmd *exec.Cmd) {

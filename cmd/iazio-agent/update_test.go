@@ -1949,3 +1949,27 @@ func TestPerformUpdateWithResult_UnmatchedTargetToolRecordedInFailedTools(t *tes
 		t.Fatalf("expected unmatched-missing-tool to be attempted and recorded in FailedTools, got FailedTools=%v Errors=%v", res.FailedTools, res.Errors)
 	}
 }
+
+func TestDefaultRepositoryForTool(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"autopilot", "viovy/autopilot"},
+		{"AUTOPILOT", "viovy/autopilot"},
+		{"autopilot-fleet", "viovy/autopilot-plugins-internal"},
+		{"autopilot-git-flow", "viovy/autopilot-plugins-internal"},
+		{"autopilot-review-scheme", "viovy/autopilot-plugins-internal"},
+		{"autopilot-nextid", "viovy/autopilot-plugins-internal"},
+		{"autopilot-plugins-internal", "viovy/autopilot-plugins-internal"},
+		{"iazio-harvester", "viovy/iazio-harvester"},
+		{"iazio-harness", "viovy/iazio-harness"},
+		{"iazio-agent", "viovy/iazio-agent"},
+	}
+	for _, tc := range tests {
+		got := defaultRepositoryForTool(tc.input)
+		if got != tc.want {
+			t.Errorf("defaultRepositoryForTool(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
