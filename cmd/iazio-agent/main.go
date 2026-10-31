@@ -644,6 +644,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}()
 			}
 			var wd *watchdog.Watchdog
+			var disp *worker.Dispatcher
 			var inFlightPrepMu sync.Mutex
 			inFlightPrepJobs := make(map[string]controlplane.ActiveJob)
 			var lastHarvesterCheckMu sync.Mutex
@@ -887,6 +888,14 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							}
 						}
 					}
+					if disp != nil {
+						for _, dj := range disp.ActiveJobs() {
+							if dj.JobID != "" && !seen[dj.JobID] {
+								seen[dj.JobID] = true
+								jobs = append(jobs, dj)
+							}
+						}
+					}
 					inFlightPrepMu.Lock()
 					for _, pj := range inFlightPrepJobs {
 						if pj.JobID != "" && !seen[pj.JobID] {
@@ -952,7 +961,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				cpSpooler, _ := controlplane.NewOfflineReportSpooler("", nil)
 				cpClient := worker.NewHTTPControlPlaneClient(api, authToken, nil, cpSpooler)
 				cliInvoker := harness.NewCLIInvoker("", "")
-				disp := worker.NewDispatcher(cpClient, cliInvoker, host)
+				disp = worker.NewDispatcher(cpClient, cliInvoker, host)
 				disp.SetHostGate(hostGate)
 				disp.SetHarvestFlusher(func(hCtx context.Context, convID string) (int, string, error) {
 					return flushHarvestConversationDetailed(hCtx, convID)
@@ -2593,10 +2602,36 @@ func stripSlotSuffix(name string) string {
 	return base
 }
 
+func isRepoSummaryIdle(r controlplane.RepoSummary) bool {
+	if strings.EqualFold(strings.TrimSpace(r.Queue), "PAUSED") {
+		return false
+	}
+	if strings.TrimSpace(r.RunningJobID) != "" {
+		return false
+	}
+	lock := strings.ToUpper(strings.TrimSpace(r.Lock))
+	return lock == "" || lock == "IDLE"
+}
+
 // resolveWorktreeFromHostDetail resolves a target worktree from the host's registered repos.
 func resolveWorktreeFromHostDetail(detail controlplane.HostDetail, repoName string) string {
 	clean := strings.TrimSpace(repoName)
-	// 1. Direct match by repo alias or basename
+	// 1. Direct match by exact worktree path, repo alias, or basename (preferring IDLE if multiple match)
+	for _, r := range detail.Repos {
+		wt := r.WorktreePath
+		if wt == "" {
+			wt = r.Path
+		}
+		if wt == "" {
+			continue
+		}
+		if wt == clean {
+			return wt
+		}
+		if (r.Alias == clean || r.RepoAlias == clean || filepath.Base(wt) == clean) && isRepoSummaryIdle(r) {
+			return wt
+		}
+	}
 	for _, r := range detail.Repos {
 		wt := r.WorktreePath
 		if wt == "" {
@@ -2609,7 +2644,41 @@ func resolveWorktreeFromHostDetail(detail controlplane.HostDetail, repoName stri
 			return wt
 		}
 	}
-	// 2. Submodule match: prefer primary worktree without auxiliary numeric suffix (e.g. -02, -03)
+	// 2. Submodule match: prefer IDLE primary worktree first, then any IDLE worktree, then primary worktree
+	for _, r := range detail.Repos {
+		wt := r.WorktreePath
+		if wt == "" {
+			wt = r.Path
+		}
+		if wt == "" || !isRepoSummaryIdle(r) {
+			continue
+		}
+		base := filepath.Base(wt)
+		if strings.Contains(base, "-0") || strings.Contains(base, "-1") || strings.Contains(base, "-2") {
+			continue
+		}
+		gmPath := filepath.Join(wt, ".gitmodules")
+		if b, err := os.ReadFile(gmPath); err == nil {
+			if strings.Contains(string(b), clean) {
+				return wt
+			}
+		}
+	}
+	for _, r := range detail.Repos {
+		wt := r.WorktreePath
+		if wt == "" {
+			wt = r.Path
+		}
+		if wt == "" || !isRepoSummaryIdle(r) {
+			continue
+		}
+		gmPath := filepath.Join(wt, ".gitmodules")
+		if b, err := os.ReadFile(gmPath); err == nil {
+			if strings.Contains(string(b), clean) {
+				return wt
+			}
+		}
+	}
 	for _, r := range detail.Repos {
 		wt := r.WorktreePath
 		if wt == "" {
@@ -2646,9 +2715,27 @@ func resolveWorktreeFromHostDetail(detail controlplane.HostDetail, repoName stri
 		}
 	}
 	// 4. Slot family fallback: if clean contains a slot suffix or matches umbrella/meta-repo,
-	// match any registered worktree on this host with the same root base name.
+	// match any registered IDLE worktree on this host with the same root base name.
 	cleanBase := stripSlotSuffix(clean)
 	if cleanBase != "" && cleanBase != "." && cleanBase != "root" {
+		for _, r := range detail.Repos {
+			wt := r.WorktreePath
+			if wt == "" {
+				wt = r.Path
+			}
+			if wt != "" && stripSlotSuffix(wt) == cleanBase && r.GlobalQueueAllocationEnabled && isRepoSummaryIdle(r) {
+				return wt
+			}
+		}
+		for _, r := range detail.Repos {
+			wt := r.WorktreePath
+			if wt == "" {
+				wt = r.Path
+			}
+			if wt != "" && stripSlotSuffix(wt) == cleanBase && isRepoSummaryIdle(r) {
+				return wt
+			}
+		}
 		for _, r := range detail.Repos {
 			wt := r.WorktreePath
 			if wt == "" {
@@ -2669,6 +2756,28 @@ func resolveWorktreeFromHostDetail(detail controlplane.HostDetail, repoName stri
 		}
 	}
 	if clean == "." || clean == "" || clean == "root" {
+		for _, r := range detail.Repos {
+			if r.GlobalQueueAllocationEnabled && isRepoSummaryIdle(r) {
+				wt := r.WorktreePath
+				if wt == "" {
+					wt = r.Path
+				}
+				if wt != "" {
+					return wt
+				}
+			}
+		}
+		for _, r := range detail.Repos {
+			if isRepoSummaryIdle(r) {
+				wt := r.WorktreePath
+				if wt == "" {
+					wt = r.Path
+				}
+				if wt != "" {
+					return wt
+				}
+			}
+		}
 		for _, r := range detail.Repos {
 			if r.GlobalQueueAllocationEnabled {
 				wt := r.WorktreePath

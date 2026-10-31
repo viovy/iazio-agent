@@ -3247,3 +3247,38 @@ func TestResolveControlPlaneToken_And_WindowsBinaryPathPrecedence(t *testing.T) 
 		t.Fatalf("expected ~/bin/iazio-agent.exe (%s) to take precedence over ~/.local/bin on Windows, got %s", winExe, resolved)
 	}
 }
+
+func TestGov3839_ResolveWorktreePrefersIdleWorktreeWhenPrimaryDirty(t *testing.T) {
+	tmp := t.TempDir()
+	dirtyPrimary := filepath.Join(tmp, "meta-repo")
+	idleSecond := filepath.Join(tmp, "meta-repo-02")
+	_ = os.MkdirAll(dirtyPrimary, 0755)
+	_ = os.MkdirAll(idleSecond, 0755)
+	_ = os.WriteFile(filepath.Join(dirtyPrimary, ".gitmodules"), []byte("[submodule \"iazio-web\"]\n\tpath = iazio-web\n"), 0644)
+	_ = os.WriteFile(filepath.Join(idleSecond, ".gitmodules"), []byte("[submodule \"iazio-web\"]\n\tpath = iazio-web\n"), 0644)
+
+	detail := controlplane.HostDetail{
+		Repos: []controlplane.RepoSummary{
+			{
+				WorktreePath:                 dirtyPrimary,
+				Lock:                         "DIRTY",
+				GlobalQueueAllocationEnabled: true,
+			},
+			{
+				WorktreePath:                 idleSecond,
+				Lock:                         "IDLE",
+				GlobalQueueAllocationEnabled: true,
+			},
+		},
+	}
+
+	if got := resolveWorktreeFromHostDetail(detail, "."); got != idleSecond {
+		t.Fatalf("expected resolveWorktreeFromHostDetail('.') to select IDLE %s over DIRTY %s, got %s", idleSecond, dirtyPrimary, got)
+	}
+	if got := resolveWorktreeFromHostDetail(detail, idleSecond); got != idleSecond {
+		t.Fatalf("expected resolveWorktreeFromHostDetail(idleSecond) to select exact %s, got %s", idleSecond, got)
+	}
+	if got := resolveWorktreeFromHostDetail(detail, "iazio-web"); got != idleSecond {
+		t.Fatalf("expected resolveWorktreeFromHostDetail('iazio-web') to select IDLE %s over DIRTY %s, got %s", idleSecond, dirtyPrimary, got)
+	}
+}

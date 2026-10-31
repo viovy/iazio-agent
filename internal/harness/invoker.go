@@ -33,12 +33,15 @@ type StoryExecutionResult struct {
 type PromptExecutionResult struct {
 	PromptID             string   `json:"prompt_id,omitempty"`
 	Repo                 string   `json:"repo,omitempty"`
+	WorktreePath         string   `json:"worktree_path,omitempty"`
+	Branch               string   `json:"branch,omitempty"`
 	TargetAgent          string   `json:"target_agent,omitempty"`
 	StoryID              string   `json:"story_id,omitempty"`
 	StoryTitle           string   `json:"story_title,omitempty"`
 	StoryPath            string   `json:"story_path,omitempty"`
 	ConversationID       string   `json:"conversation_id,omitempty"`
 	ActiveConversationID string   `json:"active_conversation_id,omitempty"`
+	ConversationIDs      []string `json:"conversation_ids,omitempty"`
 	Status               string   `json:"status"`
 	ExitCode             int      `json:"exit_code,omitempty"`
 	GitHeadSHA           string   `json:"git_head_sha,omitempty"`
