@@ -704,8 +704,34 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		sidForPayload := currentStoryID
 		allocatedStoryMu.Unlock()
 		payload := harness.EnsurePromptPayloadWithJob(job.ID, job.TraceID, job.TargetAgent, job.Repo, sidForPayload, job.Payload)
+		if httpCli, ok := d.client.(*HTTPControlPlaneClient); ok && httpCli != nil && httpCli.BaseURL != "" {
+			var m map[string]any
+			if json.Unmarshal(payload, &m) == nil && m != nil {
+				if _, exists := m["api_url"]; !exists {
+					m["api_url"] = httpCli.BaseURL
+				}
+				if httpCli.AuthToken != "" {
+					if _, exists := m["token"]; !exists {
+						m["token"] = httpCli.AuthToken
+					}
+				}
+				if b, mErr := json.Marshal(m); mErr == nil {
+					payload = b
+				}
+			}
+		}
 		startTime := time.Now()
 		res, err := invoker.ExecutePrompt(execCtx, payload)
+		if err == nil && res != nil {
+			combinedLower := strings.ToLower(res.Summary + "\n" + res.Output)
+			if strings.Contains(combinedLower, "jetski: no output produced") ||
+				strings.Contains(combinedLower, "headless mode cannot prompt for") ||
+				strings.Contains(combinedLower, "so it was auto-denied") {
+				err = fmt.Errorf("PERMISSION_DENIED: headless agent tool permission was auto-denied: %s", strings.TrimSpace(res.Summary))
+			} else if strings.EqualFold(res.Status, "failed") || res.ExitCode != 0 {
+				err = fmt.Errorf("prompt execution failed (status=%s exit=%d): %s", res.Status, res.ExitCode, strings.TrimSpace(res.Summary))
+			}
+		}
 		if toolSpan != nil {
 			toolSpan.End()
 		}
