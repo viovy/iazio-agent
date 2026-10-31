@@ -271,10 +271,27 @@ func DefaultOSProcessScanner(repoPaths []string) ([]ActiveHarnessSignal, error) 
 		// Check if command is bound to any registered repository path or name
 		matchingRepo := ""
 		for _, rp := range repoPaths {
-			base := filepath.Base(rp)
-			if strings.Contains(commandLine, rp) || (base != "" && strings.Contains(commandLine, base)) {
+			if rp == "" {
+				continue
+			}
+			cleanRP := filepath.Clean(rp)
+			if strings.Contains(commandLine, cleanRP) {
 				matchingRepo = rp
 				break
+			}
+			base := filepath.Base(cleanRP)
+			if base != "" && base != "." && base != "/" {
+				// Require exact token boundary match to avoid substring false positives (e.g., matching flag '--worktree-path')
+				for _, token := range strings.Fields(commandLine) {
+					token = strings.Trim(token, "\"'")
+					if token == base || filepath.Base(token) == base || strings.HasSuffix(token, "/"+base) {
+						matchingRepo = rp
+						break
+					}
+				}
+				if matchingRepo != "" {
+					break
+				}
 			}
 		}
 

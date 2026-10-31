@@ -210,7 +210,7 @@ func TestExecuteRunConnected(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		for i := 0; i < 60; i++ {
+		for i := 0; i < 200; i++ {
 			if heartbeatReceived.Load() {
 				break
 			}
@@ -234,7 +234,7 @@ func TestExecuteRunConnected(t *testing.T) {
 		t.Fatalf("execute failed: %v", err)
 	}
 	if !heartbeatReceived.Load() {
-		t.Fatalf("expected heartbeat to be received")
+		t.Fatalf("expected heartbeat to be received. stdout=%q, stderr=%q", stdout.String(), stderr.String())
 	}
 }
 

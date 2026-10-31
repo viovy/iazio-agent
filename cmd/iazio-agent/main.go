@@ -2870,7 +2870,7 @@ func resolveWorktreeFromHostDetail(detail controlplane.HostDetail, repoName stri
 			continue
 		}
 		base := filepath.Base(wt)
-		if strings.Contains(base, "-0") || strings.Contains(base, "-1") || strings.Contains(base, "-2") {
+		if stripSlotSuffix(base) != base {
 			continue
 		}
 		gmPath := filepath.Join(wt, ".gitmodules")

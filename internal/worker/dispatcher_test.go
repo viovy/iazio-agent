@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -571,7 +572,7 @@ func TestDispatcher_UnresolvableWorkspaceRefusal(t *testing.T) {
 		return &Job{
 			ID:      "job-ghost-path",
 			Type:    JobTypePromptExecute,
-			Repo:    "/nonexistent/ghost/work/meta-repo-04",
+			Repo:    filepath.Join(t.TempDir(), "nonexistent-workspace-ghost"),
 			Payload: json.RawMessage(`{}`),
 		}, nil
 	}
