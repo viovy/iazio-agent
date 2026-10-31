@@ -84,6 +84,8 @@ type HeartbeatRequest struct {
 	FencingToken int64  `json:"fencing_token,omitempty"`
 	LeaseToken   string `json:"lease_token,omitempty"`
 	StoryID      string `json:"story_id,omitempty"`
+	WorktreePath string `json:"worktree_path,omitempty"`
+	AgentPID     int    `json:"agent_pid,omitempty"`
 }
 
 // StoryBindingRequest is sent to dynamically bind an allocated story ID to a running job.
@@ -229,10 +231,20 @@ func (c *HTTPControlPlaneClient) CompleteJob(ctx context.Context, jobID string, 
 func (c *HTTPControlPlaneClient) HeartbeatJob(ctx context.Context, jobID, leaseToken string, fencingToken int64, storyID ...string) error {
 	url := fmt.Sprintf("%s/api/v1/agent/jobs/%s/heartbeat", c.BaseURL, jobID)
 	sid := ""
+	wt := ""
 	if len(storyID) > 0 {
 		sid = storyID[0]
 	}
-	bodyBytes, err := json.Marshal(HeartbeatRequest{FencingToken: fencingToken, LeaseToken: leaseToken, StoryID: sid})
+	if len(storyID) > 1 {
+		wt = storyID[1]
+	}
+	bodyBytes, err := json.Marshal(HeartbeatRequest{
+		FencingToken: fencingToken,
+		LeaseToken:   leaseToken,
+		StoryID:      sid,
+		WorktreePath: wt,
+		AgentPID:     os.Getpid(),
+	})
 	if err != nil {
 		return fmt.Errorf("marshal heartbeat request: %w", err)
 	}
@@ -299,11 +311,19 @@ func (c *HTTPControlPlaneClient) BindStory(ctx context.Context, jobID string, re
 
 // AckLease calls POST /api/v1/agent/jobs/{job_id}/ack-lease.
 func (c *HTTPControlPlaneClient) AckLease(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) error {
+	return c.AckLeaseWithWorktree(ctx, jobID, leaseToken, agentPID, activeConvID, "")
+}
+
+// AckLeaseWithWorktree calls POST /api/v1/agent/jobs/{job_id}/ack-lease with optional worktree_path.
+func (c *HTTPControlPlaneClient) AckLeaseWithWorktree(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID, worktreePath string) error {
 	url := fmt.Sprintf("%s/api/v1/agent/jobs/%s/ack-lease", c.BaseURL, jobID)
 	payload := map[string]any{
 		"lease_token":            leaseToken,
 		"agent_pid":              agentPID,
 		"active_conversation_id": activeConvID,
+	}
+	if strings.TrimSpace(worktreePath) != "" && worktreePath != "." {
+		payload["worktree_path"] = strings.TrimSpace(worktreePath)
 	}
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -402,6 +422,41 @@ type Dispatcher struct {
 	hostGate         HostExecutionGate
 	jobTimeout       time.Duration
 	flusher          HarvestFlusher
+	activeJobsMu     sync.Mutex
+	activeJobs       map[string]controlplane.ActiveJob
+}
+
+// ActiveJobs returns the list of jobs currently being processed by the dispatcher.
+func (d *Dispatcher) ActiveJobs() []controlplane.ActiveJob {
+	d.activeJobsMu.Lock()
+	defer d.activeJobsMu.Unlock()
+	out := make([]controlplane.ActiveJob, 0, len(d.activeJobs))
+	for _, aj := range d.activeJobs {
+		out = append(out, aj)
+	}
+	return out
+}
+
+func (d *Dispatcher) setActiveJob(jobID, worktreePath string, pid int) {
+	if strings.TrimSpace(jobID) == "" {
+		return
+	}
+	d.activeJobsMu.Lock()
+	defer d.activeJobsMu.Unlock()
+	if d.activeJobs == nil {
+		d.activeJobs = make(map[string]controlplane.ActiveJob)
+	}
+	d.activeJobs[jobID] = controlplane.ActiveJob{
+		JobID:        jobID,
+		WorktreePath: worktreePath,
+		PID:          pid,
+	}
+}
+
+func (d *Dispatcher) clearActiveJob(jobID string) {
+	d.activeJobsMu.Lock()
+	defer d.activeJobsMu.Unlock()
+	delete(d.activeJobs, jobID)
 }
 
 // NewDispatcher constructs a new Dispatcher, optionally accepting a RepoSyncer for immediate post-job sync hooks.
@@ -518,6 +573,13 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		}
 	}
 
+	effectiveRepo := job.Repo
+	if (effectiveRepo == "" || effectiveRepo == "." || effectiveRepo == "root") && worktreeDir != "" && worktreeDir != "." {
+		effectiveRepo = worktreeDir
+	}
+	d.setActiveJob(job.ID, worktreeDir, os.Getpid())
+	defer d.clearActiveJob(job.ID)
+
 	// Pre-job workspace sanitization: non-destructive lock clearing, interrupted git ops recovery, dirty patch archiving, and line ending hygiene
 	if worktreeDir != "" && worktreeDir != "." {
 		_, wsPrepSpan := telemetry.StartSpan(ctx, "agent.workspace_prep",
@@ -558,7 +620,15 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 
 	// Phase 2 of Two-Phase Lease Handshake: Acknowledge lease to transition from LEASED to RUNNING
 	if job.LeaseToken != "" {
-		if ackErr := d.client.AckLease(ctx, job.ID, job.LeaseToken, os.Getpid(), ""); ackErr != nil {
+		var ackErr error
+		if wtAcker, ok := d.client.(interface {
+			AckLeaseWithWorktree(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID, worktreePath string) error
+		}); ok {
+			ackErr = wtAcker.AckLeaseWithWorktree(ctx, job.ID, job.LeaseToken, os.Getpid(), "", worktreeDir)
+		} else {
+			ackErr = d.client.AckLease(ctx, job.ID, job.LeaseToken, os.Getpid(), "")
+		}
+		if ackErr != nil {
 			fmt.Fprintf(os.Stderr, "[dispatcher] ack lease warning for job %s: %v\n", job.ID, ackErr)
 		}
 	}
@@ -622,7 +692,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 					allocatedStoryMu.Lock()
 					sid := currentStoryID
 					allocatedStoryMu.Unlock()
-					if err := d.client.HeartbeatJob(hbCtx, job.ID, job.LeaseToken, job.FencingToken, sid); err != nil {
+					if err := d.client.HeartbeatJob(hbCtx, job.ID, job.LeaseToken, job.FencingToken, sid, worktreeDir); err != nil {
 						if strings.Contains(err.Error(), "409") || strings.Contains(err.Error(), "LEASE_FENCED") {
 							execCancel()
 							return
@@ -648,7 +718,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 
 	// Shared execution lease acquisition for harness jobs (prevents collision with binary updates)
 	if d.hostGate != nil && (job.Type == JobTypeStoryCreate || job.Type == JobTypeStoryExecute || job.Type == JobTypePromptExecute) {
-		relLease, leaseErr := d.hostGate.AcquireExecutionLease(execCtx, job.ID, job.Repo, job.FencingToken)
+		relLease, leaseErr := d.hostGate.AcquireExecutionLease(execCtx, job.ID, effectiveRepo, job.FencingToken)
 		if leaseErr != nil {
 			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: leaseErr.Error()})
 			return true, leaseErr
@@ -681,7 +751,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 			FinalTranscriptSHA256: finalSHA,
 		})
 		if compErr == nil && d.syncer != nil {
-			targetRepo := job.Repo
+			targetRepo := effectiveRepo
 			if targetRepo == "" && res != nil {
 				targetRepo = res.Submodule
 			}
@@ -703,7 +773,25 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		allocatedStoryMu.Lock()
 		sidForPayload := currentStoryID
 		allocatedStoryMu.Unlock()
-		payload := harness.EnsurePromptPayloadWithJob(job.ID, job.TraceID, job.TargetAgent, job.Repo, sidForPayload, job.Payload)
+		payload := harness.EnsurePromptPayloadWithJob(job.ID, job.TraceID, job.TargetAgent, effectiveRepo, sidForPayload, job.Payload)
+		if worktreeDir != "" && worktreeDir != "." {
+			var m map[string]any
+			if json.Unmarshal(payload, &m) == nil && m != nil {
+				m["worktree_path"] = worktreeDir
+				if b, mErr := json.Marshal(m); mErr == nil {
+					payload = b
+				}
+			}
+		}
+		if job.FencingToken > 0 {
+			var m map[string]any
+			if json.Unmarshal(payload, &m) == nil && m != nil {
+				m["fencing_token"] = job.FencingToken
+				if b, mErr := json.Marshal(m); mErr == nil {
+					payload = b
+				}
+			}
+		}
 		if httpCli, ok := d.client.(*HTTPControlPlaneClient); ok && httpCli != nil && httpCli.BaseURL != "" {
 			var m map[string]any
 			if json.Unmarshal(payload, &m) == nil && m != nil {

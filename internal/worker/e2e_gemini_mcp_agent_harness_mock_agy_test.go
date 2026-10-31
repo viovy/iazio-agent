@@ -91,6 +91,9 @@ func initTestFleetWorkspace(t *testing.T) string {
 	if err := os.WriteFile(filepath.Join(fleetDir, "README.md"), []byte("# Fleet Root\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(fleetDir, ".gitignore"), []byte(".session_story_id\n.autopilot/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	runGit("add", ".")
 	runGit("commit", "-m", "chore: initial fleet commit")
 	return fleetDir
@@ -381,6 +384,90 @@ func TestE2E_GeminiWeb_IazioMCP_HarnessAPI_Agent_Harness_MockAgy(t *testing.T) {
 		}
 		if sup.Lock(worktree) != supervisor.LockCooling {
 			t.Fatalf("expected worktree lock to transition to LockCooling, got %s", sup.Lock(worktree))
+		}
+	})
+
+	// Sub-Scenario D: job_697e5159287042b2 (story.create_and_execute with no pre-allocated StoryID):
+	// mock-agy writes ConversationID via --log-file and writes allocated StoryID to ASE state (.session_story_id);
+	// iazio-harness discovers both ConversationID and StoryID and binds StoryID via PostStoryBinding with fencing_token.
+	t.Run("Job_697e5159287042b2_CreateAndExecute_LogFileConversationID_And_ASEStateStoryBinding", func(t *testing.T) {
+		t.Setenv("MOCK_AGY_SCENARIO", "success")
+		fleetDir := initTestFleetWorkspace(t)
+		t.Setenv("IAZIO_FLEET_ROOT", fleetDir)
+
+		// Simulate mock-agy allocating STORY-GOV-3839 in ASE state (.session_story_id) during execution
+		if err := os.WriteFile(filepath.Join(fleetDir, ".session_story_id"), []byte("STORY-GOV-3839\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		payloadBytes, _ := json.Marshal(map[string]any{
+			"prompt_id":        "prompt_ase_697e5159287042b2",
+			"story_id":         "", // story.create_and_execute never mocks a story_id
+			"repo":             fleetDir,
+			"worktree_path":    fleetDir,
+			"mode":             "story.create_and_execute",
+			"command":          "/autonomous-story-execution",
+			"backlog":          "iazio",
+			"prompt":           "/autonomous-story-execution Sort prompts alphabetically in iazio-web /prompts view",
+			"target_agent":     "agy",
+			"effective_action": "/autonomous-story-execution",
+		})
+		mu.Lock()
+		queuedJobs = append(queuedJobs, &Job{
+			ID:           "job_697e5159287042b2",
+			Type:         JobTypePromptExecute,
+			Repo:         fleetDir,
+			TargetAgent:  "agy",
+			Payload:      payloadBytes,
+			FencingToken: 7,
+			LeaseToken:   "lease-697e5159287042b2",
+		})
+		mu.Unlock()
+
+		cpClient := NewHTTPControlPlaneClient(srv.URL, "test-token", srv.Client())
+		invoker := harness.NewCLIInvoker(harnessBin, fleetDir)
+		var resolvedRepo string
+		disp := NewDispatcher(cpClient, invoker, "debian", nil, nil)
+		disp.SetWorktreeResolver(func(repo string) string {
+			resolvedRepo = fleetDir
+			return fleetDir
+		})
+
+		processed, err := disp.PollAndProcess(context.Background())
+		if err != nil {
+			t.Fatalf("expected PollAndProcess to succeed for job_697e5159287042b2, got: %v", err)
+		}
+		if !processed {
+			t.Fatal("expected PollAndProcess to claim job_697e5159287042b2")
+		}
+		if resolvedRepo != fleetDir {
+			t.Fatalf("expected worktree resolver to bind idle worktree %s, got %s", fleetDir, resolvedRepo)
+		}
+
+		mu.Lock()
+		comp, ok := completedJobs["job_697e5159287042b2"]
+		bound, hasBound := boundStories["job_697e5159287042b2"]
+		mu.Unlock()
+
+		if !ok || comp.Error != "" {
+			t.Fatalf("expected job_697e5159287042b2 to complete cleanly, ok=%v err=%q", ok, comp.Error)
+		}
+		if !hasBound || bound.StoryID != "STORY-GOV-3839" {
+			t.Fatalf("expected iazio-harness to read STORY-GOV-3839 from ASE state and PostStoryBinding, got hasBound=%v bound=%+v", hasBound, bound)
+		}
+		if bound.FencingToken != 7 {
+			t.Fatalf("expected PostStoryBinding to include FencingToken=7, got %d", bound.FencingToken)
+		}
+
+		var promptRes harness.PromptExecutionResult
+		if err := json.Unmarshal(comp.Result, &promptRes); err != nil {
+			t.Fatalf("unmarshal completion result: %v", err)
+		}
+		if promptRes.ActiveConversationID == "" && len(promptRes.ConversationIDs) == 0 {
+			t.Fatalf("expected ConversationID to be captured from --log-file for job_697e5159287042b2, got %+v", promptRes)
+		}
+		if promptRes.StoryID != "STORY-GOV-3839" {
+			t.Fatalf("expected PromptExecutionResult.StoryID=STORY-GOV-3839 from ASE state, got %q", promptRes.StoryID)
 		}
 	})
 }
