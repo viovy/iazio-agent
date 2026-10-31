@@ -638,11 +638,28 @@ func TestInstallWindowsAt(t *testing.T) {
 
 	batPath := filepath.Join(home, ".iazio", "tasks", "iazio-agent.bat")
 	xmlPath := filepath.Join(home, ".iazio", "tasks", "iazio-agent.xml")
-	if _, err := os.Stat(batPath); err != nil {
-		t.Fatalf("bat missing: %v", err)
+	if _, err := os.Stat(batPath); err == nil {
+		t.Fatalf("bat should not exist: %v", batPath)
 	}
 	if _, err := os.Stat(xmlPath); err != nil {
 		t.Fatalf("xml missing: %v", err)
+	}
+	xmlData, err := os.ReadFile(xmlPath)
+	if err != nil {
+		t.Fatalf("read xml: %v", err)
+	}
+	if len(xmlData) < 2 || xmlData[0] != 0xFF || xmlData[1] != 0xFE {
+		t.Fatalf("expected UTF-16LE with BOM, got %d bytes", len(xmlData))
+	}
+	xmlStr := decodeUTF16LE(xmlData[2:])
+	if !strings.Contains(xmlStr, "<LogonType>S4U</LogonType>") {
+		t.Fatalf("expected S4U logon type in xml, got: %s", xmlStr)
+	}
+	if !strings.Contains(xmlStr, bin) {
+		t.Fatalf("expected direct command %s in xml, got: %s", bin, xmlStr)
+	}
+	if !strings.Contains(xmlStr, "run --log-file") {
+		t.Fatalf("expected run --log-file argument in xml, got: %s", xmlStr)
 	}
 	if len(commands) != 2 || !strings.Contains(commands[0], "schtasks /Create") {
 		t.Fatalf("unexpected schtasks command: %v", commands)

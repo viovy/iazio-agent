@@ -3282,3 +3282,47 @@ func TestGov3839_ResolveWorktreePrefersIdleWorktreeWhenPrimaryDirty(t *testing.T
 		t.Fatalf("expected resolveWorktreeFromHostDetail('iazio-web') to select IDLE %s over DIRTY %s, got %s", idleSecond, dirtyPrimary, got)
 	}
 }
+
+func TestRunLogFileFlagAndOutput(t *testing.T) {
+	tmpDir := t.TempDir()
+	logFile := filepath.Join(tmpDir, "logs", "test-agent.log")
+
+	t.Setenv("HOME", tmpDir)
+	t.Setenv("USERPROFILE", tmpDir)
+	t.Setenv("IAZIO_TEST_MODE", "1")
+
+	// 1. Test version with --log-file
+	ctx := context.Background()
+	var stdout, stderr bytes.Buffer
+	err := execute(ctx, []string{"version", "--log-file", logFile}, &stdout, &stderr, nil)
+	if err != nil {
+		t.Fatalf("version with log-file error: %v", err)
+	}
+
+	// 2. Test run with --log-file
+	runLog := filepath.Join(tmpDir, "logs", "run.log")
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel() // cancel immediately so run exits without blocking
+	_ = execute(cancelCtx, []string{"run", "--log-file=" + runLog}, &stdout, &stderr, nil)
+
+	if _, err := os.Stat(runLog); err != nil {
+		t.Fatalf("expected run log file to be created: %v", err)
+	}
+	data, err := os.ReadFile(runLog)
+	if err != nil {
+		t.Fatalf("read run log: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("expected run log to contain supervisor logs/output")
+	}
+
+	// 3. Test IAZIO_LOG_FILE env
+	envLog := filepath.Join(tmpDir, "logs", "env.log")
+	t.Setenv("IAZIO_LOG_FILE", envLog)
+	cancelCtx2, cancel2 := context.WithCancel(ctx)
+	cancel2()
+	_ = execute(cancelCtx2, []string{"run"}, &stdout, &stderr, nil)
+	if _, err := os.Stat(envLog); err != nil {
+		t.Fatalf("expected env log file to be created: %v", err)
+	}
+}

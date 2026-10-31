@@ -88,14 +88,49 @@ func (s *safeWriter) Write(p []byte) (n int, err error) {
 func execute(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
 	preflight.HydrateToolchainEnv()
 	ensureCanonicalSingleHome()
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+
+	var logFilePath string
+	var nonInteractive bool
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--log-file" && i+1 < len(args) {
+			logFilePath = args[i+1]
+			i++
+		} else if strings.HasPrefix(a, "--log-file=") {
+			logFilePath = strings.TrimPrefix(a, "--log-file=")
+		} else if a == "--non-interactive" || a == "-non-interactive" {
+			nonInteractive = true
+		}
+	}
+	if logFilePath == "" {
+		if envFile := strings.TrimSpace(getenv("IAZIO_LOG_FILE")); envFile != "" {
+			logFilePath = envFile
+		} else if envDir := strings.TrimSpace(getenv("IAZIO_LOG_DIR")); envDir != "" {
+			logFilePath = filepath.Join(envDir, "agent.log")
+		}
+	}
+	if nonInteractive || (len(args) > 0 && strings.ToLower(strings.TrimSpace(args[0])) == "run") {
+		_ = os.Setenv("IAZIO_AGENT_NONINTERACTIVE", "1")
+	}
+	if logFilePath != "" {
+		_ = os.MkdirAll(filepath.Dir(logFilePath), 0755)
+		if f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+			defer f.Close()
+			sw := &safeWriter{w: f}
+			stdout = sw
+			stderr = sw
+			log.SetOutput(sw)
+		}
+	}
+
 	if stdout != nil {
 		stdout = &safeWriter{w: stdout}
 	}
 	if stderr != nil {
 		stderr = &safeWriter{w: stderr}
-	}
-	if getenv == nil {
-		getenv = os.Getenv
 	}
 	if len(args) == 0 {
 		return fmt.Errorf("usage: iazio-agent version|auth|service|update|run|probe")
@@ -182,6 +217,12 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}
 			case args[i] == "--update-suite":
 				updateSuite = true
+			case args[i] == "--log-file" && i+1 < len(args):
+				i++
+			case strings.HasPrefix(args[i], "--log-file="):
+				// ok
+			case args[i] == "--non-interactive" || args[i] == "-non-interactive":
+				// ok
 			}
 		}
 		if profile == "" {
