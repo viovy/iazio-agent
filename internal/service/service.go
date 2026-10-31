@@ -762,16 +762,23 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 
 		batPath := filepath.Join(tasksDir, "iazio-agent.bat")
 		xmlPath := filepath.Join(tasksDir, "iazio-agent.xml")
+		_ = os.Remove(batPath)
 		needsInstall := false
-		if data, err := os.ReadFile(batPath); err != nil || !strings.Contains(string(data), bin) {
-			needsInstall = true
-		} else if xData, err := os.ReadFile(xmlPath); err != nil || (!strings.Contains(string(xData), "PT1M") && !bytes.Contains(xData, []byte{'P', 0, 'T', 0, '1', 0, 'M', 0})) {
+		if xData, err := os.ReadFile(xmlPath); err != nil {
 			needsInstall = true
 		} else {
-			if qOut, qErr := statusCheckCommand("schtasks", "/Query", "/TN", "iazio-agent", "/V", "/FO", "LIST"); qErr != nil {
+			xStr := string(xData)
+			hasLogon := (strings.Contains(xStr, "S4U") || strings.Contains(xStr, "InteractiveToken") || bytes.Contains(xData, []byte{'S', 0, '4', 0, 'U', 0}) || bytes.Contains(xData, []byte{'I', 0, 'n', 0, 't', 0, 'e', 0, 'r', 0, 'a', 0, 'c', 0, 't', 0, 'i', 0, 'v', 0, 'e', 0}))
+			hasExe := strings.Contains(strings.ToLower(xStr), "iazio-agent.exe") || bytes.Contains(bytes.ToLower(xData), []byte{'i', 0, 'a', 0, 'z', 0, 'i', 0, 'o', 0, '-', 0, 'a', 0, 'g', 0, 'e', 0, 'n', 0, 't', 0, '.', 0, 'e', 0, 'x', 0, 'e', 0})
+			if (!strings.Contains(xStr, "PT1M") && !bytes.Contains(xData, []byte{'P', 0, 'T', 0, '1', 0, 'M', 0})) || !hasLogon || !hasExe {
 				needsInstall = true
-			} else if len(qOut) > 0 && strings.Contains(string(qOut), "Task To Run:") && !strings.Contains(strings.ToLower(string(qOut)), strings.ToLower(batPath)) {
+			} else if qOut, qErr := statusCheckCommand("schtasks", "/Query", "/TN", "iazio-agent", "/V", "/FO", "LIST"); qErr != nil {
 				needsInstall = true
+			} else {
+				qLower := strings.ToLower(string(qOut))
+				if strings.Contains(qLower, "iazio-agent.bat") || !strings.Contains(qLower, "iazio-agent.exe") {
+					needsInstall = true
+				}
 			}
 		}
 		if needsInstall {
@@ -1574,14 +1581,22 @@ func InstallWindowsAt(home, bin, user string, run func(name string, args ...stri
 	cleanStaleBackups(dir)
 	cleanStaleBackups(filepath.Join(home, ".iazio", "bin"))
 	batPath := filepath.Join(dir, "iazio-agent.bat")
+	_ = os.Remove(batPath) // Purge legacy .bat
 	xmlPath := filepath.Join(dir, "iazio-agent.xml")
 	logPath := filepath.Join(logDir, "agent.log")
 
-	apiLine := ""
-	if apiEnv := resolveHarnessAPIURL(); apiEnv != "" {
-		apiLine = fmt.Sprintf("set \"IAZIO_HARNESS_API_URL=%s\"\r\n", apiEnv)
+	if bin == "" {
+		bin = filepath.Join(home, "bin", "iazio-agent.exe")
 	}
-	bat := fmt.Sprintf("@echo off\r\nset \"IAZIO_AGENT_NONINTERACTIVE=1\"\r\n%s\"%s\" run >> \"%s\" 2>&1\r\n", apiLine, bin, logPath)
+
+	execCommandStr := bin
+	argumentsStr := fmt.Sprintf("run --log-file \"%s\"", logPath)
+
+	sid := windowsLogonUserSID()
+	if sid == "" {
+		sid = user
+	}
+
 	xmlDoc := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers>
@@ -1600,7 +1615,8 @@ func InstallWindowsAt(home, bin, user string, run func(name string, args ...stri
   </Triggers>
   <Principals>
     <Principal id="Author">
-      <LogonType>InteractiveToken</LogonType>
+      <UserId>%s</UserId>
+      <LogonType>S4U</LogonType>
       <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
   </Principals>
@@ -1612,16 +1628,22 @@ func InstallWindowsAt(home, bin, user string, run func(name string, args ...stri
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
   </Settings>
-  <Actions Context="Author"><Exec><Command>%s</Command></Exec></Actions>
+  <Actions Context="Author"><Exec><Command>%s</Command><Arguments>%s</Arguments></Exec></Actions>
 </Task>
-`, user, batPath)
-	if err := os.WriteFile(batPath, []byte(bat), 0o755); err != nil {
-		return err
-	}
+`, user, sid, execCommandStr, argumentsStr)
+
 	if err := os.WriteFile(xmlPath, encodeUTF16LEWithBOM(xmlDoc), 0o644); err != nil {
 		return err
 	}
 	if err := run("schtasks", "/Create", "/TN", "iazio-agent", "/XML", xmlPath, "/F"); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "access is denied") {
+			xmlDocFallback := strings.Replace(xmlDoc, "<LogonType>S4U</LogonType>", "<LogonType>InteractiveToken</LogonType>", 1)
+			_ = os.WriteFile(xmlPath, encodeUTF16LEWithBOM(xmlDocFallback), 0o644)
+			if errFallback := run("schtasks", "/Create", "/TN", "iazio-agent", "/XML", xmlPath, "/F"); errFallback == nil {
+				_ = run("schtasks", "/Run", "/TN", "iazio-agent")
+				return nil
+			}
+		}
 		return err
 	}
 	_ = run("schtasks", "/Run", "/TN", "iazio-agent")
@@ -1637,6 +1659,14 @@ func encodeUTF16LEWithBOM(s string) []byte {
 		out[2+i*2+1] = byte(v >> 8)
 	}
 	return out
+}
+
+func windowsLogonUserSID() string {
+	current, err := user.Current()
+	if err == nil && current != nil && strings.HasPrefix(current.Uid, "S-1-") {
+		return strings.TrimSpace(current.Uid)
+	}
+	return windowsLogonUser()
 }
 
 func windowsLogonUser() string {

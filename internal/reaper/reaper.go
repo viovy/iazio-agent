@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -27,6 +28,18 @@ func isSessionLockHeld(lockPath string) bool {
 	cleanPath, err := filepath.Abs(lockPath)
 	if err != nil {
 		cleanPath = filepath.Clean(lockPath)
+	}
+
+	if runtime.GOOS == "windows" {
+		if _, err := os.Stat(cleanPath); os.IsNotExist(err) {
+			return false
+		}
+		f, err := os.OpenFile(cleanPath, os.O_RDWR, 0)
+		if err != nil {
+			return true
+		}
+		_ = f.Close()
+		return false
 	}
 
 	// 1. Linux /proc/*/fd scanning
