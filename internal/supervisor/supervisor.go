@@ -532,9 +532,15 @@ func (s *Sup) Tick() []ReapedJob {
 	for _, path := range dueDied {
 		jobID := s.JobID(path)
 		if jobID != "" {
-			if st, err := LoadRunState(jobID); err == nil && (st.Status == RunStatusCompleted || (st.ExitCode == 0 && st.Status != RunStatusRunning)) {
-				s.MarkIdle(path)
-				continue
+			if st, err := LoadRunState(jobID); err == nil {
+				if st.Status == RunStatusCompleted || (st.ExitCode == 0 && st.Status != RunStatusRunning) {
+					s.MarkIdle(path)
+					continue
+				}
+				if st.Status == RunStatusFailed {
+					s.BeginCooling(path)
+					continue
+				}
 			}
 		}
 		s.Cancel(path, ReasonProcessDied)

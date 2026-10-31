@@ -185,6 +185,20 @@ func (c *CLIInvoker) ExecutePrompt(ctx context.Context, payload json.RawMessage)
 		res.Output = res.Summary
 	}
 
+	combinedLower := strings.ToLower(res.Summary + "\n" + res.Output + "\n" + stderr)
+	if strings.Contains(combinedLower, "jetski: no output produced") ||
+		strings.Contains(combinedLower, "headless mode cannot prompt for") ||
+		strings.Contains(combinedLower, "so it was auto-denied") {
+		res.Status = "failed"
+		if res.ExitCode == 0 {
+			res.ExitCode = 1
+		}
+		return &res, fmt.Errorf("PERMISSION_DENIED: headless agent tool permission was auto-denied: %s", strings.TrimSpace(res.Summary))
+	}
+	if strings.EqualFold(res.Status, "failed") || res.ExitCode != 0 {
+		return &res, fmt.Errorf("iazio-harness prompt execution failed (status=%s exit=%d): %s", res.Status, res.ExitCode, strings.TrimSpace(res.Summary))
+	}
+
 	return &res, nil
 }
 
@@ -343,6 +357,12 @@ func EnsurePromptPayloadWithJob(jobID, traceID, targetAgent, repo, storyID strin
 	}
 	changed := false
 	promptID, _ := m["prompt_id"].(string)
+	if strings.TrimSpace(jobID) != "" {
+		if existingJobID, _ := m["job_id"].(string); strings.TrimSpace(existingJobID) == "" {
+			m["job_id"] = strings.TrimSpace(jobID)
+			changed = true
+		}
+	}
 	if strings.TrimSpace(promptID) == "" {
 		existingStoryID, _ := m["story_id"].(string)
 		if strings.TrimSpace(existingStoryID) == "" {
