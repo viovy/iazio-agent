@@ -805,6 +805,9 @@ func (c Client) post(ctx context.Context, path string, body any) error {
 }
 
 func (c Client) postJSON(ctx context.Context, path string, body any, out any) error {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err

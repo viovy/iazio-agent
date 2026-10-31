@@ -99,6 +99,7 @@ type Spawner func(ctx context.Context, job TrackedJob) (newPID int, err error)
 type Watchdog struct {
 	mu                   sync.Mutex
 	guardWG              sync.WaitGroup
+	ctx                  context.Context
 	stateFile            string
 	jobs                 map[string]*TrackedJob
 	runner               supervisor.Runner
@@ -296,11 +297,13 @@ func (w *Watchdog) Track(job TrackedJob) {
 
 	// Launch background reaper if runner is available
 	if w.runner != nil && job.PID > 0 {
+		w.guardWG.Add(1)
 		go w.reapProcess(job.JobID, job.PID)
 	}
 }
 
 func (w *Watchdog) reapProcess(jobID string, pid int) {
+	defer w.guardWG.Done()
 	exitCode, err := w.runner.Wait(pid)
 	w.OnProcessExit(jobID, pid, exitCode, err)
 }
@@ -308,6 +311,10 @@ func (w *Watchdog) reapProcess(jobID string, pid int) {
 // OnProcessExit handles termination of a supervised child process.
 func (w *Watchdog) OnProcessExit(jobID string, pid, exitCode int, waitErr error) {
 	w.mu.Lock()
+	if w.ctx != nil && w.ctx.Err() != nil {
+		w.mu.Unlock()
+		return
+	}
 	job, ok := w.jobs[jobID]
 	if !ok {
 		w.mu.Unlock()
@@ -403,6 +410,10 @@ func (w *Watchdog) attemptResume(jobID string) {
 
 func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []string) {
 	w.mu.Lock()
+	if w.ctx != nil && w.ctx.Err() != nil {
+		w.mu.Unlock()
+		return
+	}
 	job, ok := w.jobs[jobID]
 	if !ok || job == nil {
 		w.mu.Unlock()
@@ -440,6 +451,7 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 			w.mu.Unlock()
 
 			if w.runner != nil && newPID > 0 {
+				w.guardWG.Add(1)
 				go w.reapProcess(jobID, newPID)
 			}
 		}
@@ -599,6 +611,7 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 		w.mu.Unlock()
 
 		if w.runner != nil && newPID > 0 {
+			w.guardWG.Add(1)
 			go w.reapProcess(jobID, newPID)
 		}
 	}
@@ -754,6 +767,9 @@ func (w *Watchdog) StartWatchguard(ctx context.Context, interval time.Duration) 
 	if interval <= 0 {
 		interval = DefaultTick
 	}
+	w.mu.Lock()
+	w.ctx = ctx
+	w.mu.Unlock()
 	w.guardWG.Add(1)
 	go func() {
 		defer w.guardWG.Done()
