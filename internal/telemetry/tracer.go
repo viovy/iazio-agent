@@ -638,70 +638,76 @@ func ConfigureZipkinFromAPI(apiURL string) {
 	if derived == "" {
 		return
 	}
-	clean := strings.TrimRight(derived, "/")
-	if !strings.HasSuffix(clean, "/api/v2/spans") {
-		clean = clean + "/api/v2/spans"
-	}
-	t := GlobalTracer()
-	if t == nil {
+	clean := strings.TrimRight(derived, "/") + "/api/v2/spans"
+	ze, ok := GlobalTracer().Exporter.(*ZipkinExporter)
+	if !ok || ze == nil {
 		return
 	}
-	if ze, ok := t.Exporter.(*ZipkinExporter); ok && ze != nil {
-		ze.mu.Lock()
-		if strings.HasPrefix(ze.endpoint, "http://localhost:9411") || strings.HasPrefix(ze.endpoint, "http://127.0.0.1:9411") {
-			ze.endpoint = clean
-		}
-		ze.mu.Unlock()
+	ze.mu.Lock()
+	if strings.HasPrefix(ze.endpoint, "http://localhost:9411") || strings.HasPrefix(ze.endpoint, "http://127.0.0.1:9411") {
+		ze.endpoint = clean
 	}
+	ze.mu.Unlock()
 }
 
 func resolveZipkinFromConfig() string {
 	for _, envKey := range []string{"IAZIO_HARNESS_API_URL", "IAZIO_API_URL"} {
-		if apiEnv := strings.TrimSpace(os.Getenv(envKey)); apiEnv != "" {
-			if derived := DeriveZipkinURLFromAPI(apiEnv); derived != "" {
-				return derived
-			}
+		if derived := DeriveZipkinURLFromAPI(os.Getenv(envKey)); derived != "" {
+			return derived
 		}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return ""
 	}
-	if data, err := os.ReadFile(filepath.Join(home, ".iazio", "config.json")); err == nil {
-		var raw struct {
-			Endpoints map[string]string `json:"endpoints"`
-		}
-		if json.Unmarshal(data, &raw) == nil {
-			if zipkin, ok := raw.Endpoints["zipkin"]; ok && strings.TrimSpace(zipkin) != "" {
-				return strings.TrimSpace(zipkin)
-			}
-			for _, key := range []string{"harness_api", "iazio_api"} {
-				if u, ok := raw.Endpoints[key]; ok && strings.TrimSpace(u) != "" {
-					if derived := DeriveZipkinURLFromAPI(u); derived != "" {
-						return derived
-					}
-				}
-			}
-		}
+	if u := resolveZipkinFromIazioConfig(filepath.Join(home, ".iazio", "config.json")); u != "" {
+		return u
 	}
-	if data, err := os.ReadFile(filepath.Join(home, ".iazio", "agent.json")); err == nil {
-		var raw struct {
-			ZipkinURL string `json:"zipkin_url"`
-			APIURL    string `json:"api_url"`
-		}
-		if json.Unmarshal(data, &raw) == nil {
-			if strings.TrimSpace(raw.ZipkinURL) != "" {
-				return strings.TrimSpace(raw.ZipkinURL)
-			}
-			if derived := DeriveZipkinURLFromAPI(raw.APIURL); derived != "" {
-				return derived
-			}
-		}
+	if u := resolveZipkinFromAgentConfig(filepath.Join(home, ".iazio", "agent.json")); u != "" {
+		return u
 	}
 	if data, err := os.ReadFile(filepath.Join(home, ".iazio", "api_url")); err == nil {
-		if derived := DeriveZipkinURLFromAPI(string(data)); derived != "" {
+		return DeriveZipkinURLFromAPI(string(data))
+	}
+	return ""
+}
+
+func resolveZipkinFromIazioConfig(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var raw struct {
+		Endpoints map[string]string `json:"endpoints"`
+	}
+	if json.Unmarshal(data, &raw) != nil {
+		return ""
+	}
+	if zipkin := strings.TrimSpace(raw.Endpoints["zipkin"]); zipkin != "" {
+		return zipkin
+	}
+	for _, key := range []string{"harness_api", "iazio_api"} {
+		if derived := DeriveZipkinURLFromAPI(raw.Endpoints[key]); derived != "" {
 			return derived
 		}
 	}
 	return ""
+}
+
+func resolveZipkinFromAgentConfig(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var raw struct {
+		ZipkinURL string `json:"zipkin_url"`
+		APIURL    string `json:"api_url"`
+	}
+	if json.Unmarshal(data, &raw) != nil {
+		return ""
+	}
+	if zipkin := strings.TrimSpace(raw.ZipkinURL); zipkin != "" {
+		return zipkin
+	}
+	return DeriveZipkinURLFromAPI(raw.APIURL)
 }
