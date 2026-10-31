@@ -63,12 +63,14 @@ type gitHubAsset struct {
 }
 
 func defaultRepositoryForTool(name string) string {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "autopilot-git-flow", "autopilot-infra-ops", "autopilot-quality-gate", "autopilot-plugins-internal":
-		return "viovy/autopilot-plugins-internal"
-	default:
-		return "viovy/" + strings.TrimSpace(name)
+	clean := strings.ToLower(strings.TrimSpace(name))
+	if clean == "autopilot" {
+		return "viovy/autopilot"
 	}
+	if strings.HasPrefix(clean, "autopilot-") {
+		return "viovy/autopilot-plugins-internal"
+	}
+	return "viovy/" + strings.TrimSpace(name)
 }
 
 // syncLocalEndpoints writes or updates endpoints in ~/.iazio/config.json.
@@ -1450,9 +1452,33 @@ func buildToolFromSourceRepo(
 	nowUTC := time.Now().UTC().Format(time.RFC3339)
 	ldflags := fmt.Sprintf("-s -w -X main.version=%s -X github.com/viovy/autopilot-plugins-internal/pkg/pluginsdk.Version=%s -X main.commit=%s -X main.buildCommitSHA=%s -X main.buildTimeUTC=%s -X main.buildDirty=false", verStr, verStr, shortSHA, shortSHA, nowUTC)
 
-	cmdPath := fmt.Sprintf("./cmd/%s", toolName)
-	if _, err := os.Stat(filepath.Join(buildDir, "cmd", toolName)); err != nil {
-		cmdPath = "."
+	cmdPath := ""
+	candidates := []string{
+		toolName,
+		strings.TrimPrefix(toolName, "autopilot-"),
+		"autopilot-" + toolName,
+	}
+	for _, c := range candidates {
+		if fi, err := os.Stat(filepath.Join(buildDir, "cmd", c)); err == nil && fi.IsDir() {
+			cmdPath = "./cmd/" + c
+			break
+		}
+	}
+	if cmdPath == "" {
+		hasRootGo := false
+		if entries, err := os.ReadDir(buildDir); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() && strings.HasSuffix(e.Name(), ".go") {
+					hasRootGo = true
+					break
+				}
+			}
+		}
+		if hasRootGo {
+			cmdPath = "."
+		} else {
+			return false, fmt.Errorf("compile %s: entrypoint package not found under cmd/ in %s", tool.Name, buildDir)
+		}
 	}
 
 	buildCmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags="+ldflags, "-o", stagingBin, cmdPath)

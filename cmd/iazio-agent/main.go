@@ -93,7 +93,11 @@ func acquireWindowsSingleInstanceMutex(stderr io.Writer) (func(), bool) {
 	if user == "" {
 		user = "user"
 	}
-	ret, alreadyExists, closeFn := createWindowsMutexFn("Local\\iazio-agent-supervisor-" + user)
+	mutexName := "Local\\iazio-agent-supervisor-" + user
+	if isTestBinary() {
+		mutexName += "-test"
+	}
+	ret, alreadyExists, closeFn := createWindowsMutexFn(mutexName)
 	if alreadyExists {
 		if closeFn != nil {
 			closeFn()
@@ -107,10 +111,37 @@ func acquireWindowsSingleInstanceMutex(stderr io.Writer) (func(), bool) {
 	return closeFn, true
 }
 
+var (
+	activeAgentLockMu sync.Mutex
+	activeAgentUnlock func()
+)
+
+func releaseAgentSingleInstanceLock() {
+	activeAgentLockMu.Lock()
+	defer activeAgentLockMu.Unlock()
+	if activeAgentUnlock != nil {
+		activeAgentUnlock()
+		activeAgentUnlock = nil
+	}
+}
+
 func acquireAgentSingleInstanceLock(home string, stdout, stderr io.Writer) (func(), bool) {
 	if running, pid := service.StatusUserDaemonAt(home); running && pid > 0 && pid != os.Getpid() {
-		fmt.Fprintf(stderr, "another iazio-agent instance (PID %d) is already running on this host/user; exiting\n", pid)
-		return nil, false
+		handoff := os.Getenv("IAZIO_HANDOFF_PID")
+		if handoff != "" && strconv.Itoa(pid) == handoff {
+			// Upgraded child process waiting for parent process to exit
+			deadline := time.Now().Add(15 * time.Second)
+			for time.Now().Before(deadline) {
+				if r, _ := service.StatusUserDaemonAt(home); !r {
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+		if running, pid := service.StatusUserDaemonAt(home); running && pid > 0 && pid != os.Getpid() {
+			fmt.Fprintf(stderr, "another iazio-agent instance (PID %d) is already running on this host/user; exiting\n", pid)
+			return nil, false
+		}
 	}
 
 	var winUnlock func()
@@ -126,11 +157,19 @@ func acquireAgentSingleInstanceLock(home string, stdout, stderr io.Writer) (func
 	_ = os.MkdirAll(filepath.Dir(pidFile), 0755)
 	_ = os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0644)
 
-	return func() {
+	unlock := func() {
 		_ = os.Remove(pidFile)
 		if winUnlock != nil {
 			winUnlock()
 		}
+	}
+
+	activeAgentLockMu.Lock()
+	activeAgentUnlock = unlock
+	activeAgentLockMu.Unlock()
+
+	return func() {
+		releaseAgentSingleInstanceLock()
 	}, true
 }
 
@@ -159,9 +198,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 	}
 	args = cleanArgs
 
-	if runtime.GOOS == "windows" && (nonInteractive || getenv("IAZIO_AGENT_NONINTERACTIVE") == "1") {
-		detachWindowsConsole()
-	}
+	isDaemonRun := len(args) > 0 && strings.ToLower(strings.TrimSpace(args[0])) == "run"
 	if logFilePath == "" {
 		if envFile := strings.TrimSpace(getenv("IAZIO_LOG_FILE")); envFile != "" {
 			logFilePath = envFile
@@ -169,7 +206,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			logFilePath = filepath.Join(envDir, "agent.log")
 		}
 	}
-	if nonInteractive || (len(args) > 0 && strings.ToLower(strings.TrimSpace(args[0])) == "run") {
+	if !isTestBinary() && runtime.GOOS == "windows" && (nonInteractive || isDaemonRun || logFilePath != "" || getenv("IAZIO_AGENT_NONINTERACTIVE") == "1") {
+		detachWindowsConsole()
+	}
+	if nonInteractive || isDaemonRun {
 		_ = os.Setenv("IAZIO_AGENT_NONINTERACTIVE", "1")
 	}
 	if logFilePath != "" {
@@ -221,6 +261,17 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 	case "update":
 		return runUpdate(ctx, args[1:], stdout, stderr, getenv)
 	case "run":
+		defer func() {
+			if r := recover(); r != nil {
+				buf := make([]byte, 8192)
+				n := runtime.Stack(buf, false)
+				msg := fmt.Sprintf("[agent] PANIC RECOVERED: %v\n%s", r, string(buf[:n]))
+				log.Print(msg)
+				if stderr != nil {
+					fmt.Fprintln(stderr, msg)
+				}
+			}
+		}()
 		home, _ := os.UserHomeDir()
 		if home != "" && !isTestBinary() {
 			unlock, ok := acquireAgentSingleInstanceLock(home, stdout, stderr)
@@ -2396,19 +2447,6 @@ func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Cli
 
 var syscallExec = syscall.Exec
 
-// buildWindowsSelfRestartCommand constructs the detached background command and scheduled-task fallback
-// used on Windows when syscall.Exec is unsupported (EWINDOWS).
-func buildWindowsSelfRestartCommand(targetBin string, args []string, env []string) (*exec.Cmd, *exec.Cmd) {
-	var passArgs []string
-	if len(args) > 1 {
-		passArgs = args[1:]
-	}
-	spawnCmd := exec.Command(targetBin, passArgs...)
-	spawnCmd.Env = env
-	schtasksCmd := exec.Command("schtasks", "/Run", "/TN", "iazio-agent")
-	return spawnCmd, schtasksCmd
-}
-
 func resolveSelfBinaryPath(goos string, selfBin string, home string, args []string) string {
 	cleanSelf := strings.TrimSuffix(selfBin, " (deleted)")
 	if goos == "windows" {
@@ -2459,20 +2497,27 @@ func restartOrExecSelf(stdout io.Writer) {
 	home, _ := os.UserHomeDir()
 	targetBin := resolveSelfBinaryPath(runtime.GOOS, selfBin, home, os.Args)
 
+	if runtime.GOOS == "windows" {
+		if isTesting {
+			return
+		}
+		// Cleanly release active agent mutex lock before spawning child to prevent lock collision
+		releaseAgentSingleInstanceLock()
+		env := append(os.Environ(), fmt.Sprintf("IAZIO_HANDOFF_PID=%d", os.Getpid()))
+		spawnCmd, schtasksCmd := buildWindowsSelfRestartCommand(targetBin, os.Args, env)
+		if startErr := spawnCmd.Start(); startErr == nil {
+			os.Exit(0)
+		}
+		_ = schtasksCmd.Run()
+		os.Exit(0)
+	}
+
 	execErr := syscallExec(targetBin, os.Args, os.Environ())
 	if execErr != nil {
 		if isTesting {
 			return
 		}
 		fmt.Fprintf(os.Stderr, "[SIR: AUTO_RESTART_FAIL] syscall.Exec(%s) failed: %v; attempting background restart and service revive\n", targetBin, execErr)
-		if runtime.GOOS == "windows" {
-			spawnCmd, schtasksCmd := buildWindowsSelfRestartCommand(targetBin, os.Args, os.Environ())
-			if startErr := spawnCmd.Start(); startErr == nil {
-				os.Exit(0)
-			}
-			_ = schtasksCmd.Run()
-			os.Exit(0)
-		}
 		// Fallback: spawn background restart so the host never stays offline
 		cmd := exec.Command(targetBin, os.Args[1:]...)
 		cmd.Env = os.Environ()

@@ -1331,15 +1331,13 @@ func InstallUserDaemonAt(home, bin string, run func(name string, args ...string)
 
 	runnerPath := filepath.Join(daemonDir, "runner.sh")
 	logPath := filepath.Join(logDir, "agent.log")
-	pidPath := filepath.Join(home, ".iazio", "agent.pid")
 	apiURL := resolveHarnessAPIURL()
 
 	runnerScript := fmt.Sprintf("#!/bin/sh\n"+
 		"# iazio-agent user-space supervisor runner\n"+
 		"export IAZIO_AGENT_NONINTERACTIVE=1\n"+
 		"export IAZIO_HARNESS_API_URL=\"%s\"\n"+
-		"echo $$ > \"%s\"\n"+
-		"exec \"%s\" run >> \"%s\" 2>&1\n", apiURL, pidPath, bin, logPath)
+		"exec \"%s\" run --log-file \"%s\"\n", apiURL, bin, logPath)
 
 	if err := os.WriteFile(runnerPath, []byte(runnerScript), 0o755); err != nil {
 		return err
