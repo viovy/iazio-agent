@@ -321,3 +321,64 @@ func TestNewZipkinExporter_EnvBranches(t *testing.T) {
 		t.Errorf("expected empty spoolDir with none, got: %s", exp.spoolDir)
 	}
 }
+
+func TestDeriveZipkinURLFromAPIAndTrace7e97788c6f8c8bcea43de8bd9cc29e0b(t *testing.T) {
+	if got := DeriveZipkinURLFromAPI("https://tian.go.ro/iazio-api"); got != "https://tian.go.ro/zipkin" {
+		t.Fatalf("expected https://tian.go.ro/zipkin, got %q", got)
+	}
+	if got := DeriveZipkinURLFromAPI("http://192.168.1.50:8080"); got != "http://192.168.1.50:9411" {
+		t.Fatalf("expected http://192.168.1.50:9411, got %q", got)
+	}
+
+	t.Setenv("ZIPKIN_ENDPOINT", "")
+	t.Setenv("OTEL_EXPORTER_ZIPKIN_ENDPOINT", "")
+	t.Setenv("IAZIO_HARNESS_API_URL", "https://tian.go.ro/iazio-api")
+	exp := NewZipkinExporter("")
+	defer exp.Close()
+	if exp.endpoint != "https://tian.go.ro/zipkin/api/v2/spans" {
+		t.Fatalf("expected derived endpoint https://tian.go.ro/zipkin/api/v2/spans, got %q", exp.endpoint)
+	}
+
+	// Verify ConfigureZipkinFromAPI updates a localhost default exporter and exports trace 7e97788c6f8c8bcea43de8bd9cc29e0b
+	received := make(chan []ZipkinSpan, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var spans []ZipkinSpan
+		_ = json.NewDecoder(r.Body).Decode(&spans)
+		received <- spans
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer ts.Close()
+
+	t.Setenv("IAZIO_HARNESS_API_URL", "")
+	orig := GlobalTracer()
+	defer SetGlobalTracer(orig)
+
+	cleanup := InitGlobalTracer("iazio-agent", "http://localhost:9411")
+	defer cleanup()
+
+	// Point global exporter to test server and emit iazio-agent span for trace 7e97788c6f8c8bcea43de8bd9cc29e0b
+	if ze, ok := GlobalTracer().Exporter.(*ZipkinExporter); ok {
+		ze.mu.Lock()
+		ze.endpoint = ts.URL + "/api/v2/spans"
+		ze.mu.Unlock()
+	}
+
+	_, span := StartSpan(context.Background(), "agent.job.execute",
+		WithParentTrace("7e97788c6f8c8bcea43de8bd9cc29e0b", "a43de8bd9cc29e0b"),
+		WithTag("job.id", "job_3ffa5d0be1649f0e"),
+		WithTag("host.id", "debian"),
+	)
+	span.End()
+
+	select {
+	case spans := <-received:
+		if len(spans) != 1 {
+			t.Fatalf("expected 1 span, got %d", len(spans))
+		}
+		if spans[0].TraceID != "7e97788c6f8c8bcea43de8bd9cc29e0b" || spans[0].LocalEndpoint.ServiceName != "iazio-agent" {
+			t.Fatalf("expected trace 7e97788c6f8c8bcea43de8bd9cc29e0b from iazio-agent, got %+v", spans[0])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for iazio-agent span export")
+	}
+}

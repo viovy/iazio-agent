@@ -344,6 +344,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		if profile == "" {
 			profile = "generic"
 		}
+		telemetry.ConfigureZipkinFromAPI(api)
 		host := resolveHostID(getenv, os.Hostname, nil)
 		esURL := strings.TrimSpace(getenv("IAZIO_ELASTICSEARCH_URL"))
 		if esURL == "" {
