@@ -738,74 +738,84 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 	} else if runtime.GOOS == "darwin" {
 		return reconcileDarwinServiceConfiguration(home, bin, run)
 	} else if runtime.GOOS == "windows" {
-		tasksDir := filepath.Join(home, ".iazio", "tasks")
-		cleanStaleBackups(tasksDir)
-		cleanStaleBackups(filepath.Join(home, ".local", "bin"))
-		cleanStaleBackups(filepath.Join(home, "bin"))
-		binDir := filepath.Join(home, ".iazio", "bin")
-		cleanStaleBackups(binDir)
-		for _, legacyBin := range []string{"iazio-agent", "iazio-harvester", "iazio-harness"} {
-			_ = os.Remove(filepath.Join(binDir, legacyBin+".exe"))
-			_ = os.Remove(filepath.Join(binDir, legacyBin+".old"))
-			_ = os.Remove(filepath.Join(binDir, legacyBin+".version"))
-		}
+		return reconcileWindowsServiceConfiguration(home, bin, run)
+	}
+	return nil
+}
 
-		// Per ADR-002, iazio-harness must NEVER be installed as a user or system service.
-		harnessBat := filepath.Join(tasksDir, "iazio-harness.bat")
-		harnessXML := filepath.Join(tasksDir, "iazio-harness.xml")
-		if _, err := os.Stat(harnessBat); err == nil {
-			_ = run("schtasks", "/End", "/TN", "iazio-harness")
-			_ = run("schtasks", "/Delete", "/TN", "iazio-harness", "/F")
-			_ = os.Remove(harnessBat)
-			_ = os.Remove(harnessXML)
-		}
+func reconcileWindowsServiceConfiguration(home, bin string, run func(name string, args ...string) error) error {
+	if run == nil {
+		run = execCommand
+	}
+	if bin == "" || bin == "iazio-agent" || !filepath.IsAbs(bin) || strings.Contains(bin, filepath.Join(".iazio", "bin")) {
+		bin = filepath.Join(home, "bin", "iazio-agent.exe")
+	}
+	tasksDir := filepath.Join(home, ".iazio", "tasks")
+	cleanStaleBackups(tasksDir)
+	cleanStaleBackups(filepath.Join(home, ".local", "bin"))
+	cleanStaleBackups(filepath.Join(home, "bin"))
+	binDir := filepath.Join(home, ".iazio", "bin")
+	cleanStaleBackups(binDir)
+	for _, legacyBin := range []string{"iazio-agent", "iazio-harvester", "iazio-harness"} {
+		_ = os.Remove(filepath.Join(binDir, legacyBin+".exe"))
+		_ = os.Remove(filepath.Join(binDir, legacyBin+".old"))
+		_ = os.Remove(filepath.Join(binDir, legacyBin+".version"))
+	}
 
-		batPath := filepath.Join(tasksDir, "iazio-agent.bat")
-		xmlPath := filepath.Join(tasksDir, "iazio-agent.xml")
-		_ = os.Remove(batPath)
-		needsInstall := false
-		if xData, err := os.ReadFile(xmlPath); err != nil {
+	// Per ADR-002, iazio-harness must NEVER be installed as a user or system service.
+	harnessBat := filepath.Join(tasksDir, "iazio-harness.bat")
+	harnessXML := filepath.Join(tasksDir, "iazio-harness.xml")
+	if _, err := os.Stat(harnessBat); err == nil {
+		_ = run("schtasks", "/End", "/TN", "iazio-harness")
+		_ = run("schtasks", "/Delete", "/TN", "iazio-harness", "/F")
+		_ = os.Remove(harnessBat)
+		_ = os.Remove(harnessXML)
+	}
+
+	batPath := filepath.Join(tasksDir, "iazio-agent.bat")
+	xmlPath := filepath.Join(tasksDir, "iazio-agent.xml")
+	_ = os.Remove(batPath)
+	needsInstall := false
+	if xData, err := os.ReadFile(xmlPath); err != nil {
+		needsInstall = true
+	} else {
+		xStr := string(xData)
+		hasLogon := (strings.Contains(xStr, "S4U") || strings.Contains(xStr, "InteractiveToken") || bytes.Contains(xData, []byte{'S', 0, '4', 0, 'U', 0}) || bytes.Contains(xData, []byte{'I', 0, 'n', 0, 't', 0, 'e', 0, 'r', 0, 'a', 0, 'c', 0, 't', 0, 'i', 0, 'v', 0, 'e', 0}))
+		hasExe := strings.Contains(strings.ToLower(xStr), "iazio-agent.exe") || bytes.Contains(bytes.ToLower(xData), []byte{'i', 0, 'a', 0, 'z', 0, 'i', 0, 'o', 0, '-', 0, 'a', 0, 'g', 0, 'e', 0, 'n', 0, 't', 0, '.', 0, 'e', 0, 'x', 0, 'e', 0})
+		if (!strings.Contains(xStr, "PT1M") && !bytes.Contains(xData, []byte{'P', 0, 'T', 0, '1', 0, 'M', 0})) || !hasLogon || !hasExe {
+			needsInstall = true
+		} else if qOut, qErr := statusCheckCommand("schtasks", "/Query", "/TN", "iazio-agent", "/V", "/FO", "LIST"); qErr != nil {
 			needsInstall = true
 		} else {
-			xStr := string(xData)
-			hasLogon := (strings.Contains(xStr, "S4U") || strings.Contains(xStr, "InteractiveToken") || bytes.Contains(xData, []byte{'S', 0, '4', 0, 'U', 0}) || bytes.Contains(xData, []byte{'I', 0, 'n', 0, 't', 0, 'e', 0, 'r', 0, 'a', 0, 'c', 0, 't', 0, 'i', 0, 'v', 0, 'e', 0}))
-			hasExe := strings.Contains(strings.ToLower(xStr), "iazio-agent.exe") || bytes.Contains(bytes.ToLower(xData), []byte{'i', 0, 'a', 0, 'z', 0, 'i', 0, 'o', 0, '-', 0, 'a', 0, 'g', 0, 'e', 0, 'n', 0, 't', 0, '.', 0, 'e', 0, 'x', 0, 'e', 0})
-			if (!strings.Contains(xStr, "PT1M") && !bytes.Contains(xData, []byte{'P', 0, 'T', 0, '1', 0, 'M', 0})) || !hasLogon || !hasExe {
+			qLower := strings.ToLower(string(qOut))
+			if strings.Contains(qLower, "iazio-agent.bat") || !strings.Contains(qLower, "iazio-agent.exe") {
 				needsInstall = true
-			} else if qOut, qErr := statusCheckCommand("schtasks", "/Query", "/TN", "iazio-agent", "/V", "/FO", "LIST"); qErr != nil {
-				needsInstall = true
-			} else {
-				qLower := strings.ToLower(string(qOut))
-				if strings.Contains(qLower, "iazio-agent.bat") || !strings.Contains(qLower, "iazio-agent.exe") {
-					needsInstall = true
+			}
+		}
+	}
+	if needsInstall {
+		if err := InstallWindowsAt(home, bin, windowsLogonUser(), run); err != nil {
+			return err
+		}
+	} else {
+		lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
+		inMaintenance := false
+		if info, err := os.Stat(lockFile); err == nil && time.Since(info.ModTime()) <= 2*time.Hour {
+			inMaintenance = true
+		}
+		if !inMaintenance {
+			if out, err := statusCheckCommand("schtasks", "/Query", "/TN", "iazio-agent", "/FO", "LIST"); err == nil {
+				if running, _, ok := ParseSchtasksStatus(string(out)); ok && !running {
+					_ = run("schtasks", "/Run", "/TN", "iazio-agent")
 				}
 			}
 		}
-		if needsInstall {
-			if err := InstallWindowsAt(home, bin, windowsLogonUser(), run); err != nil {
-				return err
-			}
-		} else {
-			lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
-			inMaintenance := false
-			if info, err := os.Stat(lockFile); err == nil && time.Since(info.ModTime()) <= 2*time.Hour {
-				inMaintenance = true
-			}
-			if !inMaintenance {
-				if out, err := statusCheckCommand("schtasks", "/Query", "/TN", "iazio-agent", "/FO", "LIST"); err == nil {
-					if running, _, ok := ParseSchtasksStatus(string(out)); ok && !running {
-						_ = run("schtasks", "/Run", "/TN", "iazio-agent")
-					}
-				}
-			}
-		}
+	}
 
-		// Reconcile companion iazio-harvester Windows user service if installed in canonical ~/bin
-		harvesterBin := filepath.Join(home, "bin", "iazio-harvester.exe")
-		if _, err := os.Stat(harvesterBin); err == nil && !isTestProcess() {
-			_ = exec.Command(harvesterBin, "service", "reconcile").Run()
-		}
-		return nil
+	// Reconcile companion iazio-harvester Windows user service if installed in canonical ~/bin
+	harvesterBin := filepath.Join(home, "bin", "iazio-harvester.exe")
+	if _, err := os.Stat(harvesterBin); err == nil && !isTestProcess() {
+		_ = exec.Command(harvesterBin, "service", "reconcile").Run()
 	}
 	return nil
 }

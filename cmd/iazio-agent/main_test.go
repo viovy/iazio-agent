@@ -3333,4 +3333,73 @@ func TestRunLogFileFlagAndOutput(t *testing.T) {
 	if err := execute(cancelCtx3, []string{"--log-file", precedingLog, "help"}, &stdout, &stderr, nil); err != nil {
 		t.Fatalf("expected nil error when --log-file precedes subcommand, got %v", err)
 	}
+
+	// 5. Test IAZIO_LOG_DIR and --non-interactive
+	t.Setenv("IAZIO_LOG_FILE", "")
+	logDir := filepath.Join(tmpDir, "logdir")
+	t.Setenv("IAZIO_LOG_DIR", logDir)
+	cancelCtx4, cancel4 := context.WithCancel(ctx)
+	cancel4()
+	_ = execute(cancelCtx4, []string{"--non-interactive", "run"}, &stdout, &stderr, nil)
+	if _, err := os.Stat(filepath.Join(logDir, "agent.log")); err != nil {
+		t.Fatalf("expected IAZIO_LOG_DIR/agent.log to be created: %v", err)
+	}
+}
+
+func TestAcquireAgentSingleInstanceLockAndWindowsMutex(t *testing.T) {
+	tmpHome := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	origGOOS := currentGOOS
+	origMutexFn := createWindowsMutexFn
+	defer func() {
+		currentGOOS = origGOOS
+		createWindowsMutexFn = origMutexFn
+	}()
+
+	// 1. Default non-windows lock + unlock
+	ret, exists, closeFn := createWindowsNamedMutex("test")
+	if ret == 0 || exists {
+		t.Fatalf("unexpected default createWindowsNamedMutex: ret=%d exists=%v", ret, exists)
+	}
+	if closeFn != nil {
+		closeFn()
+	}
+	detachWindowsConsole()
+
+	unlock, ok := acquireAgentSingleInstanceLock(tmpHome, &stdout, &stderr)
+	if !ok || unlock == nil {
+		t.Fatalf("expected acquireAgentSingleInstanceLock to succeed")
+	}
+	unlock()
+
+	// 2. Simulated Windows path: success, already-exists, and zero-handle failure
+	currentGOOS = "windows"
+	t.Setenv("USERNAME", "")
+	closed := false
+	createWindowsMutexFn = func(name string) (uintptr, bool, func()) {
+		return 42, false, func() { closed = true }
+	}
+	winUnlock, ok := acquireAgentSingleInstanceLock(tmpHome, &stdout, &stderr)
+	if !ok || winUnlock == nil {
+		t.Fatalf("expected Windows single instance lock to succeed")
+	}
+	winUnlock()
+	if !closed {
+		t.Fatalf("expected Windows mutex close callback to run on unlock")
+	}
+
+	createWindowsMutexFn = func(name string) (uintptr, bool, func()) {
+		return 99, true, func() { closed = true }
+	}
+	if _, ok := acquireAgentSingleInstanceLock(tmpHome, &stdout, &stderr); ok {
+		t.Fatalf("expected already-existing Windows mutex to reject lock")
+	}
+
+	createWindowsMutexFn = func(name string) (uintptr, bool, func()) {
+		return 0, false, nil
+	}
+	if _, ok := acquireAgentSingleInstanceLock(tmpHome, &stdout, &stderr); ok {
+		t.Fatalf("expected zero-handle Windows mutex to reject lock")
+	}
 }

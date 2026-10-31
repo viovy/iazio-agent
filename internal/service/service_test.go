@@ -664,6 +664,55 @@ func TestInstallWindowsAt(t *testing.T) {
 	if len(commands) != 2 || !strings.Contains(commands[0], "schtasks /Create") {
 		t.Fatalf("unexpected schtasks command: %v", commands)
 	}
+
+	// Verify S4U access-denied fallback to InteractiveToken and default bin resolution
+	createAttempts := 0
+	fallbackRunner := func(name string, args ...string) error {
+		if len(args) > 0 && args[0] == "/Create" {
+			createAttempts++
+			if createAttempts == 1 {
+				return fmt.Errorf("ERROR: Access is denied")
+			}
+		}
+		return nil
+	}
+	if err := InstallWindowsAt(home, "", "DOMAIN\\user", fallbackRunner); err != nil {
+		t.Fatalf("InstallWindowsAt S4U fallback failed: %v", err)
+	}
+	if createAttempts != 2 {
+		t.Fatalf("expected 2 schtasks /Create attempts on S4U access denied, got %d", createAttempts)
+	}
+
+	// Test reconcileWindowsServiceConfiguration directly (missing XML -> installs, then healthy XML -> starts stopped task)
+	tasksDir := filepath.Join(home, ".iazio", "tasks")
+	_ = os.WriteFile(filepath.Join(tasksDir, "iazio-harness.bat"), []byte("bad"), 0o644)
+	_ = os.Remove(xmlPath)
+
+	origStatusCmd := statusCheckCommand
+	defer func() { statusCheckCommand = origStatusCmd }()
+
+	if err := reconcileWindowsServiceConfiguration(home, "", runner); err != nil {
+		t.Fatalf("reconcileWindowsServiceConfiguration install branch failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tasksDir, "iazio-harness.bat")); !os.IsNotExist(err) {
+		t.Fatalf("expected iazio-harness.bat to be purged")
+	}
+
+	// Now XML exists with S4U, PT1M, and iazio-agent.exe; simulate schtasks query showing task stopped
+	statusCheckCommand = func(name string, args ...string) ([]byte, error) {
+		return []byte("TaskName: \\iazio-agent\nTask To Run: C:\\Users\\user\\bin\\iazio-agent.exe run\nStatus: Ready\n"), nil
+	}
+	if err := reconcileWindowsServiceConfiguration(home, bin, runner); err != nil {
+		t.Fatalf("reconcileWindowsServiceConfiguration healthy branch failed: %v", err)
+	}
+
+	// Simulate schtasks query showing legacy .bat -> triggers reinstall
+	statusCheckCommand = func(name string, args ...string) ([]byte, error) {
+		return []byte("TaskName: \\iazio-agent\nTask To Run: C:\\Users\\user\\.iazio\\tasks\\iazio-agent.bat\nStatus: Running\n"), nil
+	}
+	if err := reconcileWindowsServiceConfiguration(home, bin, runner); err != nil {
+		t.Fatalf("reconcileWindowsServiceConfiguration legacy bat branch failed: %v", err)
+	}
 }
 
 func TestDaemonPIDLifecycleExtended(t *testing.T) {
