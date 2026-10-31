@@ -523,11 +523,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}
 				return client.PostEagerReadiness(c, h, r)
 			})
-			eagerUpdater.StartHybridTriggerLoop(runCtx, func() {
-				restartOrExecSelf(stdout)
-				cancel()
-			})
-			eagerUpdater.TriggerEvaluation("agent_startup")
 
 			if api != "" {
 				driftFetcher := &supervisor.HTTPDriftFetcher{
@@ -561,7 +556,12 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				)
 			}
 
-			// Start repoMonitor AFTER eagerUpdater is fully constructed to eliminate initialization race
+			// Start hybrid trigger loop and repoMonitor AFTER eagerUpdater is fully constructed to eliminate initialization race
+			eagerUpdater.StartHybridTriggerLoop(runCtx, func() {
+				restartOrExecSelf(stdout)
+				cancel()
+			})
+			eagerUpdater.TriggerEvaluation("agent_startup")
 			repoMonitor.Start(runCtx)
 
 			var lastUpdateCheck time.Time = time.Now().UTC()
@@ -1266,6 +1266,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 
 			wdRunner := supervisor.NewOSRunner()
 			spawner := func(sCtx context.Context, job watchdog.TrackedJob) (int, error) {
+				if runCtx.Err() != nil {
+					return 0, runCtx.Err()
+				}
 				argv := []string{
 					"iazio-harness", "run",
 					"--job-id", job.JobID,
@@ -1296,6 +1299,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				Runner:  wdRunner,
 				Spawner: spawner,
 				OnOrphanTool: func(job watchdog.TrackedJob) {
+					if runCtx.Err() != nil {
+						return
+					}
 					msg := fmt.Sprintf("\n[ASE-SUPERVISOR] [watchdog.orphan_tool_detected] Harness process (PID %d) terminated, but AI tool process (ToolPID %d, engine: %s) is STILL RUNNING for conversation %s in %s. Attaching new supervisor...\n",
 						job.PID, job.ToolPID, job.Engine, job.ConversationID, job.WorktreePath)
 					if stdout != nil {
@@ -1304,6 +1310,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					_ = client.PostChunk(runCtx, job.JobID, "stdout", msg)
 				},
 				OnAutoResume: func(job watchdog.TrackedJob, reason string, attempt, max int) {
+					if runCtx.Err() != nil {
+						return
+					}
 					promptDesc := "resume"
 					if job.ConversationID == "" {
 						if repolock.IsWorktreeDirty(job.WorktreePath) {
@@ -1325,6 +1334,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 				},
 				OnJobTerminalFailure: func(job watchdog.TrackedJob, reason string) {
+					if runCtx.Err() != nil {
+						return
+					}
 					msg := fmt.Sprintf("\n[ASE-SUPERVISOR] [watchdog.terminal_failure] Execution terminated permanently for job %s: %s\n",
 						job.JobID, reason)
 					if stderr != nil {
@@ -1345,6 +1357,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				},
 			})
 			wd.StartWatchguard(runCtx, 5*time.Second)
+			defer func() {
+				cancel()
+				wd.WaitWatchguard()
+			}()
 
 			reattached := sup.ScanAndReattachRuns(wdRunner)
 			for _, r := range reattached {
