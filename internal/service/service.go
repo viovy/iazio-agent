@@ -768,9 +768,9 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 			needsInstall = true
 		} else {
 			xStr := string(xData)
-			if (!strings.Contains(xStr, "PT1M") && !bytes.Contains(xData, []byte{'P', 0, 'T', 0, '1', 0, 'M', 0})) ||
-				(!strings.Contains(xStr, "S4U") && !bytes.Contains(xData, []byte{'S', 0, '4', 0, 'U', 0})) ||
-				(!strings.Contains(strings.ToLower(xStr), "iazio-agent.exe") && !bytes.Contains(bytes.ToLower(xData), []byte{'i', 0, 'a', 0, 'z', 0, 'i', 0, 'o', 0, '-', 0, 'a', 0, 'g', 0, 'e', 0, 'n', 0, 't', 0, '.', 0, 'e', 0, 'x', 0, 'e', 0})) {
+			hasLogon := (strings.Contains(xStr, "S4U") || strings.Contains(xStr, "InteractiveToken") || bytes.Contains(xData, []byte{'S', 0, '4', 0, 'U', 0}) || bytes.Contains(xData, []byte{'I', 0, 'n', 0, 't', 0, 'e', 0, 'r', 0, 'a', 0, 'c', 0, 't', 0, 'i', 0, 'v', 0, 'e', 0}))
+			hasExe := strings.Contains(strings.ToLower(xStr), "iazio-agent.exe") || bytes.Contains(bytes.ToLower(xData), []byte{'i', 0, 'a', 0, 'z', 0, 'i', 0, 'o', 0, '-', 0, 'a', 0, 'g', 0, 'e', 0, 'n', 0, 't', 0, '.', 0, 'e', 0, 'x', 0, 'e', 0})
+			if (!strings.Contains(xStr, "PT1M") && !bytes.Contains(xData, []byte{'P', 0, 'T', 0, '1', 0, 'M', 0})) || !hasLogon || !hasExe {
 				needsInstall = true
 			} else if qOut, qErr := statusCheckCommand("schtasks", "/Query", "/TN", "iazio-agent", "/V", "/FO", "LIST"); qErr != nil {
 				needsInstall = true
@@ -1590,7 +1590,12 @@ func InstallWindowsAt(home, bin, user string, run func(name string, args ...stri
 	}
 
 	execCommandStr := bin
-	argumentsStr := fmt.Sprintf("run --log-file %s", logPath)
+	argumentsStr := fmt.Sprintf("run --log-file \"%s\"", logPath)
+
+	sid := windowsLogonUserSID()
+	if sid == "" {
+		sid = user
+	}
 
 	xmlDoc := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -1625,7 +1630,7 @@ func InstallWindowsAt(home, bin, user string, run func(name string, args ...stri
   </Settings>
   <Actions Context="Author"><Exec><Command>%s</Command><Arguments>%s</Arguments></Exec></Actions>
 </Task>
-`, user, user, execCommandStr, argumentsStr)
+`, user, sid, execCommandStr, argumentsStr)
 
 	if err := os.WriteFile(xmlPath, encodeUTF16LEWithBOM(xmlDoc), 0o644); err != nil {
 		return err
@@ -1654,6 +1659,14 @@ func encodeUTF16LEWithBOM(s string) []byte {
 		out[2+i*2+1] = byte(v >> 8)
 	}
 	return out
+}
+
+func windowsLogonUserSID() string {
+	current, err := user.Current()
+	if err == nil && current != nil && strings.HasPrefix(current.Uid, "S-1-") {
+		return strings.TrimSpace(current.Uid)
+	}
+	return windowsLogonUser()
 }
 
 func windowsLogonUser() string {

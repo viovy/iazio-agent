@@ -31,6 +31,9 @@ func isSessionLockHeld(lockPath string) bool {
 	}
 
 	if runtime.GOOS == "windows" {
+		if _, err := os.Stat(cleanPath); os.IsNotExist(err) {
+			return false
+		}
 		f, err := os.OpenFile(cleanPath, os.O_RDWR, 0)
 		if err != nil {
 			return true

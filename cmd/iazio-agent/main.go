@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/viovy/iazio-agent/internal/auth"
 	"github.com/viovy/iazio-agent/internal/controlplane"
@@ -85,6 +86,51 @@ func (s *safeWriter) Write(p []byte) (n int, err error) {
 	return s.w.Write(p)
 }
 
+func acquireAgentSingleInstanceLock(home string, stdout, stderr io.Writer) (func(), bool) {
+	if running, pid := service.StatusUserDaemonAt(home); running && pid > 0 && pid != os.Getpid() {
+		fmt.Fprintf(stderr, "another iazio-agent instance (PID %d) is already running on this host/user; exiting\n", pid)
+		return nil, false
+	}
+
+	var winUnlock func()
+	if runtime.GOOS == "windows" {
+		k32 := syscall.NewLazyDLL("kernel32.dll")
+		createMutex := k32.NewProc("CreateMutexW")
+		closeHandle := k32.NewProc("CloseHandle")
+		user := os.Getenv("USERNAME")
+		if user == "" {
+			user = "user"
+		}
+		namePtr, _ := syscall.UTF16PtrFromString("Local\\iazio-agent-supervisor-" + user)
+		ret, _, err := createMutex.Call(0, 0, uintptr(unsafe.Pointer(namePtr)))
+		const ERROR_ALREADY_EXISTS = 183
+		if errno, ok := err.(syscall.Errno); ok && errno == ERROR_ALREADY_EXISTS {
+			if ret != 0 {
+				closeHandle.Call(ret)
+			}
+			fmt.Fprintf(stderr, "another iazio-agent instance is already running on this host/user (mutex exists); exiting\n")
+			return nil, false
+		}
+		if ret == 0 {
+			return nil, false
+		}
+		winUnlock = func() {
+			closeHandle.Call(ret)
+		}
+	}
+
+	pidFile := filepath.Join(home, ".iazio", "agent.pid")
+	_ = os.MkdirAll(filepath.Dir(pidFile), 0755)
+	_ = os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0644)
+
+	return func() {
+		_ = os.Remove(pidFile)
+		if winUnlock != nil {
+			winUnlock()
+		}
+	}, true
+}
+
 func execute(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
 	preflight.HydrateToolchainEnv()
 	ensureCanonicalSingleHome()
@@ -92,6 +138,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		getenv = os.Getenv
 	}
 
+	var cleanArgs []string
 	var logFilePath string
 	var nonInteractive bool
 	for i := 0; i < len(args); i++ {
@@ -103,7 +150,16 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			logFilePath = strings.TrimPrefix(a, "--log-file=")
 		} else if a == "--non-interactive" || a == "-non-interactive" {
 			nonInteractive = true
+		} else {
+			cleanArgs = append(cleanArgs, a)
 		}
+	}
+	args = cleanArgs
+
+	if runtime.GOOS == "windows" && (nonInteractive || getenv("IAZIO_AGENT_NONINTERACTIVE") == "1") {
+		k32 := syscall.NewLazyDLL("kernel32.dll")
+		freeConsole := k32.NewProc("FreeConsole")
+		freeConsole.Call()
 	}
 	if logFilePath == "" {
 		if envFile := strings.TrimSpace(getenv("IAZIO_LOG_FILE")); envFile != "" {
@@ -164,6 +220,14 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 	case "update":
 		return runUpdate(ctx, args[1:], stdout, stderr, getenv)
 	case "run":
+		home, _ := os.UserHomeDir()
+		if home != "" && !isTestBinary() {
+			unlock, ok := acquireAgentSingleInstanceLock(home, stdout, stderr)
+			if !ok {
+				return nil
+			}
+			defer unlock()
+		}
 		defer func() {
 			if !isTestBinary() && getenv("IAZIO_AGENT_NONINTERACTIVE") != "1" {
 				if (runtime.GOOS == "linux" && service.IsSystemdAvailable()) || runtime.GOOS == "darwin" || runtime.GOOS == "windows" {

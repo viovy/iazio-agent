@@ -3325,4 +3325,12 @@ func TestRunLogFileFlagAndOutput(t *testing.T) {
 	if _, err := os.Stat(envLog); err != nil {
 		t.Fatalf("expected env log file to be created: %v", err)
 	}
+
+	// 4. Test global flag preceding subcommand (FINDING-05)
+	precedingLog := filepath.Join(tmpDir, "logs", "preceding.log")
+	cancelCtx3, cancel3 := context.WithCancel(ctx)
+	cancel3()
+	if err := execute(cancelCtx3, []string{"--log-file", precedingLog, "help"}, &stdout, &stderr, nil); err != nil {
+		t.Fatalf("expected nil error when --log-file precedes subcommand, got %v", err)
+	}
 }
