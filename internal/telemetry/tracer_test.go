@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -319,5 +320,110 @@ func TestNewZipkinExporter_EnvBranches(t *testing.T) {
 	}
 	if exp.spoolDir != "" {
 		t.Errorf("expected empty spoolDir with none, got: %s", exp.spoolDir)
+	}
+}
+
+func TestDeriveZipkinURLFromAPIAndTrace7e97788c6f8c8bcea43de8bd9cc29e0b(t *testing.T) {
+	if got := DeriveZipkinURLFromAPI(""); got != "" {
+		t.Fatalf("expected empty for empty apiURL, got %q", got)
+	}
+	if got := DeriveZipkinURLFromAPI("not-a-valid-url"); got != "" {
+		t.Fatalf("expected empty for invalid URL, got %q", got)
+	}
+	if got := DeriveZipkinURLFromAPI("https://tian.go.ro/iazio-api"); got != "https://tian.go.ro/zipkin" {
+		t.Fatalf("expected https://tian.go.ro/zipkin, got %q", got)
+	}
+	if got := DeriveZipkinURLFromAPI("http://192.168.1.50:8080"); got != "http://192.168.1.50:9411" {
+		t.Fatalf("expected http://192.168.1.50:9411, got %q", got)
+	}
+
+	t.Setenv("ZIPKIN_ENDPOINT", "")
+	t.Setenv("OTEL_EXPORTER_ZIPKIN_ENDPOINT", "")
+	t.Setenv("IAZIO_HARNESS_API_URL", "https://tian.go.ro/iazio-api")
+	exp := NewZipkinExporter("")
+	defer exp.Close()
+	if exp.endpoint != "https://tian.go.ro/zipkin/api/v2/spans" {
+		t.Fatalf("expected derived endpoint https://tian.go.ro/zipkin/api/v2/spans, got %q", exp.endpoint)
+	}
+
+	// Test config file resolution branches (config.json, agent.json, api_url)
+	t.Setenv("IAZIO_HARNESS_API_URL", "")
+	t.Setenv("IAZIO_API_URL", "")
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
+	iazioDir := filepath.Join(tmpHome, ".iazio")
+	_ = os.MkdirAll(iazioDir, 0o755)
+
+	// 1. api_url fallback
+	_ = os.WriteFile(filepath.Join(iazioDir, "api_url"), []byte("https://tian.go.ro/iazio-api\n"), 0o644)
+	if got := resolveZipkinFromConfig(); got != "https://tian.go.ro/zipkin" {
+		t.Fatalf("expected api_url fallback https://tian.go.ro/zipkin, got %q", got)
+	}
+
+	// 2. agent.json api_url and zipkin_url fallback
+	_ = os.WriteFile(filepath.Join(iazioDir, "agent.json"), []byte(`{"api_url":"https://agent.go.ro/iazio-api"}`), 0o644)
+	if got := resolveZipkinFromConfig(); got != "https://agent.go.ro/zipkin" {
+		t.Fatalf("expected agent.json api_url fallback, got %q", got)
+	}
+	_ = os.WriteFile(filepath.Join(iazioDir, "agent.json"), []byte(`{"zipkin_url":"https://zipkin-agent.go.ro/zipkin"}`), 0o644)
+	if got := resolveZipkinFromConfig(); got != "https://zipkin-agent.go.ro/zipkin" {
+		t.Fatalf("expected agent.json zipkin_url fallback, got %q", got)
+	}
+
+	// 3. config.json harness_api and explicit zipkin fallback
+	_ = os.WriteFile(filepath.Join(iazioDir, "config.json"), []byte(`{"endpoints":{"harness_api":"https://cfg.go.ro/iazio-api"}}`), 0o644)
+	if got := resolveZipkinFromConfig(); got != "https://cfg.go.ro/zipkin" {
+		t.Fatalf("expected config.json harness_api fallback, got %q", got)
+	}
+	_ = os.WriteFile(filepath.Join(iazioDir, "config.json"), []byte(`{"endpoints":{"zipkin":"https://cfg-zipkin.go.ro/zipkin"}}`), 0o644)
+	if got := resolveZipkinFromConfig(); got != "https://cfg-zipkin.go.ro/zipkin" {
+		t.Fatalf("expected config.json explicit zipkin fallback, got %q", got)
+	}
+
+	// Verify ConfigureZipkinFromAPI updates a localhost default exporter and exports trace 7e97788c6f8c8bcea43de8bd9cc29e0b
+	received := make(chan []ZipkinSpan, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var spans []ZipkinSpan
+		_ = json.NewDecoder(r.Body).Decode(&spans)
+		received <- spans
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer ts.Close()
+
+	orig := GlobalTracer()
+	defer SetGlobalTracer(orig)
+
+	cleanup := InitGlobalTracer("iazio-agent", "http://localhost:9411")
+	defer cleanup()
+
+	ConfigureZipkinFromAPI("")
+	ConfigureZipkinFromAPI("https://tian.go.ro/iazio-api")
+	if ze, ok := GlobalTracer().Exporter.(*ZipkinExporter); ok {
+		if ze.endpoint != "https://tian.go.ro/zipkin/api/v2/spans" {
+			t.Fatalf("expected ConfigureZipkinFromAPI to update localhost endpoint, got %q", ze.endpoint)
+		}
+		ze.mu.Lock()
+		ze.endpoint = ts.URL + "/api/v2/spans"
+		ze.mu.Unlock()
+	}
+
+	_, span := StartSpan(context.Background(), "agent.job.execute",
+		WithParentTrace("7e97788c6f8c8bcea43de8bd9cc29e0b", "a43de8bd9cc29e0b"),
+		WithTag("job.id", "job_3ffa5d0be1649f0e"),
+		WithTag("host.id", "debian"),
+	)
+	span.End()
+
+	select {
+	case spans := <-received:
+		if len(spans) != 1 {
+			t.Fatalf("expected 1 span, got %d", len(spans))
+		}
+		if spans[0].TraceID != "7e97788c6f8c8bcea43de8bd9cc29e0b" || spans[0].LocalEndpoint.ServiceName != "iazio-agent" {
+			t.Fatalf("expected trace 7e97788c6f8c8bcea43de8bd9cc29e0b from iazio-agent, got %+v", spans[0])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for iazio-agent span export")
 	}
 }

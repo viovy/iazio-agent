@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -168,6 +169,8 @@ func NewZipkinExporter(endpoint string) *ZipkinExporter {
 			clean = strings.TrimRight(strings.TrimSpace(env), "/")
 		} else if env := os.Getenv("OTEL_EXPORTER_ZIPKIN_ENDPOINT"); env != "" {
 			clean = strings.TrimRight(strings.TrimSpace(env), "/")
+		} else if cfgURL := resolveZipkinFromConfig(); cfgURL != "" {
+			clean = strings.TrimRight(strings.TrimSpace(cfgURL), "/")
 		} else {
 			clean = "http://localhost:9411"
 		}
@@ -591,6 +594,8 @@ func InitGlobalTracer(serviceName, zipkinURL string) func() {
 			zipkinURL = env
 		} else if env := os.Getenv("OTEL_EXPORTER_ZIPKIN_ENDPOINT"); env != "" {
 			zipkinURL = env
+		} else if cfgURL := resolveZipkinFromConfig(); cfgURL != "" {
+			zipkinURL = cfgURL
 		} else {
 			zipkinURL = "http://localhost:9411"
 		}
@@ -604,4 +609,105 @@ func InitGlobalTracer(serviceName, zipkinURL string) func() {
 		_ = exp.Flush(context.Background())
 		_ = exp.Close()
 	}
+}
+
+// DeriveZipkinURLFromAPI derives the Zipkin base URL from a control-plane API URL
+// (e.g. https://tian.go.ro/iazio-api -> https://tian.go.ro/zipkin).
+func DeriveZipkinURLFromAPI(apiURL string) string {
+	u := strings.TrimSpace(apiURL)
+	if u == "" {
+		return ""
+	}
+	parsed, err := url.Parse(u)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	if parsed.Port() == "" || parsed.Port() == "80" || parsed.Port() == "443" {
+		return fmt.Sprintf("%s://%s/zipkin", parsed.Scheme, parsed.Host)
+	}
+	return fmt.Sprintf("%s://%s:9411", parsed.Scheme, parsed.Hostname())
+}
+
+// ConfigureZipkinFromAPI updates the active ZipkinExporter endpoint if it was still
+// pointing at the default localhost fallback and no explicit ZIPKIN_ENDPOINT env was set.
+func ConfigureZipkinFromAPI(apiURL string) {
+	if os.Getenv("ZIPKIN_ENDPOINT") != "" || os.Getenv("OTEL_EXPORTER_ZIPKIN_ENDPOINT") != "" {
+		return
+	}
+	derived := DeriveZipkinURLFromAPI(apiURL)
+	if derived == "" {
+		return
+	}
+	clean := strings.TrimRight(derived, "/") + "/api/v2/spans"
+	ze, ok := GlobalTracer().Exporter.(*ZipkinExporter)
+	if !ok || ze == nil {
+		return
+	}
+	ze.mu.Lock()
+	if strings.HasPrefix(ze.endpoint, "http://localhost:9411") || strings.HasPrefix(ze.endpoint, "http://127.0.0.1:9411") {
+		ze.endpoint = clean
+	}
+	ze.mu.Unlock()
+}
+
+func resolveZipkinFromConfig() string {
+	for _, envKey := range []string{"IAZIO_HARNESS_API_URL", "IAZIO_API_URL"} {
+		if derived := DeriveZipkinURLFromAPI(os.Getenv(envKey)); derived != "" {
+			return derived
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	if u := resolveZipkinFromIazioConfig(filepath.Join(home, ".iazio", "config.json")); u != "" {
+		return u
+	}
+	if u := resolveZipkinFromAgentConfig(filepath.Join(home, ".iazio", "agent.json")); u != "" {
+		return u
+	}
+	if data, err := os.ReadFile(filepath.Join(home, ".iazio", "api_url")); err == nil {
+		return DeriveZipkinURLFromAPI(string(data))
+	}
+	return ""
+}
+
+func resolveZipkinFromIazioConfig(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var raw struct {
+		Endpoints map[string]string `json:"endpoints"`
+	}
+	if json.Unmarshal(data, &raw) != nil {
+		return ""
+	}
+	if zipkin := strings.TrimSpace(raw.Endpoints["zipkin"]); zipkin != "" {
+		return zipkin
+	}
+	for _, key := range []string{"harness_api", "iazio_api"} {
+		if derived := DeriveZipkinURLFromAPI(raw.Endpoints[key]); derived != "" {
+			return derived
+		}
+	}
+	return ""
+}
+
+func resolveZipkinFromAgentConfig(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var raw struct {
+		ZipkinURL string `json:"zipkin_url"`
+		APIURL    string `json:"api_url"`
+	}
+	if json.Unmarshal(data, &raw) != nil {
+		return ""
+	}
+	if zipkin := strings.TrimSpace(raw.ZipkinURL); zipkin != "" {
+		return zipkin
+	}
+	return DeriveZipkinURLFromAPI(raw.APIURL)
 }
