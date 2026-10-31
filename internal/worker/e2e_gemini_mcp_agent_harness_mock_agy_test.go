@@ -470,4 +470,80 @@ func TestE2E_GeminiWeb_IazioMCP_HarnessAPI_Agent_Harness_MockAgy(t *testing.T) {
 			t.Fatalf("expected PromptExecutionResult.StoryID=STORY-GOV-3839 from ASE state, got %q", promptRes.StoryID)
 		}
 	})
+
+	// Sub-Scenario E: job_3ffa5d0be1649f0e (STORY-GOV-3851):
+	// mock-agy runs in buffered_stdout_brain_transcript_streaming mode (0 bytes written to stdout pipe while running,
+	// writing steps only to ~/.gemini/antigravity-cli/brain/<convID>/.system_generated/logs/transcript.jsonl).
+	// Verify that iazio-agent Dispatcher -> real iazio-harness -> real mock-agy streams [ASE-SUPERVISOR] startup banner,
+	// discovered conversation/story IDs, and live [agy] planner thinking/tool-call/response steps to /v1/jobs/{id}/chunks.
+	t.Run("Job_3ffa5d0be1649f0e_BufferedStdout_BrainTranscriptStreaming_And_RepoLiveOutput", func(t *testing.T) {
+		tmpHome := t.TempDir()
+		t.Setenv("HOME", tmpHome)
+		t.Setenv("MOCK_AGY_SCENARIO", "buffered_stdout_brain_transcript_streaming")
+		fleetDir := initTestFleetWorkspace(t)
+		t.Setenv("IAZIO_FLEET_ROOT", fleetDir)
+
+		payloadBytes, _ := json.Marshal(map[string]any{
+			"prompt_id":        "prompt_3ffa5d0be1649f0e",
+			"story_id":         "",
+			"repo":             ".",
+			"worktree_path":    fleetDir,
+			"mode":             "story.create_and_execute",
+			"command":          "/autonomous-story-execution",
+			"backlog":          "iazio",
+			"prompt":           "/autonomous-story-execution deep review and fix live output",
+			"target_agent":     "agy",
+			"effective_action": "/autonomous-story-execution",
+		})
+		mu.Lock()
+		queuedJobs = append(queuedJobs, &Job{
+			ID:           "job_3ffa5d0be1649f0e",
+			Type:         JobTypePromptExecute,
+			Repo:         ".",
+			TargetAgent:  "agy",
+			Payload:      payloadBytes,
+			FencingToken: 7,
+			LeaseToken:   "lease-3ffa5d0be1649f0e",
+		})
+		mu.Unlock()
+
+		cpClient := NewHTTPControlPlaneClient(srv.URL, "test-token", srv.Client())
+		invoker := harness.NewCLIInvoker(harnessBin, fleetDir)
+		disp := NewDispatcher(cpClient, invoker, "debian", nil, nil)
+		disp.SetWorktreeResolver(func(repo string) string { return fleetDir })
+
+		processed, err := disp.PollAndProcess(context.Background())
+		if err != nil {
+			t.Fatalf("expected PollAndProcess to succeed for job_3ffa5d0be1649f0e, got: %v", err)
+		}
+		if !processed {
+			t.Fatal("expected PollAndProcess to claim job_3ffa5d0be1649f0e")
+		}
+
+		mu.Lock()
+		comp, ok := completedJobs["job_3ffa5d0be1649f0e"]
+		bound, hasBound := boundStories["job_3ffa5d0be1649f0e"]
+		chunks := append([]string(nil), jobChunks["job_3ffa5d0be1649f0e"]...)
+		mu.Unlock()
+
+		if !ok || comp.Error != "" {
+			t.Fatalf("expected job_3ffa5d0be1649f0e to complete cleanly, ok=%v err=%q", ok, comp.Error)
+		}
+		if !hasBound || bound.StoryID != "STORY-GOV-3850" {
+			t.Fatalf("expected STORY-GOV-3850 bound for job_3ffa5d0be1649f0e, got hasBound=%v bound=%+v", hasBound, bound)
+		}
+		joinedChunks := strings.Join(chunks, "")
+		for _, expected := range []string{
+			"[ASE-SUPERVISOR] Starting prompt execution for Job job_3ffa5d0be1649f0e",
+			"[ASE-SUPERVISOR] Attached Antigravity conversation: ba042127-79e5-4cb2-b35c-5d47145ef4fa",
+			"[agy step #2] thinking: Inspecting repository live output pipeline",
+			"[agy step #2] tool read_file: /home/romeo/work/meta-repo-02/AGENTS.md",
+			"[agy step #2] tool run_command: Check autopilot status",
+			"[agy step #3] output: Completed STORY-GOV-3850 implementation and verified all gates.",
+		} {
+			if !strings.Contains(joinedChunks, expected) {
+				t.Fatalf("expected E2E streamed chunks for job_3ffa5d0be1649f0e to contain %q, got:\n%s", expected, joinedChunks)
+			}
+		}
+	})
 }
