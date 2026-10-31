@@ -4,6 +4,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"syscall"
 	"unsafe"
 )
@@ -37,4 +38,25 @@ func createWindowsNamedMutex(name string) (uintptr, bool, func()) {
 
 func detachWindowsConsole() {
 	_, _, _ = syscall.NewLazyDLL("kernel32.dll").NewProc("FreeConsole").Call()
+}
+
+// buildWindowsSelfRestartCommand constructs the detached background command and scheduled-task fallback
+// used on Windows when syscall.Exec is unsupported (EWINDOWS).
+func buildWindowsSelfRestartCommand(targetBin string, args []string, env []string) (*exec.Cmd, *exec.Cmd) {
+	var passArgs []string
+	if len(args) > 1 {
+		passArgs = args[1:]
+	}
+	spawnCmd := exec.Command(targetBin, passArgs...)
+	spawnCmd.Env = env
+	spawnCmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP | 0x08000000,
+		HideWindow:    true,
+	}
+	schtasksCmd := exec.Command("schtasks", "/Run", "/TN", "iazio-agent")
+	schtasksCmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: 0x08000000,
+		HideWindow:    true,
+	}
+	return spawnCmd, schtasksCmd
 }
