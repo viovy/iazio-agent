@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"syscall"
 	"unsafe"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 func createWindowsNamedMutex(name string) (uintptr, bool, func()) {
@@ -47,16 +49,9 @@ func buildWindowsSelfRestartCommand(targetBin string, args []string, env []strin
 	if len(args) > 1 {
 		passArgs = args[1:]
 	}
-	spawnCmd := exec.Command(targetBin, passArgs...)
+	spawnCmd := procutil.Command(targetBin, passArgs...)
 	spawnCmd.Env = env
-	spawnCmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP | 0x08000000,
-		HideWindow:    true,
-	}
-	schtasksCmd := exec.Command("schtasks", "/Run", "/TN", "iazio-agent")
-	schtasksCmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: 0x08000000,
-		HideWindow:    true,
-	}
+	spawnCmd.SysProcAttr.CreationFlags |= syscall.CREATE_NEW_PROCESS_GROUP
+	schtasksCmd := procutil.Command("schtasks", "/Run", "/TN", "iazio-agent")
 	return spawnCmd, schtasksCmd
 }

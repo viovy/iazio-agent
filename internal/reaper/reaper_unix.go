@@ -13,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 // TerminateProcessGroup cleanly shuts down a process group by sending SIGTERM,
@@ -74,7 +76,7 @@ func isPIDAlive(pid int) bool {
 		return false
 	}
 	// On macOS / BSD without /proc, check ps state for zombie ('Z')
-	if out, psErr := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output(); psErr == nil {
+	if out, psErr := procutil.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output(); psErr == nil {
 		st := strings.TrimSpace(string(out))
 		if st == "" || strings.HasPrefix(st, "Z") {
 			return false
@@ -148,7 +150,7 @@ func findOrphanPIDs(workspacePath, conversationID string) ([]int, error) {
 	if lsofBin, err := exec.LookPath("lsof"); err == nil {
 		if cleanWorkspace != "" {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			out, _ := exec.CommandContext(ctx, lsofBin, "+D", cleanWorkspace, "-t").Output()
+			out, _ := procutil.CommandContext(ctx, lsofBin, "+D", cleanWorkspace, "-t").Output()
 			cancel()
 			for _, line := range strings.Split(string(out), "\n") {
 				line = strings.TrimSpace(line)
@@ -165,7 +167,7 @@ func findOrphanPIDs(workspacePath, conversationID string) ([]int, error) {
 				matches, _ := filepath.Glob(sessionPattern)
 				for _, lockTarget := range matches {
 					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-					out, _ := exec.CommandContext(ctx, lsofBin, lockTarget, "-t").Output()
+					out, _ := procutil.CommandContext(ctx, lsofBin, lockTarget, "-t").Output()
 					cancel()
 					for _, line := range strings.Split(string(out), "\n") {
 						line = strings.TrimSpace(line)
@@ -179,7 +181,7 @@ func findOrphanPIDs(workspacePath, conversationID string) ([]int, error) {
 	}
 
 	// 3. Fallback / complementary ps command scanning
-	cmd := exec.Command("ps", "-eo", "pid,ppid,command")
+	cmd := procutil.Command("ps", "-eo", "pid,ppid,command")
 	out, err := cmd.Output()
 	if err == nil {
 		lines := strings.Split(string(out), "\n")

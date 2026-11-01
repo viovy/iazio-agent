@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/controlplane"
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 // SubRepoGitState details the parsed git posture of a nested submodule or child repository.
@@ -197,7 +197,7 @@ func inspectSingleGitDirectory(ctx context.Context, dir string) singleDirGitResu
 	// 2. Non-locking git status --porcelain=v2 --branch with per-repo 15s timeout
 	repoCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(repoCtx, "git", "-C", dir, "status", "--porcelain=v2", "--branch")
+	cmd := procutil.CommandContext(repoCtx, "git", "-C", dir, "status", "--porcelain=v2", "--branch")
 	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
 	out, err := cmd.CombinedOutput()
 	if err != nil {

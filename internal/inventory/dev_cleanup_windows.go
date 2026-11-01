@@ -3,10 +3,11 @@
 package inventory
 
 import (
-	"os/exec"
 	"strconv"
 	"syscall"
 	"unsafe"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 func scheduleRebootDelete(path string) {
@@ -22,7 +23,7 @@ func scheduleRebootDelete(path string) {
 }
 
 func terminatePID(pid int) {
-	_ = exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).Run()
+	_ = procutil.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).Run()
 }
 
 func forceKillPID(pid int) {

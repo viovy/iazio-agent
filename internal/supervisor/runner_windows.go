@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 var (
@@ -133,7 +135,7 @@ func signalPID(pid int, sig string) error {
 			procCloseHandle.Call(jobHandle)
 		}
 	}
-	return exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
+	return procutil.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
 }
 
 func isProcessAlive(pid int) bool {

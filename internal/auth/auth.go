@@ -15,6 +15,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 // ClientID is the public OAuth client id.
@@ -235,11 +237,11 @@ func OpenBrowser(raw string) error {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
-		cmd = exec.Command("open", raw)
+		cmd = procutil.Command("open", raw)
 	case "windows":
-		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", raw)
+		cmd = procutil.Command("rundll32", "url.dll,FileProtocolHandler", raw)
 	default:
-		cmd = exec.Command("xdg-open", raw)
+		cmd = procutil.Command("xdg-open", raw)
 	}
 	return cmd.Start()
 }

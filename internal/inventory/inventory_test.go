@@ -367,6 +367,14 @@ func TestInspectToolServiceWindows(t *testing.T) {
 			t.Fatalf("unexpected windows status: %s, %s", svcType, svcStatus)
 		}
 	}
+
+	// Custom runner test for Windows schtasks output
+	wInstalled, wType, wStatus, wCaps := InspectToolService("iazio-harvester", "windows", func(name string, args ...string) ([]byte, error) {
+		return []byte("TaskName: \\iazio-harvester\r\nStatus: Running\r\n"), nil
+	})
+	if !wInstalled || wType != "user_service" || wStatus != "active" || len(wCaps) == 0 {
+		t.Fatalf("expected active user_service on windows, got installed=%v type=%q status=%q caps=%v", wInstalled, wType, wStatus, wCaps)
+	}
 }
 
 func TestScanSymlinkDetectionAndRejection(t *testing.T) {

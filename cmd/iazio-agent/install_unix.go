@@ -5,11 +5,12 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 func installExecutableSafe(destPath string, data []byte) error {
@@ -45,7 +46,7 @@ func installExecutableSafeDirect(destPath string, data []byte) error {
 
 	// On macOS Apple Silicon, ad-hoc codesign binary so amfid does not kill it with SIGKILL
 	if runtime.GOOS == "darwin" {
-		_ = exec.Command("codesign", "--force", "--sign", "-", destPath).Run()
+		_ = procutil.Command("codesign", "--force", "--sign", "-", destPath).Run()
 	}
 
 	return nil

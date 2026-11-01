@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/ase/gate"
+	"github.com/viovy/iazio-agent/internal/procutil"
 	"github.com/viovy/iazio-agent/internal/reaper"
 	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/sessionstore"
@@ -207,14 +207,14 @@ func ComputeProgressFingerprint(worktreePath, asePhase string, passingTestCount 
 	h.Write([]byte(asePhase))
 	h.Write([]byte{0})
 
-	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd := procutil.Command("git", "rev-parse", "HEAD")
 	cmd.Dir = worktreePath
 	if out, err := cmd.CombinedOutput(); err == nil {
 		h.Write([]byte(strings.TrimSpace(string(out))))
 	}
 	h.Write([]byte{0})
 
-	diffCmd := exec.Command("git", "diff", "--stat")
+	diffCmd := procutil.Command("git", "diff", "--stat")
 	diffCmd.Dir = worktreePath
 	if diffOut, err := diffCmd.CombinedOutput(); err == nil {
 		h.Write([]byte(strings.TrimSpace(string(diffOut))))

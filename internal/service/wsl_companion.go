@@ -5,9 +5,10 @@ package service
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 // WSLServiceStatus describes the operational state of WSL services supervised from Windows native.
@@ -41,7 +42,7 @@ func NewWSLCompanionSupervisor(distro string, runner ...func(name string, args .
 }
 
 func defaultExecRunner(name string, args ...string) ([]byte, error) {
-	cmd := exec.Command(name, args...)
+	cmd := procutil.Command(name, args...)
 	return cmd.CombinedOutput()
 }
 

@@ -2,10 +2,10 @@ package preflight
 
 import (
 	"context"
-	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/viovy/iazio-agent/internal/procutil"
 	"github.com/viovy/iazio-agent/internal/sessionstore"
 )
 
@@ -27,7 +27,7 @@ func DefaultCollector() *Collector {
 		FreeSpace: FreeSpace,
 		Git: func(ctx context.Context, dir string, args ...string) (string, error) {
 			cmdArgs := append([]string{"-C", dir}, args...)
-			cmd := exec.CommandContext(ctx, "git", cmdArgs...)
+			cmd := procutil.CommandContext(ctx, "git", cmdArgs...)
 			out, err := cmd.CombinedOutput()
 			return strings.TrimSpace(string(out)), err
 		},

@@ -8,12 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
+	"github.com/viovy/iazio-agent/internal/procutil"
 	"github.com/viovy/iazio-agent/internal/telemetry"
 )
 
@@ -292,7 +292,7 @@ func (w *storyTrackingWriter) Write(p []byte) (n int, err error) {
 }
 
 func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []byte) (string, string, error) {
-	cmd := exec.CommandContext(ctx, c.HarnessBinary, args...)
+	cmd := procutil.CommandContext(ctx, c.HarnessBinary, args...)
 	setProcGroup(cmd)
 	cmd.Cancel = func() error {
 		return killProcGroup(cmd)

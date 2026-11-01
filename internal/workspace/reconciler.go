@@ -9,8 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 // WorkspaceManifest captures non-destructive snapshot telemetry for a workspace.
@@ -118,10 +121,14 @@ func hasRunningGitProcess(workspacePath string) bool {
 		return false
 	}
 
+	if runtime.GOOS == "windows" {
+		return false
+	}
+
 	// 2. lsof detection for macOS/Darwin (and BSD/Solaris)
 	if lsofBin, err := exec.LookPath("lsof"); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		out, _ := exec.CommandContext(ctx, lsofBin, "-a", "-c", "git", "+D", cleanWorkspace, "-t").Output()
+		out, _ := procutil.CommandContext(ctx, lsofBin, "-a", "-c", "git", "+D", cleanWorkspace, "-t").Output()
 		cancel()
 		if len(strings.TrimSpace(string(out))) > 0 {
 			return true
@@ -129,7 +136,7 @@ func hasRunningGitProcess(workspacePath string) bool {
 	}
 
 	// 3. Fallback using ps
-	out, err := exec.Command("ps", "-eo", "command").Output()
+	out, err := procutil.Command("ps", "-eo", "command").Output()
 	if err == nil {
 		lines := strings.Split(string(out), "\n")
 		for _, line := range lines {
@@ -145,6 +152,18 @@ func isLockFileHeld(lockPath string) bool {
 	cleanPath, err := filepath.Abs(lockPath)
 	if err != nil {
 		cleanPath = filepath.Clean(lockPath)
+	}
+
+	if runtime.GOOS == "windows" {
+		if _, err := os.Stat(cleanPath); os.IsNotExist(err) {
+			return false
+		}
+		f, err := os.OpenFile(cleanPath, os.O_RDWR, 0)
+		if err != nil {
+			return true
+		}
+		_ = f.Close()
+		return false
 	}
 
 	// 1. Linux /proc/*/fd scanning
@@ -178,7 +197,7 @@ func isLockFileHeld(lockPath string) bool {
 	if lsofBin, err := exec.LookPath("lsof"); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		out, _ := exec.CommandContext(ctx, lsofBin, cleanPath, "-t").Output()
+		out, _ := procutil.CommandContext(ctx, lsofBin, cleanPath, "-t").Output()
 		if len(strings.TrimSpace(string(out))) > 0 {
 			return true
 		}
@@ -189,7 +208,7 @@ func isLockFileHeld(lockPath string) bool {
 	if fuserBin, err := exec.LookPath("fuser"); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		out, _ := exec.CommandContext(ctx, fuserBin, cleanPath).Output()
+		out, _ := procutil.CommandContext(ctx, fuserBin, cleanPath).Output()
 		if len(strings.TrimSpace(string(out))) > 0 {
 			return true
 		}
@@ -341,19 +360,19 @@ func computeManifest(ctx context.Context, workspacePath string) (WorkspaceManife
 	}
 
 	// Branch
-	cmdBranch := exec.CommandContext(ctx, "git", "-C", workspacePath, "branch", "--show-current")
+	cmdBranch := procutil.CommandContext(ctx, "git", "-C", workspacePath, "branch", "--show-current")
 	if out, err := cmdBranch.Output(); err == nil {
 		manifest.Branch = strings.TrimSpace(string(out))
 	}
 
 	// HEAD SHA
-	cmdHead := exec.CommandContext(ctx, "git", "-C", workspacePath, "rev-parse", "HEAD")
+	cmdHead := procutil.CommandContext(ctx, "git", "-C", workspacePath, "rev-parse", "HEAD")
 	if out, err := cmdHead.Output(); err == nil {
 		manifest.HeadSHA = strings.TrimSpace(string(out))
 	}
 
 	// Status porcelain
-	cmdStatus := exec.CommandContext(ctx, "git", "-C", workspacePath, "status", "--porcelain")
+	cmdStatus := procutil.CommandContext(ctx, "git", "-C", workspacePath, "status", "--porcelain")
 	if out, err := cmdStatus.Output(); err == nil {
 		lines := strings.Split(string(out), "\n")
 		for _, l := range lines {
@@ -372,7 +391,7 @@ func computeManifest(ctx context.Context, workspacePath string) (WorkspaceManife
 	}
 
 	// Submodule status
-	cmdSub := exec.CommandContext(ctx, "git", "-C", workspacePath, "submodule", "status")
+	cmdSub := procutil.CommandContext(ctx, "git", "-C", workspacePath, "submodule", "status")
 	if out, err := cmdSub.Output(); err == nil {
 		lines := strings.Split(string(out), "\n")
 		for _, l := range lines {
@@ -411,7 +430,7 @@ func ResetAndSanitizeFreshWorkspace(ctx context.Context, workspacePath, jobID st
 	}
 
 	// 1. Check if git status --porcelain is dirty
-	cmdStatus := exec.CommandContext(ctx, "git", "-C", workspacePath, "status", "--porcelain")
+	cmdStatus := procutil.CommandContext(ctx, "git", "-C", workspacePath, "status", "--porcelain")
 	statusOut, _ := cmdStatus.Output()
 	if len(bytes.TrimSpace(statusOut)) > 0 {
 		// Archive dirty changes to .autopilot/recovery/<timestamp>-<job_id>.patch
@@ -421,9 +440,9 @@ func ResetAndSanitizeFreshWorkspace(ctx context.Context, workspacePath, jobID st
 		patchPath := filepath.Join(recoveryDir, patchFileName)
 
 		// Stage untracked files with intent-to-add so git diff HEAD captures all untracked files into the patch
-		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "add", "-N", ".").Run()
+		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "add", "-N", ".").Run()
 
-		cmdDiff := exec.CommandContext(ctx, "git", "-C", workspacePath, "diff", "HEAD")
+		cmdDiff := procutil.CommandContext(ctx, "git", "-C", workspacePath, "diff", "HEAD")
 		if diffOut, err := cmdDiff.Output(); err == nil && len(diffOut) > 0 {
 			_ = os.WriteFile(patchPath, diffOut, 0644)
 		} else {
@@ -431,26 +450,26 @@ func ResetAndSanitizeFreshWorkspace(ctx context.Context, workspacePath, jobID st
 		}
 
 		// Hard reset and clean root
-		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "reset", "--hard", "HEAD").Run()
-		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "clean", "-fd").Run()
+		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "reset", "--hard", "HEAD").Run()
+		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "clean", "-fd").Run()
 
 		// Fetch all remotes and reset to clean origin/main if available (unless a specific target branch is requested)
-		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "fetch", "--all", "--prune").Run()
+		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "fetch", "--all", "--prune").Run()
 		if requestedBranch == "" || requestedBranch == "main" {
-			if errOrigin := exec.CommandContext(ctx, "git", "-C", workspacePath, "rev-parse", "--verify", "origin/main").Run(); errOrigin == nil {
-				_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "reset", "--hard", "origin/main").Run()
+			if errOrigin := procutil.CommandContext(ctx, "git", "-C", workspacePath, "rev-parse", "--verify", "origin/main").Run(); errOrigin == nil {
+				_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "reset", "--hard", "origin/main").Run()
 			}
 		}
 
 		// Hard reset and clean recursive submodules
 		submoduleCmd := `rm -f .git/index.lock || true; git reset --hard; git clean -fd`
-		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "submodule", "foreach", "--recursive", submoduleCmd).Run()
+		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "submodule", "foreach", "--recursive", submoduleCmd).Run()
 	}
 
 	if requestedBranch != "" {
-		_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "fetch", "origin", requestedBranch).Run()
-		if err := exec.CommandContext(ctx, "git", "-C", workspacePath, "checkout", requestedBranch).Run(); err != nil {
-			_ = exec.CommandContext(ctx, "git", "-C", workspacePath, "checkout", "-B", requestedBranch, "origin/"+requestedBranch).Run()
+		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "fetch", "origin", requestedBranch).Run()
+		if err := procutil.CommandContext(ctx, "git", "-C", workspacePath, "checkout", requestedBranch).Run(); err != nil {
+			_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "checkout", "-B", requestedBranch, "origin/"+requestedBranch).Run()
 		}
 	}
 

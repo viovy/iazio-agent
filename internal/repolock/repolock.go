@@ -5,10 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 var (
@@ -205,7 +206,7 @@ func IsWorktreeDirty(worktree string) bool {
 	if worktree == "" {
 		return false
 	}
-	cmd := exec.Command("git", "-C", worktree, "status", "--porcelain")
+	cmd := procutil.Command("git", "-C", worktree, "status", "--porcelain")
 	out, err := cmd.Output()
 	if err != nil {
 		return false

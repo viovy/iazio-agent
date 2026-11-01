@@ -29,6 +29,7 @@ import (
 	"github.com/viovy/iazio-agent/internal/harness"
 	"github.com/viovy/iazio-agent/internal/inventory"
 	"github.com/viovy/iazio-agent/internal/preflight"
+	"github.com/viovy/iazio-agent/internal/procutil"
 	"github.com/viovy/iazio-agent/internal/reaper"
 	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/service"
@@ -173,9 +174,21 @@ func acquireAgentSingleInstanceLock(home string, stdout, stderr io.Writer) (func
 	}, true
 }
 
+func shouldEnsureCanonicalSingleHome(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	sub := strings.ToLower(strings.TrimSpace(args[0]))
+	switch sub {
+	case "run", "update":
+		return true
+	default:
+		return false
+	}
+}
+
 func execute(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
 	preflight.HydrateToolchainEnv()
-	ensureCanonicalSingleHome()
 	if getenv == nil {
 		getenv = os.Getenv
 	}
@@ -211,6 +224,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 	}
 	if nonInteractive || isDaemonRun {
 		_ = os.Setenv("IAZIO_AGENT_NONINTERACTIVE", "1")
+	}
+	if shouldEnsureCanonicalSingleHome(args) {
+		ensureCanonicalSingleHome()
 	}
 	if logFilePath != "" {
 		_ = os.MkdirAll(filepath.Dir(logFilePath), 0755)
@@ -1685,7 +1701,7 @@ func flushHarvestConversationDetailed(ctx context.Context, conversationID string
 	defer cancel()
 
 	harvesterBin := supervisor.ResolveBinary("iazio-harvester")
-	cmd := exec.CommandContext(fCtx, harvesterBin, "once", "--conversation", conversationID)
+	cmd := procutil.CommandContext(fCtx, harvesterBin, "once", "--conversation", conversationID)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[agent] Warning: harvest flush for conversation %s failed: %v (output: %s)\n",
@@ -1865,7 +1881,7 @@ func applyLinux(action, bin string, stdout io.Writer, force bool) error {
 		return service.InstallLinux(bin)
 	}
 	if action == "status" {
-		cmd := exec.Command("systemctl", "--user", "status", "iazio-agent.service", "--no-pager")
+		cmd := procutil.Command("systemctl", "--user", "status", "iazio-agent.service", "--no-pager")
 		out, err := cmd.CombinedOutput()
 		if stdout != nil {
 			fmt.Fprint(stdout, string(out))
@@ -1997,7 +2013,7 @@ var (
 		return installed, status
 	}
 	reconcileHarvesterServiceFn = func(ctx context.Context, harvesterBin string) error {
-		return exec.CommandContext(ctx, harvesterBin, "service", "reconcile").Run()
+		return procutil.CommandContext(ctx, harvesterBin, "service", "reconcile").Run()
 	}
 	restartToolServiceFn = service.RestartToolService
 )
@@ -2023,7 +2039,9 @@ func healHarvesterServiceIfNeeded(ctx context.Context, home, goos string) {
 	_, svcStatus := inspectToolServiceFn("iazio-harvester", goos)
 	if svcStatus == "failed" || svcStatus == "inactive" || svcStatus == "installed" || svcStatus == "ready" || svcStatus == "not_installed" {
 		_ = reconcileHarvesterServiceFn(ctx, harvesterBin)
-		_ = restartToolServiceFn("iazio-harvester")
+		if _, postStatus := inspectToolServiceFn("iazio-harvester", goos); postStatus != "active" {
+			_ = restartToolServiceFn("iazio-harvester")
+		}
 	}
 }
 
@@ -2159,7 +2177,7 @@ func copyBinary(src, dest string) error {
 }
 
 var execCommand = func(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
+	cmd := procutil.Command(name, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s: %s", name, strings.TrimSpace(string(out)))
@@ -2168,7 +2186,7 @@ var execCommand = func(name string, args ...string) error {
 }
 
 var execCommandOutput = func(name string, args ...string) ([]byte, error) {
-	cmd := exec.Command(name, args...)
+	cmd := procutil.Command(name, args...)
 	return cmd.CombinedOutput()
 }
 
@@ -2268,7 +2286,7 @@ func isGitSubmoduleDir(path string) bool {
 
 func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 	// First: verify repoPath is a valid git repository top-level root
-	topCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--show-toplevel")
+	topCmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--show-toplevel")
 	topOut, err := topCmd.Output()
 	if err != nil {
 		return false
@@ -2287,7 +2305,7 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 
 	// Try iazio-harness fleet-status --repo <repoPath> --json first
 	harnessBin := resolveHarnessBinaryPath()
-	harnessCmd := exec.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--json")
+	harnessCmd := procutil.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--json")
 	if out, err := harnessCmd.Output(); err == nil && len(out) > 0 {
 		var res struct {
 			IsClean         bool     `json:"is_clean"`
@@ -2338,7 +2356,7 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 
 	// Fallback git porcelain check:
 	// Allow untracked docs/logs and submodule commit pointer drift (CLEAN_SUBMODULE_DRIFT)
-	gitCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain")
+	gitCmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain")
 	out, err := gitCmd.CombinedOutput()
 	if err != nil {
 		return false
@@ -2360,7 +2378,7 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 		if len(parts) >= 2 {
 			candidateSub := filepath.Join(repoPath, parts[len(parts)-1])
 			if isGitSubmoduleDir(candidateSub) {
-				subCmd := exec.CommandContext(ctx, "git", "-C", candidateSub, "status", "--porcelain")
+				subCmd := procutil.CommandContext(ctx, "git", "-C", candidateSub, "status", "--porcelain")
 				if subOut, sErr := subCmd.CombinedOutput(); sErr == nil && strings.TrimSpace(string(subOut)) == "" {
 					// Clean submodule with commit pointer drift (STORY-GOV-3652 AC-2)
 					continue
@@ -2520,13 +2538,13 @@ func restartOrExecSelf(stdout io.Writer) {
 		}
 		fmt.Fprintf(os.Stderr, "[SIR: AUTO_RESTART_FAIL] syscall.Exec(%s) failed: %v; attempting background restart and service revive\n", targetBin, execErr)
 		// Fallback: spawn background restart so the host never stays offline
-		cmd := exec.Command(targetBin, os.Args[1:]...)
+		cmd := procutil.Command(targetBin, os.Args[1:]...)
 		cmd.Env = os.Environ()
 		if startErr := cmd.Start(); startErr == nil {
 			os.Exit(0)
 		}
 		// Attempt to revive via systemd if available
-		_ = exec.Command("systemctl", "--user", "restart", "iazio-agent.service").Run()
+		_ = procutil.Command("systemctl", "--user", "restart", "iazio-agent.service").Run()
 		os.Exit(1)
 	}
 }
@@ -2571,7 +2589,7 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 
 	// Try iazio-harness fleet-status --json first
 	harnessBin := resolveHarnessBinaryPath()
-	harnessCmd := exec.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--json")
+	harnessCmd := procutil.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--json")
 	if out, err := harnessCmd.Output(); err == nil && len(out) > 0 {
 		var res struct {
 			Branch               string   `json:"branch"`
@@ -2617,7 +2635,7 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 
 	if st.Branch == "" {
 		// Fallback git status & branch
-		cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain=v2", "--branch")
+		cmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain=v2", "--branch")
 		out, err := cmd.CombinedOutput()
 		if err == nil {
 			lines := strings.Split(string(out), "\n")
@@ -2643,7 +2661,7 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 	}
 
 	// Submodules check
-	subCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "status")
+	subCmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "submodule", "status")
 	if subOut, err := subCmd.CombinedOutput(); err == nil {
 		subLines := strings.Split(string(subOut), "\n")
 		st.SubmodulesClean = true
@@ -2699,7 +2717,7 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 	}
 
 	// Git flow version autodetect (git describe --tags --always)
-	gitVerCmd := exec.CommandContext(ctx, "git", "-C", repoPath, "describe", "--tags", "--always")
+	gitVerCmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "describe", "--tags", "--always")
 	if out, err := gitVerCmd.Output(); err == nil {
 		st.GitVersion = strings.TrimSpace(string(out))
 	}
@@ -2715,7 +2733,7 @@ func healGitRepo(ctx context.Context, repoPath string) {
 
 	// 1. Resolve real git directory to remove stale git locks
 	gitDir := filepath.Join(repoPath, ".git")
-	if out, err := exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--git-dir").Output(); err == nil {
+	if out, err := procutil.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--git-dir").Output(); err == nil {
 		clean := strings.TrimSpace(string(out))
 		if clean != "" {
 			if filepath.IsAbs(clean) {
@@ -2735,18 +2753,18 @@ func healGitRepo(ctx context.Context, repoPath string) {
 	_ = repolock.ForceRelease(repoPath)
 
 	// 3. Abort in-progress git operations
-	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "merge", "--abort").Run()
-	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "rebase", "--abort").Run()
-	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "cherry-pick", "--abort").Run()
+	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "merge", "--abort").Run()
+	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "rebase", "--abort").Run()
+	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "cherry-pick", "--abort").Run()
 
 	// 4. Reset and clean working tree (double -f cleans untracked directories/repos)
-	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "reset", "--hard", "HEAD").Run()
-	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "clean", "-ffd").Run()
+	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "reset", "--hard", "HEAD").Run()
+	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "clean", "-ffd").Run()
 
 	// 5. Synchronize and clean submodules
-	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "foreach", "--recursive", "git reset --hard HEAD || true").Run()
-	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "foreach", "--recursive", "git clean -ffd || true").Run()
-	_ = exec.CommandContext(ctx, "git", "-C", repoPath, "submodule", "update", "--init", "--recursive", "--force").Run()
+	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "submodule", "foreach", "--recursive", "git reset --hard HEAD || true").Run()
+	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "submodule", "foreach", "--recursive", "git clean -ffd || true").Run()
+	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "submodule", "update", "--init", "--recursive", "--force").Run()
 }
 
 func stripSlotSuffix(name string) string {

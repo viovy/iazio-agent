@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 type waitResult struct {
@@ -178,7 +180,7 @@ func (r *OSRunner) Start(argv []string) (int, error) {
 		return 0, errors.New("empty argv")
 	}
 	bin := ResolveBinary(argv[0])
-	cmd := exec.Command(bin, argv[1:]...)
+	cmd := procutil.Command(bin, argv[1:]...)
 	cmd.Env = AugmentedEnv(os.Environ())
 
 	var jobID string

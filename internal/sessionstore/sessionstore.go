@@ -8,13 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 var ErrNoSessionFound = errors.New("no matching session found")
@@ -240,7 +241,7 @@ func (r *Resolver) DetectDirtyWorktreeContext(worktree string) DirtyContext {
 	// 3. If still no story ID, inspect current branch
 	gitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(gitCtx, "git", "-C", worktree, "branch", "--show-current")
+	cmd := procutil.CommandContext(gitCtx, "git", "-C", worktree, "branch", "--show-current")
 	if out, err := cmd.CombinedOutput(); err == nil {
 		branch := strings.TrimSpace(string(out))
 		ctx.Branch = branch
@@ -741,7 +742,7 @@ func getDirtyFiles(worktree string) map[string]bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "-C", worktree, "status", "--porcelain", "-uall")
+	cmd := procutil.CommandContext(ctx, "git", "-C", worktree, "status", "--porcelain", "-uall")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return dirty

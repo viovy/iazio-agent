@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 // ReapResult summarizes orphan processes terminated and session locks released.
@@ -73,7 +75,7 @@ func isSessionLockHeld(lockPath string) bool {
 	if lsofBin, err := exec.LookPath("lsof"); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		out, _ := exec.CommandContext(ctx, lsofBin, cleanPath, "-t").Output()
+		out, _ := procutil.CommandContext(ctx, lsofBin, cleanPath, "-t").Output()
 		if len(strings.TrimSpace(string(out))) > 0 {
 			return true
 		}
@@ -84,7 +86,7 @@ func isSessionLockHeld(lockPath string) bool {
 	if fuserBin, err := exec.LookPath("fuser"); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		out, _ := exec.CommandContext(ctx, fuserBin, cleanPath).Output()
+		out, _ := procutil.CommandContext(ctx, fuserBin, cleanPath).Output()
 		if len(strings.TrimSpace(string(out))) > 0 {
 			return true
 		}
