@@ -629,15 +629,17 @@ func (c Client) HeartbeatJob(ctx context.Context, jobID, leaseToken string) erro
 
 // AttemptFailure reports a tool startup or pre-progress fault for circuit breaking and failover.
 type AttemptFailure struct {
-	Host            string `json:"host"`
-	Tool            string `json:"tool"`
-	Workspace       string `json:"workspace"`
-	ExitCode        int    `json:"exit_code"`
-	StderrTail      string `json:"stderr_tail"`
-	FailureCategory string `json:"failure_category"`
-	FailureStage    string `json:"failure_stage"`
-	Reason          string `json:"reason"`
-	Timestamp       string `json:"timestamp"`
+	Host             string `json:"host"`
+	Tool             string `json:"tool"`
+	Workspace        string `json:"workspace"`
+	ExitCode         int    `json:"exit_code"`
+	StderrTail       string `json:"stderr_tail"`
+	FailureCategory  string `json:"failure_category"`
+	FailureStage     string `json:"failure_stage"`
+	FailureDirection string `json:"failure_direction,omitempty"`
+	FailureService   string `json:"failure_service,omitempty"`
+	Reason           string `json:"reason"`
+	Timestamp        string `json:"timestamp"`
 }
 
 // FailoverJob reports early tool failure and triggers multi-tier priority failover.

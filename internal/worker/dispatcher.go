@@ -108,10 +108,12 @@ type ControlPlaneClient interface {
 
 // HTTPControlPlaneClient is a concrete implementation of ControlPlaneClient over HTTP.
 type HTTPControlPlaneClient struct {
-	BaseURL    string
-	AuthToken  string
-	HTTPClient *http.Client
-	Spooler    *controlplane.OfflineReportSpooler
+	BaseURL        string
+	AuthToken      string
+	HTTPClient     *http.Client
+	Spooler        *controlplane.OfflineReportSpooler
+	MaxRetries     int
+	InitialBackoff time.Duration
 }
 
 // NewHTTPControlPlaneClient constructs an HTTPControlPlaneClient.
@@ -125,11 +127,63 @@ func NewHTTPControlPlaneClient(baseURL, authToken string, client *http.Client, s
 		sp = spooler[0]
 	}
 	return &HTTPControlPlaneClient{
-		BaseURL:    baseURL,
-		AuthToken:  authToken,
-		HTTPClient: client,
-		Spooler:    sp,
+		BaseURL:        baseURL,
+		AuthToken:      authToken,
+		HTTPClient:     client,
+		Spooler:        sp,
+		MaxRetries:     controlplane.DefaultMaxRetries,
+		InitialBackoff: controlplane.DefaultInitialBackoff,
 	}
+}
+
+func (c *HTTPControlPlaneClient) doWithRetry(ctx context.Context, method, url string, bodyBytes []byte) (*http.Response, error) {
+	maxRetries := c.MaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
+	} else if maxRetries == 0 {
+		maxRetries = controlplane.DefaultMaxRetries
+	}
+	backoff := c.InitialBackoff
+	if backoff <= 0 {
+		backoff = controlplane.DefaultInitialBackoff
+	}
+	var lastResp *http.Response
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		httpReq, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		if c.AuthToken != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+c.AuthToken)
+		}
+		resp, err := c.HTTPClient.Do(httpReq)
+		if err != nil {
+			lastErr = err
+			if !controlplane.IsTransientError(err) || attempt == maxRetries {
+				return nil, lastErr
+			}
+		} else {
+			if !controlplane.IsTransientStatus(resp.StatusCode) || attempt == maxRetries {
+				return resp, nil
+			}
+			// Drain and close transient error response before retrying
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			lastResp = resp
+		}
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return lastResp, ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+	}
+	return lastResp, lastErr
 }
 
 // ClaimJob calls POST /api/v1/agent/jobs/claim.
@@ -140,16 +194,7 @@ func (c *HTTPControlPlaneClient) ClaimJob(ctx context.Context, req ClaimRequest)
 		return nil, fmt.Errorf("marshal claim request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, fmt.Errorf("create claim request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.AuthToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.AuthToken)
-	}
-
-	resp, err := c.HTTPClient.Do(httpReq)
+	resp, err := c.doWithRetry(ctx, http.MethodPost, url, bodyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("execute claim request: %w", err)
 	}
@@ -181,16 +226,7 @@ func (c *HTTPControlPlaneClient) CompleteJob(ctx context.Context, jobID string, 
 		return fmt.Errorf("marshal complete request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return fmt.Errorf("create complete request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.AuthToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.AuthToken)
-	}
-
-	resp, err := c.HTTPClient.Do(httpReq)
+	resp, err := c.doWithRetry(ctx, http.MethodPost, url, bodyBytes)
 	if err != nil {
 		if c.Spooler != nil {
 			headers := map[string]string{"Content-Type": "application/json"}
@@ -249,16 +285,7 @@ func (c *HTTPControlPlaneClient) HeartbeatJob(ctx context.Context, jobID, leaseT
 		return fmt.Errorf("marshal heartbeat request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return fmt.Errorf("create heartbeat request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.AuthToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.AuthToken)
-	}
-
-	resp, err := c.HTTPClient.Do(httpReq)
+	resp, err := c.doWithRetry(ctx, http.MethodPost, url, bodyBytes)
 	if err != nil {
 		return fmt.Errorf("execute heartbeat request: %w", err)
 	}
@@ -283,16 +310,7 @@ func (c *HTTPControlPlaneClient) BindStory(ctx context.Context, jobID string, re
 		return fmt.Errorf("marshal bind story request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPatch, url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return fmt.Errorf("create bind story request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.AuthToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.AuthToken)
-	}
-
-	resp, err := c.HTTPClient.Do(httpReq)
+	resp, err := c.doWithRetry(ctx, http.MethodPatch, url, bodyBytes)
 	if err != nil {
 		return fmt.Errorf("execute bind story request: %w", err)
 	}
@@ -330,16 +348,7 @@ func (c *HTTPControlPlaneClient) AckLeaseWithWorktree(ctx context.Context, jobID
 		return fmt.Errorf("marshal ack lease request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return fmt.Errorf("create ack lease request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.AuthToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.AuthToken)
-	}
-
-	resp, err := c.HTTPClient.Do(httpReq)
+	resp, err := c.doWithRetry(ctx, http.MethodPost, url, bodyBytes)
 	if err != nil {
 		return fmt.Errorf("execute ack lease request: %w", err)
 	}
@@ -360,16 +369,7 @@ func (c *HTTPControlPlaneClient) FailoverJob(ctx context.Context, jobID string, 
 		return fmt.Errorf("marshal failover request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return fmt.Errorf("create failover request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.AuthToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.AuthToken)
-	}
-
-	resp, err := c.HTTPClient.Do(httpReq)
+	resp, err := c.doWithRetry(ctx, http.MethodPost, url, bodyBytes)
 	if err != nil {
 		return fmt.Errorf("execute failover request: %w", err)
 	}
@@ -827,20 +827,26 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 			elapsed := time.Since(startTime)
 			if execCtx.Err() == nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) && elapsed < 45*time.Second && job.TargetAgent != "" {
 				category := "TOOL_CRASH"
+				direction := "LOCAL_EXECUTION"
+				service := "iazio-harness"
 				errLower := strings.ToLower(err.Error())
 				if strings.Contains(errLower, "429") || strings.Contains(errLower, "quota") || strings.Contains(errLower, "auth") || strings.Contains(errLower, "token") {
 					category = "TOOL_QUOTA_OR_AUTH"
+					direction = "UPSTREAM"
+					service = "antigravity-llm-provider"
 				}
 				attemptReq := controlplane.AttemptFailure{
-					Host:            d.hostID,
-					Tool:            job.TargetAgent,
-					Workspace:       job.Repo,
-					ExitCode:        1,
-					StderrTail:      err.Error(),
-					FailureCategory: category,
-					FailureStage:    "TOOL_EXECUTION",
-					Reason:          "PREFLIGHT_OR_EARLY_TOOL_EXIT",
-					Timestamp:       time.Now().UTC().Format(time.RFC3339),
+					Host:             d.hostID,
+					Tool:             job.TargetAgent,
+					Workspace:        job.Repo,
+					ExitCode:         1,
+					StderrTail:       err.Error(),
+					FailureCategory:  category,
+					FailureStage:     "TOOL_EXECUTION",
+					FailureDirection: direction,
+					FailureService:   service,
+					Reason:           "PREFLIGHT_OR_EARLY_TOOL_EXIT",
+					Timestamp:        time.Now().UTC().Format(time.RFC3339),
 				}
 				if foErr := d.client.FailoverJob(ctx, job.ID, attemptReq); foErr == nil {
 					return true, err

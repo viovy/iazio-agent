@@ -175,6 +175,9 @@ func acquireAgentSingleInstanceLock(home string, stdout, stderr io.Writer) (func
 }
 
 func shouldEnsureCanonicalSingleHome(args []string) bool {
+	if strings.HasPrefix(strings.TrimSpace(os.Getenv("XPC_SERVICE_NAME")), "io.iazio.") {
+		return true
+	}
 	if len(args) == 0 {
 		return false
 	}
