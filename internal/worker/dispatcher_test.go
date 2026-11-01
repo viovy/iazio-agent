@@ -1488,3 +1488,73 @@ func TestDispatcher_FlushHarvestFromResultAndSpoolerReachable(t *testing.T) {
 		t.Fatalf("expected conv-from-result-2, got %q", flushedConvIDs[1])
 	}
 }
+
+func TestHTTPControlPlaneClient_TransientRetryAcrossRestartAndFailoverDirection(t *testing.T) {
+	var completeAttempts int
+	var hbAttempts int
+	var failoverCaptured controlplane.AttemptFailure
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/agent/jobs/job_110f47f09551baba/complete", func(w http.ResponseWriter, r *http.Request) {
+		completeAttempts++
+		if completeAttempts <= 2 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":"upstream restarting"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"completed"}`))
+	})
+	mux.HandleFunc("/api/v1/agent/jobs/job_110f47f09551baba/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		hbAttempts++
+		if hbAttempts == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/api/v1/agent/jobs/job_110f47f09551baba/failover", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&failoverCaptured)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cli := NewHTTPControlPlaneClient(srv.URL, "token", srv.Client())
+	cli.InitialBackoff = 5 * time.Millisecond
+	cli.MaxRetries = 3
+
+	ctx := context.Background()
+	if err := cli.HeartbeatJob(ctx, "job_110f47f09551baba", "lease-1", 7, "STORY-GOV-3873"); err != nil {
+		t.Fatalf("expected HeartbeatJob to succeed after transient 503, got: %v", err)
+	}
+	if hbAttempts != 2 {
+		t.Fatalf("expected 2 heartbeat attempts, got %d", hbAttempts)
+	}
+
+	if err := cli.CompleteJob(ctx, "job_110f47f09551baba", CompleteRequest{
+		FencingToken: 7,
+		Result:       json.RawMessage(`{"status":"completed","story_id":"STORY-GOV-3873"}`),
+	}); err != nil {
+		t.Fatalf("expected CompleteJob to succeed after transient 502s, got: %v", err)
+	}
+	if completeAttempts != 3 {
+		t.Fatalf("expected 3 complete attempts, got %d", completeAttempts)
+	}
+
+	// Verify FailoverJob carries FailureDirection and FailureService
+	if err := cli.FailoverJob(ctx, "job_110f47f09551baba", controlplane.AttemptFailure{
+		Host:             "debian",
+		Tool:             "agy",
+		FailureCategory:  "TOOL_QUOTA_OR_AUTH",
+		FailureStage:     "TOOL_EXECUTION",
+		FailureDirection: "UPSTREAM",
+		FailureService:   "antigravity-llm-provider",
+	}); err != nil {
+		t.Fatalf("FailoverJob failed: %v", err)
+	}
+	if failoverCaptured.FailureDirection != "UPSTREAM" || failoverCaptured.FailureService != "antigravity-llm-provider" {
+		t.Fatalf("expected FailureDirection=UPSTREAM and FailureService=antigravity-llm-provider, got %+v", failoverCaptured)
+	}
+}
