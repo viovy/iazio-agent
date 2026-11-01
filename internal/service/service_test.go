@@ -655,6 +655,9 @@ func TestInstallWindowsAt(t *testing.T) {
 	if !strings.Contains(xmlStr, "<LogonType>S4U</LogonType>") {
 		t.Fatalf("expected S4U logon type in xml, got: %s", xmlStr)
 	}
+	if !strings.Contains(xmlStr, "<Hidden>true</Hidden>") {
+		t.Fatalf("expected <Hidden>true</Hidden> in xml, got: %s", xmlStr)
+	}
 	if !strings.Contains(xmlStr, bin) {
 		t.Fatalf("expected direct command %s in xml, got: %s", bin, xmlStr)
 	}

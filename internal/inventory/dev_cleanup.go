@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -15,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 // DevBinaryCandidate represents an identified non-canonical or dev executable.
@@ -110,10 +111,10 @@ func InspectToolCommitSHA(binaryPath string) string {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, binaryPath, "--version", "--json")
+	cmd := procutil.CommandContext(ctx, binaryPath, "--version", "--json")
 	if out, err := cmd.Output(); err == nil {
 		var v struct {
 			CommitSHA string `json:"commit_sha"`
@@ -124,7 +125,7 @@ func InspectToolCommitSHA(binaryPath string) string {
 	}
 
 	// Try running without --json
-	cmd2 := exec.CommandContext(ctx, binaryPath, "--version")
+	cmd2 := procutil.CommandContext(ctx, binaryPath, "--version")
 	if out, err := cmd2.Output(); err == nil {
 		outStr := string(out)
 		if idx := strings.Index(outStr, "+"); idx != -1 {
@@ -326,7 +327,7 @@ func FindPIDsExecutingFile(filePath string) []int {
 	if runtime.GOOS == "darwin" {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		if out, err := exec.CommandContext(ctx, "lsof", "-t", cleanPath).Output(); err == nil {
+		if out, err := procutil.CommandContext(ctx, "lsof", "-t", cleanPath).Output(); err == nil {
 			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 				if pid, err := strconv.Atoi(strings.TrimSpace(line)); err == nil {
 					addPID(pid)
@@ -341,7 +342,7 @@ func FindPIDsExecutingFile(filePath string) []int {
 		baseName := filepath.Base(cleanPath)
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "wmic", "process", "where", fmt.Sprintf("ExecutablePath='%s'", strings.ReplaceAll(cleanPath, `\`, `\\`)), "get", "ProcessId")
+		cmd := procutil.CommandContext(ctx, "wmic", "process", "where", fmt.Sprintf("ExecutablePath='%s'", strings.ReplaceAll(cleanPath, `\`, `\\`)), "get", "ProcessId")
 		if out, err := cmd.Output(); err == nil {
 			lines := strings.Split(string(out), "\n")
 			for _, l := range lines {

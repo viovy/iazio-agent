@@ -7,11 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 // Proc is one row from an injected process table.
@@ -289,7 +290,7 @@ func ReconcileHostCheckouts(
 					healable, sirID, sirBranch, _ := DetectAutoHealableSIR(worktree)
 					if healable {
 						gitCmd := func(args ...string) error {
-							cmd := exec.Command("git", append([]string{"-C", worktree}, args...)...)
+							cmd := procutil.Command("git", append([]string{"-C", worktree}, args...)...)
 							return cmd.Run()
 						}
 						if err := AutoHealSupersededWorktree(true, sirBranch, gitCmd); err == nil {
@@ -417,7 +418,7 @@ func DetectAutoHealableSIR(worktree string, gitBranchReader ...func(string) (str
 	if len(gitBranchReader) > 0 && gitBranchReader[0] != nil {
 		branch, _ = gitBranchReader[0](worktree)
 	} else {
-		cmd := exec.Command("git", "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD")
+		cmd := procutil.Command("git", "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD")
 		if out, err := cmd.CombinedOutput(); err == nil {
 			branch = strings.TrimSpace(string(out))
 		}

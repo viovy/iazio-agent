@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -13,12 +12,55 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 var (
 	verCacheMu sync.RWMutex
 	verCache   = make(map[string]cachedVersion)
+
+	winSvcCacheMu  sync.RWMutex
+	winSvcCache    = make(map[string]cachedWinSvc)
+	winSvcCacheTTL = 15 * time.Second
 )
+
+type cachedWinSvc struct {
+	fetchedAt time.Time
+	installed bool
+	svcType   string
+	svcStatus string
+	caps      []string
+}
+
+func isWindowsToolDaemonPIDAlive(home, toolName string) bool {
+	if home == "" {
+		return false
+	}
+	var pidPaths []string
+	switch toolName {
+	case "iazio-agent":
+		pidPaths = []string{
+			filepath.Join(home, ".iazio", "daemon", "agent.pid"),
+			filepath.Join(home, ".iazio", "agent.pid"),
+		}
+	case "iazio-harvester":
+		pidPaths = []string{
+			filepath.Join(home, ".iazio", "harvester", "watch.pid"),
+		}
+	}
+	for _, p := range pidPaths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err == nil && pid > 0 && procutil.IsPIDAlive(pid) {
+			return true
+		}
+	}
+	return false
+}
 
 type cachedVersion struct {
 	modTime time.Time
@@ -89,13 +131,13 @@ func InspectInstalledVersion(binaryPath string) string {
 		return cached.version
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, binaryPath, "--version")
+	cmd := procutil.CommandContext(ctx, binaryPath, "--version")
 	out, err := cmd.Output()
 	if err != nil {
-		cmd = exec.CommandContext(ctx, binaryPath, "version")
+		cmd = procutil.CommandContext(ctx, binaryPath, "version")
 		out, err = cmd.Output()
 	}
 	ver := "installed"
@@ -242,7 +284,7 @@ func InspectToolService(toolName, goos string, runner ...func(name string, args 
 				if customRun != nil {
 					out, _ = customRun("systemctl", "--user", "is-active", toolName+".service")
 				} else {
-					cmd := exec.CommandContext(ctx, "systemctl", "--user", "is-active", toolName+".service")
+					cmd := procutil.CommandContext(ctx, "systemctl", "--user", "is-active", toolName+".service")
 					out, _ = cmd.Output()
 				}
 				s := strings.TrimSpace(string(out))
@@ -300,7 +342,7 @@ func InspectToolService(toolName, goos string, runner ...func(name string, args 
 			if customRun != nil {
 				return customRun(name, args...)
 			}
-			return exec.CommandContext(ctx, name, args...).CombinedOutput()
+			return procutil.CommandContext(ctx, name, args...).CombinedOutput()
 		}
 
 		domain := fmt.Sprintf("gui/%d", os.Getuid())
@@ -390,10 +432,31 @@ func InspectToolService(toolName, goos string, runner ...func(name string, args 
 			return
 		}
 	case "windows":
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		cacheKey := home + "|" + toolName
+		if customRun == nil {
+			winSvcCacheMu.RLock()
+			cached, ok := winSvcCache[cacheKey]
+			winSvcCacheMu.RUnlock()
+			if ok && time.Since(cached.fetchedAt) < winSvcCacheTTL {
+				st := cached.svcStatus
+				if st != "active" && isWindowsToolDaemonPIDAlive(home, toolName) {
+					st = "active"
+				}
+				return cached.installed, cached.svcType, st, append([]string(nil), cached.caps...)
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "schtasks", "/Query", "/TN", toolName, "/FO", "LIST")
-		if out, err := cmd.Output(); err == nil && len(out) > 0 {
+		var out []byte
+		var err error
+		if customRun != nil {
+			out, err = customRun("schtasks", "/Query", "/TN", toolName, "/FO", "LIST")
+		} else {
+			cmd := procutil.CommandContext(ctx, "schtasks", "/Query", "/TN", toolName, "/FO", "LIST")
+			out, err = cmd.Output()
+		}
+		if err == nil && len(out) > 0 {
 			installed = true
 			svcType = "user_service"
 			outStr := string(out)
@@ -409,11 +472,39 @@ func InspectToolService(toolName, goos string, runner ...func(name string, args 
 					break
 				}
 			}
-			if svcStatus == "" {
+			if svcStatus == "" || isWindowsToolDaemonPIDAlive(home, toolName) {
 				svcStatus = "active"
 			}
 			caps = append(caps, "watchdog", "auto_restart", "self_update", "dev_install", "user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1")
+			if customRun == nil {
+				winSvcCacheMu.Lock()
+				winSvcCache[cacheKey] = cachedWinSvc{
+					fetchedAt: time.Now(),
+					installed: installed,
+					svcType:   svcType,
+					svcStatus: svcStatus,
+					caps:      append([]string(nil), caps...),
+				}
+				winSvcCacheMu.Unlock()
+			}
 			return
+		}
+		// Fallback on transient schtasks timeout or error: preserve cached state or live PID state
+		if customRun == nil {
+			winSvcCacheMu.RLock()
+			cached, ok := winSvcCache[cacheKey]
+			winSvcCacheMu.RUnlock()
+			if ok && cached.installed {
+				st := cached.svcStatus
+				if isWindowsToolDaemonPIDAlive(home, toolName) {
+					st = "active"
+				}
+				return cached.installed, cached.svcType, st, append([]string(nil), cached.caps...)
+			}
+			if isWindowsToolDaemonPIDAlive(home, toolName) {
+				caps = append(caps, "watchdog", "auto_restart", "self_update", "dev_install", "user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1")
+				return true, "user_service", "active", caps
+			}
 		}
 	}
 	return false, "none", "not_installed", nil

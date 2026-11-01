@@ -3,9 +3,10 @@ package gate
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 // GateResult captures the evaluation of all ASE completion gates.
@@ -35,7 +36,7 @@ type GateOptions struct {
 // DefaultGitRunner executes a git command in the target directory.
 func DefaultGitRunner(dir string) func(args ...string) (string, error) {
 	return func(args ...string) (string, error) {
-		cmd := exec.Command("git", args...)
+		cmd := procutil.Command("git", args...)
 		cmd.Dir = dir
 		out, err := cmd.CombinedOutput()
 		return strings.TrimSpace(string(out)), err

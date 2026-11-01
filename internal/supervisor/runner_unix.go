@@ -11,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 func setProcGroup(cmd *exec.Cmd) {
@@ -65,7 +67,7 @@ func verifyProcessIdentity(pid int, expectedJobID string, startedAt time.Time) b
 	// Fallback for macOS / Darwin / BSD without /proc
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	out, err := procutil.CommandContext(ctx, "ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
 	if err == nil {
 		return matchesHarnessIdentity(string(out), expectedJobID)
 	}

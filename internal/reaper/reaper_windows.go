@@ -5,12 +5,13 @@ package reaper
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 var (
@@ -32,7 +33,7 @@ func TerminateProcessGroup(pid int, gracePeriod time.Duration) error {
 	}
 
 	// Graceful terminate attempt
-	_ = exec.Command("taskkill", "/PID", strconv.Itoa(pid), "/T").Run()
+	_ = procutil.Command("taskkill", "/PID", strconv.Itoa(pid), "/T").Run()
 
 	deadline := time.Now().Add(gracePeriod)
 	for time.Now().Before(deadline) {
@@ -43,7 +44,7 @@ func TerminateProcessGroup(pid int, gracePeriod time.Duration) error {
 	}
 
 	// Forceful terminate
-	_ = exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid), "/T").Run()
+	_ = procutil.Command("taskkill", "/F", "/PID", strconv.Itoa(pid), "/T").Run()
 
 	killDeadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(killDeadline) {
@@ -80,9 +81,9 @@ func findOrphanPIDs(workspacePath, conversationID string) ([]int, error) {
 	var results []int
 	selfPID := os.Getpid()
 
-	out, err := exec.Command("wmic", "process", "get", "ProcessId,CommandLine").Output()
+	out, err := procutil.Command("wmic", "process", "get", "ProcessId,CommandLine").Output()
 	if err != nil {
-		out, err = exec.Command("powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.CommandLine) $($_.ProcessId)\" }").Output()
+		out, err = procutil.Command("powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.CommandLine) $($_.ProcessId)\" }").Output()
 		if err != nil {
 			return results, nil
 		}

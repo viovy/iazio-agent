@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -17,6 +16,8 @@ import (
 	"syscall"
 	"time"
 	"unicode/utf16"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 const DarwinLabel = "io.iazio.iazio-agent"
@@ -803,7 +804,7 @@ func reconcileWindowsServiceConfiguration(home, bin string, run func(name string
 		if info, err := os.Stat(lockFile); err == nil && time.Since(info.ModTime()) <= 2*time.Hour {
 			inMaintenance = true
 		}
-		if !inMaintenance {
+		if !inMaintenance && !isDaemonPIDAlive(filepath.Join(home, ".iazio", "daemon", "agent.pid")) && !isDaemonPIDAlive(filepath.Join(home, ".iazio", "agent.pid")) {
 			if out, err := statusCheckCommand("schtasks", "/Query", "/TN", "iazio-agent", "/FO", "LIST"); err == nil {
 				if running, _, ok := ParseSchtasksStatus(string(out)); ok && !running {
 					_ = run("schtasks", "/Run", "/TN", "iazio-agent")
@@ -815,7 +816,7 @@ func reconcileWindowsServiceConfiguration(home, bin string, run func(name string
 	// Reconcile companion iazio-harvester Windows user service if installed in canonical ~/bin
 	harvesterBin := filepath.Join(home, "bin", "iazio-harvester.exe")
 	if _, err := os.Stat(harvesterBin); err == nil && !isTestProcess() {
-		_ = exec.Command(harvesterBin, "service", "reconcile").Run()
+		_ = procutil.Command(harvesterBin, "service", "reconcile").Run()
 	}
 	return nil
 }
@@ -923,7 +924,7 @@ func reconcileLinuxServiceConfiguration(home, bin string, run func(name string, 
 	// Reconcile companion iazio-harvester user service if harvester binary exists in canonical ~/.local/bin
 	harvesterBin := filepath.Join(home, ".local", "bin", "iazio-harvester")
 	if _, err := os.Stat(harvesterBin); err == nil && !isTestProcess() {
-		_ = exec.Command(harvesterBin, "service", "reconcile").Run()
+		_ = procutil.Command(harvesterBin, "service", "reconcile").Run()
 	}
 
 	lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
@@ -1004,7 +1005,7 @@ func reconcileDarwinServiceConfiguration(home, bin string, run func(name string,
 	// Reconcile companion iazio-harvester LaunchAgent if harvester binary exists in canonical ~/.local/bin
 	harvesterBin := filepath.Join(home, ".local", "bin", "iazio-harvester")
 	if _, err := os.Stat(harvesterBin); err == nil && !isTestProcess() {
-		_ = exec.Command(harvesterBin, "service", "reconcile").Run()
+		_ = procutil.Command(harvesterBin, "service", "reconcile").Run()
 	}
 
 	lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
@@ -1155,6 +1156,9 @@ func ReviveCheck(home string, run func(name string, args ...string) error) error
 			return run("launchctl", "kickstart", "-k", target)
 		}
 	} else if runtime.GOOS == "windows" {
+		if isDaemonPIDAlive(filepath.Join(home, ".iazio", "daemon", "agent.pid")) || isDaemonPIDAlive(filepath.Join(home, ".iazio", "agent.pid")) {
+			return nil
+		}
 		out, err := statusCheckCommand("schtasks", "/Query", "/TN", "iazio-agent", "/FO", "LIST")
 		if err == nil {
 			running, _, ok := ParseSchtasksStatus(string(out))
@@ -1380,17 +1384,17 @@ func BuildUninstallCrontab(existing string) string {
 }
 
 var crontabListCommand = func() ([]byte, error) {
-	return exec.Command("crontab", "-l").Output()
+	return procutil.Command("crontab", "-l").Output()
 }
 
 var crontabApplyCommand = func(stdin string) error {
-	cmd := exec.Command("crontab", "-")
+	cmd := procutil.Command("crontab", "-")
 	cmd.Stdin = strings.NewReader(stdin)
 	return cmd.Run()
 }
 
 var crontabRemoveCommand = func() error {
-	return exec.Command("crontab", "-r").Run()
+	return procutil.Command("crontab", "-r").Run()
 }
 
 func setupUserCrontab(runnerPath string, run func(name string, args ...string) error) error {
@@ -1424,7 +1428,7 @@ func StartUserDaemonAt(home, bin string, run func(name string, args ...string) e
 	if run != nil {
 		return run("/bin/sh", runnerPath)
 	}
-	cmd := exec.Command("/bin/sh", runnerPath)
+	cmd := procutil.Command("/bin/sh", runnerPath)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start user daemon: %w", err)
 	}
@@ -1512,24 +1516,7 @@ func isDaemonPIDAlive(pidPath string) bool {
 }
 
 func checkPIDAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	if pid == os.Getpid() {
-		return true
-	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	if runtime.GOOS == "windows" {
-		out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/NH").Output()
-		if err != nil {
-			return false
-		}
-		return strings.Contains(string(out), strconv.Itoa(pid))
-	}
-	return proc.Signal(syscall.Signal(0)) == nil
+	return procutil.IsPIDAlive(pid)
 }
 
 // InstallLinuxAt writes the unit under home and runs the supplied commands.
@@ -1633,6 +1620,7 @@ func InstallWindowsAt(home, bin, user string, run func(name string, args ...stri
     <StartWhenAvailable>true</StartWhenAvailable>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <Hidden>true</Hidden>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
   </Settings>
@@ -1721,7 +1709,7 @@ var execCommand = func(name string, args ...string) error {
 	if isTestProcess() && isServiceControlCommand(name) {
 		return nil
 	}
-	cmd := exec.Command(name, args...)
+	cmd := procutil.Command(name, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s %v: %w: %s", name, args, err, string(out))
@@ -1733,7 +1721,7 @@ var statusCheckCommand = func(name string, args ...string) ([]byte, error) {
 	if isTestProcess() && isServiceControlCommand(name) {
 		return nil, errors.New("service control command disabled in test process")
 	}
-	cmd := exec.Command(name, args...)
+	cmd := procutil.Command(name, args...)
 	return cmd.CombinedOutput()
 }
 

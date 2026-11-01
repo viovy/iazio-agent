@@ -6,11 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 // LivenessSnapshot captures the multi-signal liveness telemetry for an active conversation.
@@ -166,7 +167,7 @@ func (m *ConversationLivenessMonitor) resolveSubprocessTimestamp(pid int) time.T
 	}
 
 	// Darwin/macOS fallback: check if child processes exist under pid
-	cmdDarwin := exec.Command("pgrep", "-P", strconv.Itoa(pid))
+	cmdDarwin := procutil.Command("pgrep", "-P", strconv.Itoa(pid))
 	if outDarwin, errDarwin := cmdDarwin.CombinedOutput(); errDarwin == nil && len(strings.TrimSpace(string(outDarwin))) > 0 {
 		return time.Now().UTC()
 	}
@@ -198,13 +199,13 @@ func (m *ConversationLivenessMonitor) captureProcessTree(pid int) string {
 		return ""
 	}
 	// Try GNU ps first (Linux)
-	cmd := exec.Command("ps", "-f", "--ppid", strconv.Itoa(pid))
+	cmd := procutil.Command("ps", "-f", "--ppid", strconv.Itoa(pid))
 	out, err := cmd.CombinedOutput()
 	if err == nil && len(out) > 0 {
 		return strings.TrimSpace(string(out))
 	}
 	// Darwin / BSD fallback
-	cmdDarwin := exec.Command("pgrep", "-P", strconv.Itoa(pid))
+	cmdDarwin := procutil.Command("pgrep", "-P", strconv.Itoa(pid))
 	if outDarwin, errDarwin := cmdDarwin.CombinedOutput(); errDarwin == nil && len(outDarwin) > 0 {
 		return fmt.Sprintf("Child PIDs of %d:\n%s", pid, strings.TrimSpace(string(outDarwin)))
 	}

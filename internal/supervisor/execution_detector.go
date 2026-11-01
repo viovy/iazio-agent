@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 // ActiveHarnessSignal represents a detected active execution indicator.
@@ -223,10 +225,13 @@ func (d *MultiSignalExecutionDetector) inspectWorkspaceSentinels(repoPath string
 
 // DefaultOSProcessScanner scans the OS process table for live harness or agent execution processes.
 func DefaultOSProcessScanner(repoPaths []string) ([]ActiveHarnessSignal, error) {
+	if runtime.GOOS == "windows" {
+		return nil, nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "ps", "-eo", "pid,args")
+	cmd := procutil.CommandContext(ctx, "ps", "-eo", "pid,args")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/inventory"
+	"github.com/viovy/iazio-agent/internal/procutil"
 	"github.com/viovy/iazio-agent/internal/service"
 )
 
@@ -686,7 +687,7 @@ func resolveGitHubToken(getenv func(string) string) string {
 	if tok := strings.TrimSpace(getenv("GH_TOKEN")); tok != "" {
 		return tok
 	}
-	if out, err := exec.Command("gh", "auth", "token").Output(); err == nil {
+	if out, err := procutil.Command("gh", "auth", "token").Output(); err == nil {
 		if tok := strings.TrimSpace(string(out)); tok != "" {
 			return tok
 		}
@@ -1148,7 +1149,7 @@ func pruneStaleBuildWorktrees(sourceRepo, toolName string) {
 		cleanSource = evalSource
 	}
 
-	listCmd := exec.CommandContext(cleanCtx, "git", "-C", sourceRepo, "worktree", "list", "--porcelain")
+	listCmd := procutil.CommandContext(cleanCtx, "git", "-C", sourceRepo, "worktree", "list", "--porcelain")
 	listCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	if out, err := listCmd.Output(); err == nil {
 		for idx, line := range strings.Split(string(out), "\n") {
@@ -1169,7 +1170,7 @@ func pruneStaleBuildWorktrees(sourceRepo, toolName string) {
 			}
 			base := filepath.Base(cleanWT)
 			if strings.HasPrefix(base, "iazio-build-") {
-				rmCmd := exec.CommandContext(cleanCtx, "git", "-C", sourceRepo, "worktree", "remove", "--force", wtPath)
+				rmCmd := procutil.CommandContext(cleanCtx, "git", "-C", sourceRepo, "worktree", "remove", "--force", wtPath)
 				rmCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 				_ = rmCmd.Run()
 				_ = os.RemoveAll(wtPath)
@@ -1200,7 +1201,7 @@ func pruneStaleBuildWorktrees(sourceRepo, toolName string) {
 		}
 	}
 
-	pruneCmd := exec.CommandContext(cleanCtx, "git", "-C", sourceRepo, "worktree", "prune")
+	pruneCmd := procutil.CommandContext(cleanCtx, "git", "-C", sourceRepo, "worktree", "prune")
 	pruneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	_ = pruneCmd.Run()
 }
@@ -1257,7 +1258,7 @@ func buildToolFromSourceRepo(
 	// 1. Run git fetch origin --prune --quiet (30s timeout, non-interactive)
 	fetchCtx, fetchCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer fetchCancel()
-	fetchCmd := exec.CommandContext(fetchCtx, "git", "-C", sourceRepo, "fetch", "origin", "--prune", "--quiet")
+	fetchCmd := procutil.CommandContext(fetchCtx, "git", "-C", sourceRepo, "fetch", "origin", "--prune", "--quiet")
 	fetchCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	if fetchErr := fetchCmd.Run(); fetchErr != nil && stderr != nil {
 		fmt.Fprintf(stderr, "  [!] %s: git fetch warning: %v\n", tool.Name, fetchErr)
@@ -1279,7 +1280,7 @@ func buildToolFromSourceRepo(
 		candidateRefs = []string{"origin/main", "origin/master"}
 	}
 	for _, ref := range candidateRefs {
-		revCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", ref+"^{commit}")
+		revCmd := procutil.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", ref+"^{commit}")
 		revCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 		out, err := revCmd.Output()
 		if err == nil && len(strings.TrimSpace(string(out))) > 0 {
@@ -1291,7 +1292,7 @@ func buildToolFromSourceRepo(
 		return false, fmt.Errorf("pinned target version %q not found in local source repo %s; falling back to release asset", tool.TargetVersion, sourceRepo)
 	}
 	if remoteSHA == "" {
-		revCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "HEAD")
+		revCmd := procutil.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "HEAD")
 		revCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 		if out, err := revCmd.Output(); err == nil && len(strings.TrimSpace(string(out))) > 0 {
 			remoteSHA = strings.TrimSpace(string(out))
@@ -1304,7 +1305,7 @@ func buildToolFromSourceRepo(
 	// Resolve semver tag if available in sourceRepo (or from pinnedTag)
 	semVer := pinnedTag
 	if semVer == "" {
-		tagCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "describe", "--tags", "--abbrev=0", remoteSHA)
+		tagCmd := procutil.CommandContext(ctx, "git", "-C", sourceRepo, "describe", "--tags", "--abbrev=0", remoteSHA)
 		tagCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 		if out, err := tagCmd.Output(); err == nil {
 			candTag := cleanTargetVersion(strings.TrimSpace(string(out)))
@@ -1318,19 +1319,19 @@ func buildToolFromSourceRepo(
 	installedSHA := inventory.InspectToolCommitSHA(destPath)
 
 	// 4. Check ONLY specific tool repository tracked cleanliness
-	statusCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "status", "--porcelain", "--untracked-files=no")
+	statusCmd := procutil.CommandContext(ctx, "git", "-C", sourceRepo, "status", "--porcelain", "--untracked-files=no")
 	statusCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	statusOut, _ := statusCmd.Output()
 	repoIsClean := len(strings.TrimSpace(string(statusOut))) == 0
 
 	// If local checkout is clean and unpinned, fast-forward local main/master to remoteSHA so local checkout stays current
 	if repoIsClean && pinnedTag == "" {
-		branchCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "--abbrev-ref", "HEAD")
+		branchCmd := procutil.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "--abbrev-ref", "HEAD")
 		branchCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 		if bOut, bErr := branchCmd.Output(); bErr == nil {
 			br := strings.TrimSpace(string(bOut))
 			if br == "main" || br == "master" {
-				ffCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "merge", "--ff-only", remoteSHA)
+				ffCmd := procutil.CommandContext(ctx, "git", "-C", sourceRepo, "merge", "--ff-only", remoteSHA)
 				ffCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 				_ = ffCmd.Run()
 			}
@@ -1367,7 +1368,7 @@ func buildToolFromSourceRepo(
 
 	// Check whether sourceRepo HEAD equals remoteSHA
 	var localHeadSHA string
-	if headOut, err := exec.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "HEAD").Output(); err == nil {
+	if headOut, err := procutil.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "HEAD").Output(); err == nil {
 		localHeadSHA = strings.TrimSpace(string(headOut))
 	}
 
@@ -1379,11 +1380,11 @@ func buildToolFromSourceRepo(
 		removeTempWorktree := func() {
 			cleanCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			rmCmd := exec.CommandContext(cleanCtx, "git", "-C", sourceRepo, "worktree", "remove", "--force", tempDir)
+			rmCmd := procutil.CommandContext(cleanCtx, "git", "-C", sourceRepo, "worktree", "remove", "--force", tempDir)
 			rmCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 			_ = rmCmd.Run()
 			_ = os.RemoveAll(tempDir)
-			pruneCmd := exec.CommandContext(cleanCtx, "git", "-C", sourceRepo, "worktree", "prune")
+			pruneCmd := procutil.CommandContext(cleanCtx, "git", "-C", sourceRepo, "worktree", "prune")
 			pruneCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 			_ = pruneCmd.Run()
 		}
@@ -1396,7 +1397,7 @@ func buildToolFromSourceRepo(
 			worktreeRefs = []string{remoteSHA}
 		}
 		for _, targetRef := range worktreeRefs {
-			addCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "worktree", "add", "--force", "--detach", tempDir, targetRef)
+			addCmd := procutil.CommandContext(ctx, "git", "-C", sourceRepo, "worktree", "add", "--force", "--detach", tempDir, targetRef)
 			addCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 			if err := addCmd.Run(); err == nil {
 				addWorktreeSucceeded = true
@@ -1410,9 +1411,9 @@ func buildToolFromSourceRepo(
 		} else {
 			// Fallback: extract archive from remoteSHA to ensure clean ephemeral build
 			if mkErr := os.MkdirAll(tempDir, 0755); mkErr == nil {
-				archiveCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "archive", remoteSHA)
+				archiveCmd := procutil.CommandContext(ctx, "git", "-C", sourceRepo, "archive", remoteSHA)
 				archiveCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-				tarCmd := exec.CommandContext(ctx, "tar", "-x", "-C", tempDir)
+				tarCmd := procutil.CommandContext(ctx, "tar", "-x", "-C", tempDir)
 				if pipe, pErr := archiveCmd.StdoutPipe(); pErr == nil {
 					tarCmd.Stdin = pipe
 					if err := tarCmd.Start(); err == nil && archiveCmd.Start() == nil {
@@ -1442,7 +1443,7 @@ func buildToolFromSourceRepo(
 	verStr := "0.0.1"
 	if semVer != "" {
 		verStr = semVer
-	} else if out, err := exec.CommandContext(ctx, "git", "-C", buildDir, "describe", "--tags", "--always").Output(); err == nil {
+	} else if out, err := procutil.CommandContext(ctx, "git", "-C", buildDir, "describe", "--tags", "--always").Output(); err == nil {
 		verStr = strings.TrimSpace(string(out))
 	}
 	shortSHA := remoteSHA
@@ -1481,7 +1482,7 @@ func buildToolFromSourceRepo(
 		}
 	}
 
-	buildCmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags="+ldflags, "-o", stagingBin, cmdPath)
+	buildCmd := procutil.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags="+ldflags, "-o", stagingBin, cmdPath)
 	buildCmd.Dir = buildDir
 	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := buildCmd.CombinedOutput(); err != nil {

@@ -3120,6 +3120,35 @@ func TestHealHarvesterServiceIfNeeded(t *testing.T) {
 	if reconcileCalled {
 		t.Fatal("expected active harvester service not to trigger reconcile")
 	}
+
+	// If reconcile brings harvester to active, restartToolServiceFn must NOT be called
+	calls := 0
+	restartCalled := false
+	inspectToolServiceFn = func(toolName, goos string) (bool, string) {
+		calls++
+		if calls == 1 {
+			return true, "ready"
+		}
+		return true, "active"
+	}
+	reconcileHarvesterServiceFn = func(ctx context.Context, bin string) error {
+		return nil
+	}
+	restartToolServiceFn = func(toolName string, _ ...func(name string, args ...string) error) error {
+		restartCalled = true
+		return nil
+	}
+	healHarvesterServiceIfNeeded(context.Background(), home, "darwin")
+	if restartCalled {
+		t.Fatal("expected restartToolServiceFn not to be called when reconcile brings service to active")
+	}
+
+	if shouldEnsureCanonicalSingleHome([]string{"--version"}) || shouldEnsureCanonicalSingleHome([]string{"version"}) || shouldEnsureCanonicalSingleHome([]string{"service", "reconcile"}) {
+		t.Fatal("expected lightweight CLI subcommands not to trigger ensureCanonicalSingleHome")
+	}
+	if !shouldEnsureCanonicalSingleHome([]string{"run"}) || !shouldEnsureCanonicalSingleHome([]string{"update"}) {
+		t.Fatal("expected run and update to trigger ensureCanonicalSingleHome")
+	}
 }
 
 func TestExecuteRun_InFlightPrepActiveJobsAndHeartbeat(t *testing.T) {

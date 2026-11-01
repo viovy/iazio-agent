@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-agent/internal/harness"
+	"github.com/viovy/iazio-agent/internal/procutil"
 	"github.com/viovy/iazio-agent/internal/telemetry"
 	"github.com/viovy/iazio-agent/internal/workspace"
 )
@@ -613,7 +613,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		if wsPrepSpan != nil {
 			wsPrepSpan.End()
 		}
-		if cfgErr := exec.CommandContext(ctx, "git", "-C", worktreeDir, "config", "core.autocrlf", "input").Run(); cfgErr != nil {
+		if cfgErr := procutil.CommandContext(ctx, "git", "-C", worktreeDir, "config", "core.autocrlf", "input").Run(); cfgErr != nil {
 			fmt.Fprintf(os.Stderr, "[dispatcher] git autocrlf config warning: %v\n", cfgErr)
 		}
 	}

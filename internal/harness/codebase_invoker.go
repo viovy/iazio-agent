@@ -8,8 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
+
+	"github.com/viovy/iazio-agent/internal/procutil"
 )
 
 // RepoManifest describes a submodule or superproject repository returned by codebase repos.
@@ -80,7 +81,7 @@ func NewCodebaseInvoker(binaryPath, workDir string) *CLICodebaseInvoker {
 
 // ListLocalRepos runs `iazio-harness codebase repos --json` and parses the output into []RepoManifest.
 func (c *CLICodebaseInvoker) ListLocalRepos(ctx context.Context) ([]RepoManifest, error) {
-	cmd := exec.CommandContext(ctx, c.HarnessBinary, "codebase", "repos", "--json")
+	cmd := procutil.CommandContext(ctx, c.HarnessBinary, "codebase", "repos", "--json")
 	if c.WorkDir != "" {
 		cmd.Dir = c.WorkDir
 	}
@@ -114,7 +115,7 @@ func (c *CLICodebaseInvoker) ExportRepoDelta(ctx context.Context, req ExportRequ
 		return nil, fmt.Errorf("marshal export request: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, c.HarnessBinary, "codebase", "export", "--json")
+	cmd := procutil.CommandContext(ctx, c.HarnessBinary, "codebase", "export", "--json")
 	if c.WorkDir != "" {
 		cmd.Dir = c.WorkDir
 	}
