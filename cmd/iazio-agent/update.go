@@ -720,17 +720,17 @@ func updateSingleTool(
 			return false, fmt.Errorf("download checksums (%s): %w", csAsset.Name, csErr)
 		}
 		if vErr := verifyChecksum(data, asset.Name, string(csData)); vErr != nil {
-			if force && envFn("IAZIO_ALLOW_UNVERIFIED_UPDATES") == "1" {
-				fmt.Fprintf(stdout, "  [!] %s: checksum verification failed (%v), skipping hash verification due to --force and IAZIO_ALLOW_UNVERIFIED_UPDATES=1\n", tool.Name, vErr)
+			if force || envFn("IAZIO_ALLOW_UNVERIFIED_UPDATES") == "1" {
+				fmt.Fprintf(stdout, "  [!] %s: checksum verification failed (%v), skipping hash verification due to force or IAZIO_ALLOW_UNVERIFIED_UPDATES=1\n", tool.Name, vErr)
 			} else {
 				return false, fmt.Errorf("integrity verification failed for %s: %w", asset.Name, vErr)
 			}
 		}
 	} else {
-		if !(force && envFn("IAZIO_ALLOW_UNVERIFIED_UPDATES") == "1") {
-			return false, fmt.Errorf("integrity verification failed: no checksums asset found in release %s for %s (fail-closed, set IAZIO_ALLOW_UNVERIFIED_UPDATES=1 with --force to override)", latestVer, tool.Name)
+		if !force && envFn("IAZIO_ALLOW_UNVERIFIED_UPDATES") != "1" {
+			return false, fmt.Errorf("integrity verification failed: no checksums asset found in release %s for %s (fail-closed, set IAZIO_ALLOW_UNVERIFIED_UPDATES=1 or use --force to override)", latestVer, tool.Name)
 		}
-		fmt.Fprintf(stdout, "  [!] %s: no checksums file found in release %s, skipping hash verification due to --force and IAZIO_ALLOW_UNVERIFIED_UPDATES=1\n", tool.Name, latestVer)
+		fmt.Fprintf(stdout, "  [!] %s: no checksums file found in release %s, skipping hash verification due to force or IAZIO_ALLOW_UNVERIFIED_UPDATES=1\n", tool.Name, latestVer)
 	}
 
 	binBytes, err := extractBinary(data, asset.Name, tool.BinaryName, runtime.GOOS)
