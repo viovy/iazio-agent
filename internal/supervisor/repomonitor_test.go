@@ -90,6 +90,36 @@ func TestInspectRepoGitState_CleanAndDirty(t *testing.T) {
 	_ = os.Remove(lockPath)
 }
 
+func TestInspectRepoGitState_IgnoreUntrackedDirty(t *testing.T) {
+	tempDir := t.TempDir()
+	initTestGitRepo(t, tempDir)
+
+	ctx := context.Background()
+
+	untrackedFile := filepath.Join(tempDir, "untracked.txt")
+	if err := os.WriteFile(untrackedFile, []byte("hello"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	t.Setenv("IAZIO_IGNORE_UNTRACKED_DIRTY", "1")
+	st := InspectRepoGitState(ctx, tempDir, "test-repo")
+	if !st.IsClean {
+		t.Fatalf("expected clean repo when IAZIO_IGNORE_UNTRACKED_DIRTY=1, got dirty: %s", st.Error)
+	}
+	if st.UntrackedFilesCount != 1 {
+		t.Errorf("expected 1 untracked file, got %d", st.UntrackedFilesCount)
+	}
+
+	customLock := filepath.Join(tempDir, ".git", "iazio-custom.lock")
+	if err := os.WriteFile(customLock, []byte(""), 0644); err != nil {
+		t.Fatalf("write lockfile: %v", err)
+	}
+	st2 := InspectRepoGitState(ctx, tempDir, "test-repo")
+	if st2.IsClean || !st2.HasActiveGitLock {
+		t.Fatalf("expected HasActiveGitLock=true when custom lock exists")
+	}
+}
+
 func TestRepoStateMonitor_ExecutionGuardAndFleetClean(t *testing.T) {
 	tempDir := t.TempDir()
 	initTestGitRepo(t, tempDir)

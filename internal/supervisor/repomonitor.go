@@ -178,12 +178,30 @@ func inspectSingleGitDirectory(ctx context.Context, dir string) singleDirGitResu
 		filepath.Join(gitDir, "index.lock"),
 		filepath.Join(gitDir, "HEAD.lock"),
 		filepath.Join(gitDir, "shallow.lock"),
+		filepath.Join(gitDir, "config.lock"),
 		filepath.Join(gitDir, "MERGE_HEAD"),
 		filepath.Join(gitDir, "rebase-merge"),
 		filepath.Join(gitDir, "rebase-apply"),
 		filepath.Join(gitDir, "CHERRY_PICK_HEAD"),
 		filepath.Join(gitDir, "REVERT_HEAD"),
 		filepath.Join(gitDir, "BISECT_LOG"),
+	}
+	if entries, rdErr := os.ReadDir(gitDir); rdErr == nil {
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".lock") {
+				p := filepath.Join(gitDir, e.Name())
+				found := false
+				for _, s := range lockSentinels {
+					if s == p {
+						found = true
+						break
+					}
+				}
+				if !found {
+					lockSentinels = append(lockSentinels, p)
+				}
+			}
+		}
 	}
 	for _, sentinel := range lockSentinels {
 		if fi, err := os.Stat(sentinel); err == nil {
@@ -202,10 +220,16 @@ func inspectSingleGitDirectory(ctx context.Context, dir string) singleDirGitResu
 		}
 	}
 
-	// 2. Non-locking git status --porcelain=v2 --branch with per-repo 15s timeout
-	repoCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	// 2. Non-locking git status --porcelain=v2 --branch --ignore-submodules=all
+	timeout := 45 * time.Second
+	if tStr := os.Getenv("IAZIO_GIT_STATUS_TIMEOUT"); tStr != "" {
+		if d, err := time.ParseDuration(tStr); err == nil && d > 0 {
+			timeout = d
+		}
+	}
+	repoCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := procutil.CommandContext(repoCtx, "git", "-C", dir, "status", "--porcelain=v2", "--branch")
+	cmd := procutil.CommandContext(repoCtx, "git", "-C", dir, "status", "--porcelain=v2", "--branch", "--ignore-submodules=all")
 	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -241,7 +265,12 @@ func inspectSingleGitDirectory(ctx context.Context, dir string) singleDirGitResu
 		}
 	}
 
-	res.IsClean = (res.DirtyFilesCount == 0 && res.UntrackedFilesCount == 0 && !res.HasActiveGitLock)
+	ignoreUntracked := os.Getenv("IAZIO_IGNORE_UNTRACKED_DIRTY") == "1" || strings.EqualFold(os.Getenv("IAZIO_IGNORE_UNTRACKED_DIRTY"), "true")
+	if ignoreUntracked {
+		res.IsClean = (res.DirtyFilesCount == 0 && !res.HasActiveGitLock)
+	} else {
+		res.IsClean = (res.DirtyFilesCount == 0 && res.UntrackedFilesCount == 0 && !res.HasActiveGitLock)
+	}
 	return res
 }
 
