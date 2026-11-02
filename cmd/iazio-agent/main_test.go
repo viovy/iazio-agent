@@ -3432,3 +3432,43 @@ func TestAcquireAgentSingleInstanceLockAndWindowsMutex(t *testing.T) {
 		t.Fatalf("expected zero-handle Windows mutex to reject lock")
 	}
 }
+
+func TestResolveTelemetryDestination(t *testing.T) {
+	// 1. Env variable precedence
+	u, isGw := resolveTelemetryDestination("", func(k string) string {
+		if k == "CENTRAL_TELEMETRY_GATEWAY_URL" {
+			return "https://env-gateway.local/central-telemetry-gateway"
+		}
+		return ""
+	})
+	if u != "https://env-gateway.local/central-telemetry-gateway" || !isGw {
+		t.Fatalf("expected env gateway url, got %q, isGw=%v", u, isGw)
+	}
+
+	// 2. Discovered from upstream API /v1/telemetry/config
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/telemetry/config" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("{\"central_telemetry_gateway_url\":\"https://api-discovered.local\",\"status\":\"healthy\"}"))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	u2, isGw2 := resolveTelemetryDestination(ts.URL, func(string) string { return "" })
+	if u2 != "https://api-discovered.local" || !isGw2 {
+		t.Fatalf("expected api discovered gateway url, got %q, isGw=%v", u2, isGw2)
+	}
+
+	// 3. Fallback to IAZIO_ELASTICSEARCH_URL
+	u3, isGw3 := resolveTelemetryDestination("", func(k string) string {
+		if k == "IAZIO_ELASTICSEARCH_URL" {
+			return "http://direct.es.local:9200"
+		}
+		return ""
+	})
+	if u3 != "http://direct.es.local:9200" || isGw3 {
+		t.Fatalf("expected direct ES url, got %q, isGw=%v", u3, isGw3)
+	}
+}

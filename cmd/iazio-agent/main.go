@@ -365,33 +365,24 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		}
 		telemetry.ConfigureZipkinFromAPI(api)
 		host := resolveHostID(getenv, os.Hostname, nil)
-		esURL := strings.TrimSpace(getenv("IAZIO_ELASTICSEARCH_URL"))
-		if esURL == "" {
-			if home, err := os.UserHomeDir(); err == nil && home != "" {
-				cfgFile := filepath.Join(home, ".iazio", "agent.json")
-				if data, err := os.ReadFile(cfgFile); err == nil {
-					var raw struct {
-						ElasticsearchURL string `json:"elasticsearch_url"`
-					}
-					if err := json.Unmarshal(data, &raw); err == nil {
-						esURL = strings.TrimSpace(raw.ElasticsearchURL)
-					}
-				}
-			}
-		}
+		destURL, isGateway := resolveTelemetryDestination(api, getenv)
+		authToken := resolveControlPlaneToken(getenv)
 		var sink *elasticlog.Sink
-		if esURL != "" {
+		if destURL != "" {
 			sink = elasticlog.New(elasticlog.Config{
-				URL:         esURL,
+				URL:         destURL,
+				IsGateway:   isGateway,
+				AuthToken:   authToken,
 				ServiceName: "iazio-agent",
 				Version:     formatVersion(),
 				HostName:    host,
 			})
 			defer func() { _ = sink.Close() }()
 			sink.Info("iazio-agent supervisor starting", map[string]any{
-				"host_kind": string(kind),
-				"api_url":   api,
-				"profile":   profile,
+				"host_kind":  string(kind),
+				"api_url":    api,
+				"profile":    profile,
+				"is_gateway": isGateway,
 			})
 		}
 		if ctx.Err() == nil {
@@ -3165,4 +3156,58 @@ func buildInspectOutdatedHook(
 		}
 		return supervisor.FindOutdatedTools(manifest, inventory.InspectInstalledVersion, binDir, checkTools, targetOS)
 	}
+}
+
+
+func resolveTelemetryDestination(apiURL string, getenv func(string) string) (string, bool) {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	for _, envKey := range []string{"CENTRAL_TELEMETRY_GATEWAY_URL", "IAZIO_CENTRAL_TELEMETRY_GATEWAY_URL", "TELEMETRY_GATEWAY_URL"} {
+		if u := strings.TrimSpace(getenv(envKey)); u != "" {
+			return u, true
+		}
+	}
+
+	if trimmedAPI := strings.TrimRight(strings.TrimSpace(apiURL), "/"); trimmedAPI != "" {
+		client := &http.Client{Timeout: 2 * time.Second}
+		for _, path := range []string{"/v1/telemetry/config", "/api/v1/telemetry/config", "/v1/status"} {
+			resp, err := client.Get(trimmedAPI + path)
+			if err == nil {
+				defer resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					var raw struct {
+						CentralTelemetryGatewayURL string `json:"central_telemetry_gateway_url"`
+					}
+					if err := json.NewDecoder(resp.Body).Decode(&raw); err == nil && strings.TrimSpace(raw.CentralTelemetryGatewayURL) != "" {
+						return strings.TrimSpace(raw.CentralTelemetryGatewayURL), true
+					}
+				}
+			}
+		}
+	}
+
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		cfgFile := filepath.Join(home, ".iazio", "agent.json")
+		if data, err := os.ReadFile(cfgFile); err == nil {
+			var raw struct {
+				CentralTelemetryGatewayURL string `json:"central_telemetry_gateway_url"`
+				ElasticsearchURL           string `json:"elasticsearch_url"`
+			}
+			if err := json.Unmarshal(data, &raw); err == nil {
+				if strings.TrimSpace(raw.CentralTelemetryGatewayURL) != "" {
+					return strings.TrimSpace(raw.CentralTelemetryGatewayURL), true
+				}
+				if strings.TrimSpace(raw.ElasticsearchURL) != "" {
+					return strings.TrimSpace(raw.ElasticsearchURL), false
+				}
+			}
+		}
+	}
+
+	if esURL := strings.TrimSpace(getenv("IAZIO_ELASTICSEARCH_URL")); esURL != "" {
+		return esURL, false
+	}
+
+	return "", false
 }
