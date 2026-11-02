@@ -177,3 +177,50 @@ func TestElasticlog_HelpersAndWarn(t *testing.T) {
 		t.Fatalf("expected 0 dropped count")
 	}
 }
+
+func TestElasticSink_SendCentralTelemetryGateway(t *testing.T) {
+	var requestCount atomic.Int32
+	var receivedBody []byte
+	var receivedAuth string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		if r.URL.Path != "/v1/telemetry/logs" {
+			t.Errorf("expected path /v1/telemetry/logs, got %s", r.URL.Path)
+		}
+		if r.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("expected json content type, got %s", r.Header.Get("Content-Type"))
+		}
+		receivedAuth = r.Header.Get("Authorization")
+		body, _ := io.ReadAll(r.Body)
+		receivedBody = body
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("{\"status\":\"accepted\",\"index\":\"iazio-logs\"}"))
+	}))
+	defer ts.Close()
+
+	sink := New(Config{
+		URL:           ts.URL,
+		IsGateway:     true,
+		AuthToken:     "test-token-123",
+		ServiceName:   "iazio-agent",
+		Version:       "0.0.51",
+		HostName:      "test-pc1",
+		BatchSize:     2,
+		FlushInterval: 50 * time.Millisecond,
+	})
+
+	sink.Info("gateway log message", map[string]any{"key": "val"})
+	time.Sleep(150 * time.Millisecond)
+	_ = sink.Close()
+
+	if requestCount.Load() == 0 {
+		t.Fatalf("expected at least 1 request to mock gateway, got 0")
+	}
+	if receivedAuth != "Bearer test-token-123" {
+		t.Fatalf("expected Authorization header Bearer test-token-123, got %s", receivedAuth)
+	}
+	if !strings.Contains(string(receivedBody), "gateway log message") {
+		t.Fatalf("expected body to contain message, got: %s", string(receivedBody))
+	}
+}

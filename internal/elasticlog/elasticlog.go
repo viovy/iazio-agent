@@ -57,6 +57,9 @@ type Config struct {
 	FlushInterval time.Duration
 	HTTPClient    *http.Client
 	SpoolDir      string
+	GatewayURL    string
+	IsGateway     bool
+	AuthToken     string
 }
 
 // Sink is an asynchronous, non-blocking Elasticsearch log shipper with offline spooling.
@@ -302,36 +305,62 @@ func (s *Sink) sendBulk(ctx context.Context, entries []*Entry) error {
 }
 
 func (s *Sink) sendBulkDirect(ctx context.Context, entries []*Entry) error {
-	bulkURL := strings.TrimRight(s.cfg.URL, "/") + "/_bulk"
-	var buf bytes.Buffer
+	isGateway := s.cfg.IsGateway || s.cfg.GatewayURL != "" || strings.Contains(s.cfg.URL, "central-telemetry-gateway") || strings.Contains(s.cfg.URL, "/telemetry/logs")
+	var reqURL string
+	var reqBody io.Reader
+	var contentType string
 
-	for _, e := range entries {
-		meta := map[string]any{
-			"index": map[string]any{
-				"_index": s.cfg.Index,
-			},
+	if isGateway {
+		gw := s.cfg.GatewayURL
+		if gw == "" {
+			gw = s.cfg.URL
 		}
-		metaBytes, err := json.Marshal(meta)
+		gw = strings.TrimRight(gw, "/")
+		if !strings.HasSuffix(gw, "/v1/telemetry/logs") {
+			reqURL = gw + "/v1/telemetry/logs"
+		} else {
+			reqURL = gw
+		}
+		data, err := json.Marshal(entries)
 		if err != nil {
-			continue
+			return err
 		}
-		entryBytes, err := json.Marshal(e)
-		if err != nil {
-			continue
+		reqBody = bytes.NewReader(data)
+		contentType = "application/json"
+	} else {
+		reqURL = strings.TrimRight(s.cfg.URL, "/") + "/_bulk"
+		var buf bytes.Buffer
+		for _, e := range entries {
+			meta := map[string]any{
+				"index": map[string]any{
+					"_index": s.cfg.Index,
+				},
+			}
+			metaBytes, err := json.Marshal(meta)
+			if err != nil {
+				continue
+			}
+			entryBytes, err := json.Marshal(e)
+			if err != nil {
+				continue
+			}
+			buf.Write(metaBytes)
+			buf.WriteByte('\n')
+			buf.Write(entryBytes)
+			buf.WriteByte('\n')
 		}
-
-		buf.Write(metaBytes)
-		buf.WriteByte('\n')
-		buf.Write(entryBytes)
-		buf.WriteByte('\n')
+		reqBody = &buf
+		contentType = "application/x-ndjson"
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, bulkURL, &buf)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, reqBody)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/x-ndjson")
-	if s.cfg.Username != "" || s.cfg.Password != "" {
+	req.Header.Set("Content-Type", contentType)
+	if s.cfg.AuthToken != "" {
+		req.Header.Set("Authorization", "Bearer "+s.cfg.AuthToken)
+	} else if s.cfg.Username != "" || s.cfg.Password != "" {
 		req.SetBasicAuth(s.cfg.Username, s.cfg.Password)
 	}
 
@@ -341,7 +370,7 @@ func (s *Sink) sendBulkDirect(ctx context.Context, entries []*Entry) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("elasticsearch error: status %d", resp.StatusCode)
+		return fmt.Errorf("telemetry/elasticsearch error: status %d", resp.StatusCode)
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
