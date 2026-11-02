@@ -140,7 +140,9 @@ func acquireAgentSingleInstanceLock(home string, stdout, stderr io.Writer) (func
 			}
 		}
 		if running, pid := service.StatusUserDaemonAt(home); running && pid > 0 && pid != os.Getpid() {
-			fmt.Fprintf(stderr, "another iazio-agent instance (PID %d) is already running on this host/user; exiting\n", pid)
+			if os.Getenv("IAZIO_AGENT_NONINTERACTIVE") != "1" && stderr != nil {
+				fmt.Fprintf(stderr, "another iazio-agent instance (PID %d) is already running on this host/user; exiting\n", pid)
+			}
 			return nil, false
 		}
 	}
