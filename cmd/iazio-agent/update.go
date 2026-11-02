@@ -224,10 +224,6 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 		opts.API = resolveLocalAPI(getenv)
 	}
 
-	if opts.DryRun {
-		return res, nil
-	}
-
 	manifestURL := fmt.Sprintf("%s/v1/fleet/manifest?profile=%s&os=%s&arch=%s",
 		strings.TrimRight(opts.API, "/"), opts.Profile, runtime.GOOS, runtime.GOARCH)
 
@@ -256,7 +252,7 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 		}
 	}
 
-	if len(manifest.Endpoints) > 0 {
+	if !opts.DryRun && len(manifest.Endpoints) > 0 {
 		_ = syncLocalEndpoints(manifest.Endpoints, manifest.Profile)
 	}
 
@@ -361,6 +357,17 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 	for _, tool := range targets {
 		if opts.TargetVersion != "" {
 			tool.TargetVersion = opts.TargetVersion
+		}
+		if opts.DryRun {
+			_, err := evalDryRunTool(ctx, client, tool, binDir, ghToken, opts.Force, stdout, stderr, getenv)
+			if err != nil {
+				res.Errors = append(res.Errors, fmt.Errorf("%s: %w", tool.Name, err))
+				res.FailedTools = append(res.FailedTools, tool.Name)
+				if stderr != nil {
+					fmt.Fprintf(stderr, "  [-] %s: %v\n", tool.Name, err)
+				}
+			}
+			continue
 		}
 		updated, err := updateSingleTool(ctx, client, tool, binDir, ghToken, opts.Force, stdout, stderr, getenv)
 		if err != nil {
@@ -541,6 +548,98 @@ func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer, get
 	}
 
 	return nil
+}
+
+func evalDryRunTool(
+	ctx context.Context,
+	client *http.Client,
+	tool ManifestToolItem,
+	binDir, ghToken string,
+	force bool,
+	stdout, stderr io.Writer,
+	getenv ...func(string) string,
+) (bool, error) {
+	envFn := os.Getenv
+	if len(getenv) > 0 && getenv[0] != nil {
+		envFn = getenv[0]
+	}
+
+	binName := tool.BinaryName
+	if binName == "" {
+		binName = tool.Name
+	}
+	if runtime.GOOS == "windows" && !strings.HasSuffix(binName, ".exe") {
+		binName += ".exe"
+	}
+
+	destPath := filepath.Join(binDir, binName)
+	var existingShadowPath string
+	if lookPath, err := exec.LookPath(binName); err == nil && lookPath != "" {
+		if absLook, err := filepath.Abs(lookPath); err == nil {
+			if absDest, err := filepath.Abs(destPath); err == nil && absLook != absDest {
+				existingShadowPath = absLook
+			}
+		}
+	}
+	curVer := inventory.InspectInstalledVersion(destPath)
+	if curVer == "" && existingShadowPath != "" {
+		curVer = inventory.InspectInstalledVersion(existingShadowPath)
+	}
+
+	if sourceRepo := findToolSourceRepo(tool.Name, envFn, tool.Repository); sourceRepo != "" {
+		revCmd := procutil.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "origin/main^{commit}")
+		revCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		out, err := revCmd.Output()
+		if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+			revCmd2 := procutil.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "HEAD")
+			revCmd2.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+			out, _ = revCmd2.Output()
+		}
+		if len(strings.TrimSpace(string(out))) > 0 {
+			remoteSHA := strings.TrimSpace(string(out))
+			installedSHA := inventory.InspectToolCommitSHA(destPath)
+			shortRemote := remoteSHA
+			if len(shortRemote) > 7 {
+				shortRemote = shortRemote[:7]
+			}
+			if installedSHA != "" && (installedSHA == remoteSHA || strings.HasPrefix(remoteSHA, installedSHA) || strings.HasPrefix(installedSHA, remoteSHA)) && !force {
+				if stdout != nil {
+					fmt.Fprintf(stdout, "  [=] %s: %s (dry-run: up-to-date commit %s)\n", tool.Name, shortRemote, shortRemote)
+				}
+				return false, nil
+			}
+			if stdout != nil {
+				fmt.Fprintf(stdout, "  [+] %s: %s -> commit %s (dry-run: update available from %s)\n", tool.Name, curVer, shortRemote, filepath.Base(sourceRepo))
+			}
+			return true, nil
+		}
+	}
+
+	repo := tool.Repository
+	if !strings.Contains(repo, "/") {
+		repo = "viovy/" + repo
+	}
+
+	rel, err := fetchRelease(ctx, client, repo, tool.TargetVersion, ghToken)
+	if err != nil {
+		if stdout != nil {
+			fmt.Fprintf(stdout, "  [?] %s: unable to fetch release (%v)\n", tool.Name, err)
+		}
+		return false, nil
+	}
+
+	latestVer := strings.TrimPrefix(rel.TagName, "v")
+	if curVer != "" && (curVer == latestVer || strings.Contains(curVer, latestVer) || isInstalledVersionNewerOrEqual(curVer, latestVer)) && !force {
+		if stdout != nil {
+			fmt.Fprintf(stdout, "  [=] %s: %s (dry-run: up-to-date)\n", tool.Name, latestVer)
+		}
+		return false, nil
+	}
+
+	if stdout != nil {
+		fmt.Fprintf(stdout, "  [+] %s: %s -> %s (dry-run: update available)\n", tool.Name, curVer, latestVer)
+	}
+	return true, nil
 }
 
 func updateSingleTool(
@@ -937,7 +1036,7 @@ func extractBinary(archiveData []byte, archiveName, binaryName, targetOS string)
 		}
 		for _, f := range zr.File {
 			base := filepath.Base(f.Name)
-			if strings.EqualFold(base, expectedName) {
+			if strings.EqualFold(base, expectedName) || (targetOS == "windows" && strings.EqualFold(base, strings.TrimSuffix(expectedName, ".exe"))) {
 				rc, err := f.Open()
 				if err != nil {
 					return nil, err
@@ -966,7 +1065,7 @@ func extractBinary(archiveData []byte, archiveName, binaryName, targetOS string)
 				return nil, err
 			}
 			base := filepath.Base(hdr.Name)
-			if strings.EqualFold(base, expectedName) {
+			if strings.EqualFold(base, expectedName) || (targetOS == "windows" && strings.EqualFold(base, strings.TrimSuffix(expectedName, ".exe"))) {
 				return io.ReadAll(tr)
 			}
 		}
@@ -985,6 +1084,7 @@ func findToolSourceRepo(toolName string, getenv func(string) string, repoHint ..
 		getenv = os.Getenv
 	}
 	cleanTool := strings.ToLower(strings.TrimSpace(toolName))
+	cleanTool = strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(cleanTool, ".exe"), ".cmd"), ".bat")
 	if cleanTool == "" {
 		return ""
 	}
@@ -1251,9 +1351,13 @@ func buildToolFromSourceRepo(
 	if toolName == "" {
 		toolName = tool.Name
 	}
+	cleanToolName := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(toolName, ".exe"), ".EXE"), ".cmd")
+	if cleanToolName == "" {
+		cleanToolName = strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(tool.Name, ".exe"), ".EXE"), ".cmd")
+	}
 
 	// 0. Sweep any orphaned ephemeral iazio-build-* worktrees or temp directories from prior interrupted runs
-	pruneStaleBuildWorktrees(sourceRepo, tool.Name)
+	pruneStaleBuildWorktrees(sourceRepo, cleanToolName)
 
 	// 1. Run git fetch origin --prune --quiet (30s timeout, non-interactive)
 	fetchCtx, fetchCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -1376,7 +1480,7 @@ func buildToolFromSourceRepo(
 	buildDir := sourceRepo
 
 	if force || !repoIsClean || pinnedTag != "" || localHeadSHA != remoteSHA {
-		tempDir := filepath.Join(os.TempDir(), fmt.Sprintf("iazio-build-%s-%d", tool.Name, time.Now().UnixNano()))
+		tempDir := filepath.Join(os.TempDir(), fmt.Sprintf("iazio-build-%s-%d", cleanToolName, time.Now().UnixNano()))
 		removeTempWorktree := func() {
 			cleanCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
@@ -1434,7 +1538,7 @@ func buildToolFromSourceRepo(
 		}
 	}
 
-	stagingBin := filepath.Join(os.TempDir(), fmt.Sprintf("staging-%s-%d", tool.Name, time.Now().UnixNano()))
+	stagingBin := filepath.Join(os.TempDir(), fmt.Sprintf("staging-%s-%d", cleanToolName, time.Now().UnixNano()))
 	if runtime.GOOS == "windows" {
 		stagingBin += ".exe"
 	}
@@ -1455,9 +1559,9 @@ func buildToolFromSourceRepo(
 
 	cmdPath := ""
 	candidates := []string{
-		toolName,
-		strings.TrimPrefix(toolName, "autopilot-"),
-		"autopilot-" + toolName,
+		cleanToolName,
+		strings.TrimPrefix(cleanToolName, "autopilot-"),
+		"autopilot-" + cleanToolName,
 	}
 	for _, c := range candidates {
 		if fi, err := os.Stat(filepath.Join(buildDir, "cmd", c)); err == nil && fi.IsDir() {

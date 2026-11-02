@@ -1293,6 +1293,36 @@ func TestInspectRepoGitState_RecursiveSubmodules(t *testing.T) {
 	}
 }
 
+func TestInspectRepoGitState_StaleLockAutoPruned(t *testing.T) {
+	rootTemp := t.TempDir()
+	initTestGitRepo(t, rootTemp)
+
+	lockPath := filepath.Join(rootTemp, ".git", "index.lock")
+	if err := os.WriteFile(lockPath, []byte("stale-lock-data"), 0644); err != nil {
+		t.Fatalf("create lockfile: %v", err)
+	}
+
+	// Set modification time to 15 minutes ago (abandoned lock)
+	staleTime := time.Now().Add(-15 * time.Minute)
+	if err := os.Chtimes(lockPath, staleTime, staleTime); err != nil {
+		t.Fatalf("set lockfile mtime: %v", err)
+	}
+
+	ctx := context.Background()
+	st := InspectRepoGitState(ctx, rootTemp, "stale-lock-repo")
+	if !st.IsClean {
+		t.Fatalf("expected workspace clean after stale lock auto-pruning, got: is_clean=%t (err=%s)", st.IsClean, st.Error)
+	}
+	if st.HasActiveGitLock {
+		t.Fatalf("expected HasActiveGitLock=false for stale lock older than threshold")
+	}
+
+	// Verify the lock file was removed from disk
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("expected stale lockfile to be pruned from disk, but file still exists")
+	}
+}
+
 func TestEagerToolUpdater_ReadinessReportAndGateIntegration(t *testing.T) {
 	sup := New(time.Now)
 	gate := NewHostExecutionAndUpdateGate()

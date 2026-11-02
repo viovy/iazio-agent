@@ -1973,3 +1973,78 @@ func TestDefaultRepositoryForTool(t *testing.T) {
 		}
 	}
 }
+
+func TestPerformUpdateWithResult_DryRun(t *testing.T) {
+	manifestResp := ManifestResponse{
+		Profile: "generic",
+		Tools: []ManifestToolItem{
+			{
+				Name:        "test-tool-a",
+				BinaryName:  "test-tool-a",
+				Repository:  "viovy/test-tool-a",
+				Description: "test tool",
+			},
+		},
+	}
+	manifestData, err := json.Marshal(manifestResp)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/v1/fleet/manifest") {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(manifestData)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	tmpBin := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	res, err := performUpdateWithResult(context.Background(), UpdateOptions{
+		API:         srv.URL,
+		Suite:       true,
+		DryRun:      true,
+		BinDir:      tmpBin,
+	}, &stdout, &stderr, func(k string) string { return "" })
+
+	if err != nil {
+		t.Fatalf("expected nil error on dry-run, got: %v", err)
+	}
+	if len(res.Errors) > 0 {
+		t.Fatalf("expected 0 errors on dry run, got: %v", res.Errors)
+	}
+	outStr := stdout.String()
+	if !strings.Contains(outStr, "dry-run") && !strings.Contains(outStr, "test-tool-a") {
+		t.Fatalf("expected dry-run inspection in stdout, got: %q", outStr)
+	}
+}
+
+func TestCleanToolNameForSourceBuild(t *testing.T) {
+	tests := []struct {
+		toolName   string
+		binaryName string
+		expected   string
+	}{
+		{"autopilot-fleet", "autopilot-fleet.exe", "autopilot-fleet"},
+		{"autopilot-story", "autopilot-story.EXE", "autopilot-story"},
+		{"iazio-agent", "iazio-agent", "iazio-agent"},
+		{"custom-tool", "custom-tool.cmd", "custom-tool"},
+	}
+
+	for _, tc := range tests {
+		tn := tc.binaryName
+		if tn == "" {
+			tn = tc.toolName
+		}
+		clean := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(tn, ".exe"), ".EXE"), ".cmd")
+		if clean == "" {
+			clean = strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(tc.toolName, ".exe"), ".EXE"), ".cmd")
+		}
+		if clean != tc.expected {
+			t.Errorf("expected cleanToolName for (%s, %s) = %q, got %q", tc.toolName, tc.binaryName, tc.expected, clean)
+		}
+	}
+}

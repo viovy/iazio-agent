@@ -186,10 +186,18 @@ func inspectSingleGitDirectory(ctx context.Context, dir string) singleDirGitResu
 		filepath.Join(gitDir, "BISECT_LOG"),
 	}
 	for _, sentinel := range lockSentinels {
-		if _, err := os.Stat(sentinel); err == nil {
+		if fi, err := os.Stat(sentinel); err == nil {
+			base := filepath.Base(sentinel)
+			if strings.HasSuffix(base, ".lock") && time.Since(fi.ModTime()) > 5*time.Minute {
+				// Lock file is older than 5 minutes; attempt to auto-prune abandoned stale lock.
+				// If another active process holds an open handle (especially on Windows), Remove will fail.
+				if rmErr := os.Remove(sentinel); rmErr == nil {
+					continue
+				}
+			}
 			res.HasActiveGitLock = true
 			res.IsClean = false
-			res.Error = fmt.Sprintf("active git operation or lockfile present: %s", filepath.Base(sentinel))
+			res.Error = fmt.Sprintf("active git operation or lockfile present: %s", base)
 			return res
 		}
 	}
