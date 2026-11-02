@@ -2037,14 +2037,278 @@ func TestCleanToolNameForSourceBuild(t *testing.T) {
 	for _, tc := range tests {
 		tn := tc.binaryName
 		if tn == "" {
-			tn = tc.toolName
+		tn = tc.toolName
 		}
 		clean := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(tn, ".exe"), ".EXE"), ".cmd")
 		if clean == "" {
-			clean = strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(tc.toolName, ".exe"), ".EXE"), ".cmd")
+		clean = strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(tc.toolName, ".exe"), ".EXE"), ".cmd")
 		}
 		if clean != tc.expected {
-			t.Errorf("expected cleanToolName for (%s, %s) = %q, got %q", tc.toolName, tc.binaryName, tc.expected, clean)
+		t.Errorf("expected cleanToolName for (%s, %s) = %q, got %q", tc.toolName, tc.binaryName, tc.expected, clean)
 		}
+	}
+}
+
+func TestEvaluateReleaseAgainstInstalled_Agent(t *testing.T) {
+	tests := []struct {
+		name         string
+		curVer       string
+		latestVer    string
+		wantUpToDate bool
+		wantOverride bool
+	}{
+		{"empty installed", "", "0.0.571", false, false},
+		{"installed placeholder", "installed", "0.0.571", false, false},
+		{"exact match", "0.0.571", "0.0.571", true, false},
+		{"exact match with v prefix", "v0.0.571", "v0.0.571", true, false},
+		{"older release installed", "0.0.570", "0.0.571", false, false},
+		{"newer release installed", "0.0.572", "0.0.571", true, false},
+		{"source build same base semver overridden", "0.0.571+1afd991", "0.0.571", false, true},
+		{"source build with v prefix overridden", "v0.0.571+1afd991", "0.0.571", false, true},
+		{"source build newer release available overridden", "0.0.571+1afd991", "0.0.572", false, true},
+		{"source build ahead in version retained", "0.0.572+1afd991", "0.0.571", true, false},
+		{"dev prefix build overridden", "dev+1afd991", "0.0.571", false, true},
+		{"plain dev overridden", "dev", "0.0.571", false, true},
+		{"hex sha version overridden", "1afd991", "0.0.571", false, true},
+		{"dirty suffix build overridden", "0.0.571-dirty", "0.0.571", false, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotUpToDate, gotOverride := evaluateReleaseAgainstInstalled(tt.curVer, tt.latestVer)
+			if gotUpToDate != tt.wantUpToDate {
+				t.Errorf("evaluateReleaseAgainstInstalled(%q, %q) gotUpToDate = %v, want %v", tt.curVer, tt.latestVer, gotUpToDate, tt.wantUpToDate)
+			}
+			if gotOverride != tt.wantOverride {
+				t.Errorf("evaluateReleaseAgainstInstalled(%q, %q) gotOverride = %v, want %v", tt.curVer, tt.latestVer, gotOverride, tt.wantOverride)
+			}
+		})
+	}
+}
+
+func TestShouldBuildFromSourceDuringStory(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+
+	ctx := context.Background()
+
+	// 1. Forced via environment
+	envForce := func(k string) string {
+		if k == "IAZIO_FORCE_SOURCE_BUILD" {
+			return "1"
+		}
+		return ""
+	}
+	shouldBuild, reason := shouldBuildFromSourceDuringStory(ctx, "/any/repo", envForce)
+	if !shouldBuild || !strings.Contains(reason, "forced") {
+		t.Errorf("expected force build via env, got %v, %s", shouldBuild, reason)
+	}
+
+	// 2. Preferred release download via environment
+	envPreferRel := func(k string) string {
+		if k == "IAZIO_PREFER_RELEASE_DOWNLOAD" {
+			return "1"
+		}
+		return ""
+	}
+	shouldBuild, _ = shouldBuildFromSourceDuringStory(ctx, "/any/repo", envPreferRel)
+	if shouldBuild {
+		t.Errorf("expected prefer release download to skip source build")
+	}
+
+	// 3. Clean git repository on main -> should NOT build from source (Path B used instead!)
+	tmpDir := t.TempDir()
+	srcRepo := filepath.Join(tmpDir, "repo")
+	_ = os.MkdirAll(srcRepo, 0755)
+
+	runGit := func(args ...string) string {
+		cmd := exec.Command("git", append([]string{"-C", srcRepo}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@test.local",
+			"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@test.local",
+			"GIT_TERMINAL_PROMPT=0",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v: %s", args, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit("init")
+	runGit("config", "user.name", "Test")
+	runGit("config", "user.email", "test@test.local")
+	_ = os.WriteFile(filepath.Join(srcRepo, "test.txt"), []byte("clean"), 0644)
+	runGit("add", "test.txt")
+	runGit("commit", "-m", "initial commit")
+	runGit("branch", "-M", "main")
+
+	envDefault := func(string) string { return "" }
+
+	shouldBuildClean, reasonClean := shouldBuildFromSourceDuringStory(ctx, srcRepo, envDefault)
+	if shouldBuildClean {
+		t.Errorf("expected clean repo on main NOT to build from source, got true (%s)", reasonClean)
+	}
+
+	// 4. Dirty git repository with uncommitted tracked code changes -> SHOULD build from source!
+	_ = os.WriteFile(filepath.Join(srcRepo, "test.txt"), []byte("modified"), 0644)
+	shouldBuildDirty, reasonDirty := shouldBuildFromSourceDuringStory(ctx, srcRepo, envDefault)
+	if !shouldBuildDirty || !strings.Contains(reasonDirty, "uncommitted") {
+		t.Errorf("expected dirty repo to trigger source build, got %v, %s", shouldBuildDirty, reasonDirty)
+	}
+
+	// Commit changes so repo is clean again
+	runGit("commit", "-am", "commit modifications")
+
+	// 5. Active story branch -> SHOULD build from source!
+	runGit("checkout", "-b", "feat/my-new-story")
+	shouldBuildBranch, reasonBranch := shouldBuildFromSourceDuringStory(ctx, srcRepo, envDefault)
+	if !shouldBuildBranch || !strings.Contains(reasonBranch, "active story branch") {
+		t.Errorf("expected story branch to trigger source build, got %v, %s", shouldBuildBranch, reasonBranch)
+	}
+}
+
+func TestUpdateTool_PathB_Overrides_PathA_CleanRepo(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	// 1. Create clean source repository on main (so Path B is used by default)
+	srcRepo := filepath.Join(tmpDir, "customtool")
+	_ = os.MkdirAll(srcRepo, 0755)
+
+	runGit := func(args ...string) string {
+		cmd := exec.Command("git", append([]string{"-C", srcRepo}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@test.local",
+			"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@test.local",
+			"GIT_TERMINAL_PROMPT=0",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v: %s", args, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit("init")
+	runGit("config", "user.name", "Test")
+	runGit("config", "user.email", "test@test.local")
+	_ = os.WriteFile(filepath.Join(srcRepo, "go.mod"), []byte("module customtool\n\ngo 1.22\n"), 0644)
+	_ = os.WriteFile(filepath.Join(srcRepo, "main.go"), []byte("package main\nfunc main() {}\n"), 0644)
+	runGit("add", ".")
+	runGit("commit", "-m", "init")
+	runGit("branch", "-M", "main")
+
+	// 2. Prepare mock client with roundTripFunc serving 0.0.571 archive and checksums
+	binName := "customtool"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	var tarBuf bytes.Buffer
+	gw := gzip.NewWriter(&tarBuf)
+	tw := tar.NewWriter(gw)
+	content := []byte("#!/bin/sh\necho release-binary\n")
+	hdr := &tar.Header{
+		Name: binName,
+		Mode: 0755,
+		Size: int64(len(content)),
+	}
+	_ = tw.WriteHeader(hdr)
+	_, _ = tw.Write(content)
+	_ = tw.Close()
+	_ = gw.Close()
+	tarBytes := tarBuf.Bytes()
+
+	sha := sha256.Sum256(tarBytes)
+	shaHex := hex.EncodeToString(sha[:])
+	assetName := fmt.Sprintf("customtool_0.0.571_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
+
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			path := r.URL.Path
+			if strings.HasSuffix(path, "/releases/latest") {
+				rel := gitHubRelease{
+					TagName: "v0.0.571",
+					Assets: []gitHubAsset{
+						{Name: assetName, BrowserDownloadURL: "https://example.local/download/" + assetName},
+						{Name: "checksums.txt", BrowserDownloadURL: "https://example.local/download/checksums.txt"},
+					},
+				}
+				b, _ := json.Marshal(rel)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(bytes.NewReader(b)),
+					Header:     make(http.Header),
+				}, nil
+			}
+			if strings.HasSuffix(path, "/"+assetName) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(bytes.NewReader(tarBytes)),
+					Header:     make(http.Header),
+				}, nil
+			}
+			if strings.HasSuffix(path, "/checksums.txt") {
+				csData := fmt.Sprintf("%s  %s\n", shaHex, assetName)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(csData)),
+					Header:     make(http.Header),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Body:       io.NopCloser(strings.NewReader("not found")),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+
+	// 3. Set destination bin with Path A source build version: 0.0.571+1afd991
+	binDir := filepath.Join(tmpDir, "bin")
+	_ = os.MkdirAll(binDir, 0755)
+	destPath := filepath.Join(binDir, binName)
+	_ = os.WriteFile(destPath, []byte("old-source-binary"), 0755)
+	_ = os.WriteFile(destPath+".version", []byte("0.0.571+1afd991"), 0644)
+
+	envFn := func(k string) string {
+		if k == "IAZIO_FLEET_ROOT" {
+			return tmpDir
+		}
+		return ""
+	}
+
+	tool := ManifestToolItem{
+		Name:          "customtool",
+		BinaryName:    "customtool",
+		Repository:    "viovy/customtool",
+	}
+
+	var out bytes.Buffer
+	updated, err := updateSingleTool(ctx, client, tool, binDir, "", false, &out, &out, envFn)
+	if err != nil {
+		t.Fatalf("updateSingleTool failed: %v: %s", err, out.String())
+	}
+	if !updated {
+		t.Fatalf("expected update to succeed and override source build, got false: %s", out.String())
+	}
+
+	// Verify stdout indicates override [Path B]
+	if !strings.Contains(out.String(), "overriding local source build") {
+		t.Errorf("expected output to mention overriding local source build, got: %s", out.String())
+	}
+
+	// Verify .version sidecar is now the clean release tag 0.0.571 (NOT 0.0.571+1afd991)
+	newVer, err := os.ReadFile(destPath + ".version")
+	if err != nil {
+		t.Fatalf("failed reading .version: %v", err)
+	}
+	if strings.TrimSpace(string(newVer)) != "0.0.571" {
+		t.Errorf("expected clean release tag 0.0.571 in .version, got: %q", string(newVer))
 	}
 }

@@ -586,30 +586,11 @@ func evalDryRunTool(
 		curVer = inventory.InspectInstalledVersion(existingShadowPath)
 	}
 
-	if sourceRepo := findToolSourceRepo(tool.Name, envFn, tool.Repository); sourceRepo != "" {
-		revCmd := procutil.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "origin/main^{commit}")
-		revCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-		out, err := revCmd.Output()
-		if err != nil || len(strings.TrimSpace(string(out))) == 0 {
-			revCmd2 := procutil.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "HEAD")
-			revCmd2.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-			out, _ = revCmd2.Output()
-		}
-		if len(strings.TrimSpace(string(out))) > 0 {
-			remoteSHA := strings.TrimSpace(string(out))
-			installedSHA := inventory.InspectToolCommitSHA(destPath)
-			shortRemote := remoteSHA
-			if len(shortRemote) > 7 {
-				shortRemote = shortRemote[:7]
-			}
-			if installedSHA != "" && (installedSHA == remoteSHA || strings.HasPrefix(remoteSHA, installedSHA) || strings.HasPrefix(installedSHA, remoteSHA)) && !force {
-				if stdout != nil {
-					fmt.Fprintf(stdout, "  [=] %s: %s (dry-run: up-to-date commit %s)\n", tool.Name, shortRemote, shortRemote)
-				}
-				return false, nil
-			}
+	sourceRepo := findToolSourceRepo(tool.Name, envFn, tool.Repository)
+	if sourceRepo != "" {
+		if hasStoryChanges, reason := shouldBuildFromSourceDuringStory(ctx, sourceRepo, envFn); hasStoryChanges {
 			if stdout != nil {
-				fmt.Fprintf(stdout, "  [+] %s: %s -> commit %s (dry-run: update available from %s)\n", tool.Name, curVer, shortRemote, filepath.Base(sourceRepo))
+				fmt.Fprintf(stdout, "  [*] %s: %s (dry-run: active story code changes detected in %s [%s], source build Path A available)\n", tool.Name, curVer, filepath.Base(sourceRepo), reason)
 			}
 			return true, nil
 		}
@@ -629,11 +610,17 @@ func evalDryRunTool(
 	}
 
 	latestVer := strings.TrimPrefix(rel.TagName, "v")
-	if curVer != "" && (curVer == latestVer || strings.Contains(curVer, latestVer) || isInstalledVersionNewerOrEqual(curVer, latestVer)) && !force {
+	upToDate, isOverride := evaluateReleaseAgainstInstalled(curVer, latestVer)
+	if upToDate && !force {
 		if stdout != nil {
 			fmt.Fprintf(stdout, "  [=] %s: %s (dry-run: up-to-date)\n", tool.Name, latestVer)
 		}
 		return false, nil
+	}
+
+	if isOverride && stdout != nil {
+		fmt.Fprintf(stdout, "  [+] %s: %s -> %s (dry-run: official GitHub Release can override local source build) [Path B]\n", tool.Name, curVer, latestVer)
+		return true, nil
 	}
 
 	if stdout != nil {
@@ -678,13 +665,19 @@ func updateSingleTool(
 		curVer = inventory.InspectInstalledVersion(existingShadowPath)
 	}
 
-	if sourceRepo := findToolSourceRepo(tool.Name, envFn, tool.Repository); sourceRepo != "" {
-		updated, srcErr := buildToolFromSourceRepo(ctx, tool, sourceRepo, destPath, force, stdout, stderr)
-		if srcErr == nil {
-			return updated, nil
-		}
-		if stderr != nil {
-			fmt.Fprintf(stderr, "  [!] %s: source repo build encountered error (%v), attempting release asset fetch\n", tool.Name, srcErr)
+	sourceRepo := findToolSourceRepo(tool.Name, envFn, tool.Repository)
+	if sourceRepo != "" {
+		if hasStoryChanges, reason := shouldBuildFromSourceDuringStory(ctx, sourceRepo, envFn); hasStoryChanges {
+			if stdout != nil {
+				fmt.Fprintf(stdout, "  [*] %s: active story code changes detected in %s (%s), compiling local source build (Path A)\n", tool.Name, filepath.Base(sourceRepo), reason)
+			}
+			updated, srcErr := buildToolFromSourceRepo(ctx, tool, sourceRepo, destPath, true, stdout, stderr)
+			if srcErr == nil {
+				return updated, nil
+			}
+			if stderr != nil {
+				fmt.Fprintf(stderr, "  [!] %s: source repo build encountered error (%v), attempting release asset fetch (Path B)\n", tool.Name, srcErr)
+			}
 		}
 	}
 
@@ -695,17 +688,34 @@ func updateSingleTool(
 
 	rel, err := fetchRelease(ctx, client, repo, tool.TargetVersion, ghToken)
 	if err != nil {
+		if sourceRepo != "" {
+			if stderr != nil {
+				fmt.Fprintf(stderr, "  [!] %s: fetch release failed (%v), falling back to source repo build (Path A)\n", tool.Name, err)
+			}
+			return buildToolFromSourceRepo(ctx, tool, sourceRepo, destPath, force, stdout, stderr)
+		}
 		return false, fmt.Errorf("fetch release: %w", err)
 	}
 
 	latestVer := strings.TrimPrefix(rel.TagName, "v")
-	if curVer != "" && (curVer == latestVer || strings.Contains(curVer, latestVer) || isInstalledVersionNewerOrEqual(curVer, latestVer)) && !force {
+	upToDate, isOverride := evaluateReleaseAgainstInstalled(curVer, latestVer)
+	if upToDate && !force {
 		fmt.Fprintf(stdout, "  [=] %s: %s (up-to-date)\n", tool.Name, latestVer)
 		return false, nil
 	}
 
+	if isOverride && stdout != nil {
+		fmt.Fprintf(stdout, "  [+] %s: overriding local source build (%s) with official GitHub Release (%s) [Path B]\n", tool.Name, curVer, latestVer)
+	}
+
 	asset, err := findMatchingAsset(rel, tool.Name, runtime.GOOS, runtime.GOARCH)
 	if err != nil {
+		if sourceRepo != "" {
+			if stderr != nil {
+				fmt.Fprintf(stderr, "  [!] %s: matching release asset not found (%v), falling back to source repo build (Path A)\n", tool.Name, err)
+			}
+			return buildToolFromSourceRepo(ctx, tool, sourceRepo, destPath, force, stdout, stderr)
+		}
 		return false, err
 	}
 
@@ -1306,38 +1316,175 @@ func pruneStaleBuildWorktrees(sourceRepo, toolName string) {
 	_ = pruneCmd.Run()
 }
 
+// isSourceBuildVersion reports whether a version string denotes a local source build
+// (e.g. containing build metadata '+<sha>', 'dev', a raw git commit SHA, or '-dirty').
+func isSourceBuildVersion(v string) bool {
+	v = strings.TrimSpace(v)
+	if v == "" || v == "installed" || v == "unknown" || v == "none" {
+		return true
+	}
+	if strings.Contains(v, "+") {
+		return true
+	}
+	lv := strings.ToLower(v)
+	if strings.HasPrefix(lv, "dev") || strings.Contains(lv, "-dev") || strings.Contains(lv, "-dirty") {
+		return true
+	}
+	// Check if purely a hex commit SHA (7 to 40 characters)
+	if len(v) >= 7 && len(v) <= 40 {
+		isHex := true
+		for _, r := range v {
+			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+				isHex = false
+				break
+			}
+		}
+		if isHex {
+			return true
+		}
+	}
+	return false
+}
+
+// parseTripleSemVer parses major, minor, patch from a semantic version string,
+// ignoring build metadata (+...) and pre-release (-...) extensions.
+func parseTripleSemVer(v string) (int, int, int, bool) {
+	c := cleanTargetVersion(v)
+	if c == "" {
+		return 0, 0, 0, false
+	}
+	if idx := strings.IndexAny(c, "-+"); idx >= 0 {
+		c = c[:idx]
+	}
+	parts := strings.Split(c, ".")
+	if len(parts) < 3 {
+		return 0, 0, 0, false
+	}
+	var maj, min, pat int
+	if _, err := fmt.Sscanf(parts[0]+"."+parts[1]+"."+parts[2], "%d.%d.%d", &maj, &min, &pat); err != nil {
+		return 0, 0, 0, false
+	}
+	return maj, min, pat, true
+}
+
+// evaluateReleaseAgainstInstalled evaluates whether an official GitHub release (latestVer)
+// should be installed over the currently installed version (curVer).
+// Returns isUpToDate (true if no install needed) and isOverride (true if latestVer overrides a source build).
+func evaluateReleaseAgainstInstalled(curVer, latestVer string) (bool, bool) {
+	cleanCur := strings.TrimSpace(strings.TrimPrefix(curVer, "v"))
+	cleanLatest := strings.TrimSpace(strings.TrimPrefix(latestVer, "v"))
+
+	if cleanCur == "" || cleanCur == "installed" || cleanCur == "unknown" || cleanCur == "none" {
+		return false, false
+	}
+
+	curIsSource := isSourceBuildVersion(cleanCur)
+	cMaj, cMin, cPat, okCur := parseTripleSemVer(cleanCur)
+	lMaj, lMin, lPat, okLat := parseTripleSemVer(cleanLatest)
+
+	if !okCur || !okLat {
+		if cleanCur == cleanLatest && !curIsSource {
+			return true, false
+		}
+		if curIsSource {
+			return false, true // override non-semver source build with official release
+		}
+		return cleanCur == cleanLatest, false
+	}
+
+	curIsNewer := false
+	equalBase := false
+	latestIsNewer := false
+
+	if cMaj != lMaj {
+		curIsNewer = cMaj > lMaj
+		latestIsNewer = lMaj > cMaj
+	} else if cMin != lMin {
+		curIsNewer = cMin > lMin
+		latestIsNewer = lMin > cMin
+	} else if cPat != lPat {
+		curIsNewer = cPat > lPat
+		latestIsNewer = lPat > cPat
+	} else {
+		equalBase = true
+	}
+
+	if curIsSource {
+		// If installed binary is a source build (Path A), an official GitHub Release (Path B)
+		// overrides it whenever the release version is greater than or equal to the base semver.
+		if equalBase || latestIsNewer {
+			return false, true
+		}
+		// If the source build is on a higher version branch (e.g. 0.0.572+xyz vs release 0.0.571), do not downgrade.
+		return true, false
+	}
+
+	if equalBase {
+		return true, false
+	}
+	if curIsNewer {
+		return true, false
+	}
+	return false, false
+}
+
+// shouldBuildFromSourceDuringStory checks whether a tool's local source repository
+// has active code modifications indicating ongoing story implementation.
+func shouldBuildFromSourceDuringStory(ctx context.Context, sourceRepo string, envFn func(string) string) (bool, string) {
+	if envFn == nil {
+		envFn = os.Getenv
+	}
+	if envFn("IAZIO_FORCE_SOURCE_BUILD") == "1" || envFn("AUTOPILOT_FORCE_SOURCE_BUILD") == "1" {
+		return true, "forced via environment"
+	}
+	if envFn("IAZIO_PREFER_RELEASE_DOWNLOAD") == "1" || envFn("AUTOPILOT_PREFER_RELEASE_DOWNLOAD") == "1" {
+		return false, "release download preferred via environment"
+	}
+	if sourceRepo == "" {
+		return false, "no local source repo"
+	}
+
+	// 1. Check if git status has uncommitted tracked modifications in the tool repository
+	statusCtx, statusCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer statusCancel()
+	statusCmd := procutil.CommandContext(statusCtx, "git", "-C", sourceRepo, "status", "--porcelain", "-uno")
+	statusCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if out, err := statusCmd.Output(); err == nil && len(strings.TrimSpace(string(out))) > 0 {
+		return true, "uncommitted tracked code modifications in submodule"
+	}
+
+	// 2. Check if the current branch is an active feature/story branch
+	branchCtx, branchCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer branchCancel()
+	branchCmd := procutil.CommandContext(branchCtx, "git", "-C", sourceRepo, "rev-parse", "--abbrev-ref", "HEAD")
+	branchCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if bOut, bErr := branchCmd.Output(); bErr == nil {
+		branch := strings.TrimSpace(string(bOut))
+		if branch != "" && branch != "HEAD" && branch != "main" && branch != "master" {
+			return true, fmt.Sprintf("active story branch (%s)", branch)
+		}
+	}
+
+	// 3. Check if local commits exist ahead of remote
+	revCtx, revCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer revCancel()
+	revCmd := procutil.CommandContext(revCtx, "git", "-C", sourceRepo, "rev-list", "--count", "origin/main..HEAD")
+	revCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if rOut, rErr := revCmd.Output(); rErr == nil {
+		countStr := strings.TrimSpace(string(rOut))
+		var count int
+		if _, err := fmt.Sscanf(countStr, "%d", &count); err == nil && count > 0 {
+			return true, fmt.Sprintf("submodule has %d unpushed commit(s) ahead of origin/main", count)
+		}
+	}
+
+	return false, "submodule is clean and on default branch"
+}
+
 // isInstalledVersionNewerOrEqual returns true when curVer is a valid semver that is >= latestVer.
 func isInstalledVersionNewerOrEqual(curVer, latestVer string) bool {
-	parseTriple := func(v string) (int, int, int, bool) {
-		c := cleanTargetVersion(v)
-		if c == "" {
-			return 0, 0, 0, false
-		}
-		if idx := strings.IndexAny(c, "-+"); idx >= 0 {
-			c = c[:idx]
-		}
-		parts := strings.Split(c, ".")
-		if len(parts) < 3 {
-			return 0, 0, 0, false
-		}
-		var maj, min, pat int
-		if _, err := fmt.Sscanf(parts[0]+"."+parts[1]+"."+parts[2], "%d.%d.%d", &maj, &min, &pat); err != nil {
-			return 0, 0, 0, false
-		}
-		return maj, min, pat, true
-	}
-	cMaj, cMin, cPat, ok1 := parseTriple(curVer)
-	lMaj, lMin, lPat, ok2 := parseTriple(latestVer)
-	if !ok1 || !ok2 {
-		return false
-	}
-	if cMaj != lMaj {
-		return cMaj > lMaj
-	}
-	if cMin != lMin {
-		return cMin > lMin
-	}
-	return cPat >= lPat
+	upToDate, _ := evaluateReleaseAgainstInstalled(curVer, latestVer)
+	return upToDate
 }
 
 func buildToolFromSourceRepo(
@@ -1586,7 +1733,7 @@ func buildToolFromSourceRepo(
 		}
 	}
 
-	buildCmd := procutil.CommandContext(ctx, "go", "build", "-trimpath", "-ldflags="+ldflags, "-o", stagingBin, cmdPath)
+	buildCmd := procutil.CommandContext(ctx, "go", "build", "-trimpath", "-buildvcs=false", "-ldflags="+ldflags, "-o", stagingBin, cmdPath)
 	buildCmd.Dir = buildDir
 	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
