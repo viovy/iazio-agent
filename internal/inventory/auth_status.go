@@ -160,8 +160,7 @@ func (p *AuthStatusProber) ProbeTool(ctx context.Context, binPath string) AuthSt
 	trimmed := bytes.TrimSpace(rawOut)
 
 	if len(trimmed) > 0 {
-		var parsed map[string]any
-		if jsonErr := json.Unmarshal(trimmed, &parsed); jsonErr == nil && len(parsed) > 0 {
+		if parsed, ok := decodeAuthStatusJSON(trimmed); ok {
 			entry.AuthStatus = parsed
 			if errStr, ok := parsed["error"].(string); ok && strings.TrimSpace(errStr) != "" {
 				entry.AuthStatusError = strings.TrimSpace(errStr)
@@ -239,3 +238,34 @@ func (p *AuthStatusProber) EnrichTools(ctx context.Context, tools []Tool) []Tool
 	}
 	return out
 }
+
+func decodeAuthStatusJSON(trimmed []byte) (map[string]any, bool) {
+	var parsed map[string]any
+	if err := json.Unmarshal(trimmed, &parsed); err == nil && len(parsed) > 0 {
+		return parsed, true
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	var last map[string]any
+	for dec.More() {
+		var m map[string]any
+		if err := dec.Decode(&m); err != nil {
+			break
+		}
+		if len(m) > 0 {
+			last = m
+		}
+	}
+	if len(last) > 0 {
+		return last, true
+	}
+
+	if idx := bytes.LastIndexByte(trimmed, '{'); idx >= 0 {
+		var tail map[string]any
+		if err := json.Unmarshal(trimmed[idx:], &tail); err == nil && len(tail) > 0 {
+			return tail, true
+		}
+	}
+	return nil, false
+}
+
