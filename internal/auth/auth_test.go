@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -338,6 +339,297 @@ func TestStartDeviceAndPollTokenEdgeCases(t *testing.T) {
 	// 4. save error on invalid path
 	if err := save("/dev/null/forbidden/file.json", Config{}); err == nil {
 		t.Fatal("expected error on save invalid path")
+	}
+}
+
+func TestResolveEndpointsFromAPIBaseURL(t *testing.T) {
+	cfg := Config{APIBaseURL: "https://tian.go.ro/iazio-harness-api"}
+	authURL, tokenURL, deviceURL := ResolveEndpoints(cfg, "", nil)
+	if authURL != "https://tian.go.ro/hydra/oauth2/auth" {
+		t.Fatalf("unexpected authURL: %s", authURL)
+	}
+	if tokenURL != "https://tian.go.ro/hydra/oauth2/token" {
+		t.Fatalf("unexpected tokenURL: %s", tokenURL)
+	}
+	if deviceURL != "https://tian.go.ro/hydra/oauth2/fallbacks/device/code" {
+		t.Fatalf("unexpected deviceURL: %s", deviceURL)
+	}
+}
+
+func TestLoginPKCELoopbackFlow(t *testing.T) {
+	var sawPKCE bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hydra/oauth2/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if r.Form.Get("grant_type") == "authorization_code" &&
+			r.Form.Get("client_id") == ClientID &&
+			r.Form.Get("code") == "pkce-code-123" &&
+			r.Form.Get("code_verifier") != "" {
+			sawPKCE = true
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "acc-pkce-token",
+			"refresh_token": "ref-pkce-token",
+			"token_type":    "Bearer",
+			"expires_in":    3600,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"api_base_url":"`+srv.URL+`/iazio-harness-api"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Login(t.Context(), LoginOptions{
+		LoopbackAddr: "127.0.0.1:0",
+		Getenv: func(k string) string {
+			if k == "IAZIO_AGENT_CONFIG" {
+				return cfgPath
+			}
+			return ""
+		},
+		HTTP: srv.Client(),
+		OpenBrowser: func(raw string) error {
+			// Parse the redirect_uri and state from the authorize URL and simulate browser callback
+			req, err := http.NewRequest(http.MethodGet, raw, nil)
+			if err != nil {
+				return err
+			}
+			redirectURI := req.URL.Query().Get("redirect_uri")
+			state := req.URL.Query().Get("state")
+			scope := req.URL.Query().Get("scope")
+			if !strings.Contains(scope, "harness:write") {
+				t.Errorf("expected harness:write in scope, got %q", scope)
+			}
+			go func() {
+				cbResp, cbErr := http.Get(redirectURI + "?code=pkce-code-123&state=" + state)
+				if cbErr == nil {
+					_ = cbResp.Body.Close()
+				}
+			}()
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("PKCE Login failed: %v", err)
+	}
+	if !sawPKCE {
+		t.Fatal("expected PKCE authorization_code exchange at token endpoint")
+	}
+
+	st, err := ReadStatus(cfgPath)
+	if err != nil || !st.HasRefreshToken || !st.HasAccessToken {
+		t.Fatalf("unexpected status after PKCE login: %+v, err=%v", st, err)
+	}
+	if !strings.HasSuffix(st.APIBaseURL, "/iazio-harness-api") {
+		t.Fatalf("expected api_base_url preserved, got %q", st.APIBaseURL)
+	}
+}
+
+func TestBearerRefreshAndClientCredentials(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hydra/oauth2/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		switch r.Form.Get("grant_type") {
+		case "refresh_token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token":  "refreshed-access-tok",
+				"refresh_token": "rotated-refresh-tok",
+				"token_type":    "Bearer",
+				"expires_in":    1800,
+			})
+		case "client_credentials":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": "m2m-access-tok",
+				"token_type":   "Bearer",
+				"expires_in":   1800,
+			})
+		default:
+			http.Error(w, "unsupported grant", http.StatusBadRequest)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.json")
+	if err := save(cfgPath, Config{
+		APIBaseURL:   srv.URL + "/iazio-harness-api",
+		RefreshToken: "initial-refresh-tok",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	getenv := func(k string) string {
+		if k == "IAZIO_AGENT_CONFIG" {
+			return cfgPath
+		}
+		return ""
+	}
+	tok, err := BearerWithClient(t.Context(), srv.Client(), dir, getenv)
+	if err != nil || tok != "refreshed-access-tok" {
+		t.Fatalf("expected refreshed-access-tok, got %q (err=%v)", tok, err)
+	}
+	// Second call should reuse cached unexpired access token without network
+	tok2, err := BearerWithClient(t.Context(), &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("unexpected network call on cached access token")
+		return nil, errors.New("unexpected")
+	})}, dir, getenv)
+	if err != nil || tok2 != "refreshed-access-tok" {
+		t.Fatalf("expected cached refreshed-access-tok, got %q (err=%v)", tok2, err)
+	}
+
+	// Client credentials grant path
+	ccPath := filepath.Join(dir, "cc-agent.json")
+	if err := save(ccPath, Config{
+		APIBaseURL:   srv.URL + "/iazio-harness-api",
+		ClientID:     "iazio-agent-cli",
+		ClientSecret: "secret-123",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ccTok, err := BearerWithClient(t.Context(), srv.Client(), dir, func(k string) string {
+		if k == "IAZIO_AGENT_CONFIG" {
+			return ccPath
+		}
+		return ""
+	})
+	if err != nil || ccTok != "m2m-access-tok" {
+		t.Fatalf("expected m2m-access-tok, got %q (err=%v)", ccTok, err)
+	}
+
+	// Static env token override
+	staticTok, err := Bearer(t.Context(), func(k string) string {
+		if k == "IAZIO_AUTH_TOKEN" {
+			return "env-static-token"
+		}
+		return ""
+	})
+	if err != nil || staticTok != "env-static-token" {
+		t.Fatalf("expected env-static-token, got %q (err=%v)", staticTok, err)
+	}
+
+	// Missing token endpoint fallback when AccessToken is set without Expiry
+	noTokPath := filepath.Join(dir, "notok-agent.json")
+	if err := save(noTokPath, Config{AccessToken: "fallback-at"}); err != nil {
+		t.Fatal(err)
+	}
+	fbTok, err := BearerWithClient(t.Context(), srv.Client(), dir, func(k string) string {
+		if k == "IAZIO_AGENT_CONFIG" {
+			return noTokPath
+		}
+		return ""
+	})
+	if err != nil || fbTok != "fallback-at" {
+		t.Fatalf("expected fallback-at, got %q (err=%v)", fbTok, err)
+	}
+
+	// Missing refresh token error
+	noRefreshPath := filepath.Join(dir, "norefresh-agent.json")
+	if err := save(noRefreshPath, Config{APIBaseURL: srv.URL + "/iazio-harness-api"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BearerWithClient(t.Context(), srv.Client(), dir, func(k string) string {
+		if k == "IAZIO_AGENT_CONFIG" {
+			return noRefreshPath
+		}
+		return ""
+	}); err == nil {
+		t.Fatal("expected error when no refresh token")
+	}
+}
+
+func TestSharedConfigAndLoopbackErrorBranches(t *testing.T) {
+	dir := t.TempDir()
+	// 1. Shared config.json with hydra endpoint
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"endpoints":{"hydra":"https://hydra.shared.example.com/"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a, tok, dev := ResolveEndpoints(Config{}, dir, nil)
+	if a != "https://hydra.shared.example.com/oauth2/auth" || tok != "https://hydra.shared.example.com/oauth2/token" || dev != "https://hydra.shared.example.com/oauth2/fallbacks/device/code" {
+		t.Fatalf("unexpected shared hydra endpoints: %q %q %q", a, tok, dev)
+	}
+
+	// 2. Shared config.json with harness_api endpoint
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"endpoints":{"harness_api":"https://api.shared.example.com/iazio-harness-api"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a, tok, dev = ResolveEndpoints(Config{}, dir, func(k string) string {
+		if k == "OAUTH_AUTHORIZATION_SERVER_URL" {
+			return "https://issuer.example.com/"
+		}
+		return ""
+	})
+	if a != "https://issuer.example.com/oauth2/auth" || tok != "https://issuer.example.com/oauth2/token" || dev != "https://issuer.example.com/oauth2/fallbacks/device/code" {
+		t.Fatalf("unexpected issuer endpoints: %q %q %q", a, tok, dev)
+	}
+	a, _, _ = ResolveEndpoints(Config{}, dir, nil)
+	if a != "https://api.shared.example.com/hydra/oauth2/auth" {
+		t.Fatalf("expected harness_api derived hydra url, got %q", a)
+	}
+
+	// 3. Endpoint() and DeviceAuthURL() from APIBaseURL
+	t.Setenv("IAZIO_AUTH_URL", "")
+	t.Setenv("IAZIO_TOKEN_URL", "")
+	epA, epT, err := Endpoint(Config{APIBaseURL: "https://tian.go.ro/iazio-harness-api"})
+	if err != nil || epA != "https://tian.go.ro/hydra/oauth2/auth" || epT != "https://tian.go.ro/hydra/oauth2/token" {
+		t.Fatalf("Endpoint derived failed: %q %q %v", epA, epT, err)
+	}
+	if d := DeviceAuthURL(Config{APIBaseURL: "https://tian.go.ro/iazio-harness-api"}, nil); d != "https://tian.go.ro/hydra/oauth2/fallbacks/device/code" {
+		t.Fatalf("DeviceAuthURL derived failed: %q", d)
+	}
+
+	// 4. Loopback callback error cases (state mismatch, oauth error, missing code)
+	for _, tc := range []struct {
+		name  string
+		query string
+	}{
+		{name: "state_mismatch", query: "state=wrong"},
+		{name: "oauth_error", query: "error=access_denied&error_description=denied"},
+		{name: "missing_code", query: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgFile := filepath.Join(t.TempDir(), "agent.json")
+			err := Login(t.Context(), LoginOptions{
+				Home:         t.TempDir(),
+				LoopbackAddr: "127.0.0.1:0",
+				Getenv: func(k string) string {
+					switch k {
+					case "IAZIO_AGENT_CONFIG":
+						return cfgFile
+					case "IAZIO_AUTH_URL":
+						return "https://tian.go.ro/hydra/oauth2/auth"
+					case "IAZIO_TOKEN_URL":
+						return "https://tian.go.ro/hydra/oauth2/token"
+					}
+					return ""
+				},
+				OpenBrowser: func(rawAuthURL string) error {
+					u, _ := url.Parse(rawAuthURL)
+					redir := u.Query().Get("redirect_uri")
+					st := u.Query().Get("state")
+					q := tc.query
+					if q == "" {
+						q = "state=" + url.QueryEscape(st)
+					} else if strings.HasPrefix(q, "error=") {
+						q = "state=" + url.QueryEscape(st) + "&" + q
+					}
+					go func() {
+						resp, err := http.Get(redir + "?" + q)
+						if err == nil {
+							_ = resp.Body.Close()
+						}
+					}()
+					return nil
+				},
+			})
+			if err == nil {
+				t.Fatalf("expected error for %s", tc.name)
+			}
+		})
 	}
 }
 

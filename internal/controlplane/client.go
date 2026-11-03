@@ -59,6 +59,7 @@ type CommandEnvelope struct {
 type Client struct {
 	BaseURL               string
 	Token                 string
+	TokenProvider         func(ctx context.Context) string
 	HTTP                  *http.Client
 	Presence              func() string
 	Tools                 func() []Tool
@@ -75,6 +76,15 @@ type Client struct {
 	EagerUpdateEnabled    bool
 	LastEagerUpdateAt     func() *time.Time
 	DiscoveredDevBinaries func() []string
+}
+
+func (c Client) bearerToken(ctx context.Context) string {
+	if c.TokenProvider != nil {
+		if tok := strings.TrimSpace(c.TokenProvider(ctx)); tok != "" {
+			return tok
+		}
+	}
+	return strings.TrimSpace(c.Token)
 }
 
 func (c Client) retryParams() (int, time.Duration) {
@@ -232,8 +242,8 @@ func (c Client) NextLease(ctx context.Context, hostID string) (Assignment, bool,
 			return Assignment{}, false, err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		if c.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+c.Token)
+		if tok := c.bearerToken(ctx); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
 		}
 		resp, err := c.http().Do(req)
 		if err != nil {
@@ -475,8 +485,8 @@ func (c Client) PostPreflight(ctx context.Context, hostID, worktree string, pre 
 			return PreflightHalt{}, err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		if c.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+c.Token)
+		if tok := c.bearerToken(ctx); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
 		}
 		resp, err := c.http().Do(req)
 		if err != nil {
@@ -529,8 +539,8 @@ func (c Client) PostFinish(ctx context.Context, hostID, worktree, jobID string, 
 			return FinishDecision{}, err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		if c.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+c.Token)
+		if tok := c.bearerToken(ctx); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
 		}
 		resp, err := c.http().Do(req)
 		if err != nil {
@@ -692,8 +702,8 @@ func (c Client) GetHost(ctx context.Context, hostID string) (HostDetail, error) 
 	if err != nil {
 		return HostDetail{}, err
 	}
-	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
+	if tok := c.bearerToken(ctx); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 	resp, err := c.http().Do(req)
 	if err != nil {
@@ -827,8 +837,8 @@ func (c Client) postJSON(ctx context.Context, path string, body any, out any) er
 			return err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		if c.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+c.Token)
+		if tok := c.bearerToken(ctx); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
 		}
 		resp, err := c.http().Do(req)
 		if err != nil {

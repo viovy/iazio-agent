@@ -110,10 +110,20 @@ type ControlPlaneClient interface {
 type HTTPControlPlaneClient struct {
 	BaseURL        string
 	AuthToken      string
+	TokenProvider  func(ctx context.Context) string
 	HTTPClient     *http.Client
 	Spooler        *controlplane.OfflineReportSpooler
 	MaxRetries     int
 	InitialBackoff time.Duration
+}
+
+func (c *HTTPControlPlaneClient) bearerToken(ctx context.Context) string {
+	if c.TokenProvider != nil {
+		if tok := strings.TrimSpace(c.TokenProvider(ctx)); tok != "" {
+			return tok
+		}
+	}
+	return strings.TrimSpace(c.AuthToken)
 }
 
 // NewHTTPControlPlaneClient constructs an HTTPControlPlaneClient.
@@ -155,8 +165,8 @@ func (c *HTTPControlPlaneClient) doWithRetry(ctx context.Context, method, url st
 			return nil, err
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		if c.AuthToken != "" {
-			httpReq.Header.Set("Authorization", "Bearer "+c.AuthToken)
+		if tok := c.bearerToken(ctx); tok != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+tok)
 		}
 		resp, err := c.HTTPClient.Do(httpReq)
 		if err != nil {
