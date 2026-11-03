@@ -300,3 +300,36 @@ func TestEagerToolUpdater_ReadinessOutdatedToolsAndDeferredCurTools(t *testing.T
 		t.Fatalf("expected deferred targeted tool [autopilot] to be executed after harness became idle, got %v", executedTools)
 	}
 }
+
+func TestDrift_DevBuildPlusSHAAndManifestSanitization(t *testing.T) {
+	manifest := &FleetManifest{
+		Tools: []ManifestTool{
+			{Name: "iazio-harness", BinaryName: "iazio-harness", TargetVersion: "0.0.114"},
+			{Name: "autopilot-git-flow", BinaryName: "autopilot-git-flow", TargetVersion: "0.0.579"},
+			{Name: "autopilot-git-flow", BinaryName: "autopilot-git-flow", TargetVersion: "0.0.579"}, // duplicate entry
+			{Name: "git-flow", BinaryName: "git-flow", TargetVersion: "0.0.579"},                     // deprecated unprefixed
+		},
+	}
+
+	installed := map[string]string{
+		"/bin/iazio-harness":      "0.0.114+b92a40c",
+		"/bin/autopilot-git-flow": "0.0.578+14490ec",
+	}
+	inspector := func(path string) string {
+		return installed[path]
+	}
+
+	outdated, err := FindOutdatedTools(manifest, inspector, "/bin", nil, "darwin")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(outdated) != 2 {
+		t.Fatalf("expected 2 outdated tools (dev +sha flagged, duplicate deduplicated, unprefixed git-flow skipped), got %+v", outdated)
+	}
+	if outdated[0].ToolName != "iazio-harness" || outdated[0].InstalledVersion != "0.0.114+b92a40c" {
+		t.Errorf("expected iazio-harness 0.0.114+b92a40c flagged as outdated against 0.0.114, got %+v", outdated[0])
+	}
+	if outdated[1].ToolName != "autopilot-git-flow" {
+		t.Errorf("expected second outdated tool to be autopilot-git-flow, got %+v", outdated[1])
+	}
+}

@@ -144,8 +144,30 @@ func FindOutdatedTools(
 		targetMap[strings.ToLower(strings.TrimSpace(name))] = true
 	}
 
+	hasCanonicalGitFlow := false
+	for _, tool := range manifest.Tools {
+		if strings.EqualFold(strings.TrimSpace(tool.Name), "autopilot-git-flow") ||
+			strings.EqualFold(strings.TrimSpace(tool.BinaryName), "autopilot-git-flow") {
+			hasCanonicalGitFlow = true
+			break
+		}
+	}
+
+	seenTools := make(map[string]bool)
 	var outdated []OutdatedToolInfo
 	for _, tool := range manifest.Tools {
+		toolKey := strings.ToLower(strings.TrimSpace(tool.Name))
+		if toolKey == "" {
+			toolKey = strings.ToLower(strings.TrimSpace(tool.BinaryName))
+		}
+		if toolKey == "" || seenTools[toolKey] {
+			continue
+		}
+		if toolKey == "git-flow" && hasCanonicalGitFlow && !targetMap["git-flow"] {
+			continue
+		}
+		seenTools[toolKey] = true
+
 		if len(targetMap) > 0 && !targetMap[strings.ToLower(tool.Name)] && !targetMap[strings.ToLower(tool.BinaryName)] {
 			continue
 		}
@@ -191,6 +213,8 @@ func FindOutdatedTools(
 
 		cleanCur := NormalizeVersion(curVer)
 		cleanTgt := NormalizeVersion(targetVer)
+		curHasBuildMeta := strings.Contains(cleanCur, "+")
+		tgtHasBuildMeta := strings.Contains(cleanTgt, "+")
 		if idx := strings.Index(cleanCur, "+"); idx != -1 {
 			cleanCur = strings.TrimSpace(cleanCur[:idx])
 		}
@@ -200,6 +224,7 @@ func FindOutdatedTools(
 
 		if strings.EqualFold(cleanCur, "dev") || strings.EqualFold(cleanTgt, "dev") ||
 			strings.EqualFold(cleanCur, "0.0.0-dev") || strings.EqualFold(cleanTgt, "0.0.0-dev") ||
+			(curHasBuildMeta && !tgtHasBuildMeta) ||
 			cleanCur != cleanTgt {
 			outdated = append(outdated, OutdatedToolInfo{
 				ToolName:         tool.Name,

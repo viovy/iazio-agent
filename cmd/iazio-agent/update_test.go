@@ -2348,3 +2348,41 @@ func TestFetchManifestAuthEnabledTools(t *testing.T) {
 		t.Errorf("expected iazio-agent to be disabled in map: %+v", enabled)
 	}
 }
+
+func TestNonInteractiveDaemonPrefersOfficialRelease(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	ok, reason := shouldBuildFromSourceDuringStory(ctx, tmpDir, func(k string) string {
+		if k == "IAZIO_AGENT_NONINTERACTIVE" {
+			return "1"
+		}
+		return ""
+	})
+	if ok || !strings.Contains(reason, "background service daemon") {
+		t.Fatalf("expected noninteractive daemon to skip Path A source build, got ok=%v reason=%q", ok, reason)
+	}
+
+	// Release cache test
+	cachedCtx := withReleaseCache(ctx)
+	var apiHits int
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			apiHits++
+			body, _ := json.Marshal(gitHubRelease{TagName: "v0.0.579"})
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewReader(body)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+	for i := 0; i < 5; i++ {
+		rel, err := fetchRelease(cachedCtx, client, "viovy/autopilot-plugins-internal", "0.0.579", "tok")
+		if err != nil || rel.TagName != "v0.0.579" {
+			t.Fatalf("fetchRelease failed: %v", err)
+		}
+	}
+	if apiHits != 1 {
+		t.Fatalf("expected release cache to coalesce 5 calls into 1 HTTP hit, got %d", apiHits)
+	}
+}

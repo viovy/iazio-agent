@@ -513,7 +513,32 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				repoPollInterval,
 				getRepos,
 				func(c context.Context, h string, st []controlplane.RepoRuntimeStatus) error {
-					return client.PostRepoStatus(c, h, st)
+					enriched := make([]controlplane.RepoRuntimeStatus, 0, len(st))
+					for _, item := range st {
+						probed := probeRepoRuntime(c, item.RepoPath, item.Alias)
+						if probed.Branch == "" {
+							probed.Branch = item.Branch
+						}
+						if probed.HeadSHA == "" {
+							probed.HeadSHA = item.HeadSHA
+						}
+						probed.DirtyFilesCount = item.DirtyFilesCount
+						probed.UntrackedFilesCount = item.UntrackedFilesCount
+						probed.Ahead = item.Ahead
+						probed.Behind = item.Behind
+						probed.HasActiveGitLock = item.HasActiveGitLock
+						if !item.IsClean {
+							probed.IsClean = false
+						}
+						if !item.SubmodulesClean {
+							probed.SubmodulesClean = false
+						}
+						if len(probed.DirtySubmodules) == 0 && len(item.DirtySubmodules) > 0 {
+							probed.DirtySubmodules = item.DirtySubmodules
+						}
+						enriched = append(enriched, probed)
+					}
+					return client.PostRepoStatus(c, h, enriched)
 				},
 				func(c context.Context, nr controlplane.NotificationRecord) error {
 					if api == "" {
@@ -2735,18 +2760,51 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 			StoryID string `json:"story_id"`
 		}
 		if json.Unmarshal(b, &s) == nil {
-			st.ASEState = s.State
-			st.ActiveStoryID = s.StoryID
+			if s.State != "" {
+				st.ASEState = s.State
+			}
+			if s.StoryID != "" {
+				st.ActiveStoryID = s.StoryID
+			}
 		}
 	}
-	if st.ASEState == "" {
+	if st.ASEState == "" || st.ASEState == "IDLE" {
 		if _, err := os.Stat(filepath.Join(repoPath, ".ase", "active.lock")); err == nil {
 			st.ASEState = "RUNNING"
 		} else if _, err := os.Stat(filepath.Join(repoPath, ".autopilot", "lock")); err == nil {
 			st.ASEState = "RUNNING"
-		} else {
-			st.ASEState = "IDLE"
 		}
+	}
+	// Detect ad-hoc ASE session bound via .session_story_id or tmp/ase-resume-*.json
+	if sessionBytes, err := os.ReadFile(filepath.Join(repoPath, ".session_story_id")); err == nil {
+		storyID := strings.TrimSpace(string(sessionBytes))
+		if strings.HasPrefix(storyID, "STORY-") {
+			if st.ActiveStoryID == "" {
+				st.ActiveStoryID = storyID
+			}
+			nonMainBranch := st.Branch != "" && st.Branch != "main" && st.Branch != "master" && st.Branch != "HEAD"
+			hasResumeFile := false
+			if matches, _ := filepath.Glob(filepath.Join(repoPath, "tmp", "ase-resume-*.json")); len(matches) > 0 {
+				hasResumeFile = true
+			}
+			if nonMainBranch || len(st.NonMainSubmodules) > 0 || hasResumeFile || st.ToolLiveness == "LIVE" || st.ToolLiveness == "ALIVE" {
+				if st.ASEState == "" || st.ASEState == "IDLE" {
+					st.ASEState = "RUNNING"
+				}
+				if st.ExecutionProvenance == "" || st.ExecutionProvenance == "IDLE" {
+					st.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
+				}
+				if st.ToolLiveness == "" || st.ToolLiveness == "NONE" {
+					st.ToolLiveness = "LIVE"
+				}
+				if st.ActiveTool == "" {
+					st.ActiveTool = "autopilot-ase"
+				}
+			}
+		}
+	}
+	if st.ASEState == "" {
+		st.ASEState = "IDLE"
 	}
 
 	// metadata.yml snapshot sync
