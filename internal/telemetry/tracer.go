@@ -651,7 +651,7 @@ func ConfigureZipkinFromAPI(apiURL string) {
 }
 
 func resolveZipkinFromConfig() string {
-	for _, envKey := range []string{"IAZIO_HARNESS_API_URL", "IAZIO_API_URL"} {
+	for _, envKey := range []string{"IAZIO_HARNESS_API_URL", "IAZIO_HARVESTER_API_URL", "IAZIO_API_URL"} {
 		if derived := DeriveZipkinURLFromAPI(os.Getenv(envKey)); derived != "" {
 			return derived
 		}
@@ -686,7 +686,7 @@ func resolveZipkinFromIazioConfig(path string) string {
 	if zipkin := strings.TrimSpace(raw.Endpoints["zipkin"]); zipkin != "" {
 		return zipkin
 	}
-	for _, key := range []string{"harness_api", "iazio_api"} {
+	for _, key := range []string{"harness_api", "iazio_harvester_api", "iazio_api"} {
 		if derived := DeriveZipkinURLFromAPI(raw.Endpoints[key]); derived != "" {
 			return derived
 		}
