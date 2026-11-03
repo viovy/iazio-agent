@@ -52,7 +52,12 @@ func TestHeartbeatAndChunk(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
-	c := Client{BaseURL: srv.URL, Token: "tok"}
+	c := Client{
+		BaseURL: srv.URL,
+		TokenProvider: func(context.Context) string {
+			return "tok"
+		},
+	}
 	ctx := context.Background()
 	if err := c.Register(ctx, "runner-1", "permanent"); err != nil {
 		t.Fatal(err)
