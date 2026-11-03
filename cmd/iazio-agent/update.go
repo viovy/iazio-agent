@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/viovy/iazio-agent/internal/auth"
 	"github.com/viovy/iazio-agent/internal/inventory"
 	"github.com/viovy/iazio-agent/internal/procutil"
 	"github.com/viovy/iazio-agent/internal/service"
@@ -121,7 +122,21 @@ func resolveLocalAPI(getenv func(string) string) string {
 	if api := strings.TrimSpace(getenv("IAZIO_HARNESS_API_URL")); api != "" {
 		return api
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
+	home, _ := os.UserHomeDir()
+	if h := os.Getenv("HOME"); h != "" && runtime.GOOS == "windows" {
+		home = h
+	}
+	if p := auth.ConfigPathFrom(home, getenv); p != "" {
+		if data, err := os.ReadFile(p); err == nil {
+			var cfg struct {
+				APIBaseURL string `json:"api_base_url"`
+			}
+			if err := json.Unmarshal(data, &cfg); err == nil && strings.TrimSpace(cfg.APIBaseURL) != "" {
+				return strings.TrimSpace(cfg.APIBaseURL)
+			}
+		}
+	}
+	if home != "" {
 		cfgPath := filepath.Join(home, ".iazio", "config.json")
 		if data, err := os.ReadFile(cfgPath); err == nil {
 			var cfg struct {

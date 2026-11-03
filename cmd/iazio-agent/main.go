@@ -2,6 +2,7 @@
 package main
 
 import (
+	coreauth "github.com/viovy/viovy-core-go/pkg/auth"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -1731,24 +1732,41 @@ func flushHarvestConversation(ctx context.Context, conversationID string) error 
 
 func runAuth(ctx context.Context, args []string, stdout io.Writer, getenv func(string) string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("auth status|login")
+		return fmt.Errorf("auth status|login|logout")
 	}
 	switch args[0] {
-	case "status":
-		st, err := auth.ReadStatus(auth.ConfigPathFrom("", getenv))
-		if err != nil {
-			return err
-		}
-		fmt.Fprintln(stdout, auth.FormatStatus(st))
-		return nil
-	case "login":
-		if auth.Noninteractive(getenv) {
-			return fmt.Errorf("auth login refused: noninteractive session")
-		}
-		return auth.Login(ctx, auth.LoginOptions{Getenv: getenv, Stdout: stdout})
+	case "login", "status", "logout":
 	default:
-		return fmt.Errorf("unknown auth command")
+		return fmt.Errorf("unknown auth command: %s", args[0])
 	}
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	configPath := auth.ConfigPathFrom("", getenv)
+	var lastLoginErr error
+	opts := coreauth.CLIOptions{
+		Stdout:     stdout,
+		Stderr:     os.Stderr,
+		Getenv:     getenv,
+		ConfigPath: configPath,
+		ClientID:   auth.ClientID,
+		LoginFunc: func(loginCtx context.Context, cfg *coreauth.Config, apiURL string) error {
+			if auth.Noninteractive(getenv) {
+				lastLoginErr = fmt.Errorf("auth login refused: noninteractive session")
+				return lastLoginErr
+			}
+			lastLoginErr = auth.Login(loginCtx, auth.LoginOptions{Getenv: getenv, Stdout: stdout})
+			return lastLoginErr
+		},
+	}
+	code := coreauth.RunAuthCLI(ctx, "iazio-agent", args, opts)
+	if code != 0 {
+		if lastLoginErr != nil {
+			return lastLoginErr
+		}
+		return fmt.Errorf("auth command failed with exit code %d", code)
+	}
+	return nil
 }
 
 func runService(args []string, stdout io.Writer, getenv func(string) string) error {
