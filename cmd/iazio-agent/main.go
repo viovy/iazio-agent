@@ -418,28 +418,42 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			var client controlplane.Client
 
 			var updatingTools atomic.Bool
+			authStatusInterval := inventory.DefaultAuthStatusInterval
+			if rawAuthInt := strings.TrimSpace(getenv("IAZIO_AGENT_AUTH_STATUS_INTERVAL")); rawAuthInt != "" {
+				if parsedInt, err := time.ParseDuration(rawAuthInt); err == nil && parsedInt >= 5*time.Second {
+					authStatusInterval = parsedInt
+				}
+			}
+			authProber := inventory.NewAuthStatusProber(authStatusInterval, func(fetchCtx context.Context) (map[string]bool, error) {
+				return fetchManifestAuthEnabledTools(fetchCtx, api, profile, authToken)
+			})
 			getTools := func() []controlplane.Tool {
 				home, _ := os.UserHomeDir()
 				dirs := inventory.DefaultDirs(getenv("PATH"), home, runtime.GOOS)
 				found := inventory.Scan(dirs)
 				classified, _ := inventory.Classify(found, nil)
+				classified = authProber.EnrichTools(runCtx, classified)
 				var tools []controlplane.Tool
 				for _, t := range classified {
 					tools = append(tools, controlplane.Tool{
-						Name:             t.Name,
-						Path:             t.Path,
-						Version:          t.Version,
-						CommitSHA:        t.CommitSHA,
-						Status:           t.Status,
-						ServiceInstalled: t.ServiceInstalled,
-						ServiceType:      t.ServiceType,
-						ServiceStatus:    t.ServiceStatus,
-						Capabilities:     t.Capabilities,
-						Installed:        t.Installed,
-						InstallationType: t.InstallationType,
-						ActiveState:      t.ActiveState,
-						WatchdogEnabled:  t.WatchdogEnabled,
-						ConfigStatus:     t.ConfigStatus,
+						Name:              t.Name,
+						Path:              t.Path,
+						Version:           t.Version,
+						CommitSHA:         t.CommitSHA,
+						Status:            t.Status,
+						ServiceInstalled:  t.ServiceInstalled,
+						ServiceType:       t.ServiceType,
+						ServiceStatus:     t.ServiceStatus,
+						Capabilities:      t.Capabilities,
+						Installed:         t.Installed,
+						InstallationType:  t.InstallationType,
+						ActiveState:       t.ActiveState,
+						WatchdogEnabled:   t.WatchdogEnabled,
+						ConfigStatus:      t.ConfigStatus,
+						AuthStatusEnabled: t.AuthStatusEnabled,
+						AuthStatus:        t.AuthStatus,
+						AuthStatusError:   t.AuthStatusError,
+						AuthCheckedAt:     t.AuthCheckedAt,
 					})
 				}
 				return tools

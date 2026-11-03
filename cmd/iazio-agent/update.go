@@ -28,12 +28,13 @@ import (
 )
 
 type ManifestToolItem struct {
-	Name          string `json:"name"`
-	Repository    string `json:"repository"`
-	BinaryName    string `json:"binary_name"`
-	Description   string `json:"description"`
-	Tier          string `json:"tier"`
-	TargetVersion string `json:"target_version,omitempty"`
+	Name              string `json:"name"`
+	Repository        string `json:"repository"`
+	BinaryName        string `json:"binary_name"`
+	Description       string `json:"description"`
+	Tier              string `json:"tier"`
+	TargetVersion     string `json:"target_version,omitempty"`
+	AuthStatusEnabled bool   `json:"auth_status_enabled,omitempty"`
 }
 
 type ManifestInstallRoots struct {
@@ -50,6 +51,52 @@ type ManifestResponse struct {
 	InstallRoots ManifestInstallRoots `json:"install_roots"`
 	Endpoints    map[string]string    `json:"endpoints,omitempty"`
 	Tools        []ManifestToolItem   `json:"tools"`
+}
+
+func fetchManifestAuthEnabledTools(ctx context.Context, apiURL, profile, token string) (map[string]bool, error) {
+	cleanAPI := strings.TrimRight(strings.TrimSpace(apiURL), "/")
+	if cleanAPI == "" {
+		return nil, nil
+	}
+	prof := strings.TrimSpace(profile)
+	if prof == "" {
+		prof = "generic"
+	}
+	manifestURL := fmt.Sprintf("%s/v1/fleet/manifest?profile=%s&os=%s&arch=%s",
+		cleanAPI, prof, runtime.GOOS, runtime.GOARCH)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(token) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
+	}
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("manifest HTTP %d", resp.StatusCode)
+	}
+	var manifest ManifestResponse
+	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
+		return nil, err
+	}
+	enabled := make(map[string]bool)
+	for _, t := range manifest.Tools {
+		if t.AuthStatusEnabled {
+			if strings.TrimSpace(t.Name) != "" {
+				enabled[strings.ToLower(strings.TrimSpace(t.Name))] = true
+			}
+			if strings.TrimSpace(t.BinaryName) != "" {
+				bin := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(t.BinaryName)), ".exe")
+				enabled[bin] = true
+			}
+		}
+	}
+	return enabled, nil
 }
 
 type gitHubRelease struct {

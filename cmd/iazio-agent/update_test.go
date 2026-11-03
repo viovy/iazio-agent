@@ -2312,3 +2312,39 @@ func TestUpdateTool_PathB_Overrides_PathA_CleanRepo(t *testing.T) {
 		t.Errorf("expected clean release tag 0.0.571 in .version, got: %q", string(newVer))
 	}
 }
+
+func TestFetchManifestAuthEnabledTools(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/fleet/manifest" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ManifestResponse{
+			Profile: "generic",
+			Tools: []ManifestToolItem{
+				{
+					Name:              "iazio-harvester",
+					BinaryName:        "iazio-harvester.exe",
+					AuthStatusEnabled: true,
+				},
+				{
+					Name:              "iazio-agent",
+					BinaryName:        "iazio-agent",
+					AuthStatusEnabled: false,
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	enabled, err := fetchManifestAuthEnabledTools(context.Background(), srv.URL, "generic", "test-token")
+	if err != nil {
+		t.Fatalf("fetchManifestAuthEnabledTools failed: %v", err)
+	}
+	if !enabled["iazio-harvester"] {
+		t.Errorf("expected iazio-harvester to be enabled in map: %+v", enabled)
+	}
+	if enabled["iazio-agent"] {
+		t.Errorf("expected iazio-agent to be disabled in map: %+v", enabled)
+	}
+}
