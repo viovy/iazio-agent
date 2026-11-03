@@ -100,20 +100,24 @@ type ActiveJob struct {
 
 // Tool is one binary on a heartbeat.
 type Tool struct {
-	Name             string   `json:"name"`
-	Path             string   `json:"path"`
-	Version          string   `json:"version"`
-	CommitSHA        string   `json:"commit_sha,omitempty"`
-	Status           string   `json:"status"`
-	ServiceInstalled bool     `json:"service_installed,omitempty"`
-	ServiceType      string   `json:"service_type,omitempty"`
-	ServiceStatus    string   `json:"service_status,omitempty"`
-	Capabilities     []string `json:"capabilities,omitempty"`
-	Installed        bool     `json:"installed,omitempty"`
-	InstallationType string   `json:"installation_type,omitempty"`
-	ActiveState      string   `json:"active_state,omitempty"`
-	WatchdogEnabled  bool     `json:"watchdog_enabled,omitempty"`
-	ConfigStatus     string   `json:"config_status,omitempty"`
+	Name              string         `json:"name"`
+	Path              string         `json:"path"`
+	Version           string         `json:"version"`
+	CommitSHA         string         `json:"commit_sha,omitempty"`
+	Status            string         `json:"status"`
+	ServiceInstalled  bool           `json:"service_installed,omitempty"`
+	ServiceType       string         `json:"service_type,omitempty"`
+	ServiceStatus     string         `json:"service_status,omitempty"`
+	Capabilities      []string       `json:"capabilities,omitempty"`
+	Installed         bool           `json:"installed,omitempty"`
+	InstallationType  string         `json:"installation_type,omitempty"`
+	ActiveState       string         `json:"active_state,omitempty"`
+	WatchdogEnabled   bool           `json:"watchdog_enabled,omitempty"`
+	ConfigStatus      string         `json:"config_status,omitempty"`
+	AuthStatusEnabled bool           `json:"auth_status_enabled,omitempty"`
+	AuthStatus        map[string]any `json:"auth_status,omitempty"`
+	AuthStatusError   string         `json:"auth_status_error,omitempty"`
+	AuthCheckedAt     string         `json:"auth_checked_at,omitempty"`
 }
 
 // PendingToolUpdate describes a remote tool update command for the agent.
