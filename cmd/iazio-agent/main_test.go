@@ -806,8 +806,46 @@ func TestRunAuthStatusAndErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error on missing config status: %v", err)
 	}
-	if !strings.Contains(stdout.String(), "refresh_token=absent") {
-		t.Fatalf("expected refresh_token=absent in %s", stdout.String())
+	if !strings.Contains(stdout.String(), "refresh_token: absent") && !strings.Contains(stdout.String(), "refresh_token=absent") {
+		t.Fatalf("expected refresh_token absent in %s", stdout.String())
+	}
+
+	// Status with --json
+	stdout.Reset()
+	err = runAuth(ctx, []string{"status", "--json"}, &stdout, func(k string) string {
+		if k == "IAZIO_AGENT_CONFIG" {
+			return filepath.Join(tmpDir, "missing.json")
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("unexpected error on missing config status --json: %v", err)
+	}
+	var jsonStatus map[string]interface{}
+	if err := json.Unmarshal(stdout.Bytes(), &jsonStatus); err != nil {
+		t.Fatalf("expected valid JSON from status --json, got error: %v, raw: %s", err, stdout.String())
+	}
+	if jsonStatus["refresh_token_present"] != false {
+		t.Fatalf("expected refresh_token_present: false, got: %v", jsonStatus["refresh_token_present"])
+	}
+
+	// Logout with --json
+	stdout.Reset()
+	err = runAuth(ctx, []string{"logout", "--json"}, &stdout, func(k string) string {
+		if k == "IAZIO_AGENT_CONFIG" {
+			return filepath.Join(tmpDir, "agent.json")
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("unexpected error on logout --json: %v", err)
+	}
+	var logoutResp map[string]interface{}
+	if err := json.Unmarshal(stdout.Bytes(), &logoutResp); err != nil {
+		t.Fatalf("expected valid JSON from logout --json: %v, raw: %s", err, stdout.String())
+	}
+	if logoutResp["status"] != "logged_out" {
+		t.Fatalf("expected status: logged_out, got: %v", logoutResp["status"])
 	}
 }
 
