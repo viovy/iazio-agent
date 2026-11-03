@@ -341,6 +341,147 @@ func TestStartDeviceAndPollTokenEdgeCases(t *testing.T) {
 	}
 }
 
+func TestResolveEndpointsFromAPIBaseURL(t *testing.T) {
+	cfg := Config{APIBaseURL: "https://tian.go.ro/iazio-harness-api"}
+	authURL, tokenURL, deviceURL := ResolveEndpoints(cfg, "", nil)
+	if authURL != "https://tian.go.ro/hydra/oauth2/auth" {
+		t.Fatalf("unexpected authURL: %s", authURL)
+	}
+	if tokenURL != "https://tian.go.ro/hydra/oauth2/token" {
+		t.Fatalf("unexpected tokenURL: %s", tokenURL)
+	}
+	if deviceURL != "https://tian.go.ro/hydra/oauth2/fallbacks/device/code" {
+		t.Fatalf("unexpected deviceURL: %s", deviceURL)
+	}
+}
+
+func TestLoginPKCELoopbackFlow(t *testing.T) {
+	var sawPKCE bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hydra/oauth2/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if r.Form.Get("grant_type") == "authorization_code" &&
+			r.Form.Get("client_id") == ClientID &&
+			r.Form.Get("code") == "pkce-code-123" &&
+			r.Form.Get("code_verifier") != "" {
+			sawPKCE = true
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "acc-pkce-token",
+			"refresh_token": "ref-pkce-token",
+			"token_type":    "Bearer",
+			"expires_in":    3600,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"api_base_url":"`+srv.URL+`/iazio-harness-api"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Login(t.Context(), LoginOptions{
+		LoopbackAddr: "127.0.0.1:0",
+		Getenv: func(k string) string {
+			if k == "IAZIO_AGENT_CONFIG" {
+				return cfgPath
+			}
+			return ""
+		},
+		HTTP: srv.Client(),
+		OpenBrowser: func(raw string) error {
+			// Parse the redirect_uri and state from the authorize URL and simulate browser callback
+			req, err := http.NewRequest(http.MethodGet, raw, nil)
+			if err != nil {
+				return err
+			}
+			redirectURI := req.URL.Query().Get("redirect_uri")
+			state := req.URL.Query().Get("state")
+			scope := req.URL.Query().Get("scope")
+			if !strings.Contains(scope, "harness:write") {
+				t.Errorf("expected harness:write in scope, got %q", scope)
+			}
+			go func() {
+				cbResp, cbErr := http.Get(redirectURI + "?code=pkce-code-123&state=" + state)
+				if cbErr == nil {
+					_ = cbResp.Body.Close()
+				}
+			}()
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("PKCE Login failed: %v", err)
+	}
+	if !sawPKCE {
+		t.Fatal("expected PKCE authorization_code exchange at token endpoint")
+	}
+
+	st, err := ReadStatus(cfgPath)
+	if err != nil || !st.HasRefreshToken || !st.HasAccessToken {
+		t.Fatalf("unexpected status after PKCE login: %+v, err=%v", st, err)
+	}
+	if !strings.HasSuffix(st.APIBaseURL, "/iazio-harness-api") {
+		t.Fatalf("expected api_base_url preserved, got %q", st.APIBaseURL)
+	}
+}
+
+func TestBearerRefreshAndClientCredentials(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hydra/oauth2/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		switch r.Form.Get("grant_type") {
+		case "refresh_token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token":  "refreshed-access-tok",
+				"refresh_token": "rotated-refresh-tok",
+				"token_type":    "Bearer",
+				"expires_in":    1800,
+			})
+		case "client_credentials":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": "m2m-access-tok",
+				"token_type":   "Bearer",
+				"expires_in":   1800,
+			})
+		default:
+			http.Error(w, "unsupported grant", http.StatusBadRequest)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.json")
+	if err := save(cfgPath, Config{
+		APIBaseURL:   srv.URL + "/iazio-harness-api",
+		RefreshToken: "initial-refresh-tok",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	getenv := func(k string) string {
+		if k == "IAZIO_AGENT_CONFIG" {
+			return cfgPath
+		}
+		return ""
+	}
+	tok, err := BearerWithClient(t.Context(), srv.Client(), dir, getenv)
+	if err != nil || tok != "refreshed-access-tok" {
+		t.Fatalf("expected refreshed-access-tok, got %q (err=%v)", tok, err)
+	}
+	// Second call should reuse cached unexpired access token without network
+	tok2, err := BearerWithClient(t.Context(), &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("unexpected network call on cached access token")
+		return nil, errors.New("unexpected")
+	})}, dir, getenv)
+	if err != nil || tok2 != "refreshed-access-tok" {
+		t.Fatalf("expected cached refreshed-access-tok, got %q (err=%v)", tok2, err)
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

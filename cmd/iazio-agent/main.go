@@ -836,9 +836,13 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			var lastHarvesterCheck time.Time
 			spooler, _ := controlplane.NewOfflineReportSpooler("", nil)
 			authToken := resolveControlPlaneToken(getenv)
+			tokenProvider := func(context.Context) string {
+				return resolveControlPlaneToken(getenv)
+			}
 			client = controlplane.Client{
 				BaseURL:            api,
 				Token:              authToken,
+				TokenProvider:      tokenProvider,
 				Spooler:            spooler,
 				EagerUpdateEnabled: updateInterval > 0 || eagerUpdater != nil,
 				LastEagerUpdateAt: func() *time.Time {
@@ -1145,6 +1149,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			if api != "" {
 				cpSpooler, _ := controlplane.NewOfflineReportSpooler("", nil)
 				cpClient := worker.NewHTTPControlPlaneClient(api, authToken, nil, cpSpooler)
+				cpClient.TokenProvider = tokenProvider
 				cliInvoker := harness.NewCLIInvoker("", "")
 				disp = worker.NewDispatcher(cpClient, cliInvoker, host)
 				disp.SetHostGate(hostGate)
@@ -1677,25 +1682,36 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 
 func resolveControlPlaneToken(getenv func(string) string) string {
 	if getenv != nil {
-		for _, k := range []string{"IAZIO_AUTH_TOKEN", "IAZIO_HARNESS_API_TOKEN", "HARNESS_AUTH_TOKEN"} {
+		for _, k := range []string{"IAZIO_AUTH_TOKEN", "IAZIO_HARNESS_API_TOKEN", "HARNESS_AUTH_TOKEN", "IAZIO_ACCESS_TOKEN"} {
 			if v := strings.TrimSpace(getenv(k)); v != "" {
 				return v
 			}
 		}
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		for _, fn := range []string{"agent.json", "config.json"} {
-			if data, err := os.ReadFile(filepath.Join(home, ".iazio", fn)); err == nil {
-				var cfg struct {
-					AuthToken string `json:"auth_token"`
-					Token     string `json:"token"`
-				}
-				if json.Unmarshal(data, &cfg) == nil {
-					if v := strings.TrimSpace(cfg.AuthToken); v != "" {
-						return v
+	hasExplicitConfig := getenv != nil && (strings.TrimSpace(getenv("IAZIO_AGENT_CONFIG")) != "" || strings.TrimSpace(getenv("IAZIO_AGENT_CONFIG_PATH")) != "")
+	if !isTestBinary() || hasExplicitConfig {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		tok, err := auth.Bearer(ctx, getenv)
+		cancel()
+		if err == nil && strings.TrimSpace(tok) != "" {
+			return strings.TrimSpace(tok)
+		}
+	}
+	if !isTestBinary() {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			for _, fn := range []string{"agent.json", "config.json"} {
+				if data, err := os.ReadFile(filepath.Join(home, ".iazio", fn)); err == nil {
+					var cfg struct {
+						AuthToken string `json:"auth_token"`
+						Token     string `json:"token"`
 					}
-					if v := strings.TrimSpace(cfg.Token); v != "" {
-						return v
+					if json.Unmarshal(data, &cfg) == nil {
+						if v := strings.TrimSpace(cfg.AuthToken); v != "" {
+							return v
+						}
+						if v := strings.TrimSpace(cfg.Token); v != "" {
+							return v
+						}
 					}
 				}
 			}
