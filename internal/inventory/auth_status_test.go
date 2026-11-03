@@ -114,3 +114,19 @@ func TestAuthStatusProber_EnrichToolsAndCaching(t *testing.T) {
 		t.Fatalf("expected re-probe after TTL expiry (total 4 executions), got %d", got)
 	}
 }
+
+func TestAuthStatusProber_ProbeToolWithLeadingSlogLine(t *testing.T) {
+	prober := NewAuthStatusProber(30*time.Second, nil)
+	prober.Runner = func(ctx context.Context, binPath string, args ...string) ([]byte, error) {
+		return []byte("{\"time\":\"2026-11-03T21:40:46Z\",\"level\":\"INFO\",\"msg\":\"swept orphaned shadow copies from prior runs\",\"count\":1}\n{\n  \"config_path\": \"/home/romeo/.iazio/harvester.json\",\n  \"api_base_url\": \"https://tian.go.ro/iazio-harness-api\",\n  \"refresh_token_present\": true,\n  \"token_status\": \"available\"\n}"), nil
+	}
+
+	entry := prober.ProbeTool(context.Background(), "/home/romeo/.local/bin/iazio-harvester")
+	if entry.AuthStatusError != "" {
+		t.Fatalf("expected empty AuthStatusError when leading slog JSON precedes report, got %q", entry.AuthStatusError)
+	}
+	if entry.AuthStatus["config_path"] != "/home/romeo/.iazio/harvester.json" {
+		t.Fatalf("expected config_path from final JSON object, got %+v", entry.AuthStatus)
+	}
+}
+
