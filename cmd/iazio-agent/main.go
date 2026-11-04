@@ -859,7 +859,15 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			inFlightPrepJobs := make(map[string]controlplane.ActiveJob)
 			var lastHarvesterCheckMu sync.Mutex
 			var lastHarvesterCheck time.Time
-			spooler, _ := controlplane.NewOfflineReportSpooler("", nil)
+			spoolDir := ""
+			if isTestBinary() {
+				if h := strings.TrimSpace(getenv("HOME")); h != "" {
+					spoolDir = filepath.Join(h, ".iazio", "spool")
+				} else {
+					spoolDir = filepath.Join(os.TempDir(), fmt.Sprintf("iazio-test-spool-%d", os.Getpid()))
+				}
+			}
+			spooler, _ := controlplane.NewOfflineReportSpooler(spoolDir, nil)
 			authToken := resolveControlPlaneToken(getenv)
 			tokenProvider := func(context.Context) string {
 				return resolveControlPlaneToken(getenv)
@@ -1121,6 +1129,34 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						}
 					}
 					inFlightPrepMu.Unlock()
+					if !isTestBinary() && home != "" {
+						harnessActivePath := filepath.Join(home, ".iazio", "harness-active-jobs.json")
+						if rawH, errH := os.ReadFile(harnessActivePath); errH == nil {
+							var hJobs []watchdog.TrackedJob
+							if json.Unmarshal(rawH, &hJobs) == nil {
+								for _, hj := range hJobs {
+									if hj.JobID == "" || seen[hj.JobID] || hj.Status != watchdog.StatusRunning {
+										continue
+									}
+									livePID := hj.HarnessPID
+									if livePID <= 0 {
+										livePID = hj.PID
+									}
+									if (livePID > 0 && watchdog.IsProcessAlive(livePID)) || (hj.ToolPID > 0 && watchdog.IsProcessAlive(hj.ToolPID)) {
+										if livePID <= 0 {
+											livePID = hj.ToolPID
+										}
+										seen[hj.JobID] = true
+										jobs = append(jobs, controlplane.ActiveJob{
+											JobID:        hj.JobID,
+											WorktreePath: hj.WorktreePath,
+											PID:          livePID,
+										})
+									}
+								}
+							}
+						}
+					}
 					return jobs
 				},
 				OnTick: func(ctx context.Context, hostID string) error {
@@ -1175,7 +1211,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			}
 
 			if api != "" {
-				cpSpooler, _ := controlplane.NewOfflineReportSpooler("", nil)
+				cpSpooler, _ := controlplane.NewOfflineReportSpooler(spoolDir, nil)
 				if cpSpooler != nil {
 					cpSpooler.TokenProvider = tokenProvider
 				}
@@ -1410,9 +1446,18 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				newPID, err := wdRunner.Start(argv)
 				return newPID, err
 			}
+			wdStateFile := ""
+			if isTestBinary() {
+				if h := strings.TrimSpace(getenv("HOME")); h != "" {
+					wdStateFile = filepath.Join(h, ".iazio", "watchdog-active-jobs.json")
+				} else {
+					wdStateFile = filepath.Join(os.TempDir(), fmt.Sprintf("iazio-test-watchdog-%d.json", os.Getpid()))
+				}
+			}
 			wd = watchdog.New(watchdog.Options{
-				Runner:  wdRunner,
-				Spawner: spawner,
+				StateFile: wdStateFile,
+				Runner:    wdRunner,
+				Spawner:   spawner,
 				OnOrphanTool: func(job watchdog.TrackedJob) {
 					if runCtx.Err() != nil {
 						return
@@ -1956,8 +2001,7 @@ func applyLinux(action, bin string, stdout io.Writer, force bool) error {
 		return service.InstallLinux(bin)
 	}
 	if action == "status" {
-		cmd := procutil.Command("systemctl", "--user", "status", "iazio-agent.service", "--no-pager")
-		out, err := cmd.CombinedOutput()
+		out, err := execCommandOutput("systemctl", "--user", "status", "iazio-agent.service", "--no-pager")
 		if stdout != nil {
 			fmt.Fprint(stdout, string(out))
 		}
@@ -2199,7 +2243,9 @@ func installCanonicalBinary() (string, error) {
 	if err := copyBinary(src, dest); err != nil {
 		return "", err
 	}
-	_ = service.ReconcileServiceConfiguration(home, dest, nil)
+	if !isTestBinary() {
+		_ = service.ReconcileServiceConfiguration(home, dest, nil)
+	}
 	// Purge secondary installation binary from ~/.iazio/bin/
 	_ = os.Remove(filepath.Join(home, ".iazio", "bin", binName))
 	return dest, nil
@@ -2251,7 +2297,20 @@ func copyBinary(src, dest string) error {
 	return nil
 }
 
+func isServiceControlCommand(name string) bool {
+	base := strings.ToLower(strings.TrimSuffix(filepath.Base(name), ".exe"))
+	switch base {
+	case "schtasks", "systemctl", "launchctl", "loginctl", "crontab", "taskkill", "pkill", "killall":
+		return true
+	default:
+		return false
+	}
+}
+
 var execCommand = func(name string, args ...string) error {
+	if isTestBinary() && isServiceControlCommand(name) {
+		return nil
+	}
 	cmd := procutil.Command(name, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -2261,6 +2320,9 @@ var execCommand = func(name string, args ...string) error {
 }
 
 var execCommandOutput = func(name string, args ...string) ([]byte, error) {
+	if isTestBinary() && isServiceControlCommand(name) {
+		return nil, errors.New("service control command disabled in test binary")
+	}
 	cmd := procutil.Command(name, args...)
 	return cmd.CombinedOutput()
 }

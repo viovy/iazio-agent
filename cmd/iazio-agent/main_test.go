@@ -1040,6 +1040,7 @@ func TestApplyPlatformFunctions(t *testing.T) {
 	// Linux without systemd actions
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("IAZIO_DISABLE_SYSTEMD", "1")
 	buf.Reset()
 	_ = applyLinux("status", "bin", &buf, false)
 	_ = applyLinux("stop", "bin", &buf, false)

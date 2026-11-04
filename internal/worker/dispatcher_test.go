@@ -1559,3 +1559,86 @@ func TestHTTPControlPlaneClient_TransientRetryAcrossRestartAndFailoverDirection(
 		t.Fatalf("expected FailureDirection=UPSTREAM and FailureService=antigravity-llm-provider, got %+v", failoverCaptured)
 	}
 }
+
+func TestDispatcher_ForwardsResolvedConversationIDAndDynamicToken(t *testing.T) {
+	var ackConvID string
+	var claimed bool
+	var mu sync.Mutex
+	var capturedPayload json.RawMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/agent/jobs/claim":
+			mu.Lock()
+			already := claimed
+			claimed = true
+			mu.Unlock()
+			if already {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(Job{
+				ID:                   "job-resume-conv",
+				Type:                 JobTypePromptExecute,
+				Repo:                 ".",
+				TargetAgent:          "agy",
+				TraceID:              "trace-123",
+				ParentID:             "span-456",
+				FencingToken:         7,
+				LeaseToken:           "lease-abc",
+				ActiveConversationID: "29c18bab-aa8a-4d78-8426-4808d832582a",
+				ConversationIDs:      []string{"29c18bab-aa8a-4d78-8426-4808d832582a"},
+				Payload:              json.RawMessage(`{"prompt":"/autonomous-story-execution fix bug"}`),
+			})
+		case "/api/v1/agent/jobs/job-resume-conv/ack-lease":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			ackConvID, _ = body["active_conversation_id"].(string)
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/agent/jobs/job-resume-conv/complete":
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	cli := NewHTTPControlPlaneClient(srv.URL, "", nil)
+	cli.TokenProvider = func(context.Context) string {
+		return "dynamic-oauth-token-999"
+	}
+	inv := &mockInvoker{
+		executePromptFunc: func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+			capturedPayload = payload
+			return &harness.PromptExecutionResult{
+				Status:         "completed",
+				ExitCode:       0,
+				ConversationID: "29c18bab-aa8a-4d78-8426-4808d832582a",
+			}, nil
+		},
+	}
+	disp := NewDispatcher(cli, inv, "host-1")
+	processed, err := disp.PollAndProcess(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("expected job to be processed cleanly, got processed=%v err=%v", processed, err)
+	}
+	if ackConvID != "29c18bab-aa8a-4d78-8426-4808d832582a" {
+		t.Fatalf("expected AckLease to receive active_conversation_id, got %q", ackConvID)
+	}
+	var forwarded map[string]any
+	if err := json.Unmarshal(capturedPayload, &forwarded); err != nil {
+		t.Fatalf("unmarshal forwarded payload: %v", err)
+	}
+	if forwarded["resume_conversation_id"] != "29c18bab-aa8a-4d78-8426-4808d832582a" {
+		t.Fatalf("expected resume_conversation_id to be forwarded, got %v", forwarded["resume_conversation_id"])
+	}
+	if forwarded["conversation_id"] != "29c18bab-aa8a-4d78-8426-4808d832582a" {
+		t.Fatalf("expected conversation_id to be forwarded, got %v", forwarded["conversation_id"])
+	}
+	if forwarded["lease_token"] != "lease-abc" {
+		t.Fatalf("expected lease_token=lease-abc, got %v", forwarded["lease_token"])
+	}
+	if forwarded["token"] != "dynamic-oauth-token-999" {
+		t.Fatalf("expected dynamic token=dynamic-oauth-token-999, got %v", forwarded["token"])
+	}
+}
