@@ -3484,8 +3484,19 @@ func TestResolveTelemetryDestination(t *testing.T) {
 	}
 
 	// 2. Discovered from upstream API /v1/telemetry/config
+	var statusHit atomic.Bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/telemetry/config" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.URL.Path == "/api/v1/telemetry/config" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"no-gateway-yet"}`))
+			return
+		}
+		if r.URL.Path == "/v1/status" {
+			statusHit.Store(true)
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("{\"central_telemetry_gateway_url\":\"https://api-discovered.local\",\"status\":\"healthy\"}"))
 			return
@@ -3495,8 +3506,8 @@ func TestResolveTelemetryDestination(t *testing.T) {
 	defer ts.Close()
 
 	u2, isGw2 := resolveTelemetryDestination(ts.URL, func(string) string { return "" })
-	if u2 != "https://api-discovered.local" || !isGw2 {
-		t.Fatalf("expected api discovered gateway url, got %q, isGw=%v", u2, isGw2)
+	if u2 != "https://api-discovered.local" || !isGw2 || !statusHit.Load() {
+		t.Fatalf("expected api discovered gateway url via /v1/status after closing intermediate responses, got %q, isGw=%v", u2, isGw2)
 	}
 
 	// 3. Fallback to IAZIO_ELASTICSEARCH_URL

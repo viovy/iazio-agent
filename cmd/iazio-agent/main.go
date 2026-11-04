@@ -864,6 +864,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			tokenProvider := func(context.Context) string {
 				return resolveControlPlaneToken(getenv)
 			}
+			if spooler != nil {
+				spooler.TokenProvider = tokenProvider
+			}
 			client = controlplane.Client{
 				BaseURL:            api,
 				Token:              authToken,
@@ -1173,6 +1176,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 
 			if api != "" {
 				cpSpooler, _ := controlplane.NewOfflineReportSpooler("", nil)
+				if cpSpooler != nil {
+					cpSpooler.TokenProvider = tokenProvider
+				}
 				cpClient := worker.NewHTTPControlPlaneClient(api, authToken, nil, cpSpooler)
 				cpClient.TokenProvider = tokenProvider
 				cliInvoker := harness.NewCLIInvoker("", "")
@@ -3282,14 +3288,18 @@ func resolveTelemetryDestination(apiURL string, getenv func(string) string) (str
 		for _, path := range []string{"/v1/telemetry/config", "/api/v1/telemetry/config", "/v1/status"} {
 			resp, err := client.Get(trimmedAPI + path)
 			if err == nil {
-				defer resp.Body.Close()
+				var gwURL string
 				if resp.StatusCode == http.StatusOK {
 					var raw struct {
 						CentralTelemetryGatewayURL string `json:"central_telemetry_gateway_url"`
 					}
 					if err := json.NewDecoder(resp.Body).Decode(&raw); err == nil && strings.TrimSpace(raw.CentralTelemetryGatewayURL) != "" {
-						return strings.TrimSpace(raw.CentralTelemetryGatewayURL), true
+						gwURL = strings.TrimSpace(raw.CentralTelemetryGatewayURL)
 					}
+				}
+				_ = resp.Body.Close()
+				if gwURL != "" {
+					return gwURL, true
 				}
 			}
 		}

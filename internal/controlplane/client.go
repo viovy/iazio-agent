@@ -882,8 +882,8 @@ func (c Client) postJSON(ctx context.Context, path string, body any, out any) er
 	}
 	if lastErr != nil && shouldSpool && c.Spooler != nil && out == nil {
 		headers := map[string]string{"Content-Type": "application/json"}
-		if c.Token != "" {
-			headers["Authorization"] = "Bearer " + c.Token
+		if tok := c.bearerToken(ctx); tok != "" {
+			headers["Authorization"] = "Bearer " + tok
 		}
 		_ = c.Spooler.Spool(SpooledRequest{
 			URL:     strings.TrimRight(c.BaseURL, "/") + path,

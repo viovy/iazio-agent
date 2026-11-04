@@ -723,14 +723,27 @@ func TestWatchdog_SilentHangStallDetection(t *testing.T) {
 
 func TestWatchdog_PrematureExit0GateEnforcement(t *testing.T) {
 	tmpDir := t.TempDir()
-	stateFile := filepath.Join(tmpDir, "watchdog-gate.json")
+	stateFile := filepath.Join(t.TempDir(), "watchdog-gate.json")
 	convID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+
+	runGit := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = tmpDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+		}
+	}
+	runGit("init")
+	runGit("config", "user.name", "Test Operator")
+	runGit("config", "user.email", "operator@iazio.test")
 
 	storiesDir := filepath.Join(tmpDir, "docs", "stories")
 	_ = os.MkdirAll(storiesDir, 0755)
 	storyFile := filepath.Join(storiesDir, "2026-10-25-gov-3684-premature.story.md")
 	// Story is still IN_PROGRESS (not DONE)
 	_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-3684\nstatus: IN_PROGRESS\n---\n"), 0644)
+	runGit("add", ".")
+	runGit("commit", "-m", "chore: initial story in progress")
 
 	var spawnedJobs []TrackedJob
 	w := New(Options{
@@ -775,6 +788,8 @@ func TestWatchdog_PrematureExit0GateEnforcement(t *testing.T) {
 	_ = os.MkdirAll(filepath.Join(tmpDir, "tmp", "reports"), 0755)
 	_ = os.WriteFile(filepath.Join(tmpDir, "tmp", "reports", "validate-local-ok.stamp"), []byte("ok"), 0644)
 	_ = os.WriteFile(filepath.Join(tmpDir, "tmp", "reports", "verify-live-release-ok.stamp"), []byte("ok"), 0644)
+	runGit("add", ".")
+	runGit("commit", "-m", "feat: complete STORY-GOV-3684")
 	w.OnProcessExit("job-1311", 7777, 0, nil)
 
 	j, _ := w.GetJob("job-1311")

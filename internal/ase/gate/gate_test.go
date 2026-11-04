@@ -234,3 +234,34 @@ func TestDefaultGitRunner(t *testing.T) {
 		t.Fatalf("DefaultGitRunner failed: %v out=%s", err, out)
 	}
 }
+
+func TestVerify_GitCommandsFailClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	mockGit := func(args ...string) (string, error) {
+		switch args[0] {
+		case "status":
+			return "", fmt.Errorf("git status failed")
+		case "rev-parse":
+			return "", fmt.Errorf("git rev-parse failed")
+		case "submodule":
+			return "", fmt.Errorf("git submodule status failed")
+		default:
+			return "", nil
+		}
+	}
+
+	res := Verify(GateOptions{
+		WorktreePath: tmpDir,
+		GitRunner:    mockGit,
+	})
+	if res.Passed {
+		t.Fatal("expected Verify to fail closed when git commands return errors")
+	}
+	if res.GitClean || res.BranchClean || res.SubmodulesClean {
+		t.Fatalf("expected GitClean, BranchClean, and SubmodulesClean to be false, got %+v", res)
+	}
+	if len(res.UnmetGates) != 3 {
+		t.Fatalf("expected 3 unmet gates (clean_working_tree, branch_not_detached, submodule_gitlinks_synchronized), got %v", res.UnmetGates)
+	}
+}

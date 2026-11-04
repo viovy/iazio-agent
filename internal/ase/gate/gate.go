@@ -72,7 +72,10 @@ func Verify(opts GateOptions) GateResult {
 
 	// 1. Workspace & Git Integrity Check: Clean working tree
 	porc, err := git("status", "--porcelain")
-	if err == nil {
+	if err != nil {
+		res.GitClean = false
+		res.UnmetGates = append(res.UnmetGates, "clean_working_tree")
+	} else {
 		lines := strings.Split(porc, "\n")
 		var dirtyCount int
 		for _, l := range lines {
@@ -94,7 +97,10 @@ func Verify(opts GateOptions) GateResult {
 
 	// 2. Branch cleanliness: detached HEAD check
 	branch, err := git("rev-parse", "--abbrev-ref", "HEAD")
-	if err == nil {
+	if err != nil {
+		res.BranchClean = false
+		res.UnmetGates = append(res.UnmetGates, "branch_not_detached")
+	} else {
 		branch = strings.TrimSpace(branch)
 		if branch == "HEAD" {
 			res.BranchClean = false
@@ -104,7 +110,10 @@ func Verify(opts GateOptions) GateResult {
 
 	// 3. Submodule gitlinks cleanliness
 	subStatus, err := git("submodule", "status")
-	if err == nil && subStatus != "" {
+	if err != nil {
+		res.SubmodulesClean = false
+		res.UnmetGates = append(res.UnmetGates, "submodule_gitlinks_synchronized")
+	} else if subStatus != "" {
 		lines := strings.Split(subStatus, "\n")
 		for _, l := range lines {
 			l = strings.TrimSpace(l)

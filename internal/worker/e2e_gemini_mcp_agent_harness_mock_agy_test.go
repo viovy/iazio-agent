@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-agent/internal/harness"
 	"github.com/viovy/iazio-agent/internal/supervisor"
 )
@@ -544,6 +545,174 @@ func TestE2E_GeminiWeb_IazioMCP_HarnessAPI_Agent_Harness_MockAgy(t *testing.T) {
 			if !strings.Contains(joinedChunks, expected) {
 				t.Fatalf("expected E2E streamed chunks for job_3ffa5d0be1649f0e to contain %q, got:\n%s", expected, joinedChunks)
 			}
+		}
+	})
+
+	// Sub-Scenario F (STORY-IAZIO-0183):
+	// End-to-End integration test with mock-agy covering:
+	// 1. OAuth scope enforcement on POST /api/v1/stories (requires harness:write / autopilot:write) and POST /api/v1/codebase/search (requires harness:read / workspace:read).
+	// 2. iazio-agent -> iazio-harness -> mock-agy execution of Wave 1 story, where /complete initially fails with 503 (spooling the completion with dynamic TokenProvider token),
+	//    then receives 401 Unauthorized on first Drain before TokenProvider rotates to a fresh token and drains cleanly without quarantining as .rejected.
+	t.Run("Story_IAZIO_0183_OAuthScope_SpoolerTokenRefresh_And_MockAgy_Execution", func(t *testing.T) {
+		t.Setenv("MOCK_AGY_SCENARIO", "gemini_web_mcp_sort_prompts_flow")
+		fleetDir := initTestFleetWorkspace(t)
+		t.Setenv("IAZIO_FLEET_ROOT", fleetDir)
+
+		var completeAttempts int
+		var currentAgentToken = "stale-agent-token"
+		var spoolCompleted CompleteRequest
+		var spoolCompletedOK bool
+
+		oauthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/api/v1/codebase/search":
+				if authHeader != "Bearer gemini-read-or-mcp-token" && authHeader != "Bearer m2m-harness-write-token" {
+					w.WriteHeader(http.StatusForbidden)
+					_, _ = w.Write([]byte(`{"error":"insufficient_scope","required_scope":"harness:read"}`))
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"matches":[{"path":"internal/controlplane/spooler.go","score":0.99}]}`))
+
+			case r.Method == http.MethodPost && r.URL.Path == "/api/v1/stories":
+				if authHeader != "Bearer m2m-harness-write-token" && authHeader != "Bearer gemini-autopilot-write-token" {
+					w.WriteHeader(http.StatusForbidden)
+					_, _ = w.Write([]byte(`{"error":"insufficient_scope","required_scope":"harness:write"}`))
+					return
+				}
+				payloadBytes, _ := json.Marshal(map[string]any{
+					"prompt_id":        "prompt-job-iazio-0183",
+					"story_id":         "",
+					"repo":             ".",
+					"worktree_path":    fleetDir,
+					"title":            "Fix control-plane offline spooler token refresh",
+					"prompt":           "/autonomous-story-execution Fix control-plane offline spooler token refresh",
+					"target_agent":     "agy",
+					"effective_action": "story.create_and_execute",
+				})
+				queuedJobs = append(queuedJobs, &Job{
+					ID:           "job_iazio_0183",
+					Type:         JobTypePromptExecute,
+					Repo:         ".",
+					TargetAgent:  "agy",
+					Payload:      payloadBytes,
+					FencingToken: 1,
+					LeaseToken:   "lease-iazio-0183",
+				})
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]any{"job_id": "job_iazio_0183", "status": "queued"})
+
+			case r.Method == http.MethodPost && r.URL.Path == "/api/v1/agent/jobs/claim":
+				if len(queuedJobs) == 0 {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				job := queuedJobs[0]
+				queuedJobs = queuedJobs[1:]
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(job)
+
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/complete"):
+				completeAttempts++
+				if completeAttempts == 1 {
+					// Simulate transient 503 during initial CompleteJob so it gets spooled
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				if authHeader != "Bearer refreshed-agent-token-0183" {
+					// Simulate 401 Unauthorized on first spool drain before token rotation
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				_ = json.NewDecoder(r.Body).Decode(&spoolCompleted)
+				spoolCompletedOK = true
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"status":"ok"}`))
+
+			default:
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{}`))
+			}
+		}))
+		defer oauthSrv.Close()
+
+		// 1. Verify read-only search POST succeeds with read/MCP token
+		searchReq, _ := http.NewRequest(http.MethodPost, oauthSrv.URL+"/api/v1/codebase/search", strings.NewReader(`{"query":"OfflineReportSpooler"}`))
+		searchReq.Header.Set("Authorization", "Bearer gemini-read-or-mcp-token")
+		searchResp, err := oauthSrv.Client().Do(searchReq)
+		if err != nil || searchResp.StatusCode != http.StatusOK {
+			t.Fatalf("expected search_codebase POST to succeed with 200, got err=%v status=%v", err, searchResp)
+		}
+		_ = searchResp.Body.Close()
+
+		// 2. Verify story.create_and_execute rejects unprivileged token with 403 insufficient_scope and succeeds with write token
+		unprivReq, _ := http.NewRequest(http.MethodPost, oauthSrv.URL+"/api/v1/stories", strings.NewReader(`{"title":"Wave 1","target_agent":"agy"}`))
+		unprivReq.Header.Set("Authorization", "Bearer read-only-token")
+		unprivResp, err := oauthSrv.Client().Do(unprivReq)
+		if err != nil || unprivResp.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for unprivileged token on POST /api/v1/stories, got err=%v status=%v", err, unprivResp)
+		}
+		_ = unprivResp.Body.Close()
+
+		privReq, _ := http.NewRequest(http.MethodPost, oauthSrv.URL+"/api/v1/stories", strings.NewReader(`{"title":"Wave 1","target_agent":"agy"}`))
+		privReq.Header.Set("Authorization", "Bearer gemini-autopilot-write-token")
+		privResp, err := oauthSrv.Client().Do(privReq)
+		if err != nil || privResp.StatusCode != http.StatusCreated {
+			t.Fatalf("expected 201 Created for authorized token on POST /api/v1/stories, got err=%v status=%v", err, privResp)
+		}
+		_ = privResp.Body.Close()
+
+		// 3. Execute job via Dispatcher -> real iazio-harness -> real mock-agy with OfflineReportSpooler
+		spoolDir := t.TempDir()
+		spooler, err := controlplane.NewOfflineReportSpooler(spoolDir, oauthSrv.Client())
+		if err != nil {
+			t.Fatalf("NewOfflineReportSpooler: %v", err)
+		}
+		tokenProvider := func(context.Context) string {
+			mu.Lock()
+			defer mu.Unlock()
+			return currentAgentToken
+		}
+		spooler.TokenProvider = tokenProvider
+
+		cpClient := NewHTTPControlPlaneClient(oauthSrv.URL, "", oauthSrv.Client(), spooler)
+		cpClient.TokenProvider = tokenProvider
+		cpClient.MaxRetries = -1
+		invoker := harness.NewCLIInvoker(harnessBin, fleetDir)
+		disp := NewDispatcher(cpClient, invoker, "debian", nil, nil)
+		disp.SetWorktreeResolver(func(string) string { return fleetDir })
+
+		// PollAndProcess runs mock-agy (which succeeds), then CompleteJob gets 503 and spools to disk
+		processed, _ := disp.PollAndProcess(context.Background())
+		if !processed {
+			t.Fatal("expected job_iazio_0183 to be claimed and executed by mock-agy")
+		}
+
+		// First drain with stale-agent-token receives 401 Unauthorized and retains spooled file
+		drained1, err := spooler.Drain(context.Background())
+		if err == nil || drained1 != 0 {
+			t.Fatalf("expected first Drain with 401 to retain spooled report, got drained=%d err=%v", drained1, err)
+		}
+
+		// Rotate token in TokenProvider and drain again -> 200 OK
+		mu.Lock()
+		currentAgentToken = "refreshed-agent-token-0183"
+		mu.Unlock()
+		drained2, err := spooler.Drain(context.Background())
+		if err != nil || drained2 != 1 {
+			t.Fatalf("expected second Drain with refreshed token to drain 1 report, got drained=%d err=%v", drained2, err)
+		}
+
+		mu.Lock()
+		okDone := spoolCompletedOK
+		compRes := spoolCompleted
+		mu.Unlock()
+		if !okDone || compRes.Error != "" {
+			t.Fatalf("expected spooled mock-agy completion report to be delivered cleanly, ok=%v err=%q", okDone, compRes.Error)
 		}
 	})
 }
