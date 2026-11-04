@@ -2618,9 +2618,9 @@ func restartOrExecSelf(stdout io.Writer) {
 		if startErr := cmd.Start(); startErr == nil {
 			os.Exit(0)
 		}
-		// Attempt to revive via systemd if available
-		_ = procutil.Command("systemctl", "--user", "restart", "iazio-agent.service").Run()
-		os.Exit(1)
+		// Attempt to revive via systemd if available (non-blocking to prevent 90s deadlock)
+		_ = procutil.Command("systemctl", "--user", "--no-block", "restart", "iazio-agent.service").Run()
+		os.Exit(0)
 	}
 }
 

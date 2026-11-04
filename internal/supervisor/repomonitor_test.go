@@ -271,14 +271,27 @@ func TestRepoStateMonitor_InventoryFailureFailClosed(t *testing.T) {
 		t.Fatalf("expected DirtyRepoPaths to include repo_inventory_unavailable, got %v", snap.DirtyRepoPaths)
 	}
 
-	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
-		t.Fatalf("doUpdate must NOT be called when inventory failed")
+	// By default (requireCleanFleetGit=false), Path B release updates are decoupled from inventory failures
+	var defaultUpdateCalled bool
+	defaultUpdater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
+		defaultUpdateCalled = true
+		return UpdateResult{UpdatedTools: []string{"autopilot"}}, nil
+	}, nil)
+	_, defaultDeferred, _ := defaultUpdater.EvaluateAndTrigger(context.Background(), nil, false)
+	if defaultDeferred || !defaultUpdateCalled {
+		t.Fatalf("expected default updater to proceed when repo inventory is unavailable, got deferred=%v called=%v", defaultDeferred, defaultUpdateCalled)
+	}
+
+	// When requireCleanFleetGit=true, inventory failure enforces fail-closed deferral
+	gatedUpdater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
+		t.Fatalf("doUpdate must NOT be called when requireCleanFleetGit=true and inventory failed")
 		return UpdateResult{}, nil
 	}, nil)
+	gatedUpdater.SetRequireCleanFleetGit(true)
 
-	_, deferred, _ := updater.EvaluateAndTrigger(context.Background(), nil, false)
+	_, deferred, _ := gatedUpdater.EvaluateAndTrigger(context.Background(), nil, false)
 	if !deferred {
-		t.Fatalf("expected update to be deferred when repo inventory is unavailable")
+		t.Fatalf("expected update to be deferred when requireCleanFleetGit=true and repo inventory is unavailable")
 	}
 }
 
@@ -1566,5 +1579,26 @@ func TestEagerToolUpdater_DirtyGitReposDoNotBlockReleaseUpdatesByDefault(t *test
 	_, deferred, err := updater.EvaluateAndTrigger(ctx, []string{"autopilot"}, false)
 	if err != nil || deferred || updateCalls != 1 {
 		t.Fatalf("expected Path B release binary update to proceed when git repos are dirty, got deferred=%v err=%v calls=%d", deferred, err, updateCalls)
+	}
+}
+
+func TestInspectSingleGitDirectory_IgnoreSubmodulesWhenGitmodulesPresent(t *testing.T) {
+	tempDir := t.TempDir()
+	cmdInit := exec.Command("git", "-C", tempDir, "init")
+	if out, err := cmdInit.CombinedOutput(); err != nil {
+		t.Fatalf("git init failed: %v (%s)", err, string(out))
+	}
+
+	gitmodulesPath := filepath.Join(tempDir, ".gitmodules")
+	if err := os.WriteFile(gitmodulesPath, []byte("[submodule \"dummy\"]\n\tpath = dummy\n\turl = https://example.com/dummy.git\n"), 0644); err != nil {
+		t.Fatalf("failed to write .gitmodules: %v", err)
+	}
+
+	res := inspectSingleGitDirectory(context.Background(), tempDir)
+	if res.Error != "" {
+		t.Fatalf("inspectSingleGitDirectory returned unexpected error: %s", res.Error)
+	}
+	if res.UntrackedFilesCount != 1 {
+		t.Fatalf("expected 1 untracked file (.gitmodules), got %d", res.UntrackedFilesCount)
 	}
 }

@@ -182,15 +182,6 @@ func (u *EagerToolUpdater) SetRequireCleanFleetGit(v bool) {
 	u.requireCleanFleetGit = v
 }
 
-func hasInventoryFailure(paths []string) bool {
-	for _, p := range paths {
-		if p == "repo_inventory_unavailable" {
-			return true
-		}
-	}
-	return false
-}
-
 // LastReadiness returns the most recently captured eager update readiness report.
 func (u *EagerToolUpdater) LastReadiness() EagerUpdateReadinessReport {
 	u.mu.Lock()
@@ -265,13 +256,13 @@ func (u *EagerToolUpdater) EvaluateReadiness(ctx context.Context) EagerUpdateRea
 		return rep
 	}
 
-	// 2. Check Fleet Git Cleanliness (deep inspection, Gap 1; only blocks when requireCleanFleetGit or inventory failure)
+	// 2. Check Fleet Git Cleanliness (deep inspection, Gap 1; only blocks when requireCleanFleetGit is enabled)
 	u.mu.Lock()
 	reqCleanGit := u.requireCleanFleetGit
 	u.mu.Unlock()
 	if u.monitor != nil {
 		snap := u.monitor.LastSnapshot()
-		if !snap.FleetGitClean && (reqCleanGit || hasInventoryFailure(snap.DirtyRepoPaths)) {
+		if !snap.FleetGitClean && reqCleanGit {
 			rep.EagerUpdateState = StateDeferredGitDirty
 			rep.Details = "registered repositories are dirty"
 			for _, rState := range snap.Repos {
@@ -825,12 +816,12 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 	u.mu.Lock()
 	reqCleanGit := u.requireCleanFleetGit
 	u.mu.Unlock()
-	if !snap.FleetGitClean && !force && !bypassDirty && (reqCleanGit || hasInventoryFailure(snap.DirtyRepoPaths)) {
+	if !snap.FleetGitClean && !force && !bypassDirty && reqCleanGit {
 		// If dirty repo paths is empty, run a fresh inspection instead of deferring on stale guard (R3)
 		if len(snap.DirtyRepoPaths) == 0 {
 			snap = u.monitor.InspectFleet(ctx)
 		}
-		if !snap.FleetGitClean && (reqCleanGit || hasInventoryFailure(snap.DirtyRepoPaths)) {
+		if !snap.FleetGitClean && reqCleanGit {
 			pathsCopy := append([]string(nil), snap.DirtyRepoPaths...)
 			sort.Strings(pathsCopy)
 			reason := fmt.Sprintf("BlockedByDirtyRepos: %v", pathsCopy)
@@ -874,9 +865,9 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 	}()
 
 	// Re-verify inside lock if not forced and not bypassing dirty guard
-	if !force && !bypassDirty && u.monitor != nil && (reqCleanGit || hasInventoryFailure(snap.DirtyRepoPaths)) {
+	if !force && !bypassDirty && u.monitor != nil && reqCleanGit {
 		snap2 := u.monitor.InspectFleet(ctx)
-		if !snap2.FleetGitClean && (reqCleanGit || hasInventoryFailure(snap2.DirtyRepoPaths)) {
+		if !snap2.FleetGitClean && reqCleanGit {
 			pathsCopy := append([]string(nil), snap2.DirtyRepoPaths...)
 			sort.Strings(pathsCopy)
 			reason := fmt.Sprintf("BlockedByDirtyRepos: %v", pathsCopy)

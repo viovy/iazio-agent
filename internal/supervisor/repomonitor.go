@@ -207,10 +207,20 @@ func inspectSingleGitDirectory(ctx context.Context, dir string) singleDirGitResu
 		}
 	}
 
-	// 2. Non-locking git status --porcelain=v2 --branch with per-repo 15s timeout
-	repoCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	// 2. Non-locking git status --porcelain=v2 --branch with per-repo timeout.
+	// For superprojects with submodules (e.g. meta-repo with 52 submodules), bare status
+	// traverses all submodule working trees and times out over WSL/DrvFs NTFS.
+	// Since DiscoverSubRepositories inspects each submodule individually in step 2,
+	// root status uses --ignore-submodules=all and an extended 30s timeout.
+	statusTimeout := 15 * time.Second
+	gitArgs := []string{"-C", dir, "status", "--porcelain=v2", "--branch"}
+	if _, statErr := os.Stat(filepath.Join(dir, ".gitmodules")); statErr == nil {
+		gitArgs = append(gitArgs, "--ignore-submodules=all")
+		statusTimeout = 30 * time.Second
+	}
+	repoCtx, cancel := context.WithTimeout(ctx, statusTimeout)
 	defer cancel()
-	cmd := procutil.CommandContext(repoCtx, "git", "-C", dir, "status", "--porcelain=v2", "--branch")
+	cmd := procutil.CommandContext(repoCtx, "git", gitArgs...)
 	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
 	out, err := cmd.CombinedOutput()
 	if err != nil {

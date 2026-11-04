@@ -296,7 +296,7 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 	}
 
 	var manifest ManifestResponse
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		// Control plane might be unreachable in offline or mock test runs; fallback to baseline
@@ -1139,11 +1139,23 @@ func findChecksumsAsset(rel *gitHubRelease) *gitHubAsset {
 	return nil
 }
 
+var (
+	downloadAssetCacheMu sync.Mutex
+	downloadAssetCache   = make(map[string][]byte)
+)
+
 func downloadAsset(ctx context.Context, client *http.Client, asset *gitHubAsset, token string) ([]byte, error) {
 	reqURL := asset.BrowserDownloadURL
 	if token != "" && asset.URL != "" {
 		reqURL = asset.URL
 	}
+
+	downloadAssetCacheMu.Lock()
+	if cached, ok := downloadAssetCache[reqURL]; ok {
+		downloadAssetCacheMu.Unlock()
+		return cached, nil
+	}
+	downloadAssetCacheMu.Unlock()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
@@ -1167,7 +1179,16 @@ func downloadAsset(ctx context.Context, client *http.Client, asset *gitHubAsset,
 		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, reqURL)
 	}
 
-	return io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	downloadAssetCacheMu.Lock()
+	downloadAssetCache[reqURL] = data
+	downloadAssetCacheMu.Unlock()
+
+	return data, nil
 }
 
 func verifyChecksum(data []byte, filename, checksumsText string) error {
