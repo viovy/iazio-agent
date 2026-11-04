@@ -877,6 +877,18 @@ func resolveInstallDir(roots ManifestInstallRoots, getenv func(string) string) s
 		if userProfile == "" {
 			userProfile = getenv("HOMEDRIVE") + getenv("HOMEPATH")
 		}
+		if primary == "" && roots.Unix.Primary != "" && userProfile == "" {
+			home := getenv("HOME")
+			if strings.HasPrefix(roots.Unix.Primary, "~/") {
+				return filepath.Join(home, strings.TrimPrefix(roots.Unix.Primary, "~/"))
+			}
+			return roots.Unix.Primary
+		}
+		if userProfile == "" {
+			if home := getenv("HOME"); home != "" {
+				return filepath.Join(home, ".local", "bin")
+			}
+		}
 		if primary != "" {
 			primary = strings.ReplaceAll(primary, "%USERPROFILE%", userProfile)
 			primary = strings.ReplaceAll(primary, "/", "\\")

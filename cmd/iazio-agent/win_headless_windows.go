@@ -9,6 +9,7 @@ import (
 	"unsafe"
 
 	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/viovy-core-go/pkg/userservice"
 )
 
 func createWindowsNamedMutex(name string) (uintptr, bool, func()) {
@@ -39,7 +40,7 @@ func createWindowsNamedMutex(name string) (uintptr, bool, func()) {
 }
 
 func detachWindowsConsole() {
-	_, _, _ = syscall.NewLazyDLL("kernel32.dll").NewProc("FreeConsole").Call()
+	userservice.EnsureHeadlessConsole()
 }
 
 // buildWindowsSelfRestartCommand constructs the detached background command and scheduled-task fallback

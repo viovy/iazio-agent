@@ -2,12 +2,14 @@
 package main
 
 import (
-	coreauth "github.com/viovy/viovy-core-go/pkg/auth"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	iaziouser "github.com/viovy/iazio-core/pkg/userservice"
+	coreauth "github.com/viovy/viovy-core-go/pkg/auth"
+	"github.com/viovy/viovy-core-go/pkg/userservice"
 	"io"
 	"log"
 	"net/http"
@@ -231,7 +233,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 	if nonInteractive || isDaemonRun {
 		_ = os.Setenv("IAZIO_AGENT_NONINTERACTIVE", "1")
 	}
-	if shouldEnsureCanonicalSingleHome(args) {
+	if !isDaemonRun && shouldEnsureCanonicalSingleHome(args) {
 		ensureCanonicalSingleHome()
 	}
 	if logFilePath != "" {
@@ -302,11 +304,16 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			}
 			defer unlock()
 		}
+		if shouldEnsureCanonicalSingleHome(args) {
+			ensureCanonicalSingleHome()
+		}
 		defer func() {
-			if !isTestBinary() && getenv("IAZIO_AGENT_NONINTERACTIVE") != "1" {
+			if !isTestBinary() && ctx.Err() == nil {
 				if (runtime.GOOS == "linux" && service.IsSystemdAvailable()) || runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 					home, _ := os.UserHomeDir()
-					_ = service.ReviveCheck(home, execCommand)
+					if home == "" || !iaziouser.IsMaintenancePaused(home) {
+						_ = service.ReviveCheck(home, execCommand)
+					}
 				}
 			}
 		}()
@@ -376,6 +383,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				URL:         destURL,
 				IsGateway:   isGateway,
 				AuthToken:   authToken,
+				TokenFunc:   func() string { return resolveControlPlaneToken(getenv) },
 				ServiceName: "iazio-agent",
 				Version:     formatVersion(),
 				HostName:    host,
@@ -401,7 +409,13 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 					go func() {
 						_ = service.ReconcileServiceConfiguration(home, binPath, nil)
+						_ = iaziouser.EnforceEdgeNonServicePolicy(home, runtime.GOOS, nil)
+						_ = iaziouser.HealCompanionServices(home, runtime.GOOS, nil, watchdog.IsProcessAlive)
 					}()
+				}
+				if runtime.GOOS == "windows" {
+					wslSup := service.NewWSLCompanionSupervisor(home)
+					wslSup.StartSupervisor(runCtx, 2*time.Minute)
 				}
 			}
 
@@ -1741,7 +1755,41 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				return nil
 			}
 
-			return client.Loop(runCtx, host, kind, 3*time.Second, onJob, profile)
+			loopErr := userservice.RunForever(runCtx, userservice.LoopConfig{
+				ServiceName:    "iazio-agent",
+				InitialBackoff: 1 * time.Second,
+				MaxBackoff:     30 * time.Second,
+				ShouldPause: func() bool {
+					return !isTestBinary() && home != "" && iaziouser.IsMaintenancePaused(home)
+				},
+				OnError: func(err error, attempt int, backoff time.Duration) {
+					if sink != nil {
+						sink.Error("iazio-agent controlplane loop error; supervising restart", err, map[string]any{
+							"attempt": attempt,
+							"backoff": backoff.String(),
+						})
+					}
+				},
+				OnPanic: func(recovered any, stack []byte, attempt int, backoff time.Duration) {
+					if sink != nil {
+						sink.Error("iazio-agent controlplane loop panic recovered; supervising restart", fmt.Errorf("%v", recovered), map[string]any{
+							"attempt": attempt,
+							"backoff": backoff.String(),
+							"stack":   string(stack),
+						})
+					}
+				},
+			}, func(stepCtx context.Context) error {
+				err := client.Loop(stepCtx, host, kind, 3*time.Second, onJob, profile)
+				if isTestBinary() && stepCtx.Err() == nil {
+					cancel()
+				}
+				return err
+			})
+			if errors.Is(loopErr, context.Canceled) || errors.Is(loopErr, context.DeadlineExceeded) || errors.Is(loopErr, userservice.ErrMaintenancePaused) {
+				return nil
+			}
+			return loopErr
 		}
 
 		if ctx.Err() != nil {
@@ -2108,6 +2156,12 @@ func applyWindows(action, _ string, stdout io.Writer) error {
 		if running {
 			fmt.Fprintln(stdout, "running")
 			return nil
+		}
+		if home, hErr := os.UserHomeDir(); hErr == nil && home != "" {
+			if alive, pid := service.StatusUserDaemonAt(home); alive && pid > 0 {
+				fmt.Fprintf(stdout, "running (pid: %d)\n", pid)
+				return nil
+			}
 		}
 		return fmt.Errorf("installed but not running (%s)", statusVal)
 	case "start":
@@ -2657,14 +2711,17 @@ func restartOrExecSelf(stdout io.Writer) {
 		if isTesting {
 			return
 		}
-		// Cleanly release active agent mutex lock before spawning child to prevent lock collision
-		releaseAgentSingleInstanceLock()
 		env := append(os.Environ(), fmt.Sprintf("IAZIO_HANDOFF_PID=%d", os.Getpid()))
-		spawnCmd, schtasksCmd := buildWindowsSelfRestartCommand(targetBin, os.Args, env)
-		if startErr := spawnCmd.Start(); startErr == nil {
-			os.Exit(0)
-		}
-		_ = schtasksCmd.Run()
+		spawnCmd, _ := buildWindowsSelfRestartCommand(targetBin, os.Args, env)
+		_ = userservice.TriggerWindowsScheduledTaskRestart(
+			"iazio-agent",
+			func() error {
+				releaseAgentSingleInstanceLock()
+				return nil
+			},
+			nil,
+			func() error { return spawnCmd.Start() },
+		)
 		os.Exit(0)
 	}
 
@@ -2795,28 +2852,33 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 			st.IsClean = false
 			st.Porcelain = err.Error()
 		}
-	}
 
-	// Submodules check
-	subCmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "submodule", "status")
-	if subOut, err := subCmd.CombinedOutput(); err == nil {
-		subLines := strings.Split(string(subOut), "\n")
-		st.SubmodulesClean = true
-		for _, l := range subLines {
-			l = strings.TrimSpace(l)
-			if l == "" {
-				continue
-			}
-			if strings.HasPrefix(l, "+") || strings.HasPrefix(l, "U") || strings.HasPrefix(l, "-") {
-				st.SubmodulesClean = false
-				parts := strings.Fields(l)
-				if len(parts) >= 2 {
-					st.DirtySubmodules = append(st.DirtySubmodules, parts[1])
+		// Submodules fallback check using native C builtin (submodule--helper status) to avoid spawning sh.exe on Windows
+		subCmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "submodule--helper", "status")
+		subOut, err := subCmd.CombinedOutput()
+		if err != nil {
+			subCmd = procutil.CommandContext(ctx, "git", "-C", repoPath, "submodule", "status")
+			subOut, err = subCmd.CombinedOutput()
+		}
+		if err == nil {
+			subLines := strings.Split(string(subOut), "\n")
+			st.SubmodulesClean = true
+			for _, l := range subLines {
+				l = strings.TrimSpace(l)
+				if l == "" {
+					continue
+				}
+				if strings.HasPrefix(l, "+") || strings.HasPrefix(l, "U") || strings.HasPrefix(l, "-") {
+					st.SubmodulesClean = false
+					parts := strings.Fields(l)
+					if len(parts) >= 2 {
+						st.DirtySubmodules = append(st.DirtySubmodules, parts[1])
+					}
 				}
 			}
-		}
-		if !st.SubmodulesClean || len(st.DirtySubmodules) > 0 || len(st.NonMainSubmodules) > 0 {
-			st.IsClean = false
+			if !st.SubmodulesClean || len(st.DirtySubmodules) > 0 || len(st.NonMainSubmodules) > 0 {
+				st.IsClean = false
+			}
 		}
 	}
 
@@ -3333,7 +3395,6 @@ func buildInspectOutdatedHook(
 		return supervisor.FindOutdatedTools(manifest, inventory.InspectInstalledVersion, binDir, checkTools, targetOS)
 	}
 }
-
 
 func resolveTelemetryDestination(apiURL string, getenv func(string) string) (string, bool) {
 	if getenv == nil {

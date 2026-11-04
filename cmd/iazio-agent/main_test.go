@@ -16,7 +16,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -1327,6 +1326,7 @@ func TestExecuteRunAssignmentLifecycle(t *testing.T) {
 	if !finishSeen.Load() {
 		t.Log("Note: lifecycle 1 finish")
 	}
+	time.Sleep(150 * time.Millisecond)
 }
 
 func TestApplyPlatformFunctions_Direct(t *testing.T) {
@@ -1766,6 +1766,9 @@ EOF
 	if err := os.WriteFile(mockHarness, []byte(script), 0755); err != nil {
 		t.Fatalf("failed to write mock harness: %v", err)
 	}
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell mock script test runs on unix")
+	}
 
 	t.Setenv("HOME", tempHome)
 	origPath := os.Getenv("PATH")
@@ -1910,8 +1913,7 @@ func TestOnJob_RepoBusyRefusal(t *testing.T) {
 				checkPID = lockInfo.HarnessPID
 			}
 			if checkPID > 0 {
-				p, findErr := os.FindProcess(checkPID)
-				if findErr == nil && p.Signal(syscall.Signal(0)) == nil {
+				if watchdog.IsProcessAlive(checkPID) {
 					fmt.Fprintf(&stderr, "[agent] refusing concurrent job %s on %s: worktree actively locked by job %s (pid %d)\n",
 						a.ID, a.WorktreePath, lockInfo.JobID, checkPID)
 					_ = client.AbandonJob(context.Background(), a.ID, "REPO_BUSY")
@@ -2321,6 +2323,7 @@ func TestResolveWorktreeForRepo(t *testing.T) {
 
 	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)
+	t.Setenv("USERPROFILE", fakeHome)
 	candWork := filepath.Join(fakeHome, "work", "repo-cand")
 	if err := os.MkdirAll(candWork, 0o755); err != nil {
 		t.Fatal(err)
@@ -2354,6 +2357,9 @@ func TestResolveWorktreeForRepo(t *testing.T) {
 }
 
 func TestProbeRepoRuntime_HarnessAndFallback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell mock script test runs on unix")
+	}
 	ctx := context.Background()
 
 	fakeHome := t.TempDir()
@@ -2428,6 +2434,9 @@ echo '{"branch":"feature/test-1","is_clean":false,"ahead":1,"behind":0,"modified
 }
 
 func TestScanRepoFleetStatus_HarnessJSON(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell mock script test runs on unix")
+	}
 	ctx := context.Background()
 
 	repoDir := t.TempDir()
@@ -2774,12 +2783,14 @@ func TestExecute_CommandsAndHarvest(t *testing.T) {
 	}
 
 	// 2. flushHarvestConversation with mock harvester
-	tmpDir := t.TempDir()
-	mockHarvester := filepath.Join(tmpDir, "iazio-harvester")
-	_ = os.WriteFile(mockHarvester, []byte("#!/bin/sh\nexit 0\n"), 0755)
-	t.Setenv("PATH", tmpDir+":"+os.Getenv("PATH"))
-	if err := flushHarvestConversation(context.Background(), "conv-test-123"); err != nil {
-		t.Errorf("expected success for mock harvester, got %v", err)
+	if runtime.GOOS != "windows" {
+		tmpDir := t.TempDir()
+		mockHarvester := filepath.Join(tmpDir, "iazio-harvester")
+		_ = os.WriteFile(mockHarvester, []byte("#!/bin/sh\nexit 0\n"), 0755)
+		t.Setenv("PATH", tmpDir+":"+os.Getenv("PATH"))
+		if err := flushHarvestConversation(context.Background(), "conv-test-123"); err != nil {
+			t.Errorf("expected success for mock harvester, got %v", err)
+		}
 	}
 
 	// 3. execute help & version & unknown

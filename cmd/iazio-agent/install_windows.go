@@ -63,7 +63,12 @@ func cleanStaleBackups(dir string) {
 		}
 		name := ent.Name()
 		if strings.Contains(name, ".old.") {
-			_ = os.Remove(filepath.Join(dir, name))
+			fullPath := filepath.Join(dir, name)
+			if info, err := ent.Info(); err == nil {
+				if time.Since(info.ModTime()) > 5*time.Minute {
+					_ = os.Remove(fullPath)
+				}
+			}
 		}
 	}
 }

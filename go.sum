@@ -1,2 +1,4 @@
-github.com/viovy/viovy-core-go v0.1.1 h1:nx7qFB2B0j+EK0tSZ+LSjLP6AupahNMl0vtanxuQL3U=
-github.com/viovy/viovy-core-go v0.1.1/go.mod h1:BGF8pa6/3rt4o4eWPnAwJfUWno4k/nMfUNC2lwCrvdM=
+github.com/viovy/iazio-core v0.1.1-0.20261104220125-b2f86e6e7919 h1:CuPMhbkr6mKC4bE9Cfmc5uXU+4x/yg7UTezobPh/NPQ=
+github.com/viovy/iazio-core v0.1.1-0.20261104220125-b2f86e6e7919/go.mod h1:5U+HBM2hkUIus77UxkPL/fgsgzWHk5gfKxiZI7tw2D4=
+github.com/viovy/viovy-core-go v0.1.2-0.20261104220122-e411795fdf3a h1:Fsy9YWWU1Y9Bdc/P0DuzAfC/girA4/Ty4+N2rwRDfqs=
+github.com/viovy/viovy-core-go v0.1.2-0.20261104220122-e411795fdf3a/go.mod h1:BGF8pa6/3rt4o4eWPnAwJfUWno4k/nMfUNC2lwCrvdM=

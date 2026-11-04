@@ -23,6 +23,7 @@ type waitResult struct {
 
 type processEntry struct {
 	cmd      *exec.Cmd
+	logFile  *os.File
 	pid      int
 	jobID    string
 	attached bool
@@ -75,21 +76,25 @@ func ResolveBinary(name string) string {
 			candidates = append(candidates, filepath.Join(home, "bin", name))
 		}
 		for _, c := range candidates {
-			target := c
-			if runtime.GOOS == "windows" && filepath.Ext(target) == "" {
-				target += ".exe"
+			var targets []string
+			if runtime.GOOS == "windows" && filepath.Ext(c) == "" {
+				targets = []string{c + ".exe", c}
+			} else {
+				targets = []string{c}
 			}
-			if lfi, err := os.Lstat(target); err == nil && !lfi.IsDir() {
-				if lfi.Mode()&os.ModeSymlink != 0 {
-					if realTarget, err := filepath.EvalSymlinks(target); err == nil {
-						if fi, err := os.Stat(realTarget); err == nil && !fi.IsDir() {
-							return realTarget
+			for _, target := range targets {
+				if lfi, err := os.Lstat(target); err == nil && !lfi.IsDir() {
+					if lfi.Mode()&os.ModeSymlink != 0 {
+						if realTarget, err := filepath.EvalSymlinks(target); err == nil {
+							if fi, err := os.Stat(realTarget); err == nil && !fi.IsDir() {
+								return realTarget
+							}
 						}
+						continue
 					}
-					continue
-				}
-				if fi, err := os.Stat(target); err == nil && !fi.IsDir() {
-					return target
+					if fi, err := os.Stat(target); err == nil && !fi.IsDir() {
+						return target
+					}
 				}
 			}
 		}
@@ -193,11 +198,13 @@ func (r *OSRunner) Start(argv []string) (int, error) {
 
 	stdout := r.Stdout
 	stderr := r.Stderr
+	var logFile *os.File
 	if jobID != "" {
 		runDir := RunDir(jobID)
 		if err := os.MkdirAll(runDir, 0755); err == nil {
 			logPath := filepath.Join(runDir, "output.log")
-			if logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+			if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+				logFile = lf
 				if stdout != nil {
 					stdout = io.MultiWriter(stdout, logFile)
 				} else {
@@ -216,6 +223,9 @@ func (r *OSRunner) Start(argv []string) (int, error) {
 	cmd.Stderr = stderr
 	setProcGroup(cmd)
 	if err := cmd.Start(); err != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
 		return 0, err
 	}
 	postStartProc(cmd)
@@ -225,10 +235,11 @@ func (r *OSRunner) Start(argv []string) (int, error) {
 		r.entries = make(map[int]*processEntry)
 	}
 	r.entries[pid] = &processEntry{
-		cmd:   cmd,
-		pid:   pid,
-		jobID: jobID,
-		done:  make(chan struct{}),
+		cmd:     cmd,
+		logFile: logFile,
+		pid:     pid,
+		jobID:   jobID,
+		done:    make(chan struct{}),
 	}
 	r.mu.Unlock()
 	return pid, nil
@@ -278,6 +289,9 @@ func (r *OSRunner) Wait(pid int) (int, error) {
 		var err error
 		if entry.cmd != nil {
 			err = entry.cmd.Wait()
+			if entry.logFile != nil {
+				_ = entry.logFile.Close()
+			}
 			if err != nil {
 				if errors.As(err, &exitErr) {
 					exitCode = exitErr.ExitCode()

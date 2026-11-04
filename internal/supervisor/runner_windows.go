@@ -162,5 +162,20 @@ func verifyProcessIdentity(pid int, expectedJobID string, startedAt time.Time) b
 	if pid <= 0 || !isProcessAlive(pid) {
 		return false
 	}
-	return !startedAt.IsZero() && time.Since(startedAt) < 24*time.Hour
+	if startedAt.IsZero() || time.Since(startedAt) >= 24*time.Hour {
+		return false
+	}
+	const processQueryLimitedInformation = 0x1000
+	h, err := syscall.OpenProcess(processQueryLimitedInformation, false, uint32(pid))
+	if err == nil {
+		defer syscall.CloseHandle(h)
+		var creation, exit, kernel, user syscall.Filetime
+		if err := syscall.GetProcessTimes(h, &creation, &exit, &kernel, &user); err == nil {
+			procStart := time.Unix(0, creation.Nanoseconds())
+			if procStart.After(startedAt.Add(2 * time.Minute)) {
+				return false
+			}
+		}
+	}
+	return true
 }

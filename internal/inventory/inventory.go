@@ -249,7 +249,7 @@ type Tool struct {
 // its installation type, runtime status, and supported capabilities.
 // Per ADR-002, iazio-harness is strictly an on-demand CLI and must never be installed or reported as an OS service.
 func InspectToolService(toolName, goos string, runner ...func(name string, args ...string) ([]byte, error)) (installed bool, svcType string, svcStatus string, caps []string) {
-	if toolName == "iazio-harness" {
+	if toolName == "iazio-harness" || toolName == "iazio-mcp" {
 		return false, "none", "not_installed", nil
 	}
 	var customRun func(name string, args ...string) ([]byte, error)
@@ -748,7 +748,7 @@ func Classify(found []Tool, expected map[string]string) (tools []Tool, schedulab
 				Name:          name,
 				Status:        "MISSING",
 				ServiceType:   "none",
-				ServiceStatus: "not_installed",
+				ServiceStatus: defaultMissingServiceStatus(name),
 			})
 			schedulable = false
 			continue
@@ -883,4 +883,11 @@ func dedupe(dirs []string) []string {
 		out = append(out, clean)
 	}
 	return out
+}
+
+func defaultMissingServiceStatus(name string) string {
+	if name == "iazio-agent" || name == "iazio-harvester" {
+		return "not_installed"
+	}
+	return ""
 }

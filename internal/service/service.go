@@ -551,7 +551,8 @@ WantedBy=default.target
 `, bin, bin)
 }
 
-// LinuxWatcherService returns the oneshot service that restarts the agent on binary changes.
+// LinuxWatcherService returns the oneshot service that starts the agent on binary changes
+// if it is not already running, avoiding SIGTERM races with in-PID self-update execs.
 func LinuxWatcherService() string {
 	return `[Unit]
 Description=Auto-restart iazio-agent on binary replacement
@@ -559,7 +560,7 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/systemctl --user restart iazio-agent.service
+ExecStart=/usr/bin/systemctl --user start iazio-agent.service
 `
 }
 
@@ -763,14 +764,20 @@ func reconcileWindowsServiceConfiguration(home, bin string, run func(name string
 		_ = os.Remove(filepath.Join(binDir, legacyBin+".version"))
 	}
 
-	// Per ADR-002, iazio-harness must NEVER be installed as a user or system service.
-	harnessBat := filepath.Join(tasksDir, "iazio-harness.bat")
-	harnessXML := filepath.Join(tasksDir, "iazio-harness.xml")
-	if _, err := os.Stat(harnessBat); err == nil {
-		_ = run("schtasks", "/End", "/TN", "iazio-harness")
-		_ = run("schtasks", "/Delete", "/TN", "iazio-harness", "/F")
-		_ = os.Remove(harnessBat)
-		_ = os.Remove(harnessXML)
+	// Per ADR-002 and edge non-service policy, iazio-harness and iazio-mcp must NEVER be installed as user services.
+	for _, disallowed := range []string{"iazio-harness", "iazio-mcp"} {
+		disBat := filepath.Join(tasksDir, disallowed+".bat")
+		disXML := filepath.Join(tasksDir, disallowed+".xml")
+		if _, err := os.Stat(disBat); err == nil {
+			_ = run("schtasks", "/End", "/TN", disallowed)
+			_ = run("schtasks", "/Delete", "/TN", disallowed, "/F")
+			_ = os.Remove(disBat)
+			_ = os.Remove(disXML)
+		} else if _, err := os.Stat(disXML); err == nil {
+			_ = run("schtasks", "/End", "/TN", disallowed)
+			_ = run("schtasks", "/Delete", "/TN", disallowed, "/F")
+			_ = os.Remove(disXML)
+		}
 	}
 
 	batPath := filepath.Join(tasksDir, "iazio-agent.bat")
@@ -864,7 +871,7 @@ func reconcileLinuxServiceConfiguration(home, bin string, run func(name string, 
 	}
 
 	watcherSvcFile := filepath.Join(unitDir, "iazio-agent-watcher.service")
-	if _, err := os.Stat(watcherSvcFile); err != nil {
+	if wSvcData, err := os.ReadFile(watcherSvcFile); err != nil || strings.Contains(string(wSvcData), "--user restart ") {
 		if err := os.WriteFile(watcherSvcFile, []byte(LinuxWatcherService()), 0o644); err != nil {
 			return fmt.Errorf("write iazio-agent-watcher.service: %w", err)
 		}
@@ -897,16 +904,22 @@ func reconcileLinuxServiceConfiguration(home, bin string, run func(name string, 
 	_ = run("systemctl", "--user", "enable", "--now", "iazio-agent-watchdog.timer")
 	_ = run("loginctl", "enable-linger")
 
-	// Per ADR-002, iazio-harness must NEVER be installed as a user or system service.
-	// Purge any legacy iazio-harness systemd user units if present.
+	// Per ADR-002 and edge non-service policy, iazio-harness and iazio-mcp must NEVER be installed as user services.
+	// Purge any legacy iazio-harness or iazio-mcp systemd user units if present.
 	_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-harness"))
 	_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-harvester"))
+	_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-mcp"))
 	legacyHarnessUnits := []string{
 		"iazio-harness.service",
 		"iazio-harness-watcher.path",
 		"iazio-harness-watcher.service",
 		"iazio-harness-watchdog.timer",
 		"iazio-harness-watchdog.service",
+		"iazio-mcp.service",
+		"iazio-mcp-watcher.path",
+		"iazio-mcp-watcher.service",
+		"iazio-mcp-watchdog.timer",
+		"iazio-mcp-watchdog.service",
 	}
 	purgedHarness := false
 	for _, u := range legacyHarnessUnits {
