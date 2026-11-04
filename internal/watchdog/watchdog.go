@@ -232,6 +232,34 @@ func ComputeProgressFingerprint(worktreePath, asePhase string, passingTestCount 
 	return hex.EncodeToString(sum[:16])
 }
 
+func isWatchdogTestProcess() bool {
+	for _, arg := range os.Args {
+		if strings.HasPrefix(arg, "-test.") {
+			return true
+		}
+	}
+	if len(os.Args) > 0 {
+		base := strings.ToLower(filepath.Base(os.Args[0]))
+		if strings.HasSuffix(base, ".test") || strings.HasSuffix(base, ".test.exe") {
+			return true
+		}
+	}
+	return false
+}
+
+func isSyntheticTestTrackedJob(j *TrackedJob) bool {
+	if j == nil {
+		return false
+	}
+	if j.WorktreePath == "/nonexistent/worktree/path/for/test" || strings.Contains(j.WorktreePath, "/TestExecuteRun") {
+		return true
+	}
+	if (j.JobID == "job-invalid" || j.JobID == "job-auto-heal") && strings.HasPrefix(j.APIURL, "http://127.0.0.1:") {
+		return true
+	}
+	return false
+}
+
 func (w *Watchdog) loadState() {
 	if w.stateFile == "" {
 		return
@@ -241,12 +269,22 @@ func (w *Watchdog) loadState() {
 		return
 	}
 	var list []*TrackedJob
+	pruned := false
+	inTest := isWatchdogTestProcess()
 	if err := json.Unmarshal(data, &list); err == nil {
 		for _, j := range list {
-			if j != nil && j.JobID != "" {
-				w.jobs[j.JobID] = j
+			if j == nil || j.JobID == "" {
+				continue
 			}
+			if !inTest && isSyntheticTestTrackedJob(j) {
+				pruned = true
+				continue
+			}
+			w.jobs[j.JobID] = j
 		}
+	}
+	if pruned {
+		w.persistStateLocked()
 	}
 }
 

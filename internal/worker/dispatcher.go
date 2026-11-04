@@ -43,25 +43,65 @@ const DefaultJobExecutionTimeout = 7 * 24 * time.Hour
 
 // Job describes a unit of work received from the control plane.
 type Job struct {
-	ID                   string          `json:"id"`
-	Type                 string          `json:"type"`
-	Repo                 string          `json:"repo"`
-	TargetHost           string          `json:"target_host,omitempty"`
-	TargetAgent          string          `json:"target_agent,omitempty"`
-	Payload              json.RawMessage `json:"payload"`
-	TraceID              string          `json:"trace_id,omitempty"`
-	ParentID             string          `json:"parent_id,omitempty"`
-	StoryID              string          `json:"story_id,omitempty"`
-	FencingToken         int64           `json:"fencing_token,omitempty"`
-	LeaseToken           string          `json:"lease_token,omitempty"`
-	LeaseAckDeadlineAt   string          `json:"lease_ack_deadline_at,omitempty"`
-	Traceparent          string          `json:"traceparent,omitempty"`
-	ZipkinTraceID        string          `json:"zipkin_trace_id,omitempty"`
-	ZipkinTraceURL       string          `json:"zipkin_trace_url,omitempty"`
-	InfraRequeueCount    int             `json:"infra_requeue_count,omitempty"`
-	FailureCategory      string          `json:"failure_category,omitempty"`
-	ActiveConversationID string          `json:"active_conversation_id,omitempty"`
-	ConversationID       string          `json:"conversation_id,omitempty"`
+	ID                    string          `json:"id"`
+	Type                  string          `json:"type"`
+	Repo                  string          `json:"repo"`
+	TargetHost            string          `json:"target_host,omitempty"`
+	TargetAgent           string          `json:"target_agent,omitempty"`
+	Payload               json.RawMessage `json:"payload"`
+	TraceID               string          `json:"trace_id,omitempty"`
+	ParentID              string          `json:"parent_id,omitempty"`
+	ParentJobID           string          `json:"parent_job_id,omitempty"`
+	StoryID               string          `json:"story_id,omitempty"`
+	FencingToken          int64           `json:"fencing_token,omitempty"`
+	LeaseToken            string          `json:"lease_token,omitempty"`
+	LeaseAckDeadlineAt    string          `json:"lease_ack_deadline_at,omitempty"`
+	Traceparent           string          `json:"traceparent,omitempty"`
+	ZipkinTraceID         string          `json:"zipkin_trace_id,omitempty"`
+	ZipkinTraceURL        string          `json:"zipkin_trace_url,omitempty"`
+	Attempts              int             `json:"attempts,omitempty"`
+	InfraRequeueCount     int             `json:"infra_requeue_count,omitempty"`
+	FailureCategory       string          `json:"failure_category,omitempty"`
+	ActiveConversationID  string          `json:"active_conversation_id,omitempty"`
+	ConversationID        string          `json:"conversation_id,omitempty"`
+	ResumeConversationID  string          `json:"resume_conversation_id,omitempty"`
+	InitialConversationID string          `json:"initial_conversation_id,omitempty"`
+	ConversationIDs       []string        `json:"conversation_ids,omitempty"`
+}
+
+// ResolvedConversationID returns the canonical conversation ID to resume for this job, if any.
+func (j *Job) ResolvedConversationID() string {
+	if j == nil {
+		return ""
+	}
+	for _, cand := range []string{
+		j.ResumeConversationID,
+		j.ActiveConversationID,
+		j.ConversationID,
+		j.InitialConversationID,
+	} {
+		if trimmed := strings.TrimSpace(cand); trimmed != "" {
+			return trimmed
+		}
+	}
+	for _, cid := range j.ConversationIDs {
+		if trimmed := strings.TrimSpace(cid); trimmed != "" {
+			return trimmed
+		}
+	}
+	if len(j.Payload) > 0 {
+		var pMap map[string]any
+		if json.Unmarshal(j.Payload, &pMap) == nil && pMap != nil {
+			for _, key := range []string{"resume_conversation_id", "active_conversation_id", "conversation_id", "initial_conversation_id"} {
+				if v, ok := pMap[key].(string); ok {
+					if trimmed := strings.TrimSpace(v); trimmed != "" {
+						return trimmed
+					}
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // ClaimRequest is sent to claim pending jobs.
@@ -590,13 +630,15 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	d.setActiveJob(job.ID, worktreeDir, os.Getpid())
 	defer d.clearActiveJob(job.ID)
 
+	resolvedConvID := job.ResolvedConversationID()
+	isResumeJob := job.ParentJobID != "" || resolvedConvID != "" || job.Attempts > 1 || job.InfraRequeueCount > 0 || job.Type == "resume" || strings.Contains(string(job.Payload), `"kind":"resume"`) || strings.Contains(string(job.Payload), `"Kind":"resume"`) || strings.Contains(string(job.Payload), `"parent_job_id"`) || strings.Contains(string(job.Payload), `"resume_conversation_id"`)
+
 	// Pre-job workspace sanitization: non-destructive lock clearing, interrupted git ops recovery, dirty patch archiving, and line ending hygiene
 	if worktreeDir != "" && worktreeDir != "." {
 		_, wsPrepSpan := telemetry.StartSpan(ctx, "agent.workspace_prep",
 			telemetry.WithTag("job.id", job.ID),
 			telemetry.WithTag("workspace", worktreeDir),
 		)
-		isResumeJob := job.ParentID != "" || job.Type == "resume" || strings.Contains(string(job.Payload), `"kind":"resume"`) || strings.Contains(string(job.Payload), `"Kind":"resume"`) || strings.Contains(string(job.Payload), `"parent_job_id"`)
 		if isResumeJob {
 			// For resume / remediation jobs: preserve dirty worktree and branch, only reap stale locks and orphan processes
 			if sanRes, sanErr := workspace.SanitizeWorkspace(ctx, worktreeDir); sanErr != nil {
@@ -634,9 +676,9 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		if wtAcker, ok := d.client.(interface {
 			AckLeaseWithWorktree(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID, worktreePath string) error
 		}); ok {
-			ackErr = wtAcker.AckLeaseWithWorktree(ctx, job.ID, job.LeaseToken, os.Getpid(), "", worktreeDir)
+			ackErr = wtAcker.AckLeaseWithWorktree(ctx, job.ID, job.LeaseToken, os.Getpid(), resolvedConvID, worktreeDir)
 		} else {
-			ackErr = d.client.AckLease(ctx, job.ID, job.LeaseToken, os.Getpid(), "")
+			ackErr = d.client.AckLease(ctx, job.ID, job.LeaseToken, os.Getpid(), resolvedConvID)
 		}
 		if ackErr != nil {
 			fmt.Fprintf(os.Stderr, "[dispatcher] ack lease warning for job %s: %v\n", job.ID, ackErr)
@@ -784,35 +826,44 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		sidForPayload := currentStoryID
 		allocatedStoryMu.Unlock()
 		payload := harness.EnsurePromptPayloadWithJob(job.ID, job.TraceID, job.TargetAgent, effectiveRepo, sidForPayload, job.Payload)
-		if worktreeDir != "" && worktreeDir != "." {
-			var m map[string]any
-			if json.Unmarshal(payload, &m) == nil && m != nil {
+		var m map[string]any
+		if json.Unmarshal(payload, &m) == nil && m != nil {
+			mutated := false
+			if worktreeDir != "" && worktreeDir != "." {
 				m["worktree_path"] = worktreeDir
-				if b, mErr := json.Marshal(m); mErr == nil {
-					payload = b
-				}
+				mutated = true
 			}
-		}
-		if job.FencingToken > 0 {
-			var m map[string]any
-			if json.Unmarshal(payload, &m) == nil && m != nil {
+			if job.FencingToken > 0 {
 				m["fencing_token"] = job.FencingToken
-				if b, mErr := json.Marshal(m); mErr == nil {
-					payload = b
+				mutated = true
+			}
+			if job.LeaseToken != "" {
+				m["lease_token"] = job.LeaseToken
+				mutated = true
+			}
+			if resolvedConvID != "" {
+				if existing, _ := m["resume_conversation_id"].(string); strings.TrimSpace(existing) == "" {
+					m["resume_conversation_id"] = resolvedConvID
+					mutated = true
+				}
+				if existing, _ := m["conversation_id"].(string); strings.TrimSpace(existing) == "" {
+					m["conversation_id"] = resolvedConvID
+					mutated = true
 				}
 			}
-		}
-		if httpCli, ok := d.client.(*HTTPControlPlaneClient); ok && httpCli != nil && httpCli.BaseURL != "" {
-			var m map[string]any
-			if json.Unmarshal(payload, &m) == nil && m != nil {
+			if httpCli, ok := d.client.(*HTTPControlPlaneClient); ok && httpCli != nil && httpCli.BaseURL != "" {
 				if _, exists := m["api_url"]; !exists {
 					m["api_url"] = httpCli.BaseURL
+					mutated = true
 				}
-				if httpCli.AuthToken != "" {
+				if tok := httpCli.bearerToken(ctx); tok != "" {
 					if _, exists := m["token"]; !exists {
-						m["token"] = httpCli.AuthToken
+						m["token"] = tok
+						mutated = true
 					}
 				}
+			}
+			if mutated {
 				if b, mErr := json.Marshal(m); mErr == nil {
 					payload = b
 				}

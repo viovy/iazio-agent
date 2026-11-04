@@ -323,6 +323,29 @@ func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []
 			"TRACE_ID="+span.TraceID,
 		)
 	}
+	if len(stdinData) > 0 {
+		var envMap map[string]any
+		if json.Unmarshal(stdinData, &envMap) == nil && envMap != nil {
+			if apiURL, ok := envMap["api_url"].(string); ok && strings.TrimSpace(apiURL) != "" {
+				cmd.Env = append(cmd.Env, "IAZIO_HARNESS_API_URL="+strings.TrimSpace(apiURL))
+			}
+			if tok, ok := envMap["token"].(string); ok && strings.TrimSpace(tok) != "" {
+				cmd.Env = append(cmd.Env, "IAZIO_HARNESS_TOKEN="+strings.TrimSpace(tok))
+			}
+			if jid, ok := envMap["job_id"].(string); ok && strings.TrimSpace(jid) != "" {
+				cmd.Env = append(cmd.Env, "IAZIO_JOB_ID="+strings.TrimSpace(jid))
+			}
+			if lt, ok := envMap["lease_token"].(string); ok && strings.TrimSpace(lt) != "" {
+				cmd.Env = append(cmd.Env, "IAZIO_LEASE_TOKEN="+strings.TrimSpace(lt))
+			}
+			switch ft := envMap["fencing_token"].(type) {
+			case float64:
+				if int64(ft) > 0 {
+					cmd.Env = append(cmd.Env, fmt.Sprintf("IAZIO_FENCING_TOKEN=%d", int64(ft)))
+				}
+			}
+		}
+	}
 
 	cmd.Stdin = bytes.NewReader(stdinData)
 	var stdoutWriter storyTrackingWriter
