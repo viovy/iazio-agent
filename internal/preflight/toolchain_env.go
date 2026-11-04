@@ -57,6 +57,8 @@ func HydrateToolchainEnvWith(
 			prependDirs = append(prependDirs,
 				join(home, ".local", "bin"),
 				join(home, "bin"),
+				join(home, "brew", "bin"),
+				join(home, "brew", "sbin"),
 				join(home, "go", "bin"),
 			)
 		}

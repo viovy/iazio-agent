@@ -186,6 +186,7 @@ func TestEagerToolUpdater_PreconditionsAndDeduplicatedNotifications(t *testing.T
 	}
 
 	updater := NewEagerToolUpdater(sup, monitor, "test-host", doUpdate, postNotif)
+	updater.SetRequireCleanFleetGit(true)
 	ctx := context.Background()
 
 	// 1. Blocked by Active Harness
@@ -461,6 +462,7 @@ func TestEagerToolUpdater_PendingForceRunsAfterUnforcedPassDefersOnDirtyFleet(t 
 		mu.Unlock()
 		return UpdateResult{UpdatedTools: []string{"tool-forced"}}, nil
 	}, nil)
+	updater.SetRequireCleanFleetGit(true)
 
 	// Pre-queue a pending forced update by taking the mutex temporarily
 	updater.updateMutex.Lock()
@@ -511,6 +513,7 @@ func TestEagerToolUpdater_AgentUpdatedPreservedWhenPass2Defers(t *testing.T) {
 		}
 		return UpdateResult{}, nil
 	}, nil)
+	updater.SetRequireCleanFleetGit(true)
 
 	// Pre-queue pass 2 targeted but UNFORCED so it defers on the dirty repos (N2)
 	updater.updateMutex.Lock()
@@ -568,6 +571,7 @@ func TestEagerToolUpdater_DedupeKeyResetOnCleanPass(t *testing.T) {
 	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
 		return UpdateResult{}, nil
 	}, notifFn)
+	updater.SetRequireCleanFleetGit(true)
 	updater.CheckDrift = func(ctx context.Context, targetTools []string) (bool, error) {
 		return false, nil // no drift on clean passes
 	}
@@ -617,6 +621,7 @@ func TestEagerToolUpdater_DedupeMultipleDirtyReposOrderAgnostic(t *testing.T) {
 	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
 		return UpdateResult{}, nil
 	}, notifFn)
+	updater.SetRequireCleanFleetGit(true)
 
 	// Pass 1: multiple dirty repos in order B, A
 	monitor.mu.Lock()
@@ -1343,6 +1348,7 @@ func TestEagerToolUpdater_ReadinessReportAndGateIntegration(t *testing.T) {
 	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
 		return UpdateResult{UpdatedTools: []string{"autopilot"}}, nil
 	}, nil)
+	updater.SetRequireCleanFleetGit(true)
 	updater.SetHostGate(gate)
 	updater.SetReadinessReporter(reportFn)
 
@@ -1516,5 +1522,49 @@ func TestInspectSingleGitDirectory_Gitfile(t *testing.T) {
 	res := inspectSingleGitDirectory(context.Background(), worktreeDir)
 	if res.IsClean || !res.HasActiveGitLock {
 		t.Fatalf("expected active git lock detected via gitfile redirection")
+	}
+}
+
+func TestInspectSingleGitDirectory_UninitializedNonGitDirIsClean(t *testing.T) {
+	emptyDir := t.TempDir()
+	res := inspectSingleGitDirectory(context.Background(), emptyDir)
+	if !res.IsClean || res.Error != "" {
+		t.Fatalf("expected uninitialized directory without .git to be treated as clean, got IsClean=%v Error=%q", res.IsClean, res.Error)
+	}
+}
+
+func TestEagerToolUpdater_DirtyGitReposDoNotBlockReleaseUpdatesByDefault(t *testing.T) {
+	sup := New(time.Now)
+	monitor := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	monitor.mu.Lock()
+	monitor.lastSnapshot = FleetStateSnapshot{
+		FleetGitClean:  false,
+		DirtyRepoPaths: []string{"/Users/romeo/work/meta-repo-02"},
+		Repos: map[string]RepoGitState{
+			"/Users/romeo/work/meta-repo-02": {
+				RepoPath:        "/Users/romeo/work/meta-repo-02",
+				IsClean:         false,
+				RootClean:       false,
+				DirtyFilesCount: 4,
+				Branch:          "main",
+			},
+		},
+	}
+	monitor.mu.Unlock()
+
+	var updateCalls int
+	updater := NewEagerToolUpdater(sup, monitor, "test-host", func(ctx context.Context, targetTools []string, force bool) (UpdateResult, error) {
+		updateCalls++
+		return UpdateResult{UpdatedTools: []string{"autopilot"}}, nil
+	}, nil)
+
+	ctx := context.Background()
+	rep := updater.EvaluateReadiness(ctx)
+	if rep.EagerUpdateState != StateUpToDate {
+		t.Fatalf("expected StateUpToDate by default even when git worktrees are dirty, got %s", rep.EagerUpdateState)
+	}
+	_, deferred, err := updater.EvaluateAndTrigger(ctx, []string{"autopilot"}, false)
+	if err != nil || deferred || updateCalls != 1 {
+		t.Fatalf("expected Path B release binary update to proceed when git repos are dirty, got deferred=%v err=%v calls=%d", deferred, err, updateCalls)
 	}
 }

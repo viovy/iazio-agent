@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/auth"
@@ -302,8 +303,8 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 		manifest = defaultBaselineManifest(opts.Profile)
 	} else {
 		defer resp.Body.Close()
-		if resp.StatusCode == http.StatusNotFound {
-			// Fallback to baseline default profile if control plane hasn't registered profile yet
+		if resp.StatusCode == http.StatusNotFound || (opts.DryRun && resp.StatusCode >= 500) {
+			// Fallback to baseline default profile if control plane hasn't registered profile yet or is unreachable in dry-run
 			manifest = defaultBaselineManifest(opts.Profile)
 		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return res, fmt.Errorf("fetch manifest returned HTTP %d", resp.StatusCode)
@@ -410,6 +411,42 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 	if opts.TargetVersion != "" && len(targets) != 1 {
 		return res, fmt.Errorf("target_version %q can only be specified when exactly one tool is targeted, got %d targets", opts.TargetVersion, len(targets))
 	}
+
+	// Sanitize and deduplicate targets (skip deprecated unprefixed git-flow when autopilot-git-flow is present)
+	hasCanonicalGitFlow := false
+	for _, t := range manifest.Tools {
+		if strings.EqualFold(strings.TrimSpace(t.Name), "autopilot-git-flow") ||
+			strings.EqualFold(strings.TrimSpace(t.BinaryName), "autopilot-git-flow") {
+			hasCanonicalGitFlow = true
+			break
+		}
+	}
+	explicitGitFlow := false
+	for _, name := range opts.TargetTools {
+		if strings.EqualFold(strings.TrimSpace(name), "git-flow") {
+			explicitGitFlow = true
+			break
+		}
+	}
+	seenTargets := make(map[string]bool, len(targets))
+	dedupedTargets := make([]ManifestToolItem, 0, len(targets))
+	for _, t := range targets {
+		key := strings.ToLower(strings.TrimSpace(t.Name))
+		if key == "" {
+			key = strings.ToLower(strings.TrimSpace(t.BinaryName))
+		}
+		if key == "" || seenTargets[key] {
+			continue
+		}
+		if key == "git-flow" && hasCanonicalGitFlow && !explicitGitFlow {
+			continue
+		}
+		seenTargets[key] = true
+		dedupedTargets = append(dedupedTargets, t)
+	}
+	targets = dedupedTargets
+
+	ctx = withReleaseCache(ctx)
 
 	// Always update iazio-agent last so self-update never interrupts sibling tool updates
 	sort.SliceStable(targets, func(i, j int) bool {
@@ -748,9 +785,14 @@ func updateSingleTool(
 		repo = "viovy/" + repo
 	}
 
+	allowSourceFallback := envFn("IAZIO_AGENT_NONINTERACTIVE") != "1" ||
+		envFn("IAZIO_FORCE_SOURCE_BUILD") == "1" ||
+		envFn("AUTOPILOT_FORCE_SOURCE_BUILD") == "1" ||
+		envFn("IAZIO_ALLOW_SOURCE_FALLBACK") == "1"
+
 	rel, err := fetchRelease(ctx, client, repo, tool.TargetVersion, ghToken)
 	if err != nil {
-		if sourceRepo != "" {
+		if sourceRepo != "" && allowSourceFallback {
 			if stderr != nil {
 				fmt.Fprintf(stderr, "  [!] %s: fetch release failed (%v), falling back to source repo build (Path A)\n", tool.Name, err)
 			}
@@ -772,7 +814,7 @@ func updateSingleTool(
 
 	asset, err := findMatchingAsset(rel, tool.Name, runtime.GOOS, runtime.GOARCH)
 	if err != nil {
-		if sourceRepo != "" {
+		if sourceRepo != "" && allowSourceFallback {
 			if stderr != nil {
 				fmt.Fprintf(stderr, "  [!] %s: matching release asset not found (%v), falling back to source repo build (Path A)\n", tool.Name, err)
 			}
@@ -858,12 +900,44 @@ func resolveGitHubToken(getenv func(string) string) string {
 	if tok := strings.TrimSpace(getenv("GH_TOKEN")); tok != "" {
 		return tok
 	}
-	if out, err := procutil.Command("gh", "auth", "token").Output(); err == nil {
-		if tok := strings.TrimSpace(string(out)); tok != "" {
-			return tok
+	home := strings.TrimSpace(getenv("HOME"))
+	if home == "" {
+		home, _ = os.UserHomeDir()
+	}
+	ghCandidates := []string{"gh"}
+	if home != "" {
+		ghCandidates = append(ghCandidates, filepath.Join(home, "brew", "bin", "gh"))
+	}
+	ghCandidates = append(ghCandidates, "/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh")
+	seen := make(map[string]bool, len(ghCandidates))
+	for _, bin := range ghCandidates {
+		if bin == "" || seen[bin] {
+			continue
+		}
+		seen[bin] = true
+		if out, err := procutil.Command(bin, "auth", "token").Output(); err == nil {
+			if tok := strings.TrimSpace(string(out)); tok != "" {
+				return tok
+			}
 		}
 	}
 	return ""
+}
+
+type releaseCacheKey struct{}
+
+type releaseCacheStore struct {
+	mu    sync.Mutex
+	items map[string]*gitHubRelease
+}
+
+func withReleaseCache(ctx context.Context) context.Context {
+	if ctx.Value(releaseCacheKey{}) != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, releaseCacheKey{}, &releaseCacheStore{
+		items: make(map[string]*gitHubRelease),
+	})
 }
 
 func cleanTargetVersion(v string) string {
@@ -883,6 +957,28 @@ func cleanTargetVersion(v string) string {
 
 func fetchRelease(ctx context.Context, client *http.Client, repo, version, token string) (*gitHubRelease, error) {
 	tag := cleanTargetVersion(version)
+	cacheKey := repo + "@" + tag
+	var cache *releaseCacheStore
+	if v := ctx.Value(releaseCacheKey{}); v != nil {
+		cache, _ = v.(*releaseCacheStore)
+		if cache != nil {
+			cache.mu.Lock()
+			if cached, ok := cache.items[cacheKey]; ok && cached != nil {
+				cache.mu.Unlock()
+				return cached, nil
+			}
+			cache.mu.Unlock()
+		}
+	}
+	storeCached := func(r *gitHubRelease) *gitHubRelease {
+		if cache != nil && r != nil {
+			cache.mu.Lock()
+			cache.items[cacheKey] = r
+			cache.mu.Unlock()
+		}
+		return r
+	}
+
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
 	if tag != "" {
 		url = fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, tag)
@@ -917,7 +1013,7 @@ func fetchRelease(ctx context.Context, client *http.Client, repo, version, token
 			defer resp2.Body.Close()
 			var r gitHubRelease
 			if err := json.NewDecoder(resp2.Body).Decode(&r); err == nil {
-				return &r, nil
+				return storeCached(&r), nil
 			}
 		}
 	}
@@ -936,7 +1032,7 @@ func fetchRelease(ctx context.Context, client *http.Client, repo, version, token
 				if respList.StatusCode == http.StatusOK {
 					var list []gitHubRelease
 					if err := json.NewDecoder(respList.Body).Decode(&list); err == nil && len(list) > 0 {
-						return &list[0], nil
+						return storeCached(&list[0]), nil
 					}
 				}
 			}
@@ -951,7 +1047,7 @@ func fetchRelease(ctx context.Context, client *http.Client, repo, version, token
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
 		return nil, err
 	}
-	return &r, nil
+	return storeCached(&r), nil
 }
 
 func findMatchingAsset(rel *gitHubRelease, toolName, targetOS, targetArch string) (*gitHubAsset, error) {
@@ -1501,6 +1597,9 @@ func shouldBuildFromSourceDuringStory(ctx context.Context, sourceRepo string, en
 	}
 	if envFn("IAZIO_PREFER_RELEASE_DOWNLOAD") == "1" || envFn("AUTOPILOT_PREFER_RELEASE_DOWNLOAD") == "1" {
 		return false, "release download preferred via environment"
+	}
+	if envFn("IAZIO_AGENT_NONINTERACTIVE") == "1" {
+		return false, "background service daemon prefers official release (Path B)"
 	}
 	if sourceRepo == "" {
 		return false, "no local source repo"

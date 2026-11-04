@@ -160,7 +160,12 @@ func inspectSingleGitDirectory(ctx context.Context, dir string) singleDirGitResu
 
 	// 1. Sentinel checks for active git operations or locks
 	gitDir := filepath.Join(dir, ".git")
-	if fi, err := os.Stat(gitDir); err == nil && !fi.IsDir() {
+	fi, statErr := os.Stat(gitDir)
+	if os.IsNotExist(statErr) {
+		// Uninitialized directory without .git metadata is not a dirty git repository.
+		return res
+	}
+	if statErr == nil && !fi.IsDir() {
 		// Submodule gitfile pointing to actual gitdir
 		if b, rErr := os.ReadFile(gitDir); rErr == nil {
 			content := strings.TrimSpace(string(b))
@@ -518,8 +523,8 @@ func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot 
 		}
 	}
 
-	// Level-triggered: evaluate onFleetClean on every inspection pass when all registered repos are clean
-	if allClean && m.onFleetClean != nil {
+	// Level-triggered: evaluate onFleetClean on every inspection pass when no harness is active
+	if !snap.HarnessActive && m.onFleetClean != nil {
 		m.onFleetClean(snap)
 	}
 

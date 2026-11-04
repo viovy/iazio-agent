@@ -16,6 +16,8 @@ func TestHydrateToolchainEnv_Darwin(t *testing.T) {
 	expectedDirs := []string{
 		"/Users/testuser/.local/bin",
 		"/Users/testuser/bin",
+		"/Users/testuser/brew/bin",
+		"/Users/testuser/brew/sbin",
 		"/Users/testuser/go/bin",
 		"/opt/homebrew/bin",
 		"/opt/homebrew/sbin",

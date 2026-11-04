@@ -116,6 +116,7 @@ type EagerToolUpdater struct {
 	updating              bool
 	pendingRequests       []PendingToolRequest // discrete requests preserved per tool (R4, R5, N5)
 	hasPending            bool
+	requireCleanFleetGit  bool
 	lastReadiness         EagerUpdateReadinessReport
 	triggerCh             chan string
 
@@ -171,6 +172,23 @@ func (u *EagerToolUpdater) SetReadinessReporter(fn func(ctx context.Context, hos
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.postReadiness = fn
+}
+
+// SetRequireCleanFleetGit configures whether dirty git repositories on the host
+// block Path B precompiled release binary updates in ~/.local/bin.
+func (u *EagerToolUpdater) SetRequireCleanFleetGit(v bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.requireCleanFleetGit = v
+}
+
+func hasInventoryFailure(paths []string) bool {
+	for _, p := range paths {
+		if p == "repo_inventory_unavailable" {
+			return true
+		}
+	}
+	return false
 }
 
 // LastReadiness returns the most recently captured eager update readiness report.
@@ -247,10 +265,13 @@ func (u *EagerToolUpdater) EvaluateReadiness(ctx context.Context) EagerUpdateRea
 		return rep
 	}
 
-	// 2. Check Fleet Git Cleanliness (deep inspection, Gap 1)
+	// 2. Check Fleet Git Cleanliness (deep inspection, Gap 1; only blocks when requireCleanFleetGit or inventory failure)
+	u.mu.Lock()
+	reqCleanGit := u.requireCleanFleetGit
+	u.mu.Unlock()
 	if u.monitor != nil {
 		snap := u.monitor.LastSnapshot()
-		if !snap.FleetGitClean {
+		if !snap.FleetGitClean && (reqCleanGit || hasInventoryFailure(snap.DirtyRepoPaths)) {
 			rep.EagerUpdateState = StateDeferredGitDirty
 			rep.Details = "registered repositories are dirty"
 			for _, rState := range snap.Repos {
@@ -312,6 +333,8 @@ func (u *EagerToolUpdater) StartHybridTriggerLoop(ctx context.Context, onAgentUp
 	go func() {
 		debounceTimer := time.NewTimer(500 * time.Millisecond)
 		debounceTimer.Stop()
+		periodicTicker := time.NewTicker(90 * time.Second)
+		defer periodicTicker.Stop()
 		var pendingSource string
 		timerActive := false
 
@@ -319,6 +342,8 @@ func (u *EagerToolUpdater) StartHybridTriggerLoop(ctx context.Context, onAgentUp
 			select {
 			case <-ctx.Done():
 				return
+			case <-periodicTicker.C:
+				u.TriggerEvaluation("periodic_90s")
 			case src := <-u.triggerCh:
 				pendingSource = src
 				if !timerActive {
@@ -797,12 +822,15 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 			return UpdateResult{}, true, nil
 		}
 	}
-	if !snap.FleetGitClean && !force && !bypassDirty {
+	u.mu.Lock()
+	reqCleanGit := u.requireCleanFleetGit
+	u.mu.Unlock()
+	if !snap.FleetGitClean && !force && !bypassDirty && (reqCleanGit || hasInventoryFailure(snap.DirtyRepoPaths)) {
 		// If dirty repo paths is empty, run a fresh inspection instead of deferring on stale guard (R3)
 		if len(snap.DirtyRepoPaths) == 0 {
 			snap = u.monitor.InspectFleet(ctx)
 		}
-		if !snap.FleetGitClean {
+		if !snap.FleetGitClean && (reqCleanGit || hasInventoryFailure(snap.DirtyRepoPaths)) {
 			pathsCopy := append([]string(nil), snap.DirtyRepoPaths...)
 			sort.Strings(pathsCopy)
 			reason := fmt.Sprintf("BlockedByDirtyRepos: %v", pathsCopy)
@@ -846,9 +874,9 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 	}()
 
 	// Re-verify inside lock if not forced and not bypassing dirty guard
-	if !force && !bypassDirty {
+	if !force && !bypassDirty && u.monitor != nil && (reqCleanGit || hasInventoryFailure(snap.DirtyRepoPaths)) {
 		snap2 := u.monitor.InspectFleet(ctx)
-		if !snap2.FleetGitClean {
+		if !snap2.FleetGitClean && (reqCleanGit || hasInventoryFailure(snap2.DirtyRepoPaths)) {
 			pathsCopy := append([]string(nil), snap2.DirtyRepoPaths...)
 			sort.Strings(pathsCopy)
 			reason := fmt.Sprintf("BlockedByDirtyRepos: %v", pathsCopy)
