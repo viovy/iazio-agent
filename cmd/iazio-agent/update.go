@@ -262,6 +262,9 @@ func performUpdate(ctx context.Context, opts UpdateOptions, stdout, stderr io.Wr
 }
 
 func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, stderr io.Writer, getenv func(string) string) (UpdateResult, error) {
+	if ctx.Value(downloadAssetCacheKey{}) == nil {
+		ctx = context.WithValue(ctx, downloadAssetCacheKey{}, &assetCache{items: make(map[string][]byte)})
+	}
 	var res UpdateResult
 
 	// Single-tool guard (F2, F7): TargetVersion can only be applied when exactly one tool is targeted
@@ -1139,10 +1142,17 @@ func findChecksumsAsset(rel *gitHubRelease) *gitHubAsset {
 	return nil
 }
 
-var (
-	downloadAssetCacheMu sync.Mutex
-	downloadAssetCache   = make(map[string][]byte)
-)
+type downloadAssetCacheKey struct{}
+
+type assetCache struct {
+	mu    sync.Mutex
+	items map[string][]byte
+}
+
+func isArchiveAsset(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".zip") || strings.HasSuffix(lower, ".tgz")
+}
 
 func downloadAsset(ctx context.Context, client *http.Client, asset *gitHubAsset, token string) ([]byte, error) {
 	reqURL := asset.BrowserDownloadURL
@@ -1150,12 +1160,18 @@ func downloadAsset(ctx context.Context, client *http.Client, asset *gitHubAsset,
 		reqURL = asset.URL
 	}
 
-	downloadAssetCacheMu.Lock()
-	if cached, ok := downloadAssetCache[reqURL]; ok {
-		downloadAssetCacheMu.Unlock()
-		return cached, nil
+	var cache *assetCache
+	if c, ok := ctx.Value(downloadAssetCacheKey{}).(*assetCache); ok && c != nil {
+		cache = c
+		if isArchiveAsset(asset.Name) {
+			cache.mu.Lock()
+			if cached, ok := cache.items[reqURL]; ok {
+				cache.mu.Unlock()
+				return cached, nil
+			}
+			cache.mu.Unlock()
+		}
 	}
-	downloadAssetCacheMu.Unlock()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
@@ -1184,9 +1200,11 @@ func downloadAsset(ctx context.Context, client *http.Client, asset *gitHubAsset,
 		return nil, err
 	}
 
-	downloadAssetCacheMu.Lock()
-	downloadAssetCache[reqURL] = data
-	downloadAssetCacheMu.Unlock()
+	if cache != nil && isArchiveAsset(asset.Name) {
+		cache.mu.Lock()
+		cache.items[reqURL] = data
+		cache.mu.Unlock()
+	}
 
 	return data, nil
 }
