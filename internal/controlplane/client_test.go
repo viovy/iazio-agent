@@ -929,3 +929,50 @@ func TestClient_PostJSON_SpoolerReachableOnRetryExhaustion(t *testing.T) {
 		t.Fatalf("expected 1 spooled request after retry exhaustion, got %d", len(entries))
 	}
 }
+
+func TestClient_PostJSON_SpoolsDynamicTokenProviderBearerToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	spoolDir := t.TempDir()
+	spooler, err := NewOfflineReportSpooler(spoolDir, nil)
+	if err != nil {
+		t.Fatalf("NewOfflineReportSpooler: %v", err)
+	}
+
+	c := Client{
+		BaseURL: srv.URL,
+		TokenProvider: func(context.Context) string {
+			return "dynamic-oauth-token-183"
+		},
+		Spooler:        spooler,
+		MaxRetries:     1,
+		InitialBackoff: 1 * time.Millisecond,
+	}
+
+	err = c.PostExit(context.Background(), "job-spool-dyn", ExitOptions{
+		ExitCode:              1,
+		TerminationReasonCode: "RETRY_EXHAUSTED",
+	})
+	if err == nil {
+		t.Fatal("expected error after retry exhaustion")
+	}
+
+	entries, err := os.ReadDir(spoolDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected 1 spooled file, got %d (err=%v)", len(entries), err)
+	}
+	raw, err := os.ReadFile(spoolDir + "/" + entries[0].Name())
+	if err != nil {
+		t.Fatalf("ReadFile spooled request: %v", err)
+	}
+	var spooled SpooledRequest
+	if err := json.Unmarshal(raw, &spooled); err != nil {
+		t.Fatalf("Unmarshal spooled request: %v", err)
+	}
+	if spooled.Headers["Authorization"] != "Bearer dynamic-oauth-token-183" {
+		t.Fatalf("expected Authorization header from TokenProvider, got %q", spooled.Headers["Authorization"])
+	}
+}

@@ -29,9 +29,10 @@ type SpooledRequest struct {
 // OfflineReportSpooler persists outbound telemetry and completion reports when the control plane is offline
 // and automatically drains them chronologically when connectivity is restored.
 type OfflineReportSpooler struct {
-	mu       sync.Mutex
-	spoolDir string
-	client   *http.Client
+	mu            sync.Mutex
+	spoolDir      string
+	client        *http.Client
+	TokenProvider func(ctx context.Context) string
 }
 
 // NewOfflineReportSpooler initializes a spooler rooted at spoolDir (or ~/.iazio/reports-spool by default).
@@ -132,6 +133,11 @@ func (s *OfflineReportSpooler) Drain(ctx context.Context) (int, error) {
 		for k, v := range req.Headers {
 			httpReq.Header.Set(k, v)
 		}
+		if s.TokenProvider != nil {
+			if freshTok := strings.TrimSpace(s.TokenProvider(ctx)); freshTok != "" {
+				httpReq.Header.Set("Authorization", "Bearer "+freshTok)
+			}
+		}
 
 		resp, err := s.client.Do(httpReq)
 		if err != nil {
@@ -147,8 +153,8 @@ func (s *OfflineReportSpooler) Drain(ctx context.Context) (int, error) {
 			// Successfully drained
 			_ = os.Remove(fPath)
 			drainedCount++
-		} else if IsTransientStatus(resp.StatusCode) {
-			// Remote server overload/restarting: stop draining, wait for next tick
+		} else if IsTransientStatus(resp.StatusCode) || resp.StatusCode == http.StatusUnauthorized {
+			// Remote server overload/restarting or token awaiting refresh: stop draining, wait for next tick
 			req.Attempts++
 			updated, _ := json.MarshalIndent(req, "", "  ")
 			_ = os.WriteFile(fPath, updated, 0o600)

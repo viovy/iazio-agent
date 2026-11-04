@@ -240,8 +240,8 @@ func (c *HTTPControlPlaneClient) CompleteJob(ctx context.Context, jobID string, 
 	if err != nil {
 		if c.Spooler != nil {
 			headers := map[string]string{"Content-Type": "application/json"}
-			if c.AuthToken != "" {
-				headers["Authorization"] = "Bearer " + c.AuthToken
+			if tok := c.bearerToken(ctx); tok != "" {
+				headers["Authorization"] = "Bearer " + tok
 			}
 			_ = c.Spooler.Spool(controlplane.SpooledRequest{
 				URL:     url,
@@ -258,8 +258,8 @@ func (c *HTTPControlPlaneClient) CompleteJob(ctx context.Context, jobID string, 
 		respBody, _ := io.ReadAll(resp.Body)
 		if c.Spooler != nil && resp.StatusCode >= 500 {
 			headers := map[string]string{"Content-Type": "application/json"}
-			if c.AuthToken != "" {
-				headers["Authorization"] = "Bearer " + c.AuthToken
+			if tok := c.bearerToken(ctx); tok != "" {
+				headers["Authorization"] = "Bearer " + tok
 			}
 			_ = c.Spooler.Spool(controlplane.SpooledRequest{
 				URL:     url,

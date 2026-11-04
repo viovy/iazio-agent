@@ -105,3 +105,68 @@ func TestOfflineReportSpooler_TransientFailureStopsDrain(t *testing.T) {
 		t.Fatalf("expected 1 file preserved, got %d", len(entries))
 	}
 }
+
+func TestOfflineReportSpooler_TokenProviderRefreshesAndRetries401(t *testing.T) {
+	tempDir := t.TempDir()
+
+	var currentToken atomic.Value
+	currentToken.Store("expired-token")
+
+	var seenAuth []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		seenAuth = append(seenAuth, authHeader)
+		if authHeader != "Bearer refreshed-token-183" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	spooler, err := NewOfflineReportSpooler(tempDir, server.Client())
+	if err != nil {
+		t.Fatalf("NewOfflineReportSpooler: %v", err)
+	}
+	spooler.TokenProvider = func(context.Context) string {
+		v, _ := currentToken.Load().(string)
+		return v
+	}
+
+	if err := spooler.Spool(SpooledRequest{
+		ID:      "req-auth-refresh",
+		URL:     server.URL + "/v1/jobs/job-1/exit",
+		Method:  http.MethodPost,
+		Headers: map[string]string{"Authorization": "Bearer stale-initial-token"},
+		Body:    []byte(`{"exit_code":0}`),
+	}); err != nil {
+		t.Fatalf("Spool failed: %v", err)
+	}
+
+	// First drain: server returns 401 Unauthorized; file must NOT be quarantined as .rejected
+	ctx := context.Background()
+	drained, err := spooler.Drain(ctx)
+	if err == nil {
+		t.Fatal("expected error on 401 Unauthorized during first drain")
+	}
+	if drained != 0 {
+		t.Fatalf("expected 0 drained on 401, got %d", drained)
+	}
+	entries, _ := os.ReadDir(tempDir)
+	if len(entries) != 1 || entries[0].Name()[len(entries[0].Name())-5:] != ".json" {
+		t.Fatalf("expected spooled .json file preserved after 401 (not .rejected), got %v", entries)
+	}
+
+	// Rotate token in TokenProvider and drain again
+	currentToken.Store("refreshed-token-183")
+	drained2, err := spooler.Drain(ctx)
+	if err != nil {
+		t.Fatalf("expected second drain with refreshed token to succeed, got %v", err)
+	}
+	if drained2 != 1 {
+		t.Fatalf("expected 1 drained, got %d", drained2)
+	}
+	if len(seenAuth) != 2 || seenAuth[1] != "Bearer refreshed-token-183" {
+		t.Fatalf("expected refreshed token on second drain, got %v", seenAuth)
+	}
+}
