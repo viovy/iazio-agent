@@ -262,6 +262,9 @@ func performUpdate(ctx context.Context, opts UpdateOptions, stdout, stderr io.Wr
 }
 
 func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, stderr io.Writer, getenv func(string) string) (UpdateResult, error) {
+	if ctx.Value(downloadAssetCacheKey{}) == nil {
+		ctx = context.WithValue(ctx, downloadAssetCacheKey{}, &assetCache{items: make(map[string][]byte)})
+	}
 	var res UpdateResult
 
 	// Single-tool guard (F2, F7): TargetVersion can only be applied when exactly one tool is targeted
@@ -296,7 +299,7 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 	}
 
 	var manifest ManifestResponse
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		// Control plane might be unreachable in offline or mock test runs; fallback to baseline
@@ -1139,10 +1142,35 @@ func findChecksumsAsset(rel *gitHubRelease) *gitHubAsset {
 	return nil
 }
 
+type downloadAssetCacheKey struct{}
+
+type assetCache struct {
+	mu    sync.Mutex
+	items map[string][]byte
+}
+
+func isArchiveAsset(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".zip") || strings.HasSuffix(lower, ".tgz")
+}
+
 func downloadAsset(ctx context.Context, client *http.Client, asset *gitHubAsset, token string) ([]byte, error) {
 	reqURL := asset.BrowserDownloadURL
 	if token != "" && asset.URL != "" {
 		reqURL = asset.URL
+	}
+
+	var cache *assetCache
+	if c, ok := ctx.Value(downloadAssetCacheKey{}).(*assetCache); ok && c != nil {
+		cache = c
+		if isArchiveAsset(asset.Name) {
+			cache.mu.Lock()
+			if cached, ok := cache.items[reqURL]; ok {
+				cache.mu.Unlock()
+				return cached, nil
+			}
+			cache.mu.Unlock()
+		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
@@ -1167,7 +1195,18 @@ func downloadAsset(ctx context.Context, client *http.Client, asset *gitHubAsset,
 		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, reqURL)
 	}
 
-	return io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if cache != nil && isArchiveAsset(asset.Name) {
+		cache.mu.Lock()
+		cache.items[reqURL] = data
+		cache.mu.Unlock()
+	}
+
+	return data, nil
 }
 
 func verifyChecksum(data []byte, filename, checksumsText string) error {
