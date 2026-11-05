@@ -3636,3 +3636,79 @@ func TestResolveWorktree_ExactSubmoduleMatchAndNoSetenvRace(t *testing.T) {
 		t.Fatalf("expected cachedFleetRoot %q, got %q", candDir, cached)
 	}
 }
+
+func TestProbeRepoRuntime_CompletedSessionStoryAndHarnessSSOT(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell mock script test runs on unix")
+	}
+	ctx := context.Background()
+	repoDir := t.TempDir()
+	_ = exec.Command("git", "init", "-b", "main", repoDir).Run()
+	_ = os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("ok\n"), 0o644)
+	cmdAdd := exec.Command("git", "-C", repoDir, "add", "README.md")
+	_ = cmdAdd.Run()
+	cmdCommit := exec.Command("git", "-C", repoDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+	_ = cmdCommit.Run()
+
+	// Create completed story in index.yml + stale .session_story_id + unrelated historical resume file
+	storiesDir := filepath.Join(repoDir, "docs", "stories")
+	_ = os.MkdirAll(storiesDir, 0o755)
+	_ = os.WriteFile(filepath.Join(storiesDir, "index.yml"), []byte("stories:\n  - id: STORY-VIGO-0235\n    status: DONE\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(repoDir, ".session_story_id"), []byte("STORY-VIGO-0235\n"), 0o644)
+	tmpDir := filepath.Join(repoDir, "tmp")
+	_ = os.MkdirAll(tmpDir, 0o755)
+	_ = os.WriteFile(filepath.Join(tmpDir, "ase-resume-STORY-GOV-3143.json"), []byte(`{"story_id":"STORY-GOV-3143"}`), 0o644)
+
+	// 1. When iazio-harness is present, probeRepoRuntime trusts iazio-harness SSOT and does NOT re-read .session_story_id locally
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	fakeBin := filepath.Join(fakeHome, ".local", "bin")
+	_ = os.MkdirAll(fakeBin, 0o755)
+	harnessScript := filepath.Join(fakeBin, "iazio-harness")
+	script := `#!/bin/sh
+cat << 'EOF'
+{
+  "branch": "main",
+  "head_sha": "abc1234",
+  "is_clean": true,
+  "submodules_clean": true,
+  "ase_state": "IDLE",
+  "active_story_id": "",
+  "agent_tool": "agy",
+  "tool_liveness": "LIVE",
+  "execution_provenance": "IDLE"
+}
+EOF
+`
+	_ = os.WriteFile(harnessScript, []byte(script), 0o755)
+
+	var cleanPathElements []string
+	for _, elem := range filepath.SplitList(os.Getenv("PATH")) {
+		if strings.Contains(elem, ".iazio") {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(elem, "iazio-harness")); err == nil {
+			continue
+		}
+		cleanPathElements = append(cleanPathElements, elem)
+	}
+	cleanPath := strings.Join(cleanPathElements, string(os.PathListSeparator))
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+cleanPath)
+
+	st := probeRepoRuntime(ctx, repoDir, "meta-repo")
+	if st.ASEState != "IDLE" || st.ActiveStoryID != "" {
+		t.Fatalf("expected IDLE and empty ActiveStoryID from harness SSOT even when .session_story_id exists on disk, got state=%q story=%q", st.ASEState, st.ActiveStoryID)
+	}
+
+	// 2. When iazio-harness is absent (fallback path), completed .session_story_id is removed and unrelated resume file does not trigger RUNNING
+	_ = os.Remove(harnessScript)
+	t.Setenv("PATH", cleanPath)
+
+	stFallback := probeRepoRuntime(ctx, repoDir, "meta-repo")
+	if stFallback.ASEState != "IDLE" || stFallback.ActiveStoryID != "" {
+		t.Fatalf("expected fallback to clean completed .session_story_id and stay IDLE, got state=%q story=%q", stFallback.ASEState, stFallback.ActiveStoryID)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, ".session_story_id")); !os.IsNotExist(err) {
+		t.Fatalf("expected fallback to remove completed .session_story_id")
+	}
+}

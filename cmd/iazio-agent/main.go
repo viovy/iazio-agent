@@ -536,19 +536,31 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						if probed.HeadSHA == "" {
 							probed.HeadSHA = item.HeadSHA
 						}
-						probed.DirtyFilesCount = item.DirtyFilesCount
-						probed.UntrackedFilesCount = item.UntrackedFilesCount
-						probed.Ahead = item.Ahead
-						probed.Behind = item.Behind
-						probed.HasActiveGitLock = item.HasActiveGitLock
-						if !item.IsClean {
-							probed.IsClean = false
+						if probed.DirtyFilesCount == 0 && !probed.IsClean {
+							probed.DirtyFilesCount = item.DirtyFilesCount
 						}
-						if !item.SubmodulesClean {
-							probed.SubmodulesClean = false
+						if probed.UntrackedFilesCount == 0 && !probed.IsClean {
+							probed.UntrackedFilesCount = item.UntrackedFilesCount
 						}
-						if len(probed.DirtySubmodules) == 0 && len(item.DirtySubmodules) > 0 {
-							probed.DirtySubmodules = item.DirtySubmodules
+						if probed.Ahead == 0 {
+							probed.Ahead = item.Ahead
+						}
+						if probed.Behind == 0 {
+							probed.Behind = item.Behind
+						}
+						if item.HasActiveGitLock {
+							probed.HasActiveGitLock = true
+						}
+						if probed.Branch == "" {
+							if !item.IsClean {
+								probed.IsClean = false
+							}
+							if !item.SubmodulesClean {
+								probed.SubmodulesClean = false
+							}
+							if len(probed.DirtySubmodules) == 0 && len(item.DirtySubmodules) > 0 {
+								probed.DirtySubmodules = item.DirtySubmodules
+							}
 						}
 						enriched = append(enriched, probed)
 					}
@@ -2494,9 +2506,9 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 		return false
 	}
 
-	// Try iazio-harness fleet-status --repo <repoPath> --json first
+	// Try iazio-harness fleet-status --repo <repoPath> --auto-remediate --json first
 	harnessBin := resolveHarnessBinaryPath()
-	harnessCmd := procutil.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--json")
+	harnessCmd := procutil.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--auto-remediate", "--json")
 	if out, err := harnessCmd.Output(); err == nil && len(out) > 0 {
 		var res struct {
 			IsClean         bool     `json:"is_clean"`
@@ -2773,6 +2785,35 @@ func resolveHarnessBinaryPath() string {
 	return binName
 }
 
+func isStoryCompletedOnDiskFallback(repoPath, storyID string) bool {
+	storyID = strings.TrimSpace(storyID)
+	if !strings.HasPrefix(storyID, "STORY-") {
+		return false
+	}
+	indexPath := filepath.Join(repoPath, "docs", "stories", "index.yml")
+	if b, err := os.ReadFile(indexPath); err == nil {
+		lines := strings.Split(string(b), "\n")
+		inTarget := false
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "- id:") || strings.HasPrefix(trimmed, "id:") {
+				val := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(trimmed, "- id:"), "id:"))
+				val = strings.Trim(val, `"'`)
+				inTarget = (val == storyID)
+				continue
+			}
+			if inTarget && strings.HasPrefix(trimmed, "status:") {
+				st := strings.ToUpper(strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "status:")), `"'`))
+				if st == "DONE" || st == "COMPLETED" || st == "ARCHIVED" || st == "CANCELLED" {
+					return true
+				}
+				break
+			}
+		}
+	}
+	return false
+}
+
 func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.RepoRuntimeStatus {
 	st := controlplane.RepoRuntimeStatus{
 		RepoPath:      repoPath,
@@ -2781,15 +2822,20 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 		LastCheckedAt: time.Now(),
 	}
 
-	// Try iazio-harness fleet-status --json first
+	// Delegate repo evaluation and Tier 1/Tier 2 self-remediation to iazio-harness (SSOT Intelligence Engine).
+	harnessSucceeded := false
 	harnessBin := resolveHarnessBinaryPath()
-	harnessCmd := procutil.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--json")
+	harnessCmd := procutil.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--auto-remediate", "--json")
 	if out, err := harnessCmd.Output(); err == nil && len(out) > 0 {
 		var res struct {
 			Branch               string   `json:"branch"`
+			HeadSHA              string   `json:"head_sha"`
 			IsClean              bool     `json:"is_clean"`
 			Ahead                int      `json:"ahead"`
 			Behind               int      `json:"behind"`
+			DirtyFilesCount      int      `json:"dirty_files_count"`
+			UntrackedFilesCount  int      `json:"untracked_files_count"`
+			HasActiveGitLock     bool     `json:"has_active_git_lock"`
 			ModifiedFiles        []string `json:"modified_files"`
 			UntrackedFiles       []string `json:"untracked_files"`
 			SubmodulesClean      bool     `json:"submodules_clean"`
@@ -2801,19 +2847,43 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 			ToolLiveness         string   `json:"tool_liveness"`
 			ExecutionProvenance  string   `json:"execution_provenance"`
 			ActiveConversationID string   `json:"active_conversation_id"`
+			MetadataYmlRaw       string   `json:"metadata_yml_raw"`
+			MetadataYmlSHA       string   `json:"metadata_yml_sha"`
+			MetadataYmlModTime   string   `json:"metadata_yml_mod_time"`
+			GitVersion           string   `json:"git_version"`
 		}
-		if json.Unmarshal(out, &res) == nil {
+		if json.Unmarshal(out, &res) == nil && res.Branch != "" {
+			harnessSucceeded = true
 			st.Branch = res.Branch
+			st.HeadSHA = res.HeadSHA
 			st.IsClean = res.IsClean
+			st.Ahead = res.Ahead
+			st.Behind = res.Behind
+			st.DirtyFilesCount = res.DirtyFilesCount
+			if st.DirtyFilesCount == 0 && len(res.ModifiedFiles) > 0 {
+				st.DirtyFilesCount = len(res.ModifiedFiles)
+			}
+			st.UntrackedFilesCount = res.UntrackedFilesCount
+			if st.UntrackedFilesCount == 0 && len(res.UntrackedFiles) > 0 {
+				st.UntrackedFilesCount = len(res.UntrackedFiles)
+			}
+			st.HasActiveGitLock = res.HasActiveGitLock
 			st.SubmodulesClean = res.SubmodulesClean
 			st.DirtySubmodules = res.DirtySubmodules
 			st.NonMainSubmodules = res.NonMainSubmodules
 			st.ASEState = res.ASEState
+			if st.ASEState == "" {
+				st.ASEState = "IDLE"
+			}
 			st.ActiveStoryID = res.ActiveStoryID
 			st.ActiveTool = res.AgentTool
 			st.ToolLiveness = res.ToolLiveness
 			st.ExecutionProvenance = res.ExecutionProvenance
 			st.ActiveConversationID = res.ActiveConversationID
+			st.MetadataYmlRaw = res.MetadataYmlRaw
+			st.MetadataYmlSHA = res.MetadataYmlSHA
+			st.MetadataYmlModTime = res.MetadataYmlModTime
+			st.GitVersion = res.GitVersion
 			if len(res.ModifiedFiles) > 0 || len(res.UntrackedFiles) > 0 {
 				var pLines []string
 				for _, m := range res.ModifiedFiles {
@@ -2827,8 +2897,8 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 		}
 	}
 
-	if st.Branch == "" {
-		// Fallback git status & branch
+	if !harnessSucceeded {
+		// Fallback git status & branch when iazio-harness binary is unavailable
 		cmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain=v2", "--branch")
 		out, err := cmd.CombinedOutput()
 		if err == nil {
@@ -2841,6 +2911,8 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 				}
 				if strings.HasPrefix(l, "# branch.head ") {
 					st.Branch = strings.TrimPrefix(l, "# branch.head ")
+				} else if strings.HasPrefix(l, "# branch.oid ") {
+					st.HeadSHA = strings.TrimPrefix(l, "# branch.oid ")
 				} else if !strings.HasPrefix(l, "# ") {
 					porcelainLines = append(porcelainLines, l)
 				}
@@ -2880,90 +2952,121 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 				st.IsClean = false
 			}
 		}
-	}
 
-	// ASE state
-	statePath := filepath.Join(repoPath, ".autopilot", "state.json")
-	if b, err := os.ReadFile(statePath); err == nil {
-		var s struct {
-			State   string `json:"state"`
-			StoryID string `json:"story_id"`
-		}
-		if json.Unmarshal(b, &s) == nil {
-			if s.State != "" {
-				st.ASEState = s.State
+		// ASE state fallback
+		statePath := filepath.Join(repoPath, ".autopilot", "state.json")
+		if b, err := os.ReadFile(statePath); err == nil {
+			var s struct {
+				State   string `json:"state"`
+				StoryID string `json:"story_id"`
 			}
-			if s.StoryID != "" {
-				st.ActiveStoryID = s.StoryID
-			}
-		}
-	}
-	if st.ASEState == "" || st.ASEState == "IDLE" {
-		if _, err := os.Stat(filepath.Join(repoPath, ".ase", "active.lock")); err == nil {
-			st.ASEState = "RUNNING"
-		} else if _, err := os.Stat(filepath.Join(repoPath, ".autopilot", "lock")); err == nil {
-			st.ASEState = "RUNNING"
-		}
-	}
-	// Detect ad-hoc ASE session bound via .session_story_id or tmp/ase-resume-*.json
-	if sessionBytes, err := os.ReadFile(filepath.Join(repoPath, ".session_story_id")); err == nil {
-		storyID := strings.TrimSpace(string(sessionBytes))
-		if strings.HasPrefix(storyID, "STORY-") {
-			if st.ActiveStoryID == "" {
-				st.ActiveStoryID = storyID
-			}
-			nonMainBranch := st.Branch != "" && st.Branch != "main" && st.Branch != "master" && st.Branch != "HEAD"
-			hasResumeFile := false
-			if matches, _ := filepath.Glob(filepath.Join(repoPath, "tmp", "ase-resume-*.json")); len(matches) > 0 {
-				hasResumeFile = true
-			}
-			if nonMainBranch || len(st.NonMainSubmodules) > 0 || hasResumeFile || st.ToolLiveness == "LIVE" || st.ToolLiveness == "ALIVE" {
-				if st.ASEState == "" || st.ASEState == "IDLE" {
-					st.ASEState = "RUNNING"
+			if json.Unmarshal(b, &s) == nil {
+				if s.State != "" {
+					st.ASEState = s.State
 				}
-				if st.ExecutionProvenance == "" || st.ExecutionProvenance == "IDLE" {
-					st.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
-				}
-				if st.ToolLiveness == "" || st.ToolLiveness == "NONE" {
-					st.ToolLiveness = "LIVE"
-				}
-				if st.ActiveTool == "" {
-					st.ActiveTool = "autopilot-ase"
+				if s.StoryID != "" {
+					st.ActiveStoryID = s.StoryID
 				}
 			}
 		}
-	}
-	if st.ASEState == "" {
-		st.ASEState = "IDLE"
-	}
-
-	// metadata.yml snapshot sync
-	metaPath := filepath.Join(repoPath, "metadata.yml")
-	if fi, err := os.Stat(metaPath); err == nil && !fi.IsDir() && fi.Size() < 2<<20 {
-		if metaBytes, err := os.ReadFile(metaPath); err == nil {
-			st.MetadataYmlRaw = string(metaBytes)
-			hash := sha256.Sum256(metaBytes)
-			st.MetadataYmlSHA = fmt.Sprintf("%x", hash)
-			st.MetadataYmlModTime = fi.ModTime().UTC().Format(time.RFC3339)
+		if st.ASEState == "" || st.ASEState == "IDLE" {
+			if _, err := os.Stat(filepath.Join(repoPath, ".ase", "active.lock")); err == nil {
+				st.ASEState = "RUNNING"
+			} else if _, err := os.Stat(filepath.Join(repoPath, ".autopilot", "lock")); err == nil {
+				st.ASEState = "RUNNING"
+			}
+		}
+		// Detect ad-hoc ASE session bound via .session_story_id or scoped tmp/ase-resume-<storyID>.json
+		sessionFile := filepath.Join(repoPath, ".session_story_id")
+		if sessionBytes, err := os.ReadFile(sessionFile); err == nil {
+			storyID := strings.TrimSpace(string(sessionBytes))
+			if strings.HasPrefix(storyID, "STORY-") {
+				if isStoryCompletedOnDiskFallback(repoPath, storyID) {
+					_ = os.Remove(sessionFile)
+					_ = os.Remove(filepath.Join(repoPath, "tmp", "ase-resume-"+storyID+".json"))
+				} else {
+					if st.ActiveStoryID == "" {
+						st.ActiveStoryID = storyID
+					}
+					nonMainBranch := st.Branch != "" && st.Branch != "main" && st.Branch != "master" && st.Branch != "HEAD"
+					hasResumeFile := false
+					if _, err := os.Stat(filepath.Join(repoPath, "tmp", "ase-resume-"+storyID+".json")); err == nil {
+						hasResumeFile = true
+					}
+					if nonMainBranch || len(st.NonMainSubmodules) > 0 || hasResumeFile {
+						if st.ASEState == "" || st.ASEState == "IDLE" {
+							st.ASEState = "RUNNING"
+						}
+						if st.ExecutionProvenance == "" || st.ExecutionProvenance == "IDLE" {
+							st.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
+						}
+						if st.ToolLiveness == "" || st.ToolLiveness == "NONE" {
+							st.ToolLiveness = "LIVE"
+						}
+						if st.ActiveTool == "" {
+							st.ActiveTool = "autopilot-ase"
+						}
+					}
+				}
+			}
+		}
+		if st.ASEState == "" {
+			st.ASEState = "IDLE"
 		}
 	}
 
-	// Git flow version autodetect (git describe --tags --always)
-	gitVerCmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "describe", "--tags", "--always")
-	if out, err := gitVerCmd.Output(); err == nil {
-		st.GitVersion = strings.TrimSpace(string(out))
+	// metadata.yml snapshot sync (fallback if not populated by harness)
+	if st.MetadataYmlRaw == "" {
+		metaPath := filepath.Join(repoPath, "metadata.yml")
+		if fi, err := os.Stat(metaPath); err == nil && !fi.IsDir() && fi.Size() < 2<<20 {
+			if metaBytes, err := os.ReadFile(metaPath); err == nil {
+				st.MetadataYmlRaw = string(metaBytes)
+				hash := sha256.Sum256(metaBytes)
+				st.MetadataYmlSHA = fmt.Sprintf("%x", hash)
+				st.MetadataYmlModTime = fi.ModTime().UTC().Format(time.RFC3339)
+			}
+		}
+	}
+
+	// Git flow version autodetect (fallback if not populated by harness)
+	if st.GitVersion == "" {
+		gitVerCmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "describe", "--tags", "--always")
+		if out, err := gitVerCmd.Output(); err == nil {
+			st.GitVersion = strings.TrimSpace(string(out))
+		}
 	}
 
 	return st
 }
 
-// healGitRepo deterministic cleanup for broken, diverged, or locked repo state.
+// healGitRepo delegates destructive cleanup for broken, diverged, or locked repo state to iazio-harness,
+// falling back to local lock & git cleanup if iazio-harness is unavailable.
 func healGitRepo(ctx context.Context, repoPath string) {
 	if strings.TrimSpace(repoPath) == "" {
 		return
 	}
 
-	// 1. Resolve real git directory to remove stale git locks
+	// Always release local locks and stale ASE session artifacts
+	_ = os.Remove(filepath.Join(repoPath, ".ase", "active.lock"))
+	_ = os.Remove(filepath.Join(repoPath, ".autopilot", "lock"))
+	_ = os.Remove(filepath.Join(repoPath, ".autopilot", "state.json"))
+	_ = os.Remove(filepath.Join(repoPath, ".autopilot", "ase-state.json"))
+	_ = os.Remove(filepath.Join(repoPath, ".session_story_id"))
+	if matches, err := filepath.Glob(filepath.Join(repoPath, "tmp", "ase-resume-*.json")); err == nil {
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
+	}
+	_ = repolock.ForceRelease(repoPath)
+
+	// Delegate Tier 3 force-clean remediation to iazio-harness
+	harnessBin := resolveHarnessBinaryPath()
+	harnessCmd := procutil.CommandContext(ctx, harnessBin, "repo", "remediate", "--repo", repoPath, "--strategy", "force-clean", "--json")
+	if err := harnessCmd.Run(); err == nil {
+		return
+	}
+
+	// Fallback if iazio-harness binary is unavailable
 	gitDir := filepath.Join(repoPath, ".git")
 	if out, err := procutil.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--git-dir").Output(); err == nil {
 		clean := strings.TrimSpace(string(out))
@@ -2979,21 +3082,13 @@ func healGitRepo(ctx context.Context, repoPath string) {
 	_ = os.Remove(filepath.Join(gitDir, "HEAD.lock"))
 	_ = os.Remove(filepath.Join(gitDir, "config.lock"))
 
-	// 2. Remove autopilot / ase / iazio repo locks
-	_ = os.Remove(filepath.Join(repoPath, ".ase", "active.lock"))
-	_ = os.Remove(filepath.Join(repoPath, ".autopilot", "lock"))
-	_ = repolock.ForceRelease(repoPath)
-
-	// 3. Abort in-progress git operations
 	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "merge", "--abort").Run()
 	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "rebase", "--abort").Run()
 	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "cherry-pick", "--abort").Run()
 
-	// 4. Reset and clean working tree (double -f cleans untracked directories/repos)
 	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "reset", "--hard", "HEAD").Run()
 	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "clean", "-ffd").Run()
 
-	// 5. Synchronize and clean submodules
 	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "submodule", "foreach", "--recursive", "git reset --hard HEAD || true").Run()
 	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "submodule", "foreach", "--recursive", "git clean -ffd || true").Run()
 	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "submodule", "update", "--init", "--recursive", "--force").Run()
