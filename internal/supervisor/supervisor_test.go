@@ -908,6 +908,7 @@ func TestResolveBinaryAndRunnerSignal(t *testing.T) {
 	_ = os.WriteFile(customTool, []byte("#!/bin/sh\n"), 0755)
 
 	t.Setenv("HOME", fakeHome)
+	t.Setenv("USERPROFILE", fakeHome)
 	if got := ResolveBinary("custom-iazio-tool"); got != customTool {
 		t.Fatalf("expected custom tool resolved from .local/bin, got %s", got)
 	}

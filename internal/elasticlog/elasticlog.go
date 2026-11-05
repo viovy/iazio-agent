@@ -60,6 +60,7 @@ type Config struct {
 	GatewayURL    string
 	IsGateway     bool
 	AuthToken     string
+	TokenFunc     func() string
 }
 
 // Sink is an asynchronous, non-blocking Elasticsearch log shipper with offline spooling.
@@ -358,8 +359,14 @@ func (s *Sink) sendBulkDirect(ctx context.Context, entries []*Entry) error {
 		return err
 	}
 	req.Header.Set("Content-Type", contentType)
-	if s.cfg.AuthToken != "" {
-		req.Header.Set("Authorization", "Bearer "+s.cfg.AuthToken)
+	authToken := s.cfg.AuthToken
+	if s.cfg.TokenFunc != nil {
+		if refreshed := strings.TrimSpace(s.cfg.TokenFunc()); refreshed != "" {
+			authToken = refreshed
+		}
+	}
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
 	} else if s.cfg.Username != "" || s.cfg.Password != "" {
 		req.SetBasicAuth(s.cfg.Username, s.cfg.Password)
 	}

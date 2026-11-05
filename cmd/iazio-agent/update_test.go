@@ -1306,6 +1306,9 @@ func TestUpdateSingleTool_ShadowingBinarySync(t *testing.T) {
 
 	// Verify target binDir was written
 	destBin := filepath.Join(binDir, toolName)
+	if runtime.GOOS == "windows" {
+		destBin += ".exe"
+	}
 	destData, err := os.ReadFile(destBin)
 	if err != nil {
 		t.Fatalf("failed to read dest binary: %v", err)
@@ -2004,10 +2007,10 @@ func TestPerformUpdateWithResult_DryRun(t *testing.T) {
 	tmpBin := t.TempDir()
 	var stdout, stderr bytes.Buffer
 	res, err := performUpdateWithResult(context.Background(), UpdateOptions{
-		API:         srv.URL,
-		Suite:       true,
-		DryRun:      true,
-		BinDir:      tmpBin,
+		API:    srv.URL,
+		Suite:  true,
+		DryRun: true,
+		BinDir: tmpBin,
 	}, &stdout, &stderr, func(k string) string { return "" })
 
 	if err != nil {
@@ -2037,14 +2040,14 @@ func TestCleanToolNameForSourceBuild(t *testing.T) {
 	for _, tc := range tests {
 		tn := tc.binaryName
 		if tn == "" {
-		tn = tc.toolName
+			tn = tc.toolName
 		}
 		clean := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(tn, ".exe"), ".EXE"), ".cmd")
 		if clean == "" {
-		clean = strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(tc.toolName, ".exe"), ".EXE"), ".cmd")
+			clean = strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(tc.toolName, ".exe"), ".EXE"), ".cmd")
 		}
 		if clean != tc.expected {
-		t.Errorf("expected cleanToolName for (%s, %s) = %q, got %q", tc.toolName, tc.binaryName, tc.expected, clean)
+			t.Errorf("expected cleanToolName for (%s, %s) = %q, got %q", tc.toolName, tc.binaryName, tc.expected, clean)
 		}
 	}
 }
@@ -2284,9 +2287,9 @@ func TestUpdateTool_PathB_Overrides_PathA_CleanRepo(t *testing.T) {
 	}
 
 	tool := ManifestToolItem{
-		Name:          "customtool",
-		BinaryName:    "customtool",
-		Repository:    "viovy/customtool",
+		Name:       "customtool",
+		BinaryName: "customtool",
+		Repository: "viovy/customtool",
 	}
 
 	var out bytes.Buffer
