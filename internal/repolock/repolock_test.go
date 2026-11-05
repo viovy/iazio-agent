@@ -3,6 +3,8 @@ package repolock
 import (
 	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -259,4 +261,76 @@ func TestForceRelease(t *testing.T) {
 	if readErr == nil {
 		t.Fatalf("expected Read to fail after ForceRelease")
 	}
+}
+
+func TestTryLockFileAndUnlockFile_DirectOSExclusivity(t *testing.T) {
+	wt := t.TempDir()
+	lockFile := filepath.Join(wt, "repo.lock.flock")
+
+	f1, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open f1: %v", err)
+	}
+	defer f1.Close()
+
+	f2, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open f2: %v", err)
+	}
+	defer f2.Close()
+
+	if err := tryLockFile(f1); err != nil {
+		t.Fatalf("tryLockFile(f1) failed: %v", err)
+	}
+
+	// Second file handle must fail to acquire exclusive lock immediately
+	if err := tryLockFile(f2); err == nil {
+		_ = unlockFile(f2)
+		t.Fatal("expected tryLockFile(f2) to fail while f1 holds exclusive lock")
+	}
+
+	// After unlocking f1, f2 must succeed
+	if err := unlockFile(f1); err != nil {
+		t.Fatalf("unlockFile(f1) failed: %v", err)
+	}
+	if err := tryLockFile(f2); err != nil {
+		t.Fatalf("tryLockFile(f2) should succeed after f1 unlock: %v", err)
+	}
+	if err := unlockFile(f2); err != nil {
+		t.Fatalf("unlockFile(f2) failed: %v", err)
+	}
+}
+
+func TestAcquire_OSLockConflictWithoutPIDLiveness(t *testing.T) {
+	wt := t.TempDir()
+	info1 := LockInfo{
+		JobID: "job-os-lock-1",
+		PID:   os.Getpid(),
+	}
+
+	// Even when isAlive returns false, an active OS lock must block concurrent Acquire
+	handle1, err := Acquire(wt, info1, func(int) bool { return false })
+	if err != nil {
+		t.Fatalf("Acquire handle1 failed: %v", err)
+	}
+
+	info2 := LockInfo{
+		JobID: "job-os-lock-2",
+		PID:   os.Getpid() + 1,
+	}
+	_, err = Acquire(wt, info2, func(int) bool { return false })
+	if !errors.Is(err, ErrRepoBusy) || !strings.Contains(err.Error(), "lock conflict on") {
+		_ = handle1.Release()
+		t.Fatalf("expected OS lock conflict ErrRepoBusy even with isAlive=false, got: %v", err)
+	}
+
+	if err := handle1.Release(); err != nil {
+		t.Fatalf("Release handle1 failed: %v", err)
+	}
+
+	handle2, err := Acquire(wt, info2, func(int) bool { return false })
+	if err != nil {
+		t.Fatalf("Acquire handle2 after Release failed: %v", err)
+	}
+	_ = handle2.Release()
 }

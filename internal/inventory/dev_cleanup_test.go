@@ -2,6 +2,7 @@ package inventory
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -245,5 +246,72 @@ func TestDevCleanup_CanonicalHomeBinScansLocalAndIazioDirs(t *testing.T) {
 	}
 	if !foundShadow {
 		t.Fatalf("expected shadow binary %s in ~/.iazio/bin to be detected when ~/bin is canonical, got %+v", shadowPath, candidates)
+	}
+}
+
+func TestFindPIDsExecutingFile_WindowsWmicAndPowerShellFallback(t *testing.T) {
+	origOS := findPIDsOS
+	origExec := findPIDsExecFn
+	t.Cleanup(func() {
+		findPIDsOS = origOS
+		findPIDsExecFn = origExec
+	})
+	findPIDsOS = "windows"
+
+	targetPath := filepath.Join(t.TempDir(), "iazio-agent.exe")
+
+	// 1. WMIC succeeds -> returns WMIC PIDs without invoking PowerShell
+	powershellCalled := false
+	findPIDsExecFn = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "wmic" {
+			return []byte("ProcessId\r\n4101\r\n4102\r\n"), nil
+		}
+		if name == "powershell" {
+			powershellCalled = true
+		}
+		return nil, errors.New("unexpected command")
+	}
+	pids := FindPIDsExecutingFile(targetPath)
+	if powershellCalled {
+		t.Fatal("expected powershell fallback NOT to be called when wmic succeeds with PIDs")
+	}
+	if len(pids) != 2 || pids[0] != 4101 || pids[1] != 4102 {
+		t.Fatalf("expected [4101 4102], got %v", pids)
+	}
+
+	// 2. WMIC fails (e.g. Windows 11 without wmic) -> falls back to PowerShell Get-CimInstance Win32_Process
+	var capturedPSArgs []string
+	findPIDsExecFn = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "wmic" {
+			return nil, errors.New("wmic not found")
+		}
+		if name == "powershell" {
+			capturedPSArgs = args
+			return []byte("5201\r\n5202\r\n5201\r\n"), nil
+		}
+		return nil, errors.New("unexpected command")
+	}
+	pids = FindPIDsExecutingFile(targetPath)
+	if len(pids) != 2 || pids[0] != 5201 || pids[1] != 5202 {
+		t.Fatalf("expected [5201 5202] from PowerShell fallback, got %v", pids)
+	}
+	joinedArgs := strings.Join(capturedPSArgs, " ")
+	if !strings.Contains(joinedArgs, "Get-CimInstance Win32_Process") {
+		t.Fatalf("expected PowerShell command to use Get-CimInstance Win32_Process, got: %q", joinedArgs)
+	}
+
+	// 3. WMIC returns empty output / header only -> falls back to PowerShell Get-CimInstance Win32_Process
+	findPIDsExecFn = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "wmic" {
+			return []byte("ProcessId\r\n\r\n"), nil
+		}
+		if name == "powershell" {
+			return []byte("6301\n"), nil
+		}
+		return nil, errors.New("unexpected command")
+	}
+	pids = FindPIDsExecutingFile(targetPath)
+	if len(pids) != 1 || pids[0] != 6301 {
+		t.Fatalf("expected [6301] when wmic returns no PIDs, got %v", pids)
 	}
 }

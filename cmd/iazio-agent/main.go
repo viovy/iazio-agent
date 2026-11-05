@@ -2969,6 +2969,38 @@ func isRepoSummaryIdle(r controlplane.RepoSummary) bool {
 	return lock == "" || lock == "IDLE"
 }
 
+// gitmodulesHasSubmodule checks whether .gitmodules content declares a submodule
+// matching repoName by exact submodule section name or path (avoiding substring false positives).
+func gitmodulesHasSubmodule(content, repoName string) bool {
+	clean := strings.TrimSpace(repoName)
+	if clean == "" || clean == "." || clean == "root" {
+		return false
+	}
+	for _, rawLine := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[submodule \"") && strings.HasSuffix(line, "\"]") {
+			subName := strings.TrimSpace(line[len("[submodule \"") : len(line)-2])
+			if subName == clean || filepath.Base(subName) == clean {
+				return true
+			}
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); ok {
+			key := strings.ToLower(strings.TrimSpace(k))
+			val := strings.Trim(strings.TrimSpace(v), "\"")
+			if key == "path" {
+				if val == clean || filepath.Base(val) == clean {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // resolveWorktreeFromHostDetail resolves a target worktree from the host's registered repos.
 func resolveWorktreeFromHostDetail(detail controlplane.HostDetail, repoName string) string {
 	clean := strings.TrimSpace(repoName)
@@ -3015,7 +3047,7 @@ func resolveWorktreeFromHostDetail(detail controlplane.HostDetail, repoName stri
 		}
 		gmPath := filepath.Join(wt, ".gitmodules")
 		if b, err := os.ReadFile(gmPath); err == nil {
-			if strings.Contains(string(b), clean) {
+			if gitmodulesHasSubmodule(string(b), clean) {
 				return wt
 			}
 		}
@@ -3030,7 +3062,7 @@ func resolveWorktreeFromHostDetail(detail controlplane.HostDetail, repoName stri
 		}
 		gmPath := filepath.Join(wt, ".gitmodules")
 		if b, err := os.ReadFile(gmPath); err == nil {
-			if strings.Contains(string(b), clean) {
+			if gitmodulesHasSubmodule(string(b), clean) {
 				return wt
 			}
 		}
@@ -3049,7 +3081,7 @@ func resolveWorktreeFromHostDetail(detail controlplane.HostDetail, repoName stri
 		}
 		gmPath := filepath.Join(wt, ".gitmodules")
 		if b, err := os.ReadFile(gmPath); err == nil {
-			if strings.Contains(string(b), clean) {
+			if gitmodulesHasSubmodule(string(b), clean) {
 				return wt
 			}
 		}
@@ -3065,7 +3097,7 @@ func resolveWorktreeFromHostDetail(detail controlplane.HostDetail, repoName stri
 		}
 		gmPath := filepath.Join(wt, ".gitmodules")
 		if b, err := os.ReadFile(gmPath); err == nil {
-			if strings.Contains(string(b), clean) {
+			if gitmodulesHasSubmodule(string(b), clean) {
 				return wt
 			}
 		}
@@ -3162,6 +3194,23 @@ type hostDetailGetter interface {
 	GetHost(ctx context.Context, hostID string) (controlplane.HostDetail, error)
 }
 
+var (
+	cachedFleetRootMu sync.RWMutex
+	cachedFleetRoot   string
+)
+
+func getCachedFleetRoot() string {
+	cachedFleetRootMu.RLock()
+	defer cachedFleetRootMu.RUnlock()
+	return cachedFleetRoot
+}
+
+func setCachedFleetRoot(root string) {
+	cachedFleetRootMu.Lock()
+	cachedFleetRoot = root
+	cachedFleetRootMu.Unlock()
+}
+
 func resolveWorktreeForRepo(ctx context.Context, getter hostDetailGetter, host, repoName string, getenv func(string) string) string {
 	clean := strings.TrimSpace(repoName)
 	if getter != nil {
@@ -3174,6 +3223,30 @@ func resolveWorktreeForRepo(ctx context.Context, getter hostDetailGetter, host, 
 	if getenv != nil {
 		if envRoot := getenv("IAZIO_FLEET_ROOT"); envRoot != "" {
 			return envRoot
+		}
+	}
+	matchesCandidate := func(cand string) bool {
+		gmPath := filepath.Join(cand, ".gitmodules")
+		if b, err := os.ReadFile(gmPath); err == nil {
+			if clean == "." || clean == "" || clean == "root" || gitmodulesHasSubmodule(string(b), clean) {
+				return true
+			}
+			if clean != "" {
+				if _, err := os.Stat(filepath.Join(cand, clean)); err == nil {
+					return true
+				}
+			}
+		}
+		if strings.Contains(clean, "meta-repo") && strings.Contains(filepath.Base(cand), "meta-repo") {
+			if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
+				return true
+			}
+		}
+		return false
+	}
+	if cached := getCachedFleetRoot(); cached != "" {
+		if matchesCandidate(cached) {
+			return cached
 		}
 	}
 	var candidateRoots []string
@@ -3197,13 +3270,15 @@ func resolveWorktreeForRepo(ctx context.Context, getter hostDetailGetter, host, 
 	for _, cand := range candidateRoots {
 		gmPath := filepath.Join(cand, ".gitmodules")
 		if b, err := os.ReadFile(gmPath); err == nil {
-			if clean == "." || clean == "" || clean == "root" || strings.Contains(string(b), clean) {
-				_ = os.Setenv("IAZIO_FLEET_ROOT", cand)
+			if clean == "." || clean == "" || clean == "root" || gitmodulesHasSubmodule(string(b), clean) {
+				setCachedFleetRoot(cand)
 				return cand
 			}
-			if _, err := os.Stat(filepath.Join(cand, clean)); err == nil {
-				_ = os.Setenv("IAZIO_FLEET_ROOT", cand)
-				return cand
+			if clean != "" {
+				if _, err := os.Stat(filepath.Join(cand, clean)); err == nil {
+					setCachedFleetRoot(cand)
+					return cand
+				}
 			}
 		}
 	}
@@ -3211,7 +3286,7 @@ func resolveWorktreeForRepo(ctx context.Context, getter hostDetailGetter, host, 
 		for _, cand := range candidateRoots {
 			if strings.Contains(filepath.Base(cand), "meta-repo") {
 				if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
-					_ = os.Setenv("IAZIO_FLEET_ROOT", cand)
+					setCachedFleetRoot(cand)
 					return cand
 				}
 			}
