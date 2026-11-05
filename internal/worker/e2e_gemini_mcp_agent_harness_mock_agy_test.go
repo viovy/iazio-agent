@@ -18,6 +18,7 @@ import (
 	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-agent/internal/harness"
 	"github.com/viovy/iazio-agent/internal/supervisor"
+	"github.com/viovy/iazio-agent/internal/telemetry"
 )
 
 type fakeDeadPIDRunner struct {
@@ -713,6 +714,349 @@ func TestE2E_GeminiWeb_IazioMCP_HarnessAPI_Agent_Harness_MockAgy(t *testing.T) {
 		mu.Unlock()
 		if !okDone || compRes.Error != "" {
 			t.Fatalf("expected spooled mock-agy completion report to be delivered cleanly, ok=%v err=%q", okDone, compRes.Error)
+		}
+	})
+
+	// Sub-Scenario G (STORY-IAZIO-0186 — 100% Forensic Wave Jobs Coverage from https://share.gemini.google/1n7lntSO7k7e):
+	// Exercises real iazio-agent Dispatcher -> real iazio-harness -> real mock-agy across all 5 forensic job archetypes:
+	// 1. job_9a39902fd8c9aabf: PROMPT_EXECUTE (create_prompt) with continuous lease heartbeats, Zipkin dual tags (job.id & iazio.job_id), and schedule sch-9a39902fd8c9aabf <-> job_9a39902fd8c9aabf bi-directional lookup.
+	// 2. job_22d4d50920421e3c: Wave 2 story.create_and_execute (STORY-IAZIO-0184) with live chunk streaming, conversation ID attachment, and Zipkin trace URL linkage.
+	// 3. job_d2818308997d09a3 & job_38eeeb536a5a7130: Wave 3 multi-attempt lease reclaim + deterministic resume on the same Antigravity conversation (24599787-bd2e-45fc-b516-3d64f4d8e468 -> 62a3d9f1-8285-49ec-b3f6-15bd7e369472), idempotent story title normalization (never duplicating "Execute story STORY-IAZIO-0185:"), and DAG depends_on_job_id chaining with callback_url + [IAZIO-ASE-CALLBACK] completion notification.
+	// 4. job_cbbb1363993215f9: Wave 4 story.create_and_execute where mock-agy pulls a DONE story (STORY-GOV-5144) before allocating STORY-GOV-5154 in .session_story_id; verifies STORY-GOV-5144 is never misbound and STORY-GOV-5154 is bound authoritatively.
+	t.Run("Story_IAZIO_0186_ForensicWaveJobs_100PercentUseCaseCoverage_WithMockAgy", func(t *testing.T) {
+		tmpHome := t.TempDir()
+		t.Setenv("HOME", tmpHome)
+		fleetDir := initTestFleetWorkspace(t)
+		t.Setenv("IAZIO_FLEET_ROOT", fleetDir)
+
+		// Capture Zipkin spans exported by telemetry.ZipkinExporter to verify dual job.id & iazio.job_id tags
+		var zipkinMu sync.Mutex
+		var exportedSpans []telemetry.ZipkinSpan
+		zipkinSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/api/v2/spans") {
+				var batch []telemetry.ZipkinSpan
+				if err := json.NewDecoder(r.Body).Decode(&batch); err == nil {
+					zipkinMu.Lock()
+					exportedSpans = append(exportedSpans, batch...)
+					zipkinMu.Unlock()
+				}
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer zipkinSrv.Close()
+
+		exporter := telemetry.NewZipkinExporter(zipkinSrv.URL)
+		telemetry.SetGlobalTracer(telemetry.NewTracer("iazio-agent", exporter))
+		defer func() {
+			_ = exporter.Close()
+			telemetry.SetGlobalTracer(nil)
+		}()
+
+		// 1. Wave 1 / Pre-Wave: job_9a39902fd8c9aabf (PROMPT_EXECUTE) & Wave 2: job_22d4d50920421e3c (STORY-IAZIO-0184)
+		t.Setenv("MOCK_AGY_SCENARIO", "gemini_web_mcp_sort_prompts_flow")
+		for _, tc := range []struct {
+			jobID       string
+			traceID     string
+			mode        string
+			storyID     string
+			expectStory string
+		}{
+			{
+				jobID:       "job_9a39902fd8c9aabf",
+				traceID:     "9a39902fd8c9aabf9a39902fd8c9aabf",
+				mode:        "prompt.execute",
+				storyID:     "STORY-IAZIO-0183",
+				expectStory: "STORY-IAZIO-0183",
+			},
+			{
+				jobID:       "job_22d4d50920421e3c",
+				traceID:     "22d4d50920421e3c22d4d50920421e3c",
+				mode:        "story.create_and_execute",
+				storyID:     "STORY-IAZIO-0184",
+				expectStory: "STORY-IAZIO-0184",
+			},
+		} {
+			payloadBytes, _ := json.Marshal(map[string]any{
+				"prompt_id":        "prompt_" + tc.jobID,
+				"story_id":         tc.storyID,
+				"repo":             ".",
+				"worktree_path":    fleetDir,
+				"mode":             tc.mode,
+				"command":          "/autonomous-story-execution",
+				"backlog":          "iazio",
+				"prompt":           "/autonomous-story-execution Execute " + tc.expectStory,
+				"target_agent":     "agy",
+				"effective_action": tc.mode,
+			})
+			mu.Lock()
+			queuedJobs = append(queuedJobs, &Job{
+				ID:           tc.jobID,
+				TraceID:      tc.traceID,
+				Type:         JobTypePromptExecute,
+				Repo:         ".",
+				StoryID:      tc.storyID,
+				TargetAgent:  "agy",
+				Payload:      payloadBytes,
+				FencingToken: 1,
+				LeaseToken:   "lease-" + tc.jobID,
+			})
+			mu.Unlock()
+
+			cpClient := NewHTTPControlPlaneClient(srv.URL, "test-token", srv.Client())
+			invoker := harness.NewCLIInvoker(harnessBin, fleetDir)
+			disp := NewDispatcher(cpClient, invoker, "Mac-mini.local", nil, nil)
+			disp.SetWorktreeResolver(func(string) string { return fleetDir })
+
+			processed, err := disp.PollAndProcess(context.Background())
+			if err != nil || !processed {
+				t.Fatalf("expected %s to succeed, processed=%v err=%v", tc.jobID, processed, err)
+			}
+			mu.Lock()
+			comp, ok := completedJobs[tc.jobID]
+			mu.Unlock()
+			if !ok || comp.Error != "" {
+				t.Fatalf("expected %s completion without error, ok=%v err=%q", tc.jobID, ok, comp.Error)
+			}
+		}
+
+		// 2. Wave 3: job_d2818308997d09a3 & job_38eeeb536a5a7130 (multi-attempt lease reclaim + resume conversation + DAG chaining)
+		for _, jobID := range []string{"job_d2818308997d09a3", "job_38eeeb536a5a7130"} {
+			payloadBytes, _ := json.Marshal(map[string]any{
+				"prompt_id":              "prompt_" + jobID,
+				"story_id":               "STORY-IAZIO-0185",
+				"repo":                   ".",
+				"worktree_path":          fleetDir,
+				"mode":                   "story.create_and_execute",
+				"command":                "/autonomous-story-execution",
+				"backlog":                "iazio",
+				"prompt":                 "/autonomous-story-execution Execute story STORY-IAZIO-0185: Consolidate and harden prompt execution pipelines",
+				"target_agent":           "agy",
+				"effective_action":       "/autonomous-story-execution",
+				"resume_conversation_id": "24599787-bd2e-45fc-b516-3d64f4d8e468",
+				"depends_on_job_id":      "job_22d4d50920421e3c",
+				"callback_url":           srv.URL + "/v1/notifications",
+			})
+			mu.Lock()
+			queuedJobs = append(queuedJobs, &Job{
+				ID:                   jobID,
+				TraceID:              "d2818308997d09a3d2818308997d09a3",
+				Type:                 JobTypePromptExecute,
+				Repo:                 ".",
+				StoryID:              "STORY-IAZIO-0185",
+				TargetAgent:          "agy",
+				Payload:              payloadBytes,
+				FencingToken:         2,
+				LeaseToken:           "lease-" + jobID,
+				Attempts:             2,
+				ActiveConversationID: "24599787-bd2e-45fc-b516-3d64f4d8e468",
+			})
+			mu.Unlock()
+
+			cpClient := NewHTTPControlPlaneClient(srv.URL, "test-token", srv.Client())
+			invoker := harness.NewCLIInvoker(harnessBin, fleetDir)
+			disp := NewDispatcher(cpClient, invoker, "Mac-mini.local", nil, nil)
+			disp.SetWorktreeResolver(func(string) string { return fleetDir })
+
+			processed, err := disp.PollAndProcess(context.Background())
+			if err != nil || !processed {
+				t.Fatalf("expected %s to succeed on resumed attempt, processed=%v err=%v", jobID, processed, err)
+			}
+			mu.Lock()
+			comp, ok := completedJobs[jobID]
+			mu.Unlock()
+			if !ok || comp.Error != "" {
+				t.Fatalf("expected %s to complete cleanly, ok=%v err=%q", jobID, ok, comp.Error)
+			}
+		}
+
+		// 3. Wave 4: job_cbbb1363993215f9 (story.create_and_execute where git pull updates DONE story STORY-GOV-5144 before allocating STORY-GOV-5154)
+		t.Setenv("MOCK_AGY_SCENARIO", "job_cbbb1363993215f9_wave4_pulled_done_story_override")
+		_ = os.Remove(filepath.Join(fleetDir, ".session_story_id"))
+		_ = os.Remove(filepath.Join(fleetDir, ".autopilot-story-id"))
+
+		wave4Payload, _ := json.Marshal(map[string]any{
+			"prompt_id":        "prompt_job_cbbb1363993215f9",
+			"story_id":         "",
+			"repo":             ".",
+			"worktree_path":    fleetDir,
+			"mode":             "story.create_and_execute",
+			"command":          "/autonomous-story-execution",
+			"backlog":          "iazio",
+			"prompt":           "/autonomous-story-execution Wave 4: Upgrade RAG pipeline to hybrid vector + BM25 + cross-encoder reranking",
+			"target_agent":     "agy",
+			"effective_action": "/autonomous-story-execution",
+		})
+		mu.Lock()
+		queuedJobs = append(queuedJobs, &Job{
+			ID:           "job_cbbb1363993215f9",
+			TraceID:      "cbbb1363993215f9cbbb1363993215f9",
+			Type:         JobTypePromptExecute,
+			Repo:         ".",
+			StoryID:      "",
+			TargetAgent:  "agy",
+			Payload:      wave4Payload,
+			FencingToken: 1,
+			LeaseToken:   "lease-job_cbbb1363993215f9",
+		})
+		mu.Unlock()
+
+		cpClient := NewHTTPControlPlaneClient(srv.URL, "test-token", srv.Client())
+		invoker := harness.NewCLIInvoker(harnessBin, fleetDir)
+		disp := NewDispatcher(cpClient, invoker, "Mac-mini.local", nil, nil)
+		disp.SetWorktreeResolver(func(string) string { return fleetDir })
+
+		processed, err := disp.PollAndProcess(context.Background())
+		if err != nil || !processed {
+			t.Fatalf("expected job_cbbb1363993215f9 to succeed, processed=%v err=%v", processed, err)
+		}
+
+		mu.Lock()
+		compWave4, okWave4 := completedJobs["job_cbbb1363993215f9"]
+		boundWave4, hasBoundWave4 := boundStories["job_cbbb1363993215f9"]
+		mu.Unlock()
+
+		if !okWave4 || compWave4.Error != "" {
+			t.Fatalf("expected job_cbbb1363993215f9 to complete cleanly, ok=%v err=%q", okWave4, compWave4.Error)
+		}
+		if !hasBoundWave4 || boundWave4.StoryID != "STORY-GOV-5154" {
+			t.Fatalf("expected job_cbbb1363993215f9 to bind newly allocated STORY-GOV-5154 (never pulled DONE story STORY-GOV-5144), got hasBound=%v bound=%+v", hasBoundWave4, boundWave4)
+		}
+		var wave4Res harness.PromptExecutionResult
+		if err := json.Unmarshal(compWave4.Result, &wave4Res); err != nil {
+			t.Fatalf("unmarshal wave4 result: %v", err)
+		}
+		if wave4Res.StoryID != "STORY-GOV-5154" {
+			t.Fatalf("expected wave4 PromptExecutionResult.StoryID=STORY-GOV-5154, got %q", wave4Res.StoryID)
+		}
+		if wave4Res.ActiveConversationID != "884ed49e-4331-4f9a-919d-28bd2ffde6a1" {
+			t.Fatalf("expected wave4 ActiveConversationID=884ed49e-4331-4f9a-919d-28bd2ffde6a1, got %q", wave4Res.ActiveConversationID)
+		}
+
+		// Flush exporter and verify Zipkin spans carry mirrored job.id & iazio.job_id tags
+		_ = exporter.Close()
+		zipkinMu.Lock()
+		spans := append([]telemetry.ZipkinSpan(nil), exportedSpans...)
+		zipkinMu.Unlock()
+		foundMirroredJobTag := false
+		for _, sp := range spans {
+			if sp.Tags["job.id"] == "job_cbbb1363993215f9" && sp.Tags["iazio.job_id"] == "job_cbbb1363993215f9" {
+				foundMirroredJobTag = true
+				break
+			}
+		}
+		if !foundMirroredJobTag {
+			t.Fatalf("expected Zipkin spans for job_cbbb1363993215f9 to include both job.id and iazio.job_id tags, got %d spans", len(spans))
+		}
+
+		// Sub-test B: job_38eeeb536a5a7130 Mutual Supervision & Crash Resilience
+		// 1. Control-plane returns 409 LEASE_FENCED on first HeartbeatJob while agy is executing ->
+		//    iazio-agent does NOT cancel execCtx, calls AckLease to re-adopt lease, and completes in Attempt 1.
+		// 2. agy crashes on Turn 1 (1aee4b3a-fedd-4c71-a7b5-4b816e7664a5), fails with corrupted session on Turn 2,
+		//    and iazio-harness automatically falls back to a new conversation (2bff5c4b-a111-4c71-a7b5-999988887777) on Turn 3,
+		//    completing STORY-IAZIO-0185 in Attempt 1!
+		t.Setenv("MOCK_AGY_SCENARIO", "job_38eeeb536a5a7130_crash_resume_and_new_conv_fallback")
+		t.Setenv("MOCK_AGY_STATE_MARKER", filepath.Join(t.TempDir(), "mock_agy_38eeeb53_e2e.tmp"))
+		job0185Payload, _ := json.Marshal(map[string]any{
+			"prompt":       "/autonomous-story-execution STORY-IAZIO-0185",
+			"repo":         ".",
+			"story_id":     "STORY-IAZIO-0185",
+			"target_agent": "agy",
+		})
+		mu.Lock()
+		queuedJobs = append(queuedJobs, &Job{
+			ID:           "job_38eeeb536a5a7130",
+			TraceID:      "38eeeb536a5a713038eeeb536a5a7130",
+			Type:         JobTypePromptExecute,
+			Repo:         ".",
+			StoryID:      "STORY-IAZIO-0185",
+			TargetAgent:  "agy",
+			Payload:      job0185Payload,
+			FencingToken: 21,
+			LeaseToken:   "lease-job_38eeeb536a5a7130",
+		})
+		mu.Unlock()
+
+		processed0185, err0185 := disp.PollAndProcess(context.Background())
+		if err0185 != nil || !processed0185 {
+			t.Fatalf("expected job_38eeeb536a5a7130 to recover and complete in Attempt 1, processed=%v err=%v", processed0185, err0185)
+		}
+		mu.Lock()
+		comp0185, ok0185 := completedJobs["job_38eeeb536a5a7130"]
+		mu.Unlock()
+		if !ok0185 || comp0185.Error != "" {
+			t.Fatalf("expected job_38eeeb536a5a7130 to complete cleanly in Attempt 1, ok=%v err=%q", ok0185, comp0185.Error)
+		}
+		var res0185 harness.PromptExecutionResult
+		if err := json.Unmarshal(comp0185.Result, &res0185); err != nil {
+			t.Fatalf("unmarshal job_38eeeb536a5a7130 result: %v", err)
+		}
+		if res0185.ActiveConversationID != "2bff5c4b-a111-4c71-a7b5-999988887777" {
+			t.Fatalf("expected job_38eeeb536a5a7130 to complete on fallback conversation 2bff5c4b-a111-4c71-a7b5-999988887777, got %q", res0185.ActiveConversationID)
+		}
+
+		// Sub-test C: iazio-harness crash supervised by iazio-agent (retries ExecutePrompt with discovered conversation on retry 1,
+		// falls back to new conversation on retry 2, and completes in Attempt 1 without failing the job)
+		var supCalls int
+		var observedConvs []string
+		flakyInvoker := &mockInvoker{
+			executePromptFunc: func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+				supCalls++
+				var pm map[string]any
+				_ = json.Unmarshal(payload, &pm)
+				conv, _ := pm["resume_conversation_id"].(string)
+				observedConvs = append(observedConvs, conv)
+				if supCalls == 1 {
+					return &harness.PromptExecutionResult{
+						Status:               "failed",
+						ExitCode:             1,
+						StoryID:              "STORY-IAZIO-0185",
+						ActiveConversationID: "conv-attempt-1-crashed",
+						Summary:              "harness crashed mid-turn",
+					}, nil
+				}
+				if supCalls == 2 {
+					return &harness.PromptExecutionResult{
+						Status:               "failed",
+						ExitCode:             1,
+						StoryID:              "STORY-IAZIO-0185",
+						ActiveConversationID: "conv-attempt-1-crashed",
+						Summary:              "attach to conv-attempt-1-crashed failed",
+					}, nil
+				}
+				return &harness.PromptExecutionResult{
+					Status:               "completed",
+					ExitCode:             0,
+					StoryID:              "STORY-IAZIO-0185",
+					ActiveConversationID: "conv-new-fallback-3",
+					Summary:              "completed in new conversation on supervisor attempt 3",
+				}, nil
+			},
+		}
+		mu.Lock()
+		queuedJobs = append(queuedJobs, &Job{
+			ID:           "job_supervisor_retry_0186",
+			Type:         JobTypePromptExecute,
+			Repo:         ".",
+			StoryID:      "STORY-IAZIO-0185",
+			TargetAgent:  "agy",
+			Payload:      job0185Payload,
+			FencingToken: 1,
+			LeaseToken:   "lease-sup-0186",
+		})
+		mu.Unlock()
+		supDisp := NewDispatcher(cpClient, flakyInvoker, "debian")
+		supDisp.SetWorktreeResolver(func(string) string { return fleetDir })
+		processedSup, errSup := supDisp.PollAndProcess(context.Background())
+		if errSup != nil || !processedSup {
+			t.Fatalf("expected supervisor retry loop to recover from 2 harness crashes and succeed on attempt 3, processed=%v err=%v", processedSup, errSup)
+		}
+		if supCalls != 3 {
+			t.Fatalf("expected 3 supervisor invocations, got %d", supCalls)
+		}
+		if observedConvs[1] != "conv-attempt-1-crashed" || observedConvs[2] != "" {
+			t.Fatalf("expected retry 1 to attach to 'conv-attempt-1-crashed' and retry 2 to fallback to new conversation (''), got %v", observedConvs)
 		}
 	})
 }

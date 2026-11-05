@@ -745,10 +745,10 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 					sid := currentStoryID
 					allocatedStoryMu.Unlock()
 					if err := d.client.HeartbeatJob(hbCtx, job.ID, job.LeaseToken, job.FencingToken, sid, worktreeDir); err != nil {
-						if strings.Contains(err.Error(), "409") || strings.Contains(err.Error(), "LEASE_FENCED") {
-							execCancel()
-							return
-						}
+						// Upstream control-plane errors (including 409 LEASE_FENCED after a control-plane redeploy/restart,
+						// 5xx, or transient network blips) must NEVER kill an active local agy/iazio-harness execution
+						// (job_38eeeb536a5a7130 root cause). Re-ack the lease to re-synchronize with the control plane.
+						_ = d.client.AckLease(hbCtx, job.ID, job.LeaseToken, os.Getpid(), resolvedConvID)
 					}
 				}
 			}
@@ -870,16 +870,75 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 			}
 		}
 		startTime := time.Now()
-		res, err := invoker.ExecutePrompt(execCtx, payload)
-		if err == nil && res != nil {
-			combinedLower := strings.ToLower(res.Summary + "\n" + res.Output)
-			if strings.Contains(combinedLower, "jetski: no output produced") ||
-				strings.Contains(combinedLower, "headless mode cannot prompt for") ||
-				strings.Contains(combinedLower, "so it was auto-denied") {
-				err = fmt.Errorf("PERMISSION_DENIED: headless agent tool permission was auto-denied: %s", strings.TrimSpace(res.Summary))
-			} else if strings.EqualFold(res.Status, "failed") || res.ExitCode != 0 {
-				err = fmt.Errorf("prompt execution failed (status=%s exit=%d): %s", res.Status, res.ExitCode, strings.TrimSpace(res.Summary))
+		const maxSupervisorAttempts = 3
+		var res *harness.PromptExecutionResult
+		var err error
+		for supAttempt := 1; supAttempt <= maxSupervisorAttempts; supAttempt++ {
+			res, err = invoker.ExecutePrompt(execCtx, payload)
+			if err == nil && res != nil {
+				combinedLower := strings.ToLower(res.Summary + "\n" + res.Output)
+				if strings.Contains(combinedLower, "jetski: no output produced") ||
+					strings.Contains(combinedLower, "headless mode cannot prompt for") ||
+					strings.Contains(combinedLower, "so it was auto-denied") {
+					err = fmt.Errorf("PERMISSION_DENIED: headless agent tool permission was auto-denied: %s", strings.TrimSpace(res.Summary))
+				} else if strings.EqualFold(res.Status, "failed") || res.ExitCode != 0 {
+					err = fmt.Errorf("prompt execution failed (status=%s exit=%d): %s", res.Status, res.ExitCode, strings.TrimSpace(res.Summary))
+				}
 			}
+			if err == nil || supAttempt == maxSupervisorAttempts || execCtx.Err() != nil {
+				break
+			}
+			errLower := strings.ToLower(err.Error())
+			if strings.Contains(err.Error(), "PERMISSION_DENIED") ||
+				errors.Is(err, context.DeadlineExceeded) ||
+				errors.Is(err, context.Canceled) ||
+				strings.Contains(errLower, "429") ||
+				strings.Contains(errLower, "quota") {
+				break
+			}
+			// Mutual supervision: iazio-harness or agy crashed/exited non-zero locally.
+			// Re-ack/heartbeat the job lease and retry in-place (attaching to discovered conversation on attempt 2,
+			// or falling back to a new conversation on attempt 3 if conversation attach also failed).
+			var discoveredStory, discoveredConv string
+			if rawSID, sErr := os.ReadFile(filepath.Join(worktreeDir, ".session_story_id")); sErr == nil {
+				discoveredStory = strings.TrimSpace(string(rawSID))
+			}
+			if res != nil {
+				if conIDs := extractConversationIDFromResult(res); len(conIDs) > 0 {
+					discoveredConv = conIDs[0]
+				}
+				if s := strings.TrimSpace(res.StoryID); s != "" {
+					discoveredStory = s
+				} else if s := extractStoryID(res.Summary, res.Output); s != "" && discoveredStory == "" {
+					discoveredStory = s
+				}
+			}
+			if discoveredStory != "" {
+				onStoryDiscovered(discoveredStory)
+			}
+			var retryMap map[string]any
+			if json.Unmarshal(payload, &retryMap) == nil && retryMap != nil {
+				if discoveredStory != "" {
+					retryMap["story_id"] = discoveredStory
+				}
+				if supAttempt == 1 && discoveredConv != "" {
+					resolvedConvID = discoveredConv
+					retryMap["resume_conversation_id"] = discoveredConv
+					retryMap["conversation_id"] = discoveredConv
+				} else if supAttempt >= 2 {
+					// Previous conversation resume also failed -> fallback to a new conversation in the ASE flow
+					resolvedConvID = ""
+					delete(retryMap, "resume_conversation_id")
+					delete(retryMap, "conversation_id")
+					if discoveredStory != "" {
+						retryMap["prompt"] = fmt.Sprintf("Resume and complete /autonomous-story-execution for %s in a new conversation, inspecting existing workspace state, running verification gates, review scheme, and git-flow landing.", discoveredStory)
+					}
+				}
+				if updatedPayload, mErr := json.Marshal(retryMap); mErr == nil {
+					payload = updatedPayload
+				}
+			}
+			_ = d.client.HeartbeatJob(ctx, job.ID, job.LeaseToken, job.FencingToken, discoveredStory, worktreeDir)
 		}
 		if toolSpan != nil {
 			toolSpan.End()

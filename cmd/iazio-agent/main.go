@@ -2843,6 +2843,7 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 			NonMainSubmodules    []string `json:"non_main_submodules"`
 			ASEState             string   `json:"ase_state"`
 			ActiveStoryID        string   `json:"active_story_id"`
+			StoryID              string   `json:"story_id"`
 			AgentTool            string   `json:"agent_tool"`
 			ToolLiveness         string   `json:"tool_liveness"`
 			ExecutionProvenance  string   `json:"execution_provenance"`
@@ -2876,6 +2877,24 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 				st.ASEState = "IDLE"
 			}
 			st.ActiveStoryID = res.ActiveStoryID
+			if st.ActiveStoryID == "" {
+				st.ActiveStoryID = res.StoryID
+			}
+			if st.ActiveStoryID == "" {
+				statePath := filepath.Join(repoPath, ".autopilot", "state.json")
+				if b, err := os.ReadFile(statePath); err == nil {
+					var s struct {
+						State   string `json:"state"`
+						StoryID string `json:"story_id"`
+					}
+					if json.Unmarshal(b, &s) == nil && s.StoryID != "" {
+						st.ActiveStoryID = s.StoryID
+						if st.ASEState == "" || st.ASEState == "IDLE" {
+							st.ASEState = s.State
+						}
+					}
+				}
+			}
 			st.ActiveTool = res.AgentTool
 			st.ToolLiveness = res.ToolLiveness
 			st.ExecutionProvenance = res.ExecutionProvenance
