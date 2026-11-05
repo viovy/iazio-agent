@@ -284,6 +284,13 @@ func ScanDevAndShadowBinaries(searchDirs []string, canonicalBinDir string) []Dev
 	return candidates
 }
 
+var (
+	findPIDsOS     = runtime.GOOS
+	findPIDsExecFn = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return procutil.CommandContext(ctx, name, args...).Output()
+	}
+)
+
 // FindPIDsExecutingFile locates running OS processes whose binary image points to filePath.
 func FindPIDsExecutingFile(filePath string) []int {
 	cleanPath, err := filepath.Abs(filePath)
@@ -304,30 +311,32 @@ func FindPIDsExecutingFile(filePath string) []int {
 	}
 
 	// 1. Linux /proc/*/exe scanning
-	if procEntries, err := os.ReadDir("/proc"); err == nil {
-		for _, ent := range procEntries {
-			if !ent.IsDir() {
-				continue
-			}
-			pid, parseErr := strconv.Atoi(ent.Name())
-			if parseErr != nil {
-				continue
-			}
-			exeLink := filepath.Join("/proc", ent.Name(), "exe")
-			if target, readErr := os.Readlink(exeLink); readErr == nil {
-				if filepath.Clean(target) == cleanPath {
-					addPID(pid)
+	if findPIDsOS != "windows" && findPIDsOS != "darwin" {
+		if procEntries, err := os.ReadDir("/proc"); err == nil {
+			for _, ent := range procEntries {
+				if !ent.IsDir() {
+					continue
+				}
+				pid, parseErr := strconv.Atoi(ent.Name())
+				if parseErr != nil {
+					continue
+				}
+				exeLink := filepath.Join("/proc", ent.Name(), "exe")
+				if target, readErr := os.Readlink(exeLink); readErr == nil {
+					if filepath.Clean(target) == cleanPath {
+						addPID(pid)
+					}
 				}
 			}
+			return pids
 		}
-		return pids
 	}
 
 	// 2. macOS / Darwin: lsof -t
-	if runtime.GOOS == "darwin" {
+	if findPIDsOS == "darwin" {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		if out, err := procutil.CommandContext(ctx, "lsof", "-t", cleanPath).Output(); err == nil {
+		if out, err := findPIDsExecFn(ctx, "lsof", "-t", cleanPath); err == nil {
 			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 				if pid, err := strconv.Atoi(strings.TrimSpace(line)); err == nil {
 					addPID(pid)
@@ -337,21 +346,33 @@ func FindPIDsExecutingFile(filePath string) []int {
 		return pids
 	}
 
-	// 3. Windows tasklist / WMI
-	if runtime.GOOS == "windows" {
-		baseName := filepath.Base(cleanPath)
+	// 3. Windows tasklist / WMI with PowerShell Get-CimInstance fallback
+	if findPIDsOS == "windows" {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		cmd := procutil.CommandContext(ctx, "wmic", "process", "where", fmt.Sprintf("ExecutablePath='%s'", strings.ReplaceAll(cleanPath, `\`, `\\`)), "get", "ProcessId")
-		if out, err := cmd.Output(); err == nil {
+		escapedWmicPath := strings.ReplaceAll(cleanPath, `\`, `\\`)
+		out, err := findPIDsExecFn(ctx, "wmic", "process", "where", fmt.Sprintf("ExecutablePath='%s'", escapedWmicPath), "get", "ProcessId")
+		if err == nil {
 			lines := strings.Split(string(out), "\n")
 			for _, l := range lines {
-				if pid, err := strconv.Atoi(strings.TrimSpace(l)); err == nil {
+				if pid, parseErr := strconv.Atoi(strings.TrimSpace(l)); parseErr == nil {
 					addPID(pid)
 				}
 			}
 		}
-		_ = baseName
+		if err != nil || len(pids) == 0 {
+			psCtx, psCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer psCancel()
+			escapedPSPath := strings.ReplaceAll(cleanPath, `'`, `''`)
+			psCmd := fmt.Sprintf("Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq '%s' } | Select-Object -ExpandProperty ProcessId", escapedPSPath)
+			if psOut, psErr := findPIDsExecFn(psCtx, "powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd); psErr == nil {
+				for _, l := range strings.Split(string(psOut), "\n") {
+					if pid, parseErr := strconv.Atoi(strings.TrimSpace(l)); parseErr == nil {
+						addPID(pid)
+					}
+				}
+			}
+		}
 		return pids
 	}
 

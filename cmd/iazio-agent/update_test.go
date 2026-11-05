@@ -405,6 +405,14 @@ func TestCleanStaleBackups(t *testing.T) {
 	oldTime := time.Now().Add(-10 * time.Minute)
 	_ = os.Chtimes(oldFile, oldTime, oldTime)
 
+	recentBackup := filepath.Join(tmpDir, "iazio-agent.old.150.exe")
+	if err := os.WriteFile(recentBackup, []byte("recent"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Change mtime to 4 minutes ago (< 5 minutes retention threshold)
+	recentTime := time.Now().Add(-4 * time.Minute)
+	_ = os.Chtimes(recentBackup, recentTime, recentTime)
+
 	freshFile := filepath.Join(tmpDir, "iazio-agent.old.200.exe")
 	if err := os.WriteFile(freshFile, []byte("fresh"), 0755); err != nil {
 		t.Fatal(err)
@@ -417,6 +425,9 @@ func TestCleanStaleBackups(t *testing.T) {
 
 	if _, err := os.Stat(oldFile); !os.IsNotExist(err) {
 		t.Fatal("expected old backup to be removed")
+	}
+	if _, err := os.Stat(recentBackup); err != nil {
+		t.Fatal("expected recent backup (< 5m) to remain")
 	}
 	if _, err := os.Stat(freshFile); err != nil {
 		t.Fatal("expected fresh backup to remain")

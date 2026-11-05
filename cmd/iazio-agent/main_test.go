@@ -3533,3 +3533,106 @@ func TestResolveTelemetryDestination(t *testing.T) {
 		t.Fatalf("expected direct ES url, got %q, isGw=%v", u3, isGw3)
 	}
 }
+
+func TestResolveWorktree_ExactSubmoduleMatchAndNoSetenvRace(t *testing.T) {
+	tmp := t.TempDir()
+	webOnlyWT := filepath.Join(tmp, "web-umbrella")
+	coreWT := filepath.Join(tmp, "core-umbrella")
+	if err := os.MkdirAll(webOnlyWT, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(coreWT, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// webOnlyWT has iazio-web and iazio-mcp, NOT "iazio"
+	if err := os.WriteFile(filepath.Join(webOnlyWT, ".gitmodules"), []byte(`[submodule "iazio-web"]
+	path = iazio-web
+	url = https://github.com/viovy/iazio-web.git
+[submodule "iazio-mcp"]
+	path = iazio-mcp
+	url = https://github.com/viovy/iazio-mcp.git
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// coreWT has exact "iazio" submodule
+	if err := os.WriteFile(filepath.Join(coreWT, ".gitmodules"), []byte(`[submodule "iazio"]
+	path = iazio
+	url = https://github.com/viovy/iazio.git
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	detailWebOnly := controlplane.HostDetail{
+		Repos: []controlplane.RepoSummary{
+			{WorktreePath: webOnlyWT, Lock: "IDLE"},
+		},
+	}
+	// Short name "iazio" must NOT falsely match "iazio-web" or "iazio-mcp"
+	if got := resolveWorktreeFromHostDetail(detailWebOnly, "iazio"); got != "" {
+		t.Fatalf("expected empty worktree when querying 'iazio' against iazio-web/iazio-mcp, got %q", got)
+	}
+	if got := resolveWorktreeFromHostDetail(detailWebOnly, "iazio-web"); got != webOnlyWT {
+		t.Fatalf("expected %s for 'iazio-web', got %q", webOnlyWT, got)
+	}
+
+	detailBoth := controlplane.HostDetail{
+		Repos: []controlplane.RepoSummary{
+			{WorktreePath: webOnlyWT, Lock: "IDLE"},
+			{WorktreePath: coreWT, Lock: "IDLE"},
+		},
+	}
+	if got := resolveWorktreeFromHostDetail(detailBoth, "iazio"); got != coreWT {
+		t.Fatalf("expected %s for exact submodule 'iazio', got %q", coreWT, got)
+	}
+
+	// Verify resolveWorktreeForRepo caches fleet root safely without calling os.Setenv or racing with os.Getenv
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("USERPROFILE", fakeHome)
+	t.Setenv("IAZIO_FLEET_ROOT", "")
+	setCachedFleetRoot("")
+
+	candDir := filepath.Join(fakeHome, "work", "meta-repo")
+	if err := os.MkdirAll(candDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(candDir, ".gitmodules"), []byte(`[submodule "iazio-web"]
+	path = iazio-web
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	getterErr := mockHostGetter{err: errors.New("offline")}
+
+	// Substring "iazio" must not match candDir (unless /work on host matches, so test gitmodulesHasSubmodule directly too)
+	if gitmodulesHasSubmodule("[submodule \"iazio-web\"]\n\tpath = iazio-web\n", "iazio") {
+		t.Fatal("gitmodulesHasSubmodule must not match substring 'iazio' against 'iazio-web'")
+	}
+	if !gitmodulesHasSubmodule("[submodule \"iazio-web\"]\n\tpath = iazio-web\n", "iazio-web") {
+		t.Fatal("gitmodulesHasSubmodule must match exact 'iazio-web'")
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = os.Getenv("IAZIO_FLEET_ROOT")
+			got := resolveWorktreeForRepo(ctx, getterErr, "host-1", "iazio-web", os.Getenv)
+			if got != candDir {
+				t.Errorf("expected %s, got %q", candDir, got)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if envVal := os.Getenv("IAZIO_FLEET_ROOT"); envVal != "" {
+		t.Fatalf("expected os.Getenv(\"IAZIO_FLEET_ROOT\") to remain empty (no runtime os.Setenv), got %q", envVal)
+	}
+	if cached := getCachedFleetRoot(); cached != candDir {
+		t.Fatalf("expected cachedFleetRoot %q, got %q", candDir, cached)
+	}
+}
