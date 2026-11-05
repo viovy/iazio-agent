@@ -155,6 +155,39 @@ func DiscoverSubRepositories(repoPath string) []string {
 	return subRepos
 }
 
+func isEphemeralCachePath(relPath string) bool {
+	p := filepath.ToSlash(strings.TrimSpace(relPath))
+	p = strings.TrimPrefix(p, "./")
+	if p == "" {
+		return false
+	}
+	base := filepath.Base(p)
+	if base == ".DS_Store" || base == "Thumbs.db" {
+		return true
+	}
+	if strings.Contains(p, "/.gradle/") || strings.HasPrefix(p, ".gradle/") {
+		return true
+	}
+	if strings.Contains(p, "/.dart_tool/") || strings.HasPrefix(p, ".dart_tool/") {
+		return true
+	}
+	return false
+}
+
+func extractPorcelainV2Path(line string) string {
+	if strings.HasPrefix(line, "? ") || strings.HasPrefix(line, "! ") {
+		return strings.TrimSpace(line[2:])
+	}
+	// Format "1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>"
+	if strings.HasPrefix(line, "1 ") {
+		fields := strings.Fields(line)
+		if len(fields) >= 9 {
+			return strings.Join(fields[8:], " ")
+		}
+	}
+	return ""
+}
+
 func inspectSingleGitDirectory(ctx context.Context, dir string) singleDirGitResult {
 	res := singleDirGitResult{IsClean: true}
 
@@ -250,8 +283,18 @@ func inspectSingleGitDirectory(ctx context.Context, dir string) singleDirGitResu
 				}
 			}
 		} else if strings.HasPrefix(l, "? ") {
+			p := extractPorcelainV2Path(l)
+			if isEphemeralCachePath(p) {
+				_ = os.RemoveAll(filepath.Join(dir, p))
+				continue
+			}
 			res.UntrackedFilesCount++
 		} else if !strings.HasPrefix(l, "# ") {
+			p := extractPorcelainV2Path(l)
+			if isEphemeralCachePath(p) {
+				_ = procutil.CommandContext(ctx, "git", "-C", dir, "checkout", "--", p).Run()
+				continue
+			}
 			res.DirtyFilesCount++
 		}
 	}
