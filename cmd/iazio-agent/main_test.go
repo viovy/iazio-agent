@@ -4590,7 +4590,7 @@ cat << 'EOF'
   "submodules_clean": false,
   "dirty_files_count": 2,
   "modified_files": [".session_story_id"],
-  "dirty_submodules": ["home-infra (uncommitted changes)"],
+  "dirty_submodules": ["sub-infra (uncommitted changes)"],
   "ase_state": "FAILED_DIRTY",
   "active_story_id": "",
   "agent_tool": "agy",
@@ -4608,7 +4608,7 @@ EOF
 	_ = os.MkdirAll(filepath.Join(repoDir, ".autopilot"), 0o755)
 	_ = os.WriteFile(filepath.Join(repoDir, ".autopilot", "state.json"), []byte(`{"state":"IDLE","verification_status":"PASSED"}`), 0o644)
 
-	st := probeRepoRuntime(context.Background(), repoDir, "meta-repo-03")
+	st := probeRepoRuntime(context.Background(), repoDir, "sample-repo-03")
 	if !st.IsClean || !st.SubmodulesClean || st.ASEState != "IDLE" || st.ExecutionProvenance != "NONE" || st.Porcelain != "" {
 		t.Fatalf("expected post-ASE git-update autoremediation to clean repo and clear INDEPENDENT_USER_SESSION, got %+v", st)
 	}
