@@ -265,3 +265,89 @@ func TestVerify_GitCommandsFailClosed(t *testing.T) {
 		t.Fatalf("expected 3 unmet gates (clean_working_tree, branch_not_detached, submodule_gitlinks_synchronized), got %v", res.UnmetGates)
 	}
 }
+
+func TestVerify_FrontmatterOnlyStatusDone(t *testing.T) {
+	tmpDir := t.TempDir()
+	storiesDir := filepath.Join(tmpDir, "docs", "stories")
+	if err := os.MkdirAll(storiesDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	storyFile := filepath.Join(storiesDir, "2026-11-07-gov-5176-test.story.md")
+	// Body mentions `status: DONE` (e.g. closeout template), while YAML frontmatter is IN PROGRESS.
+	bodyWithFalsePositive := "---\nid: STORY-GOV-5176\nstatus: IN PROGRESS\n---\n\n# Story\nUpdate `status: DONE` in closeout.\nstatus: \"DONE\"\n"
+	if err := os.WriteFile(storyFile, []byte(bodyWithFalsePositive), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	mockGit := func(args ...string) (string, error) {
+		switch args[0] {
+		case "status":
+			return "", nil
+		case "rev-parse":
+			return "main", nil
+		case "submodule":
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+
+	res := Verify(GateOptions{
+		WorktreePath: tmpDir,
+		StoryID:      "STORY-GOV-5176",
+		GitRunner:    mockGit,
+	})
+	if res.Passed || res.StoryDone {
+		t.Fatalf("expected StoryDone=false when status: DONE is only in markdown body, got %+v", res)
+	}
+
+	// Now update frontmatter to status: DONE
+	doneFrontmatter := "---\nid: STORY-GOV-5176\nstatus: \"DONE\" # completed\n---\n\n# Story\n"
+	if err := os.WriteFile(storyFile, []byte(doneFrontmatter), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res2 := Verify(GateOptions{
+		WorktreePath: tmpDir,
+		StoryID:      "STORY-GOV-5176",
+		GitRunner:    mockGit,
+	})
+	if !res2.Passed || !res2.StoryDone {
+		t.Fatalf("expected StoryDone=true when frontmatter status is DONE, got %+v", res2)
+	}
+}
+
+func TestVerify_UninitializedSubmoduleAndGitLogNoLimit(t *testing.T) {
+	tmpDir := t.TempDir()
+	var logArgs []string
+
+	mockGit := func(args ...string) (string, error) {
+		switch args[0] {
+		case "status":
+			return "", nil
+		case "rev-parse":
+			return "main", nil
+		case "submodule":
+			return "-abcdef0 uninitialized-submod", nil
+		case "log":
+			logArgs = append([]string(nil), args...)
+			return "deadbeef", nil
+		default:
+			return "", nil
+		}
+	}
+
+	res := Verify(GateOptions{
+		WorktreePath: tmpDir,
+		StoryID:      "STORY-GOV-5176",
+		GitRunner:    mockGit,
+	})
+	if res.SubmodulesClean {
+		t.Fatalf("expected SubmodulesClean=false for '-' uninitialized submodule, got %+v", res)
+	}
+	for _, a := range logArgs {
+		if a == "-n" || a == "10" {
+			t.Fatalf("expected git log without -n 10 limit, got args %v", logArgs)
+		}
+	}
+}

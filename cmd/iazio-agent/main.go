@@ -47,6 +47,7 @@ import (
 func main() {
 	preflight.HydrateToolchainEnv()
 	flushTracer := telemetry.InitGlobalTracer("iazio-agent", "")
+	setGlobalTracerFlusher(flushTracer)
 	defer flushTracer()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -54,6 +55,43 @@ func main() {
 	if err := execute(ctx, os.Args[1:], os.Stdout, os.Stderr, os.Getenv); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
+	}
+}
+
+var (
+	shutdownHooksMu     sync.Mutex
+	globalTracerFlusher func()
+	activeElasticSink   *elasticlog.Sink
+)
+
+func setGlobalTracerFlusher(fn func()) {
+	shutdownHooksMu.Lock()
+	globalTracerFlusher = fn
+	shutdownHooksMu.Unlock()
+}
+
+func setActiveElasticSink(s *elasticlog.Sink) {
+	shutdownHooksMu.Lock()
+	activeElasticSink = s
+	shutdownHooksMu.Unlock()
+}
+
+func flushTelemetryAndCloseSink() {
+	shutdownHooksMu.Lock()
+	flusher := globalTracerFlusher
+	globalTracerFlusher = nil
+	s := activeElasticSink
+	activeElasticSink = nil
+	shutdownHooksMu.Unlock()
+
+	if flusher != nil {
+		flusher()
+	} else if tr := telemetry.GlobalTracer(); tr != nil && tr.Exporter != nil {
+		_ = tr.Exporter.Flush(context.Background())
+		_ = tr.Exporter.Close()
+	}
+	if s != nil {
+		_ = s.Close()
 	}
 }
 
@@ -388,7 +426,11 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				Version:     formatVersion(),
 				HostName:    host,
 			})
-			defer func() { _ = sink.Close() }()
+			setActiveElasticSink(sink)
+			defer func() {
+				setActiveElasticSink(nil)
+				_ = sink.Close()
+			}()
 			sink.Info("iazio-agent supervisor starting", map[string]any{
 				"host_kind":  string(kind),
 				"api_url":    api,
@@ -1096,9 +1138,16 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 								target = strings.Trim(strings.TrimSpace(string(cmd.Payload)), "\"")
 							}
 							if target != "" {
+								resolvedTarget, ok := resolveRegisteredRepoWorktree(runCtx, getRepos, target)
+								if !ok {
+									if stderr != nil {
+										fmt.Fprintf(stderr, "[agent] refusing %s on unregistered repository path %q\n", cmd.Type, target)
+									}
+									return
+								}
 								// First cancel and abort any active harness executions on target repo
 								for _, rj := range sup.RunningJobs() {
-									if target == "" || rj.WorktreePath == target || filepath.Base(rj.WorktreePath) == target || rj.JobID == target {
+									if rj.WorktreePath == resolvedTarget || filepath.Base(rj.WorktreePath) == filepath.Base(resolvedTarget) || rj.WorktreePath == target || filepath.Base(rj.WorktreePath) == target || rj.JobID == target {
 										sup.Cancel(rj.WorktreePath, "FORCE_CLEAN_GIT")
 										releaseOnJobGateLease(rj.JobID)
 										if wd != nil {
@@ -1106,8 +1155,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 										}
 									}
 								}
-								healGitRepo(runCtx, target)
-								st := probeRepoRuntime(runCtx, target, filepath.Base(target))
+								healGitRepo(runCtx, resolvedTarget)
+								st := probeRepoRuntime(runCtx, resolvedTarget, filepath.Base(resolvedTarget))
 								_ = client.PostRepoStatus(runCtx, host, []controlplane.RepoRuntimeStatus{st})
 							}
 						}()
@@ -1269,24 +1318,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return flushHarvestConversationDetailed(hCtx, convID)
 				})
 				var pendingSelfRestart atomic.Bool
-				disp.SetPreDispatchHook(func(ctx context.Context, job *worker.Job) error {
-					if job != nil && job.Type == worker.JobTypeToolsUpdate {
-						return nil
-					}
-					if eagerUpdater != nil && !updatingTools.Load() {
-						rep := eagerUpdater.EvaluateReadiness(ctx)
-						if rep.EagerUpdateState == supervisor.StateUpToDate {
-							res, _, err := eagerUpdater.EvaluateAndTriggerWithOpts(ctx, supervisor.TriggerOptions{
-								BypassDirty: false,
-								Force:       false,
-							})
-							if err == nil && res.AgentUpdated {
-								pendingSelfRestart.Store(true)
-							}
-						}
-					}
-					return nil
-				})
+				disp.SetPreDispatchHook(buildPreDispatchHook(eagerUpdater, &updatingTools, &pendingSelfRestart))
 				disp.SetPostJobHook(func(ctx context.Context, job *worker.Job) {
 					if eagerUpdater != nil {
 						eagerUpdater.TriggerEvaluation("post_job_completion")
@@ -1587,7 +1619,47 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return fmt.Errorf("repository %s busy with job %s", a.WorktreePath, lockInfo.JobID)
 				}
 
+				convID := ResolveDispatchConversationID(a, lockInfo.ConversationID, lockInfo.StoryID, lockInfo.Status)
+
+				// Reserve worktree state across supervisor, dispatcher, and in-flight prep table before running multi-second reaper/sanitization.
+				if busyOwner, busy := tryReserveOnJobWorktree(&inFlightPrepMu, inFlightPrepJobs, sup, disp, a.ID, a.WorktreePath); busy {
+					if stderr != nil {
+						fmt.Fprintf(stderr, "[agent] refusing concurrent job %s on %s: worktree already reserved by job %s\n",
+							a.ID, a.WorktreePath, busyOwner)
+					}
+					_ = client.AbandonJob(runCtx, a.ID, "REPO_BUSY")
+					return fmt.Errorf("repository %s busy with job %s", a.WorktreePath, busyOwner)
+				}
+				defer func() {
+					inFlightPrepMu.Lock()
+					delete(inFlightPrepJobs, a.ID)
+					inFlightPrepMu.Unlock()
+				}()
+
+				var prepRepoLock *repolock.LockHandle
+				if a.WorktreePath != "" {
+					if h, lockErr := repolock.Acquire(a.WorktreePath, repolock.LockInfo{
+						JobID:          a.ID,
+						ScheduleID:     a.ScheduleID,
+						PID:            os.Getpid(),
+						ToolPID:        lockInfo.ToolPID,
+						ConversationID: convID,
+						StoryID:        a.StoryID,
+						Status:         "RUNNING",
+					}, watchdog.IsProcessAlive); lockErr == nil {
+						prepRepoLock = h
+					}
+				}
+				releasePrepRepoLock := func() {
+					if prepRepoLock != nil {
+						_ = prepRepoLock.Release()
+						prepRepoLock = nil
+					}
+				}
+				defer releasePrepRepoLock()
+
 				if hostGate != nil {
+					releaseOnJobGateLease(a.ID)
 					relGate, gateErr := hostGate.AcquireExecutionLease(runCtx, a.ID, a.WorktreePath)
 					if gateErr != nil {
 						return gateErr
@@ -1596,20 +1668,11 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					onJobGateLeases[a.ID] = relGate
 					onJobGateMu.Unlock()
 				}
-
-				convID := ResolveDispatchConversationID(a, lockInfo.ConversationID, lockInfo.StoryID, lockInfo.Status)
-
-				inFlightPrepMu.Lock()
-				inFlightPrepJobs[a.ID] = controlplane.ActiveJob{
-					JobID:        a.ID,
-					WorktreePath: a.WorktreePath,
-					PID:          os.Getpid(),
-				}
-				inFlightPrepMu.Unlock()
+				leaseHandedOff := false
 				defer func() {
-					inFlightPrepMu.Lock()
-					delete(inFlightPrepJobs, a.ID)
-					inFlightPrepMu.Unlock()
+					if !leaseHandedOff {
+						releaseOnJobGateLease(a.ID)
+					}
 				}()
 
 				prepCtx, prepCancel := context.WithCancel(runCtx)
@@ -1738,6 +1801,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}
 
 				prepCancel()
+				releasePrepRepoLock()
 				err := sup.Spawn(wdRunner, a.ID, api, a.WorktreePath, a.DocsHubPath, "", spawnExtras...)
 				inFlightPrepMu.Lock()
 				delete(inFlightPrepJobs, a.ID)
@@ -1766,6 +1830,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					HarnessPID:     pid,
 					ToolPID:        toolPID,
 				})
+				leaseHandedOff = true
 				return nil
 			}
 
@@ -2727,6 +2792,7 @@ func restartOrExecSelf(stdout io.Writer) {
 	if stdout != nil {
 		fmt.Fprintln(stdout, "[supervisor] iazio-agent self-updated; executing in-PID handoff to updated binary...")
 	}
+	flushTelemetryAndCloseSink()
 	selfBin, _ := os.Executable()
 	home, _ := os.UserHomeDir()
 	targetBin := resolveSelfBinaryPath(runtime.GOOS, selfBin, home, os.Args)
@@ -3225,42 +3291,137 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 	return st
 }
 
+func buildPreDispatchHook(eagerUpdater *supervisor.EagerToolUpdater, updatingTools *atomic.Bool, pendingSelfRestart *atomic.Bool) func(ctx context.Context, job *worker.Job) error {
+	return func(ctx context.Context, job *worker.Job) error {
+		if job != nil && job.Type == worker.JobTypeToolsUpdate {
+			return nil
+		}
+		if eagerUpdater != nil && (updatingTools == nil || !updatingTools.Load()) {
+			rep := eagerUpdater.EvaluateReadiness(ctx)
+			if rep.EagerUpdateState != supervisor.StateUpToDate {
+				res, _, err := eagerUpdater.EvaluateAndTriggerWithOpts(ctx, supervisor.TriggerOptions{
+					BypassDirty: false,
+					Force:       false,
+				})
+				if err == nil && res.AgentUpdated && pendingSelfRestart != nil {
+					pendingSelfRestart.Store(true)
+				}
+			}
+		}
+		return nil
+	}
+}
+
+func tryReserveOnJobWorktree(
+	inFlightPrepMu *sync.Mutex,
+	inFlightPrepJobs map[string]controlplane.ActiveJob,
+	sup *supervisor.Sup,
+	disp *worker.Dispatcher,
+	jobID, worktreePath string,
+) (string, bool) {
+	inFlightPrepMu.Lock()
+	defer inFlightPrepMu.Unlock()
+
+	cleanWT := filepath.Clean(strings.TrimSpace(worktreePath))
+	if cleanWT != "" && cleanWT != "." {
+		for existingID, aj := range inFlightPrepJobs {
+			if existingID != jobID && filepath.Clean(strings.TrimSpace(aj.WorktreePath)) == cleanWT {
+				return existingID, true
+			}
+		}
+		if sup != nil && sup.Lock(worktreePath) != "IDLE" {
+			return sup.Lock(worktreePath), true
+		}
+		if disp != nil {
+			for _, aj := range disp.ActiveJobs() {
+				if aj.JobID != jobID && filepath.Clean(strings.TrimSpace(aj.WorktreePath)) == cleanWT {
+					return aj.JobID, true
+				}
+			}
+		}
+	}
+
+	inFlightPrepJobs[jobID] = controlplane.ActiveJob{
+		JobID:        jobID,
+		WorktreePath: worktreePath,
+		PID:          os.Getpid(),
+	}
+	return "", false
+}
+
+func resolveRegisteredRepoWorktree(_ context.Context, getRepos func() ([]supervisor.RepoConfigItem, error), target string) (string, bool) {
+	trimmed := strings.TrimSpace(target)
+	if trimmed == "" || getRepos == nil {
+		return "", false
+	}
+	repos, err := getRepos()
+	if err != nil || len(repos) == 0 {
+		return "", false
+	}
+	cleanTarget := filepath.Clean(filepath.FromSlash(trimmed))
+	for _, r := range repos {
+		cand := strings.TrimSpace(r.Path)
+		if cand == "" {
+			continue
+		}
+		cleanCand := filepath.Clean(filepath.FromSlash(cand))
+		if cleanCand == cleanTarget || strings.EqualFold(r.Alias, trimmed) || filepath.Base(cleanCand) == trimmed {
+			return cleanCand, true
+		}
+	}
+	return "", false
+}
+
+func isVerifiedGitTopLevel(ctx context.Context, repoPath string) bool {
+	cleanPath := filepath.Clean(strings.TrimSpace(repoPath))
+	if cleanPath == "" || cleanPath == "." || cleanPath == string(filepath.Separator) || !filepath.IsAbs(cleanPath) {
+		return false
+	}
+	if len(cleanPath) == 3 && cleanPath[1] == ':' && (cleanPath[2] == '\\' || cleanPath[2] == '/') {
+		return false
+	}
+	out, err := procutil.CommandContext(ctx, "git", "-C", cleanPath, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return false
+	}
+	topLevel := filepath.Clean(filepath.FromSlash(strings.TrimSpace(string(out))))
+	if topLevel == cleanPath {
+		return true
+	}
+	evalTop, err1 := filepath.EvalSymlinks(topLevel)
+	evalRepo, err2 := filepath.EvalSymlinks(cleanPath)
+	return err1 == nil && err2 == nil && filepath.Clean(evalTop) == filepath.Clean(evalRepo)
+}
+
 // healGitRepo delegates destructive cleanup for broken, diverged, or locked repo state to iazio-harness,
 // falling back to local lock & git cleanup if iazio-harness is unavailable.
 func healGitRepo(ctx context.Context, repoPath string) {
-	if strings.TrimSpace(repoPath) == "" {
+	cleanRepo := filepath.Clean(strings.TrimSpace(repoPath))
+	if cleanRepo == "" || cleanRepo == "." || cleanRepo == string(filepath.Separator) || !filepath.IsAbs(cleanRepo) {
 		return
 	}
 
 	// Always release local locks and stale ASE session artifacts
-	_ = os.Remove(filepath.Join(repoPath, ".ase", "active.lock"))
-	_ = os.Remove(filepath.Join(repoPath, ".autopilot", "lock"))
-	_ = os.Remove(filepath.Join(repoPath, ".autopilot", "state.json"))
-	_ = os.Remove(filepath.Join(repoPath, ".autopilot", "ase-state.json"))
-	_ = os.Remove(filepath.Join(repoPath, ".session_story_id"))
-	if matches, err := filepath.Glob(filepath.Join(repoPath, "tmp", "ase-resume-*.json")); err == nil {
+	_ = os.Remove(filepath.Join(cleanRepo, ".ase", "active.lock"))
+	_ = os.Remove(filepath.Join(cleanRepo, ".autopilot", "lock"))
+	_ = os.Remove(filepath.Join(cleanRepo, ".autopilot", "state.json"))
+	_ = os.Remove(filepath.Join(cleanRepo, ".autopilot", "ase-state.json"))
+	_ = os.Remove(filepath.Join(cleanRepo, ".session_story_id"))
+	if matches, err := filepath.Glob(filepath.Join(cleanRepo, "tmp", "ase-resume-*.json")); err == nil {
 		for _, m := range matches {
 			_ = os.Remove(m)
 		}
 	}
-	_ = repolock.ForceRelease(repoPath)
+	_ = repolock.ForceRelease(cleanRepo)
 
-	// Delegate Tier 3 force-clean remediation to iazio-harness
-	harnessBin := resolveHarnessBinaryPath()
-	harnessCmd := procutil.CommandContext(ctx, harnessBin, "repo", "remediate", "--repo", repoPath, "--strategy", "force-clean", "--json")
-	if err := harnessCmd.Run(); err == nil {
-		return
-	}
-
-	// Fallback if iazio-harness binary is unavailable
-	gitDir := filepath.Join(repoPath, ".git")
-	if out, err := procutil.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--git-dir").Output(); err == nil {
+	gitDir := filepath.Join(cleanRepo, ".git")
+	if out, err := procutil.CommandContext(ctx, "git", "-C", cleanRepo, "rev-parse", "--git-dir").Output(); err == nil {
 		clean := strings.TrimSpace(string(out))
 		if clean != "" {
 			if filepath.IsAbs(clean) {
 				gitDir = clean
 			} else {
-				gitDir = filepath.Join(repoPath, clean)
+				gitDir = filepath.Join(cleanRepo, clean)
 			}
 		}
 	}
@@ -3268,16 +3429,31 @@ func healGitRepo(ctx context.Context, repoPath string) {
 	_ = os.Remove(filepath.Join(gitDir, "HEAD.lock"))
 	_ = os.Remove(filepath.Join(gitDir, "config.lock"))
 
-	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "merge", "--abort").Run()
-	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "rebase", "--abort").Run()
-	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "cherry-pick", "--abort").Run()
+	// Delegate Tier 3 force-clean remediation to iazio-harness
+	harnessBin := resolveHarnessBinaryPath()
+	harnessCmd := procutil.CommandContext(ctx, harnessBin, "repo", "remediate", "--repo", cleanRepo, "--strategy", "force-clean", "--json")
+	if err := harnessCmd.Run(); err == nil {
+		return
+	}
 
-	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "reset", "--hard", "HEAD").Run()
-	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "clean", "-ffd").Run()
+	// Fallback if iazio-harness binary is unavailable: verify cleanRepo is an actual git top-level worktree
+	if !isVerifiedGitTopLevel(ctx, cleanRepo) {
+		return
+	}
 
-	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "submodule", "foreach", "--recursive", "git reset --hard HEAD || true").Run()
-	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "submodule", "foreach", "--recursive", "git clean -ffd || true").Run()
-	_ = procutil.CommandContext(ctx, "git", "-C", repoPath, "submodule", "update", "--init", "--recursive", "--force").Run()
+	// Archive any dirty/untracked state before resetting so unmerged work is never blindly lost without backup.
+	_, _ = workspace.ResetAndSanitizeFreshWorkspace(ctx, cleanRepo, "heal-git-repo", "")
+
+	_ = procutil.CommandContext(ctx, "git", "-C", cleanRepo, "merge", "--abort").Run()
+	_ = procutil.CommandContext(ctx, "git", "-C", cleanRepo, "rebase", "--abort").Run()
+	_ = procutil.CommandContext(ctx, "git", "-C", cleanRepo, "cherry-pick", "--abort").Run()
+
+	_ = procutil.CommandContext(ctx, "git", "-C", cleanRepo, "reset", "--hard", "HEAD").Run()
+	_ = procutil.CommandContext(ctx, "git", "-C", cleanRepo, "clean", "-ffd").Run()
+
+	_ = procutil.CommandContext(ctx, "git", "-C", cleanRepo, "submodule", "foreach", "--recursive", "git reset --hard HEAD || true").Run()
+	_ = procutil.CommandContext(ctx, "git", "-C", cleanRepo, "submodule", "foreach", "--recursive", "git clean -ffd || true").Run()
+	_ = procutil.CommandContext(ctx, "git", "-C", cleanRepo, "submodule", "update", "--init", "--recursive", "--force").Run()
 }
 
 func stripSlotSuffix(name string) string {

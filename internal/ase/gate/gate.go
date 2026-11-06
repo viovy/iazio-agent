@@ -117,7 +117,7 @@ func Verify(opts GateOptions) GateResult {
 		lines := strings.Split(subStatus, "\n")
 		for _, l := range lines {
 			l = strings.TrimSpace(l)
-			if len(l) > 0 && (l[0] == '+' || l[0] == 'U') {
+			if len(l) > 0 && (l[0] == '+' || l[0] == 'U' || l[0] == '-') {
 				res.SubmodulesClean = false
 				res.UnmetGates = append(res.UnmetGates, "submodule_gitlinks_synchronized")
 				break
@@ -172,11 +172,8 @@ func isStoryCompleted(worktreePath, storyID string, git func(args ...string) (st
 			if !e.IsDir() && strings.HasSuffix(lowerName, ".story.md") && (strings.Contains(lowerName, strings.ToLower(storyID)) || strings.Contains(lowerName, cleanID)) {
 				hasStoryFile = true
 				content, err := os.ReadFile(filepath.Join(storiesDir, e.Name()))
-				if err == nil {
-					text := string(content)
-					if strings.Contains(text, "status: DONE") || strings.Contains(text, "status: \"DONE\"") || strings.Contains(text, "status: 'DONE'") {
-						return true
-					}
+				if err == nil && hasFrontmatterStatusDone(string(content)) {
+					return true
 				}
 			}
 		}
@@ -188,7 +185,7 @@ func isStoryCompleted(worktreePath, storyID string, git func(args ...string) (st
 
 	// Fallback: check git log strictly on origin/main (already merged closeout)
 	if git != nil {
-		out, err := git("log", "origin/main", "-n", "10", "--grep="+storyID, "--format=%H")
+		out, err := git("log", "origin/main", "--grep="+storyID, "--format=%H")
 		if err == nil && strings.TrimSpace(out) != "" {
 			return true
 		}
@@ -200,5 +197,34 @@ func isStoryCompleted(worktreePath, storyID string, git func(args ...string) (st
 		return true
 	}
 
+	return false
+}
+
+// hasFrontmatterStatusDone extracts the YAML frontmatter block (bounded by leading and closing "---" lines)
+// and returns true only if `status: DONE` (unquoted or single/double quoted) appears inside frontmatter.
+func hasFrontmatterStatusDone(text string) bool {
+	trimmed := strings.TrimLeft(text, "\ufeff \t\r\n")
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) < 3 || strings.TrimSpace(lines[0]) != "---" {
+		return false
+	}
+	for i := 1; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "---" || line == "..." {
+			break
+		}
+		key, val, ok := strings.Cut(line, ":")
+		if !ok || strings.TrimSpace(key) != "status" {
+			continue
+		}
+		if idx := strings.Index(val, "#"); idx >= 0 {
+			val = val[:idx]
+		}
+		val = strings.TrimSpace(val)
+		val = strings.Trim(val, `"'`)
+		if val == "DONE" {
+			return true
+		}
+	}
 	return false
 }

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -332,6 +333,12 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 		hbInterval = 1 * time.Second
 	}
 
+	var (
+		dispatchedCmdMu sync.Mutex
+		inFlightCmds    = make(map[string]bool)
+		completedCmds   = make(map[string]time.Time)
+	)
+
 	sendHB := func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -364,8 +371,37 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 			}
 			if len(hbRes.PendingCommands) > 0 && c.OnCommand != nil {
 				for _, cmd := range hbRes.PendingCommands {
+					if cmd.ID != "" {
+						dispatchedCmdMu.Lock()
+						if len(completedCmds) > 256 {
+							cutoff := time.Now().Add(-15 * time.Minute)
+							for id, ts := range completedCmds {
+								if ts.Before(cutoff) {
+									delete(completedCmds, id)
+								}
+							}
+						}
+						if inFlightCmds[cmd.ID] {
+							dispatchedCmdMu.Unlock()
+							continue
+						}
+						if _, done := completedCmds[cmd.ID]; done {
+							dispatchedCmdMu.Unlock()
+							continue
+						}
+						inFlightCmds[cmd.ID] = true
+						dispatchedCmdMu.Unlock()
+					}
 					go func(cmd CommandEnvelope) {
-						_ = c.OnCommand(ctx, cmd)
+						cmdErr := c.OnCommand(ctx, cmd)
+						if cmd.ID != "" {
+							dispatchedCmdMu.Lock()
+							delete(inFlightCmds, cmd.ID)
+							if cmdErr == nil {
+								completedCmds[cmd.ID] = time.Now()
+							}
+							dispatchedCmdMu.Unlock()
+						}
 					}(cmd)
 				}
 			}
