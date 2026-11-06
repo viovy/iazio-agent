@@ -429,6 +429,21 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				return !snap.IsStalled
 			})
 			hostGate := supervisor.NewHostExecutionAndUpdateGate()
+			var disp *worker.Dispatcher
+			var onJobGateMu sync.Mutex
+			onJobGateLeases := make(map[string]func())
+			releaseOnJobGateLease := func(jobID string) {
+				if jobID == "" {
+					return
+				}
+				onJobGateMu.Lock()
+				rel := onJobGateLeases[jobID]
+				delete(onJobGateLeases, jobID)
+				onJobGateMu.Unlock()
+				if rel != nil {
+					rel()
+				}
+			}
 			var client controlplane.Client
 
 			var updatingTools atomic.Bool
@@ -748,7 +763,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return res, false, nil
 				}
 
-				if !opts.BypassDirty && !areAllReposCleanAndHarnessIdle(ctx, client, sup, host, api, opts.Force, stdout) {
+				if !opts.BypassDirty && !areAllReposCleanAndHarnessIdle(ctx, client, sup, host, api, opts.Force, stdout, hostGate, disp) {
 					span.SetTag("result", "deferred")
 					if sink != nil {
 						sink.Info("Tool update check deferred: workstation is busy or worktree dirty", map[string]any{
@@ -880,7 +895,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}()
 			}
 			var wd *watchdog.Watchdog
-			var disp *worker.Dispatcher
 			var inFlightPrepMu sync.Mutex
 			inFlightPrepJobs := make(map[string]controlplane.ActiveJob)
 			var lastHarvesterCheckMu sync.Mutex
@@ -1083,6 +1097,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 								for _, rj := range sup.RunningJobs() {
 									if target == "" || rj.WorktreePath == target || filepath.Base(rj.WorktreePath) == target || rj.JobID == target {
 										sup.Cancel(rj.WorktreePath, "FORCE_CLEAN_GIT")
+										releaseOnJobGateLease(rj.JobID)
 										if wd != nil {
 											wd.AbortJob(rj.JobID, "FORCE_CLEAN_GIT")
 										}
@@ -1105,6 +1120,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							for _, rj := range sup.RunningJobs() {
 								if target == "" || rj.JobID == target || rj.WorktreePath == target || filepath.Base(rj.WorktreePath) == target {
 									sup.Cancel(rj.WorktreePath, "KILL_BACKGROUND_TASKS")
+									releaseOnJobGateLease(rj.JobID)
 									if wd != nil {
 										wd.AbortJob(rj.JobID, "KILL_BACKGROUND_TASKS")
 									}
@@ -1200,6 +1216,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							}
 						}
 						if r.JobID != "" {
+							releaseOnJobGateLease(r.JobID)
 							_ = client.AbandonJob(ctx, r.JobID, r.Reason)
 						}
 					}
@@ -1392,7 +1409,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 
 							// Autonomic idle tool update trigger:
 							// When all repos are open / idle and git is clean, trigger tool update check
-							if areAllReposCleanAndHarnessIdle(runCtx, client, sup, host, api, false, nil) {
+							if areAllReposCleanAndHarnessIdle(runCtx, client, sup, host, api, false, nil, hostGate, disp) {
 								lastUpdateMu.Lock()
 								elapsed := time.Since(lastUpdateCheck)
 								pendingRemoteMu.Lock()
@@ -1515,11 +1532,13 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					_ = client.PostChunk(runCtx, job.JobID, "stdout", msg)
 				},
 				OnJobCompleted: func(job watchdog.TrackedJob) {
+					releaseOnJobGateLease(job.JobID)
 					if job.WorktreePath != "" {
 						sup.MarkIdle(job.WorktreePath)
 					}
 				},
 				OnJobTerminalFailure: func(job watchdog.TrackedJob, reason string) {
+					releaseOnJobGateLease(job.JobID)
 					if runCtx.Err() != nil {
 						return
 					}
@@ -1575,25 +1594,25 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				)
 				defer span.End()
 
-				// Repo lock verification: refuse duplicate/concurrent jobs in the same worktree
-				lockInfo, lockErr := repolock.Read(a.WorktreePath)
-				if lockErr == nil && lockInfo.JobID != "" && lockInfo.JobID != a.ID {
-					checkPID := lockInfo.PID
-					if lockInfo.HarnessPID > 0 {
-						checkPID = lockInfo.HarnessPID
+				// Repo lock verification: refuse duplicate/concurrent jobs in the same worktree (cross-platform liveness via watchdog.IsProcessAlive)
+				lockInfo, checkPID, repoBusy := checkRepoLockBusy(a.WorktreePath, a.ID, watchdog.IsProcessAlive)
+				if repoBusy {
+					if stderr != nil {
+						fmt.Fprintf(stderr, "[agent] refusing concurrent job %s on %s: worktree actively locked by job %s (pid %d)\n",
+							a.ID, a.WorktreePath, lockInfo.JobID, checkPID)
 					}
-					if checkPID > 0 {
-						// Check if process is still alive
-						p, findErr := os.FindProcess(checkPID)
-						if findErr == nil && p.Signal(syscall.Signal(0)) == nil {
-							if stderr != nil {
-								fmt.Fprintf(stderr, "[agent] refusing concurrent job %s on %s: worktree actively locked by job %s (pid %d)\n",
-									a.ID, a.WorktreePath, lockInfo.JobID, checkPID)
-							}
-							_ = client.AbandonJob(runCtx, a.ID, "REPO_BUSY")
-							return fmt.Errorf("repository %s busy with job %s", a.WorktreePath, lockInfo.JobID)
-						}
+					_ = client.AbandonJob(runCtx, a.ID, "REPO_BUSY")
+					return fmt.Errorf("repository %s busy with job %s", a.WorktreePath, lockInfo.JobID)
+				}
+
+				if hostGate != nil {
+					relGate, gateErr := hostGate.AcquireExecutionLease(runCtx, a.ID, a.WorktreePath)
+					if gateErr != nil {
+						return gateErr
 					}
+					onJobGateMu.Lock()
+					onJobGateLeases[a.ID] = relGate
+					onJobGateMu.Unlock()
 				}
 
 				convID := ResolveDispatchConversationID(a, lockInfo.ConversationID, lockInfo.StoryID, lockInfo.Status)
@@ -1742,6 +1761,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				delete(inFlightPrepJobs, a.ID)
 				inFlightPrepMu.Unlock()
 				if err != nil {
+					releaseOnJobGateLease(a.ID)
 					if strings.Contains(err.Error(), "busy") {
 						_ = client.AbandonJob(runCtx, a.ID, "REPO_BUSY")
 					}
@@ -2594,12 +2614,53 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 	return true
 }
 
-func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Client, sup *supervisor.Sup, host, api string, force bool, stdout io.Writer) bool {
+func checkRepoLockBusy(worktreePath, jobID string, isAlive func(int) bool) (repolock.LockInfo, int, bool) {
+	if isAlive == nil {
+		isAlive = watchdog.IsProcessAlive
+	}
+	lockInfo, lockErr := repolock.Read(worktreePath)
+	if lockErr == nil && lockInfo.JobID != "" && lockInfo.JobID != jobID {
+		checkPID := lockInfo.PID
+		if lockInfo.HarnessPID > 0 {
+			checkPID = lockInfo.HarnessPID
+		}
+		if checkPID > 0 && isAlive(checkPID) {
+			return lockInfo, checkPID, true
+		}
+	}
+	return lockInfo, 0, false
+}
+
+func areAllReposCleanAndHarnessIdle(ctx context.Context, client controlplane.Client, sup *supervisor.Sup, host, api string, force bool, stdout io.Writer, extraTrackers ...any) bool {
 	if sup != nil && sup.HasRunningHarness() {
 		if stdout != nil {
 			fmt.Fprintln(stdout, "[SIR: IDLE_UPDATE_DEFERRED] reason=\"harness execution is active\"")
 		}
 		return false
+	}
+	if client.ActiveJobs != nil && len(client.ActiveJobs()) > 0 {
+		if stdout != nil {
+			fmt.Fprintln(stdout, "[SIR: IDLE_UPDATE_DEFERRED] reason=\"active controlplane or dispatcher jobs in flight\"")
+		}
+		return false
+	}
+	for _, tracker := range extraTrackers {
+		switch t := tracker.(type) {
+		case *supervisor.HostExecutionAndUpdateGate:
+			if t != nil && (t.ActiveCount() > 0 || t.IsMaintenanceHeld()) {
+				if stdout != nil {
+					fmt.Fprintln(stdout, "[SIR: IDLE_UPDATE_DEFERRED] reason=\"host execution gate has active execution or maintenance lease\"")
+				}
+				return false
+			}
+		case *worker.Dispatcher:
+			if t != nil && len(t.ActiveJobs()) > 0 {
+				if stdout != nil {
+					fmt.Fprintln(stdout, "[SIR: IDLE_UPDATE_DEFERRED] reason=\"worker dispatcher has active jobs\"")
+				}
+				return false
+			}
+		}
 	}
 	if force {
 		// When force is explicitly requested, bypass worktree checks as long as harness is not executing

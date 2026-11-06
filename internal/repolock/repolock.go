@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/procutil"
@@ -37,6 +39,7 @@ type LockInfo struct {
 
 // LockHandle holds an exclusive OS-level flock on a repository worktree.
 type LockHandle struct {
+	mu        sync.Mutex
 	worktree  string
 	flockFile *os.File
 	info      LockInfo
@@ -45,6 +48,8 @@ type LockHandle struct {
 
 // Info returns the current lock information.
 func (h *LockHandle) Info() LockInfo {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	return h.info
 }
 
@@ -53,8 +58,54 @@ func (h *LockHandle) Worktree() string {
 	return h.worktree
 }
 
+// writeLockFileAtomic marshals info and atomically replaces lockPath via a temporary file + rename
+// so concurrent unlocked Read(worktree) callers never observe a 0-byte or partially written JSON file.
+func writeLockFileAtomic(lockPath string, info LockInfo) error {
+	data, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	dir := filepath.Dir(lockPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmpFile, err := os.CreateTemp(dir, ".repo.lock.tmp.*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmpFile.Chmod(0o644); err != nil && runtime.GOOS != "windows" {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, lockPath); err != nil {
+		if runtime.GOOS == "windows" {
+			_ = os.Remove(lockPath)
+			if err2 := os.Rename(tmpPath, lockPath); err2 == nil {
+				return nil
+			}
+		}
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
 // Update updates the in-memory and on-disk lock state while holding the OS flock.
 func (h *LockHandle) Update(info LockInfo) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.released {
 		return errors.New("lock already released")
 	}
@@ -71,15 +122,13 @@ func (h *LockHandle) Update(info LockInfo) error {
 	h.info = info
 
 	lockPath := filepath.Join(h.worktree, ".iazio", "repo.lock")
-	data, err := json.MarshalIndent(info, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(lockPath, data, 0o644)
+	return writeLockFileAtomic(lockPath, info)
 }
 
 // Release writes status COMPLETED if still running and releases the OS flock.
 func (h *LockHandle) Release() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.released {
 		return nil
 	}
@@ -89,9 +138,7 @@ func (h *LockHandle) Release() error {
 		h.info.Status = "COMPLETED"
 		h.info.UpdatedAt = time.Now().UTC()
 		lockPath := filepath.Join(h.worktree, ".iazio", "repo.lock")
-		if data, err := json.MarshalIndent(h.info, "", "  "); err == nil {
-			_ = os.WriteFile(lockPath, data, 0o644)
-		}
+		_ = writeLockFileAtomic(lockPath, h.info)
 	}
 
 	if h.flockFile != nil {
@@ -164,12 +211,7 @@ func Acquire(worktree string, info LockInfo, isAlive func(int) bool) (*LockHandl
 	}
 
 	lockPath := filepath.Join(iazioDir, "repo.lock")
-	data, err := json.MarshalIndent(info, "", "  ")
-	if err != nil {
-		_ = handle.Release()
-		return nil, err
-	}
-	if err := os.WriteFile(lockPath, data, 0o644); err != nil {
+	if err := writeLockFileAtomic(lockPath, info); err != nil {
 		_ = handle.Release()
 		return nil, err
 	}

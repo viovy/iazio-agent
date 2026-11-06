@@ -2,10 +2,14 @@ package repolock
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestAcquireAndRelease(t *testing.T) {
@@ -333,4 +337,166 @@ func TestAcquire_OSLockConflictWithoutPIDLiveness(t *testing.T) {
 		t.Fatalf("Acquire handle2 after Release failed: %v", err)
 	}
 	_ = handle2.Release()
+}
+
+func TestWriteLockFileAtomic_ConcurrentReadNeverSeesPartialJSON(t *testing.T) {
+	wt := t.TempDir()
+	initial := LockInfo{
+		JobID:          "job-atomic-init",
+		PID:            os.Getpid(),
+		Engine:         "agy",
+		ConversationID: "conv-atomic-0",
+		StoryID:        "STORY-IAZIO-0188",
+		Prompt:         strings.Repeat("atomic lock payload ", 32),
+	}
+
+	handle, err := Acquire(wt, initial, func(int) bool { return true })
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+
+	const writers = 4
+	const iterations = 40
+	const readers = 6
+
+	done := make(chan struct{})
+	var readerWG sync.WaitGroup
+	errCh := make(chan error, readers)
+
+	for r := 0; r < readers; r++ {
+		readerWG.Add(1)
+		go func() {
+			defer readerWG.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					info, rErr := Read(wt)
+					if rErr != nil {
+						errCh <- fmt.Errorf("concurrent Read observed error/partial JSON: %w", rErr)
+						return
+					}
+					if info.JobID == "" || info.StoryID != "STORY-IAZIO-0188" {
+						errCh <- fmt.Errorf("concurrent Read observed unexpected LockInfo: %+v", info)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	var writerWG sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		writerWG.Add(1)
+		go func(workerID int) {
+			defer writerWG.Done()
+			for i := 0; i < iterations; i++ {
+				upd := initial
+				upd.JobID = fmt.Sprintf("job-atomic-%d-%d", workerID, i)
+				upd.ConversationID = fmt.Sprintf("conv-%d-%d", workerID, i)
+				if uErr := handle.Update(upd); uErr != nil {
+					errCh <- fmt.Errorf("handle.Update failed: %w", uErr)
+					return
+				}
+			}
+		}(w)
+	}
+
+	writerWG.Wait()
+	if err := handle.Release(); err != nil {
+		t.Fatalf("Release failed: %v", err)
+	}
+	close(done)
+	readerWG.Wait()
+	close(errCh)
+
+	for e := range errCh {
+		t.Fatal(e)
+	}
+
+	finalInfo, err := Read(wt)
+	if err != nil {
+		t.Fatalf("final Read failed: %v", err)
+	}
+	if finalInfo.Status != "COMPLETED" {
+		t.Fatalf("expected COMPLETED status after Release, got %q", finalInfo.Status)
+	}
+	if err := handle.Update(initial); err == nil {
+		t.Fatal("expected Update after Release to return error")
+	}
+
+	// Verify no leftover .repo.lock.tmp.* files remain in .iazio
+	entries, err := os.ReadDir(filepath.Join(wt, ".iazio"))
+	if err != nil {
+		t.Fatalf("ReadDir .iazio failed: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".repo.lock.tmp.") {
+			t.Fatalf("leftover temp lock file found: %s", entry.Name())
+		}
+	}
+}
+
+func TestIsWorktreeDirty_And_EdgeCases(t *testing.T) {
+	// 1. Empty worktree paths
+	if _, err := Acquire("", LockInfo{JobID: "j"}, nil); err == nil {
+		t.Fatal("expected error for empty worktree in Acquire")
+	}
+	if err := ForceRelease(""); err != nil {
+		t.Fatalf("expected nil for empty worktree in ForceRelease, got %v", err)
+	}
+	if IsWorktreeDirty("") {
+		t.Fatal("expected false for empty worktree in IsWorktreeDirty")
+	}
+	if IsWorktreeDirty(t.TempDir()) {
+		t.Fatal("expected false for non-git dir in IsWorktreeDirty")
+	}
+
+	// 2. Git repo dirty vs clean check
+	repoDir := t.TempDir()
+	if err := exec.Command("git", "init", repoDir).Run(); err != nil {
+		t.Skip("git not available")
+	}
+	_ = exec.Command("git", "-C", repoDir, "config", "user.email", "test@test.local").Run()
+	_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Test").Run()
+
+	if IsWorktreeDirty(repoDir) {
+		t.Fatal("expected empty git repo to be clean")
+	}
+
+	f := filepath.Join(repoDir, "dirty_file.txt")
+	if err := os.WriteFile(f, []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !IsWorktreeDirty(repoDir) {
+		t.Fatal("expected repo with untracked file to be dirty")
+	}
+
+	_ = exec.Command("git", "-C", repoDir, "add", "dirty_file.txt").Run()
+	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "initial").Run()
+	if IsWorktreeDirty(repoDir) {
+		t.Fatal("expected committed git repo to be clean")
+	}
+
+	// 3. Update with zero LockedAt and empty Status preserves/defaults fields
+	wt := t.TempDir()
+	h, err := Acquire(wt, LockInfo{JobID: "j-edge", PID: os.Getpid()}, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	h.info.Status = ""
+	if err := h.Update(LockInfo{JobID: "j-edge-updated", LockedAt: time.Time{}, Status: ""}); err != nil {
+		t.Fatalf("Update failed: %v", err)
+	}
+	if h.Info().Status != "RUNNING" || h.Info().LockedAt.IsZero() {
+		t.Fatalf("expected Update to default Status=RUNNING and preserve LockedAt, got %+v", h.Info())
+	}
+	// Double release is a no-op
+	if err := h.Release(); err != nil {
+		t.Fatalf("first Release failed: %v", err)
+	}
+	if err := h.Release(); err != nil {
+		t.Fatalf("second Release failed: %v", err)
+	}
 }
