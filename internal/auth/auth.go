@@ -18,9 +18,15 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/procutil"
+)
+
+var (
+	tokenRefreshMu sync.Mutex
+	configFileMu   sync.Mutex
 )
 
 // ClientID is the public OAuth client id.
@@ -520,6 +526,19 @@ func BearerWithClient(ctx context.Context, client *http.Client, home string, get
 	if accessUsable(cfg) {
 		return strings.TrimSpace(cfg.AccessToken), nil
 	}
+
+	tokenRefreshMu.Lock()
+	defer tokenRefreshMu.Unlock()
+
+	// Re-load and re-check after acquiring lock in case another goroutine already refreshed the token
+	cfg, err = load(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if accessUsable(cfg) {
+		return strings.TrimSpace(cfg.AccessToken), nil
+	}
+
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
@@ -772,7 +791,11 @@ func save(path string, cfg Config) error {
 	if strings.HasPrefix(filepath.ToSlash(path), "/dev/null/") || filepath.ToSlash(path) == "/dev/null" {
 		return errors.New("invalid config path")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	configFileMu.Lock()
+	defer configFileMu.Unlock()
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	existing := map[string]any{}
@@ -795,5 +818,35 @@ func save(path string, cfg Config) error {
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o600)
+
+	tmpFile, err := os.CreateTemp(dir, ".agent.json.tmp.*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	if err := tmpFile.Chmod(0o600); err != nil && runtime.GOOS != "windows" {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		if runtime.GOOS == "windows" {
+			_ = os.Remove(path)
+			if err2 := os.Rename(tmpPath, path); err2 == nil {
+				return nil
+			}
+		}
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }

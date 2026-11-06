@@ -10,7 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -640,4 +643,127 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+func TestBearerWithClient_ConcurrentRefreshSingleFlightAndAtomicSave(t *testing.T) {
+	var refreshCalls atomic.Int32
+	var usedRefreshMu sync.Mutex
+	usedRefreshTokens := make(map[string]bool)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hydra/oauth2/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if r.Form.Get("grant_type") != "refresh_token" {
+			http.Error(w, "expected refresh_token grant", http.StatusBadRequest)
+			return
+		}
+		rt := r.Form.Get("refresh_token")
+		usedRefreshMu.Lock()
+		alreadyUsed := usedRefreshTokens[rt]
+		usedRefreshTokens[rt] = true
+		usedRefreshMu.Unlock()
+		if alreadyUsed {
+			// Simulate Ory Hydra one-time refresh token rotation rejection on concurrent reuse
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_grant"})
+			return
+		}
+		callNum := refreshCalls.Add(1)
+		time.Sleep(15 * time.Millisecond)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "concurrent-access-tok-1",
+			"refresh_token": "rotated-refresh-tok-1",
+			"token_type":    "Bearer",
+			"expires_in":    1800,
+			"call_num":      callNum,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.json")
+	// Write initial config with an expired access token and a custom field that save() must preserve
+	initialJSON := `{"api_base_url":"` + srv.URL + `/iazio-harness-api","access_token":"expired-tok","refresh_token":"initial-rt-0","expiry":"2020-01-01T00:00:00Z","custom_field":"preserved-val"}`
+	if err := os.WriteFile(cfgPath, []byte(initialJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	getenv := func(k string) string {
+		if k == "IAZIO_AGENT_CONFIG" {
+			return cfgPath
+		}
+		return ""
+	}
+
+	const callers = 20
+	var wg sync.WaitGroup
+	errCh := make(chan error, callers*2)
+	startBarrier := make(chan struct{})
+
+	for i := 0; i < callers; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-startBarrier
+			tok, err := BearerWithClient(t.Context(), srv.Client(), dir, getenv)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if tok != "concurrent-access-tok-1" {
+				errCh <- errors.New("unexpected access token: " + tok)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			<-startBarrier
+			st, err := ReadStatus(cfgPath)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if !st.HasRefreshToken {
+				errCh <- errors.New("expected HasRefreshToken=true during concurrent read")
+			}
+		}()
+	}
+
+	close(startBarrier)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("concurrent refresh/read error: %v", err)
+	}
+
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 refresh_token HTTP call across %d concurrent callers, got %d", callers, got)
+	}
+
+	// Verify custom_field was preserved and no .agent.json.tmp.* files remain
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read final agent.json: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("unmarshal final agent.json: %v", err)
+	}
+	if parsed["custom_field"] != "preserved-val" {
+		t.Fatalf("expected custom_field preserved-val, got %v", parsed["custom_field"])
+	}
+	if parsed["refresh_token"] != "rotated-refresh-tok-1" {
+		t.Fatalf("expected rotated-refresh-tok-1, got %v", parsed["refresh_token"])
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".agent.json.tmp.") {
+			t.Fatalf("leftover temp file in config dir: %s", entry.Name())
+		}
+	}
 }

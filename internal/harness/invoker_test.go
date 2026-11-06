@@ -497,3 +497,55 @@ func TestCLIInvoker_StreamingStoryAllocationCallback(t *testing.T) {
 		t.Fatalf("expected allocated story STORY-STREAM-123, got %q", allocated)
 	}
 }
+
+func TestStoryTrackingWriter_SplitChunksAndValidation(t *testing.T) {
+	var allocated []string
+	w := &storyTrackingWriter{
+		onStoryAllocated: func(sid string) {
+			allocated = append(allocated, sid)
+		},
+	}
+
+	// 1. Split mid-token across two Write calls: must NOT fire with truncated "STORY-GOV-5"
+	_, _ = w.Write([]byte("some preamble\nALLOCATED_STORY_ID: STORY-GOV-5"))
+	if len(allocated) != 0 {
+		t.Fatalf("expected 0 callbacks before newline arrives, got %v", allocated)
+	}
+	_, _ = w.Write([]byte("200\n"))
+	if len(allocated) != 1 || allocated[0] != "STORY-GOV-5200" {
+		t.Fatalf("expected [STORY-GOV-5200] after newline chunk, got %v", allocated)
+	}
+
+	// 2. Split mid-prefix across Write calls + quotes
+	_, _ = w.Write([]byte("Bound dynamically allo"))
+	_, _ = w.Write([]byte("cated story ID: \"STORY-IAZIO-0188\" (active)\n"))
+	if len(allocated) != 2 || allocated[1] != "STORY-IAZIO-0188" {
+		t.Fatalf("expected second callback STORY-IAZIO-0188, got %v", allocated)
+	}
+
+	// 3. Invalid or placeholder Story IDs must be rejected
+	_, _ = w.Write([]byte("ALLOCATED_STORY_ID: pending-allocation\n"))
+	_, _ = w.Write([]byte("ALLOCATED_STORY_ID: pending_harness_creation\n"))
+	_, _ = w.Write([]byte("ALLOCATED_STORY_ID: }\n"))
+	_, _ = w.Write([]byte("STORY_ID: STORY-INCOMPLETE-\n"))
+	_, _ = w.Write([]byte("STORY_ID: NOTASTORY-123\n"))
+	if len(allocated) != 2 {
+		t.Fatalf("expected invalid/placeholder IDs to be ignored, got %v", allocated)
+	}
+
+	// 4. Duplicate line with same Story ID is deduplicated
+	_, _ = w.Write([]byte("STORY_ID: STORY-IAZIO-0188\n"))
+	if len(allocated) != 2 {
+		t.Fatalf("expected duplicate STORY-IAZIO-0188 to be deduplicated, got %v", allocated)
+	}
+
+	// 5. Trailing line without newline is processed on Flush()
+	_, _ = w.Write([]byte("Bound active story ID: STORY-VIGO-0245"))
+	if len(allocated) != 2 {
+		t.Fatalf("expected no callback before Flush() on unterminated line, got %v", allocated)
+	}
+	w.Flush()
+	if len(allocated) != 3 || allocated[2] != "STORY-VIGO-0245" {
+		t.Fatalf("expected Flush() to emit STORY-VIGO-0245, got %v", allocated)
+	}
+}

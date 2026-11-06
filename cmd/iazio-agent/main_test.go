@@ -3712,3 +3712,784 @@ EOF
 		t.Fatalf("expected fallback to remove completed .session_story_id")
 	}
 }
+
+func TestCheckRepoLockBusy_CrossPlatformProcessLiveness(t *testing.T) {
+	wt := t.TempDir()
+	handle, err := repolock.Acquire(wt, repolock.LockInfo{
+		JobID:      "job-holder-1",
+		PID:        1111,
+		HarnessPID: 2222,
+	}, func(int) bool { return true })
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	defer handle.Release()
+
+	// 1. Different job ID with alive HarnessPID (checked via injected cross-platform isAlive / watchdog.IsProcessAlive) -> busy=true
+	info, pid, busy := checkRepoLockBusy(wt, "job-incoming-2", func(p int) bool { return p == 2222 })
+	if !busy || pid != 2222 || info.JobID != "job-holder-1" {
+		t.Fatalf("expected busy=true with pid=2222 and holder job-holder-1, got busy=%v pid=%d job=%q", busy, pid, info.JobID)
+	}
+
+	// 2. Same job ID -> busy=false (re-entrant / self-resume allowed)
+	if _, _, busySame := checkRepoLockBusy(wt, "job-holder-1", func(int) bool { return true }); busySame {
+		t.Fatal("expected busy=false when incoming job matches holder job ID")
+	}
+
+	// 3. Dead PID -> busy=false
+	if _, _, busyDead := checkRepoLockBusy(wt, "job-incoming-2", func(int) bool { return false }); busyDead {
+		t.Fatal("expected busy=false when lock holder PID is dead")
+	}
+
+	// 4. Default nil isAlive uses watchdog.IsProcessAlive with current live PID
+	_ = handle.Update(repolock.LockInfo{
+		JobID: "job-holder-live-self",
+		PID:   os.Getpid(),
+	})
+	if _, livePID, busySelf := checkRepoLockBusy(wt, "job-other", nil); !busySelf || livePID != os.Getpid() {
+		t.Fatalf("expected busy=true with current process PID %d via default watchdog.IsProcessAlive, got busy=%v pid=%d", os.Getpid(), busySelf, livePID)
+	}
+}
+
+func TestAreAllReposCleanAndHarnessIdle_DualPollerHostGateAndDispatcher(t *testing.T) {
+	ctx := context.Background()
+	var stdout bytes.Buffer
+	idleSup := supervisor.New(time.Now)
+
+	// 1. Active execution lease in HostExecutionAndUpdateGate must defer idle update even when sup is idle
+	hostGate := supervisor.NewHostExecutionAndUpdateGate()
+	relLease, err := hostGate.AcquireExecutionLease(ctx, "disp-job-1", "/work/meta-repo")
+	if err != nil {
+		t.Fatalf("AcquireExecutionLease failed: %v", err)
+	}
+	if areAllReposCleanAndHarnessIdle(ctx, controlplane.Client{}, idleSup, "host-1", "", false, &stdout, hostGate) {
+		t.Fatal("expected false when hostGate has an active execution lease")
+	}
+	if !strings.Contains(stdout.String(), "host execution gate") {
+		t.Fatalf("expected host execution gate deferral log, got %q", stdout.String())
+	}
+	relLease()
+
+	// 2. After releasing hostGate lease, must return true
+	stdout.Reset()
+	if !areAllReposCleanAndHarnessIdle(ctx, controlplane.Client{}, idleSup, "host-1", "", false, &stdout, hostGate) {
+		t.Fatal("expected true after hostGate execution lease is released")
+	}
+
+	// 3. Active job reported via client.ActiveJobs (which aggregates disp.ActiveJobs and inFlightPrepJobs) must defer idle update
+	clientWithActiveDispJob := controlplane.Client{
+		ActiveJobs: func() []controlplane.ActiveJob {
+			return []controlplane.ActiveJob{{JobID: "disp-job-2", WorktreePath: "/work/meta-repo", PID: os.Getpid()}}
+		},
+	}
+	stdout.Reset()
+	if areAllReposCleanAndHarnessIdle(ctx, clientWithActiveDispJob, idleSup, "host-1", "", false, &stdout, hostGate) {
+		t.Fatal("expected false when client.ActiveJobs reports an active dispatcher job")
+	}
+	if !strings.Contains(stdout.String(), "active controlplane or dispatcher jobs") {
+		t.Fatalf("expected active controlplane or dispatcher jobs deferral log, got %q", stdout.String())
+	}
+
+	// 4. force=true bypasses remote host repo checks when idle
+	if !areAllReposCleanAndHarnessIdle(ctx, controlplane.Client{}, idleSup, "host-1", "http://127.0.0.1:1", true, &stdout, hostGate) {
+		t.Fatal("expected force=true to return true when no harness or gate is active")
+	}
+
+	// 5. Remote host repo state checks (queue paused, lock busy, runningJobID, dirty worktree)
+	cleanRepoDir := t.TempDir()
+	_ = exec.Command("git", "init", cleanRepoDir).Run()
+	dirtyRepoDir := t.TempDir()
+	_ = exec.Command("git", "init", dirtyRepoDir).Run()
+	_ = os.WriteFile(filepath.Join(dirtyRepoDir, "dirty.go"), []byte("package p\n"), 0o644)
+
+	var currentRepos []controlplane.RepoSummary
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		repos := currentRepos
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(controlplane.HostDetail{
+			Repos: repos,
+		})
+	}))
+	defer srv.Close()
+
+	cpClient := controlplane.Client{BaseURL: srv.URL}
+
+	// 5a. Queue PAUSED
+	mu.Lock()
+	currentRepos = []controlplane.RepoSummary{{WorktreePath: cleanRepoDir, Queue: "PAUSED", Lock: "IDLE"}}
+	mu.Unlock()
+	stdout.Reset()
+	if areAllReposCleanAndHarnessIdle(ctx, cpClient, idleSup, "host-1", srv.URL, false, &stdout) {
+		t.Fatal("expected false when repo queue is PAUSED")
+	}
+
+	// 5b. Lock RUNNING
+	mu.Lock()
+	currentRepos = []controlplane.RepoSummary{{WorktreePath: cleanRepoDir, Queue: "OPEN", Lock: "RUNNING"}}
+	mu.Unlock()
+	stdout.Reset()
+	if areAllReposCleanAndHarnessIdle(ctx, cpClient, idleSup, "host-1", srv.URL, false, &stdout) {
+		t.Fatal("expected false when repo lock is RUNNING")
+	}
+
+	// 5c. RunningJobID present
+	mu.Lock()
+	currentRepos = []controlplane.RepoSummary{{WorktreePath: cleanRepoDir, Queue: "OPEN", Lock: "IDLE", RunningJobID: "job-99"}}
+	mu.Unlock()
+	stdout.Reset()
+	if areAllReposCleanAndHarnessIdle(ctx, cpClient, idleSup, "host-1", srv.URL, false, &stdout) {
+		t.Fatal("expected false when RunningJobID is non-empty")
+	}
+
+	// 5d. Dirty worktree
+	mu.Lock()
+	currentRepos = []controlplane.RepoSummary{{Path: dirtyRepoDir, Queue: "OPEN", Lock: "IDLE"}}
+	mu.Unlock()
+	stdout.Reset()
+	if areAllReposCleanAndHarnessIdle(ctx, cpClient, idleSup, "host-1", srv.URL, false, &stdout) {
+		t.Fatal("expected false when worktree is dirty")
+	}
+
+	// 5e. Clean worktree + nonexistent path skipped
+	mu.Lock()
+	currentRepos = []controlplane.RepoSummary{
+		{WorktreePath: ""},
+		{WorktreePath: filepath.Join(cleanRepoDir, "nonexistent")},
+		{WorktreePath: cleanRepoDir, Queue: "OPEN", Lock: "IDLE"},
+	}
+	mu.Unlock()
+	stdout.Reset()
+	if !areAllReposCleanAndHarnessIdle(ctx, cpClient, idleSup, "host-1", srv.URL, false, &stdout) {
+		t.Fatalf("expected true when all existing repos are clean and idle, got log: %s", stdout.String())
+	}
+}
+
+type stubDriftFetcher struct {
+	manifest *supervisor.FleetManifest
+	err      error
+}
+
+func (s *stubDriftFetcher) FetchManifest(context.Context) (*supervisor.FleetManifest, error) {
+	return s.manifest, s.err
+}
+
+func TestVersionEvaluationAndInstallDirHelpers(t *testing.T) {
+	if !isInstalledVersionNewerOrEqual("v1.2.3", "v1.2.3") {
+		t.Fatal("expected 1.2.3 >= 1.2.3")
+	}
+	if !isInstalledVersionNewerOrEqual("v1.3.0", "v1.2.9") {
+		t.Fatal("expected 1.3.0 >= 1.2.9")
+	}
+	if !isInstalledVersionNewerOrEqual("v2.0.0", "v1.9.9") {
+		t.Fatal("expected 2.0.0 >= 1.9.9")
+	}
+	if isInstalledVersionNewerOrEqual("v1.2.2", "v1.2.3") {
+		t.Fatal("expected 1.2.2 < 1.2.3")
+	}
+	if isInstalledVersionNewerOrEqual("", "v1.0.0") {
+		t.Fatal("expected empty curVer to not be up to date")
+	}
+	// Source build (+sha) on older or equal base is overridden by release; on newer base is kept
+	if up, over := evaluateReleaseAgainstInstalled("0.0.571+abc1234", "0.0.571"); up || !over {
+		t.Fatalf("expected source build on equal base to be overridden, got up=%v over=%v", up, over)
+	}
+	if up, over := evaluateReleaseAgainstInstalled("0.0.572+abc1234", "0.0.571"); !up || over {
+		t.Fatalf("expected source build on newer base to be retained, got up=%v over=%v", up, over)
+	}
+	if up, over := evaluateReleaseAgainstInstalled("abcdef1", "0.0.571"); up || !over {
+		t.Fatalf("expected raw sha source build to be overridden, got up=%v over=%v", up, over)
+	}
+	if up, over := evaluateReleaseAgainstInstalled("custom-v1", "custom-v1"); !up || over {
+		t.Fatalf("expected matching non-semver non-source to be up-to-date, got up=%v over=%v", up, over)
+	}
+
+	// resolveInstallDir
+	roots := ManifestInstallRoots{
+		Unix:    ManifestInstallRootPaths{Primary: "~/.local/bin"},
+		Windows: ManifestInstallRootPaths{Primary: "%USERPROFILE%/bin"},
+	}
+	gotDir := resolveInstallDir(roots, func(k string) string {
+		if k == "HOME" || k == "USERPROFILE" {
+			return "/tmp/fakehome"
+		}
+		return ""
+	})
+	if gotDir == "" {
+		t.Fatal("expected non-empty install dir")
+	}
+	gotExplicit := resolveInstallDir(ManifestInstallRoots{
+		Unix: ManifestInstallRootPaths{Primary: "/opt/iazio/bin"},
+	}, func(string) string { return "/tmp/fakehome" })
+	if runtime.GOOS != "windows" && gotExplicit != "/opt/iazio/bin" {
+		t.Fatalf("expected /opt/iazio/bin, got %q", gotExplicit)
+	}
+	gotFallback := resolveInstallDir(ManifestInstallRoots{}, func(string) string { return "/tmp/fakehome" })
+	if gotFallback == "" {
+		t.Fatal("expected fallback install dir")
+	}
+
+	// buildInspectOutdatedHook
+	nilHook := buildInspectOutdatedHook(true, nil, nil, runtime.GOOS)
+	if list, err := nilHook(context.Background()); err != nil || list != nil {
+		t.Fatalf("expected nil, nil for nil driftFetcher, got %v, %v", list, err)
+	}
+	errHook := buildInspectOutdatedHook(true, &stubDriftFetcher{err: errors.New("boom")}, nil, runtime.GOOS)
+	if _, err := errHook(context.Background()); err == nil {
+		t.Fatal("expected error from errHook")
+	}
+	tmpBin := t.TempDir()
+	okHook := buildInspectOutdatedHook(false, &stubDriftFetcher{
+		manifest: &supervisor.FleetManifest{
+			Tools: []supervisor.ManifestTool{
+				{Name: "iazio-agent", BinaryName: "iazio-agent", TargetVersion: "9.9.9"},
+			},
+		},
+	}, func(*supervisor.FleetManifest) string { return tmpBin }, runtime.GOOS)
+	outdated, err := okHook(context.Background())
+	if err != nil || len(outdated) != 1 {
+		t.Fatalf("expected 1 outdated tool, got %v, err=%v", outdated, err)
+	}
+}
+
+func TestRunCleanupBinariesAndHarvestFlush(t *testing.T) {
+	ctx := context.Background()
+	tmpHome := t.TempDir()
+	canonDir := filepath.Join(tmpHome, ".local", "bin")
+	shadowDir := filepath.Join(tmpHome, ".iazio", "bin")
+	_ = os.MkdirAll(canonDir, 0o755)
+	_ = os.MkdirAll(shadowDir, 0o755)
+	_ = os.WriteFile(filepath.Join(canonDir, "iazio-agent"), []byte("canon"), 0o755)
+	_ = os.WriteFile(filepath.Join(shadowDir, "iazio-agent.old"), []byte("stale"), 0o755)
+
+	getenv := func(k string) string {
+		switch k {
+		case "HOME":
+			return tmpHome
+		case "CANONICAL_BIN_DIR":
+			return canonDir
+		case "PATH":
+			return canonDir + string(os.PathListSeparator) + shadowDir
+		default:
+			return ""
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := runCleanupBinaries(ctx, []string{"--dry-run"}, &stdout, &stderr, getenv); err != nil {
+		t.Fatalf("runCleanupBinaries --dry-run failed: %v", err)
+	}
+	stdout.Reset()
+	if err := runCleanupBinaries(ctx, []string{"--dry-run", "--json"}, &stdout, &stderr, getenv); err != nil {
+		t.Fatalf("runCleanupBinaries --dry-run --json failed: %v", err)
+	}
+	stdout.Reset()
+	if err := runCleanupBinaries(ctx, []string{"--json"}, &stdout, &stderr, getenv); err != nil {
+		t.Fatalf("runCleanupBinaries --json failed: %v", err)
+	}
+	stdout.Reset()
+	if err := runCleanupBinaries(ctx, nil, &stdout, &stderr, getenv); err != nil {
+		t.Fatalf("runCleanupBinaries live failed: %v", err)
+	}
+
+	// flushHarvestConversationDetailed: empty conversation ID
+	if turns, sha, err := flushHarvestConversationDetailed(ctx, "   "); err != nil || turns != 0 || sha != "" {
+		t.Fatalf("expected 0, empty, nil for blank conversationID, got %d, %q, %v", turns, sha, err)
+	}
+	if runtime.GOOS != "windows" {
+		t.Setenv("HOME", tmpHome)
+		t.Setenv("PATH", canonDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		mockHarvester := filepath.Join(canonDir, "iazio-harvester")
+		_ = os.WriteFile(mockHarvester, []byte("#!/bin/sh\necho '{\"turn_count\":7,\"transcript_sha256\":\"sha-abc\"}'\n"), 0o755)
+		turns, sha, err := flushHarvestConversationDetailed(ctx, "conv-test-1")
+		if err != nil || turns != 7 || sha != "sha-abc" {
+			t.Fatalf("unexpected harvest flush result: turns=%d sha=%q err=%v", turns, sha, err)
+		}
+		_ = os.WriteFile(mockHarvester, []byte("#!/bin/sh\necho 'fail' >&2\nexit 1\n"), 0o755)
+		if err := flushHarvestConversation(ctx, "conv-test-fail"); err == nil {
+			t.Fatal("expected error when mock harvester exits non-zero")
+		}
+	}
+}
+
+func TestScanRepoFleetStatusAndShouldBuildFromSource(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell mock script test runs on unix")
+	}
+	ctx := context.Background()
+	repoDir := t.TempDir()
+	_ = exec.Command("git", "init", "-b", "main", repoDir).Run()
+	_ = os.WriteFile(filepath.Join(repoDir, "main.go"), []byte("package main\n"), 0o644)
+	_ = exec.Command("git", "-C", repoDir, "add", "main.go").Run()
+	_ = exec.Command("git", "-C", repoDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "init").Run()
+
+	fakeHome := t.TempDir()
+	fakeBin := filepath.Join(fakeHome, ".local", "bin")
+	_ = os.MkdirAll(fakeBin, 0o755)
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	harnessScript := filepath.Join(fakeBin, "iazio-harness")
+
+	writeHarnessJSON := func(payload string) {
+		script := "#!/bin/sh\ncat << 'EOF'\n" + payload + "\nEOF\n"
+		_ = os.WriteFile(harnessScript, []byte(script), 0o755)
+	}
+
+	writeHarnessJSON(`{"worktree_state":"CLEAN","is_clean":true,"submodules_clean":true}`)
+	if !scanRepoFleetStatus(ctx, repoDir) {
+		t.Fatal("expected CLEAN worktree_state to return true")
+	}
+
+	writeHarnessJSON(`{"worktree_state":"DIRTY_UNTRACKED_ONLY","submodules_clean":true,"untracked_files":["docs/readme.md"]}`)
+	if !scanRepoFleetStatus(ctx, repoDir) {
+		t.Fatal("expected DIRTY_UNTRACKED_ONLY with docs only to return true")
+	}
+
+	writeHarnessJSON(`{"worktree_state":"DIRTY_UNTRACKED_ONLY","submodules_clean":true,"untracked_files":["cmd/app.go"]}`)
+	if scanRepoFleetStatus(ctx, repoDir) {
+		t.Fatal("expected DIRTY_UNTRACKED_ONLY with code file to return false")
+	}
+
+	writeHarnessJSON(`{"worktree_state":"DIRTY_MODIFIED","is_clean":false}`)
+	if scanRepoFleetStatus(ctx, repoDir) {
+		t.Fatal("expected DIRTY_MODIFIED to return false")
+	}
+
+	writeHarnessJSON(`{"is_clean":true,"submodules_clean":true,"untracked_files":["docs/story.md"]}`)
+	if !scanRepoFleetStatus(ctx, repoDir) {
+		t.Fatal("expected legacy IsClean with docs to return true")
+	}
+
+	writeHarnessJSON(`{"is_clean":false,"modified_files":["main.go"]}`)
+	if scanRepoFleetStatus(ctx, repoDir) {
+		t.Fatal("expected legacy modified_files to return false")
+	}
+
+	// shouldBuildFromSourceDuringStory branches
+	if ok, _ := shouldBuildFromSourceDuringStory(ctx, repoDir, func(k string) string {
+		if k == "IAZIO_FORCE_SOURCE_BUILD" {
+			return "1"
+		}
+		return ""
+	}); !ok {
+		t.Fatal("expected forced source build to return true")
+	}
+	if ok, _ := shouldBuildFromSourceDuringStory(ctx, repoDir, func(k string) string {
+		if k == "IAZIO_PREFER_RELEASE_DOWNLOAD" {
+			return "1"
+		}
+		return ""
+	}); ok {
+		t.Fatal("expected prefer release download to return false")
+	}
+	if ok, _ := shouldBuildFromSourceDuringStory(ctx, repoDir, func(k string) string {
+		if k == "IAZIO_AGENT_NONINTERACTIVE" {
+			return "1"
+		}
+		return ""
+	}); ok {
+		t.Fatal("expected noninteractive to return false")
+	}
+	if ok, _ := shouldBuildFromSourceDuringStory(ctx, "", func(string) string { return "" }); ok {
+		t.Fatal("expected empty sourceRepo to return false")
+	}
+	if ok, _ := shouldBuildFromSourceDuringStory(ctx, repoDir, func(string) string { return "" }); ok {
+		t.Fatal("expected clean main repo to return false")
+	}
+	// Feature branch triggers source build
+	_ = exec.Command("git", "-C", repoDir, "checkout", "-b", "feat/story-1").Run()
+	if ok, _ := shouldBuildFromSourceDuringStory(ctx, repoDir, func(string) string { return "" }); !ok {
+		t.Fatal("expected feature branch to return true")
+	}
+	// Tracked modification triggers source build
+	_ = os.WriteFile(filepath.Join(repoDir, "main.go"), []byte("package main\n// modified\n"), 0o644)
+	if ok, _ := shouldBuildFromSourceDuringStory(ctx, repoDir, func(string) string { return "" }); !ok {
+		t.Fatal("expected uncommitted tracked modification to return true")
+	}
+}
+
+func TestExecuteRun_PendingCommandsAndToolUpdateAndHelpers(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("USERPROFILE", fakeHome)
+
+	// 1. healHarvesterServiceIfNeeded
+	origInspectSvc := inspectToolServiceFn
+	origReconcileSvc := reconcileHarvesterServiceFn
+	origRestartSvc := restartToolServiceFn
+	t.Cleanup(func() {
+		inspectToolServiceFn = origInspectSvc
+		reconcileHarvesterServiceFn = origReconcileSvc
+		restartToolServiceFn = origRestartSvc
+	})
+
+	harvesterBin := filepath.Join(fakeHome, ".local", "bin", "iazio-harvester")
+	if runtime.GOOS == "windows" {
+		harvesterBin = filepath.Join(fakeHome, "bin", "iazio-harvester.exe")
+	}
+	_ = os.MkdirAll(filepath.Dir(harvesterBin), 0o755)
+	_ = os.WriteFile(harvesterBin, []byte("#!/bin/sh\n"), 0o755)
+
+	var reconciled, restarted bool
+	inspectToolServiceFn = func(toolName, goos string) (bool, string) {
+		return true, "failed"
+	}
+	reconcileHarvesterServiceFn = func(ctx context.Context, bin string) error {
+		reconciled = true
+		return nil
+	}
+	restartToolServiceFn = func(toolName string, _ ...func(string, ...string) error) error {
+		restarted = true
+		return nil
+	}
+	healHarvesterServiceIfNeeded(context.Background(), fakeHome, runtime.GOOS)
+	if !reconciled || !restarted {
+		t.Fatalf("expected harvester service to be reconciled and restarted, got reconciled=%v restarted=%v", reconciled, restarted)
+	}
+	healHarvesterServiceIfNeeded(context.Background(), fakeHome, "plan9")
+
+	// 2. ensureCanonicalSingleHomeAt
+	legacyDir := filepath.Join(fakeHome, ".iazio", "bin")
+	_ = os.MkdirAll(legacyDir, 0o755)
+	_ = os.WriteFile(filepath.Join(legacyDir, "iazio-agent.old"), []byte("old"), 0o755)
+	_ = os.WriteFile(filepath.Join(legacyDir, "iazio-agent.next"), []byte("next"), 0o755)
+	_ = os.WriteFile(filepath.Join(legacyDir, "foo.tmp"), []byte("tmp"), 0o755)
+	_ = os.WriteFile(filepath.Join(legacyDir, "bar.bak"), []byte("bak"), 0o755)
+	ensureCanonicalSingleHomeAt(fakeHome, func(string, string, func(string, ...string) error) error { return nil })
+	if _, err := os.Stat(filepath.Join(legacyDir, "foo.tmp")); !os.IsNotExist(err) {
+		t.Fatal("expected foo.tmp to be removed by ensureCanonicalSingleHomeAt")
+	}
+	// Replace copied test binary with lightweight version stub so inventory scan does not re-run test binary
+	_ = os.WriteFile(filepath.Join(fakeHome, ".local", "bin", "iazio-agent"), []byte("#!/bin/sh\necho 'iazio-agent 1.0.0'\n"), 0o755)
+
+	// 3. applyLinux with systemd enabled and disabled
+	origSystemd := isSystemdAvailable
+	origExec := execCommand
+	origExecOut := execCommandOutput
+	t.Cleanup(func() {
+		isSystemdAvailable = origSystemd
+		execCommand = origExec
+		execCommandOutput = origExecOut
+	})
+	execCommand = func(string, ...string) error { return nil }
+	execCommandOutput = func(string, ...string) ([]byte, error) { return []byte("active (running)\n"), nil }
+
+	isSystemdAvailable = func() bool { return true }
+	t.Setenv("IAZIO_DISABLE_SYSTEMD", "0")
+	var linuxOut bytes.Buffer
+	_ = applyLinux("status", "iazio-agent", &linuxOut, false)
+	_ = applyLinux("start", "iazio-agent", &linuxOut, false)
+	_ = applyLinux("restart", "iazio-agent", &linuxOut, false)
+
+	// 4. resolveTelemetryDestination from ~/.iazio/agent.json
+	iazioCfgDir := filepath.Join(fakeHome, ".iazio")
+	_ = os.MkdirAll(iazioCfgDir, 0o755)
+	_ = os.WriteFile(filepath.Join(iazioCfgDir, "agent.json"), []byte(`{"central_telemetry_gateway_url":"https://cfg-gw.local"}`), 0o600)
+	if u, gw := resolveTelemetryDestination("", func(string) string { return "" }); u != "https://cfg-gw.local" || !gw {
+		t.Fatalf("expected cfg-gw.local from agent.json, got %q gw=%v", u, gw)
+	}
+	_ = os.WriteFile(filepath.Join(iazioCfgDir, "agent.json"), []byte(`{"elasticsearch_url":"http://cfg-es.local:9200"}`), 0o600)
+	if u, gw := resolveTelemetryDestination("", func(string) string { return "" }); u != "http://cfg-es.local:9200" || gw {
+		t.Fatalf("expected cfg-es.local from agent.json, got %q gw=%v", u, gw)
+	}
+
+	// 5. isRepoSummaryIdle branches
+	if isRepoSummaryIdle(controlplane.RepoSummary{Queue: "PAUSED"}) {
+		t.Fatal("expected PAUSED queue to not be idle")
+	}
+	if isRepoSummaryIdle(controlplane.RepoSummary{RunningJobID: "job-1"}) {
+		t.Fatal("expected RunningJobID to not be idle")
+	}
+	if !isRepoSummaryIdle(controlplane.RepoSummary{Queue: "OPEN", Lock: "IDLE"}) {
+		t.Fatal("expected OPEN/IDLE to be idle")
+	}
+
+	// 6. Execute run with PendingCommands, PendingToolUpdate, Dispatcher claim (2s), and RepoMonitor initial check (3s)
+	repoDir := t.TempDir()
+	_ = exec.Command("git", "init", "-b", "main", repoDir).Run()
+	_ = os.WriteFile(filepath.Join(repoDir, "dirty.txt"), []byte("dirty\n"), 0o644)
+	var hbCount atomic.Int32
+	var claimCount atomic.Int32
+	var completeSeen atomic.Bool
+	var repoStatusCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/register"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/ping-ack"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/api/v1/agent/jobs/claim"):
+			c := claimCount.Add(1)
+			if c == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(worker.Job{
+					ID:      "job-disp-tools-1",
+					Type:    worker.JobTypeToolsUpdate,
+					Repo:    "test-repo",
+					Payload: json.RawMessage(`{"tools":["iazio-mcp"],"force":false,"target_version":"1.0.0"}`),
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case strings.Contains(r.URL.Path, "/api/v1/agent/jobs/") && strings.HasSuffix(r.URL.Path, "/complete"):
+			completeSeen.Store(true)
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/repos/status"):
+			repoStatusCount.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			w.Header().Set("Content-Type", "application/json")
+			if hbCount.Add(1) <= 2 {
+				_ = json.NewEncoder(w).Encode(controlplane.HeartbeatResponse{
+					Status: "OK",
+					PendingToolUpdate: &controlplane.PendingToolUpdate{
+						Tools:         []string{"iazio-mcp"},
+						Force:         false,
+						TargetVersion: "1.0.0",
+					},
+					PendingCommands: []controlplane.CommandEnvelope{
+						{Type: "PING", ID: "cmd-ping"},
+						{Type: "TRIGGER_IDLE_UPDATE", ID: "cmd-idle"},
+						{Type: "FORCE_TOOL_UPDATE", ID: "cmd-force", Payload: json.RawMessage(`{"tools":["iazio-mcp"],"force":false}`)},
+						{Type: "CLEANUP_BINARIES", ID: "cmd-clean"},
+						{Type: "CHECK_FLEET_GIT_STATUS", ID: "cmd-git-1", Payload: json.RawMessage(`"` + filepath.ToSlash(repoDir) + `"`)},
+						{Type: "CHECK_FLEET_GIT_STATUS", ID: "cmd-git-all"},
+						{Type: "FETCH_METADATA_YML", ID: "cmd-meta", Payload: json.RawMessage(`"` + filepath.ToSlash(repoDir) + `"`)},
+						{Type: "FORCE_CLEAN_GIT", ID: "cmd-heal", Payload: json.RawMessage(`"` + filepath.ToSlash(repoDir) + `"`)},
+						{Type: "KILL_BACKGROUND_TASKS", ID: "cmd-kill", Payload: json.RawMessage(`"` + filepath.ToSlash(repoDir) + `"`)},
+					},
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(controlplane.HeartbeatResponse{Status: "OK"})
+		case strings.Contains(r.URL.Path, "/hosts/"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(controlplane.HostDetail{
+				Repos: []controlplane.RepoSummary{{Path: repoDir, Alias: "test-repo", Queue: "OPEN", Lock: "IDLE"}},
+			})
+		case strings.Contains(r.URL.Path, "/manifest"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(ManifestResponse{Tools: []ManifestToolItem{}})
+		case strings.HasSuffix(r.URL.Path, "/poll"):
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	go func() {
+		// Wait 3.15s so both the 2s Dispatcher poll and the 3s RepoStateMonitor initial inspection fire
+		time.Sleep(3150 * time.Millisecond)
+		cancel()
+	}()
+	var stdout, stderr bytes.Buffer
+	_ = execute(runCtx, []string{"run"}, &stdout, &stderr, func(k string) string {
+		switch k {
+		case "HOME":
+			return fakeHome
+		case "IAZIO_HARNESS_API_URL":
+			return srv.URL
+		case "IAZIO_AGENT_HOST_ID":
+			return "test-host-cmds"
+		case "IAZIO_AGENT_UPDATE_INTERVAL":
+			return "0"
+		case "IAZIO_AGENT_REPO_POLL_INTERVAL":
+			return "10m"
+		case "IAZIO_AGENT_AUTH_STATUS_INTERVAL":
+			return "10s"
+		default:
+			return ""
+		}
+	})
+}
+
+func TestVersionMetadataAndInstallSafeHelpers(t *testing.T) {
+	origBuildSHA := buildCommitSHA
+	origCommit := commit
+	origBuildTime := buildTimeUTC
+	origBuildDirty := buildDirty
+	origBranch := branch
+	t.Cleanup(func() {
+		buildCommitSHA = origBuildSHA
+		commit = origCommit
+		buildTimeUTC = origBuildTime
+		buildDirty = origBuildDirty
+		branch = origBranch
+	})
+
+	buildCommitSHA = "abcdef1234567"
+	if got := resolveCommit(); got != "abcdef1" {
+		t.Fatalf("expected abcdef1, got %q", got)
+	}
+	buildCommitSHA = ""
+	commit = "1234567890abc"
+	if got := resolveCommit(); got != "1234567" {
+		t.Fatalf("expected 1234567, got %q", got)
+	}
+	buildTimeUTC = "2026-11-06T00:00:00Z"
+	if got := resolveBuildTime(); got != "2026-11-06T00:00:00Z" {
+		t.Fatalf("expected stamped buildTimeUTC, got %q", got)
+	}
+	buildTimeUTC = ""
+	_ = resolveBuildTime()
+
+	buildDirty = "true"
+	if !resolveDirty() {
+		t.Fatal("expected resolveDirty true when buildDirty='true'")
+	}
+	buildDirty = ""
+	_ = resolveDirty()
+
+	branch = ""
+	if got := branchName(); got != "unknown" {
+		t.Fatalf("expected unknown for empty branch, got %q", got)
+	}
+
+	// installExecutableSafe & cleanStaleBackups
+	tmpDir := t.TempDir()
+	destBin := filepath.Join(tmpDir, "bin", "test-tool")
+	if err := installExecutableSafe(destBin, []byte("#!/bin/sh\necho ok\n")); err != nil {
+		t.Fatalf("installExecutableSafe failed: %v", err)
+	}
+	// Overwrite existing binary
+	if err := installExecutableSafe(destBin, []byte("#!/bin/sh\necho ok2\n")); err != nil {
+		t.Fatalf("installExecutableSafe overwrite failed: %v", err)
+	}
+	oldBackup := filepath.Join(tmpDir, "bin", "test-tool.old.123")
+	_ = os.WriteFile(oldBackup, []byte("old"), 0o644)
+	past := time.Now().Add(-10 * time.Minute)
+	_ = os.Chtimes(oldBackup, past, past)
+	cleanStaleBackups(filepath.Join(tmpDir, "bin"))
+	if _, err := os.Stat(oldBackup); !os.IsNotExist(err) {
+		t.Fatal("expected stale .old. backup to be removed by cleanStaleBackups")
+	}
+
+	// copyBinary symlink destination handling
+	srcBin := filepath.Join(tmpDir, "src-bin")
+	_ = os.WriteFile(srcBin, []byte("binary-data"), 0o755)
+	symDest := filepath.Join(tmpDir, "sym-dest")
+	_ = os.Symlink(srcBin, symDest)
+	if err := copyBinary(srcBin, symDest); err != nil {
+		t.Fatalf("copyBinary over symlink failed: %v", err)
+	}
+
+	// runUpdate flag error & dry-run
+	var upOut, upErr bytes.Buffer
+	if err := runUpdate(context.Background(), []string{"--unknown-flag"}, &upOut, &upErr, nil); err == nil {
+		t.Fatal("expected error for unknown update flag")
+	}
+}
+
+func TestProbeFallbackAndResolveWorktreeAndTokenBranches(t *testing.T) {
+	// 1. resolveControlPlaneToken with IAZIO_AGENT_CONFIG containing a valid future JWT
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "agent.json")
+	// Build a minimal valid JWT with exp far in the future (year 2099: 4102444800)
+	hdr := "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9"
+	// {"sub":"agent-1","exp":4102444800} -> base64url: eyJzdWIiOiJhZ2VudC0xIiwiZXhwIjo0MTAyNDQ0ODAwfQ
+	validJWT := hdr + ".eyJzdWIiOiJhZ2VudC0xIiwiZXhwIjo0MTAyNDQ0ODAwfQ.sig"
+	_ = os.WriteFile(cfgPath, []byte(fmt.Sprintf(`{"access_token":%q,"expires_at":4102444800}`, validJWT)), 0o600)
+	gotTok := resolveControlPlaneToken(func(k string) string {
+		if k == "IAZIO_AGENT_CONFIG" {
+			return cfgPath
+		}
+		return ""
+	})
+	if gotTok != validJWT {
+		t.Fatalf("expected validJWT from IAZIO_AGENT_CONFIG via auth.Bearer, got %q", gotTok)
+	}
+
+	// 2. resolveWorktreeFromHostDetail fallback tiers for ".", "root", and slot family
+	dIdleNoGlobal := controlplane.HostDetail{
+		Repos: []controlplane.RepoSummary{
+			{Path: "/wt/umbrella-02", Lock: "IDLE", GlobalQueueAllocationEnabled: false},
+		},
+	}
+	if got := resolveWorktreeFromHostDetail(dIdleNoGlobal, "."); got != "/wt/umbrella-02" {
+		t.Fatalf("expected /wt/umbrella-02 for idle non-global root fallback, got %q", got)
+	}
+	if got := resolveWorktreeFromHostDetail(dIdleNoGlobal, "/foreign/umbrella-04"); got != "/wt/umbrella-02" {
+		t.Fatalf("expected /wt/umbrella-02 for idle non-global slot family fallback, got %q", got)
+	}
+
+	dBusyGlobal := controlplane.HostDetail{
+		Repos: []controlplane.RepoSummary{
+			{Path: "/wt/umbrella-01", Lock: "RUNNING", GlobalQueueAllocationEnabled: true},
+		},
+	}
+	if got := resolveWorktreeFromHostDetail(dBusyGlobal, "root"); got != "/wt/umbrella-01" {
+		t.Fatalf("expected /wt/umbrella-01 for busy global root fallback, got %q", got)
+	}
+	if got := resolveWorktreeFromHostDetail(dBusyGlobal, "/foreign/umbrella-04"); got != "/wt/umbrella-01" {
+		t.Fatalf("expected /wt/umbrella-01 for busy global slot family fallback, got %q", got)
+	}
+
+	dBusyNoGlobal := controlplane.HostDetail{
+		Repos: []controlplane.RepoSummary{
+			{Path: "/wt/umbrella-03", Lock: "RUNNING", GlobalQueueAllocationEnabled: false},
+		},
+	}
+	if got := resolveWorktreeFromHostDetail(dBusyNoGlobal, "."); got != "/wt/umbrella-03" {
+		t.Fatalf("expected /wt/umbrella-03 for busy non-global root fallback, got %q", got)
+	}
+	if got := resolveWorktreeFromHostDetail(dBusyNoGlobal, "/foreign/umbrella-04"); got != "/wt/umbrella-03" {
+		t.Fatalf("expected /wt/umbrella-03 for busy non-global slot family fallback, got %q", got)
+	}
+
+	// 3. probeRepoRuntime fallback (when iazio-harness is absent): metadata.yml, .ase/active.lock, active .session_story_id + resume file
+	if runtime.GOOS != "windows" {
+		fakeHome := t.TempDir()
+		t.Setenv("HOME", fakeHome)
+		var cleanPathElements []string
+		for _, elem := range filepath.SplitList(os.Getenv("PATH")) {
+			if strings.Contains(elem, ".iazio") {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(elem, "iazio-harness")); err == nil {
+				continue
+			}
+			cleanPathElements = append(cleanPathElements, elem)
+		}
+		t.Setenv("PATH", strings.Join(cleanPathElements, string(os.PathListSeparator)))
+
+		repoDir := t.TempDir()
+		_ = exec.Command("git", "init", "-b", "feat/active-story", repoDir).Run()
+		_ = os.WriteFile(filepath.Join(repoDir, "metadata.yml"), []byte("name: test-meta\n"), 0o644)
+		_ = os.MkdirAll(filepath.Join(repoDir, ".ase"), 0o755)
+		_ = os.WriteFile(filepath.Join(repoDir, ".ase", "active.lock"), []byte("1"), 0o644)
+		_ = os.WriteFile(filepath.Join(repoDir, ".session_story_id"), []byte("STORY-ACTIVE-0001\n"), 0o644)
+		_ = os.MkdirAll(filepath.Join(repoDir, "tmp"), 0o755)
+		_ = os.WriteFile(filepath.Join(repoDir, "tmp", "ase-resume-STORY-ACTIVE-0001.json"), []byte(`{"story_id":"STORY-ACTIVE-0001"}`), 0o644)
+
+		st := probeRepoRuntime(context.Background(), repoDir, "meta-repo")
+		if st.MetadataYmlRaw == "" || st.MetadataYmlSHA == "" {
+			t.Fatalf("expected MetadataYmlRaw and MetadataYmlSHA to be populated, got %+v", st)
+		}
+		if st.ActiveStoryID != "STORY-ACTIVE-0001" || st.ASEState != "RUNNING" {
+			t.Fatalf("expected STORY-ACTIVE-0001 and RUNNING in fallback probeRepoRuntime, got story=%q state=%q", st.ActiveStoryID, st.ASEState)
+		}
+
+		// Also test .session_story_id without .ase/active.lock so lines 3077-3088 execute
+		_ = os.Remove(filepath.Join(repoDir, ".ase", "active.lock"))
+		st2 := probeRepoRuntime(context.Background(), repoDir, "meta-repo")
+		if st2.ASEState != "RUNNING" || st2.ExecutionProvenance != "INDEPENDENT_USER_SESSION" || st2.ActiveTool != "autopilot-ase" {
+			t.Fatalf("expected INDEPENDENT_USER_SESSION / autopilot-ase in fallback, got %+v", st2)
+		}
+
+		// 4. scanRepoFleetStatus fallback with tracked modified file and clean submodule drift
+		_ = exec.Command("git", "-C", repoDir, "add", "metadata.yml").Run()
+		_ = exec.Command("git", "-C", repoDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "init").Run()
+		_ = os.WriteFile(filepath.Join(repoDir, "metadata.yml"), []byte("name: modified\n"), 0o644)
+		if scanRepoFleetStatus(context.Background(), repoDir) {
+			t.Fatal("expected scanRepoFleetStatus fallback to return false on modified tracked file")
+		}
+	}
+}
+
+
+
+

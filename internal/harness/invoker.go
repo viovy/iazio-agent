@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -265,30 +266,72 @@ func (c *CLIInvoker) WithStoryCallback(cb func(storyID string)) Invoker {
 	return &clone
 }
 
+var validAllocatedStoryIDRegex = regexp.MustCompile(`^(?i)STORY-[A-Z0-9]+-[A-Z0-9][A-Z0-9-]*$`)
+
+func isValidAllocatedStoryID(storyID string) bool {
+	s := strings.TrimSpace(storyID)
+	if s == "" || strings.EqualFold(s, "pending-allocation") || strings.EqualFold(s, "pending_harness_creation") {
+		return false
+	}
+	if strings.HasSuffix(s, "-") {
+		return false
+	}
+	return validAllocatedStoryIDRegex.MatchString(s)
+}
+
 type storyTrackingWriter struct {
 	buf              bytes.Buffer
+	lineBuf          bytes.Buffer
+	lastAllocatedID  string
 	onStoryAllocated func(string)
 }
 
 func (w *storyTrackingWriter) Write(p []byte) (n int, err error) {
 	n, err = w.buf.Write(p)
 	if w.onStoryAllocated != nil && len(p) > 0 {
-		str := string(p)
-		for _, prefix := range []string{"ALLOCATED_STORY_ID:", "STORY_ID:", "Bound active story ID:", "Bound dynamically allocated story ID:"} {
-			if idx := strings.Index(str, prefix); idx != -1 {
-				rem := strings.TrimLeft(str[idx+len(prefix):], " \t")
-				if endIdx := strings.IndexAny(rem, "\r\n ,;()"); endIdx != -1 {
-					rem = rem[:endIdx]
-				}
-				storyID := strings.TrimSpace(rem)
-				if storyID != "" && storyID != "pending-allocation" && storyID != "pending_harness_creation" {
-					w.onStoryAllocated(storyID)
-					break
-				}
+		_, _ = w.lineBuf.Write(p)
+		for {
+			b := w.lineBuf.Bytes()
+			nlIdx := bytes.IndexByte(b, '\n')
+			if nlIdx == -1 {
+				break
 			}
+			line := string(w.lineBuf.Next(nlIdx + 1))
+			w.scanLine(line)
 		}
 	}
 	return n, err
+}
+
+// Flush processes any remaining partial line in lineBuf after subprocess completion.
+func (w *storyTrackingWriter) Flush() {
+	if w.onStoryAllocated != nil && w.lineBuf.Len() > 0 {
+		line := w.lineBuf.String()
+		w.lineBuf.Reset()
+		w.scanLine(line)
+	}
+}
+
+func (w *storyTrackingWriter) scanLine(line string) {
+	if w.onStoryAllocated == nil || line == "" {
+		return
+	}
+	for _, prefix := range []string{"ALLOCATED_STORY_ID:", "STORY_ID:", "Bound active story ID:", "Bound dynamically allocated story ID:"} {
+		if idx := strings.Index(line, prefix); idx != -1 {
+			rem := strings.TrimLeft(line[idx+len(prefix):], " \t\"'`")
+			if endIdx := strings.IndexAny(rem, "\r\n \t,;()\"'`{}[]"); endIdx != -1 {
+				rem = rem[:endIdx]
+			}
+			storyID := strings.TrimSpace(rem)
+			if isValidAllocatedStoryID(storyID) {
+				if storyID != w.lastAllocatedID {
+					w.lastAllocatedID = storyID
+					w.onStoryAllocated(storyID)
+				}
+				break
+			}
+		}
+	}
 }
 
 func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []byte) (string, string, error) {
@@ -355,6 +398,7 @@ func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []
 	cmd.Stderr = &stderrBuf
 
 	err := cmd.Run()
+	stdoutWriter.Flush()
 	stdoutStr := stdoutWriter.buf.String()
 	stderrStr := stderrBuf.String()
 
