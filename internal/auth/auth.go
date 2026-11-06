@@ -27,7 +27,64 @@ import (
 var (
 	tokenRefreshMu sync.Mutex
 	configFileMu   sync.Mutex
+	tokenCacheMu   sync.RWMutex
+	tokenCache     = make(map[string]cachedBearerEntry)
 )
+
+const tokenCacheTTL = 30 * time.Second
+
+type cachedBearerEntry struct {
+	token      string
+	validUntil time.Time
+}
+
+func getCachedBearerToken(path string) (string, bool) {
+	if path == "" {
+		return "", false
+	}
+	tokenCacheMu.RLock()
+	entry, ok := tokenCache[path]
+	tokenCacheMu.RUnlock()
+	if !ok || entry.token == "" || !time.Now().Before(entry.validUntil) {
+		return "", false
+	}
+	return entry.token, true
+}
+
+func setCachedBearerToken(path string, cfg Config) {
+	if path == "" {
+		return
+	}
+	tok := strings.TrimSpace(cfg.AccessToken)
+	if tok == "" || !accessUsable(cfg) {
+		tokenCacheMu.Lock()
+		delete(tokenCache, path)
+		tokenCacheMu.Unlock()
+		return
+	}
+	now := time.Now()
+	validUntil := now.Add(tokenCacheTTL)
+	if exp := strings.TrimSpace(cfg.Expiry); exp != "" {
+		if t, err := time.Parse(time.RFC3339, exp); err == nil {
+			usableUntil := t.Add(-accessSkew)
+			if usableUntil.Before(validUntil) {
+				validUntil = usableUntil
+			}
+		}
+	}
+	if !now.Before(validUntil) {
+		tokenCacheMu.Lock()
+		delete(tokenCache, path)
+		tokenCacheMu.Unlock()
+		return
+	}
+	tokenCacheMu.Lock()
+	tokenCache[path] = cachedBearerEntry{
+		token:      tok,
+		validUntil: validUntil,
+	}
+	tokenCacheMu.Unlock()
+}
 
 // ClientID is the public OAuth client id.
 const ClientID = "iazio-agent-cli"
@@ -519,16 +576,24 @@ func BearerWithClient(ctx context.Context, client *http.Client, home string, get
 		}
 	}
 	path := ConfigPathFrom(home, getenv)
+	if tok, ok := getCachedBearerToken(path); ok {
+		return tok, nil
+	}
 	cfg, err := load(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
 	if accessUsable(cfg) {
+		setCachedBearerToken(path, cfg)
 		return strings.TrimSpace(cfg.AccessToken), nil
 	}
 
 	tokenRefreshMu.Lock()
 	defer tokenRefreshMu.Unlock()
+
+	if tok, ok := getCachedBearerToken(path); ok {
+		return tok, nil
+	}
 
 	// Re-load and re-check after acquiring lock in case another goroutine already refreshed the token
 	cfg, err = load(path)
@@ -536,6 +601,7 @@ func BearerWithClient(ctx context.Context, client *http.Client, home string, get
 		return "", err
 	}
 	if accessUsable(cfg) {
+		setCachedBearerToken(path, cfg)
 		return strings.TrimSpace(cfg.AccessToken), nil
 	}
 
@@ -781,7 +847,15 @@ func postForm(ctx context.Context, client *http.Client, endpoint string, form ur
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode >= 500 {
+	if resp.StatusCode >= 400 {
+		if resp.StatusCode == http.StatusBadRequest {
+			var oauthErr struct {
+				Error string `json:"error"`
+			}
+			if json.Unmarshal(body, &oauthErr) == nil && strings.TrimSpace(oauthErr.Error) != "" {
+				return body, nil
+			}
+		}
 		return nil, fmt.Errorf("auth endpoint status %d", resp.StatusCode)
 	}
 	return body, nil
@@ -793,6 +867,7 @@ func save(path string, cfg Config) error {
 	}
 	configFileMu.Lock()
 	defer configFileMu.Unlock()
+	defer setCachedBearerToken(path, cfg)
 
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {

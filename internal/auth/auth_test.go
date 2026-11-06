@@ -767,3 +767,61 @@ func TestBearerWithClient_ConcurrentRefreshSingleFlightAndAtomicSave(t *testing.
 		}
 	}
 }
+
+func TestPostForm_Status400AndStructuredOAuthErrors(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Plain 400/401/403/404 without structured OAuth JSON error must fail
+	for _, code := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "client error", code)
+		}))
+		_, err := postForm(ctx, srv.Client(), srv.URL, url.Values{"grant_type": {"device_code"}})
+		srv.Close()
+		if err == nil || !strings.Contains(err.Error(), "auth endpoint status") {
+			t.Fatalf("expected status error for %d, got %v", code, err)
+		}
+	}
+
+	// 2. Structured OAuth 400 error JSON (authorization_pending / slow_down) is allowed for pollTokenDetailed
+	for _, oauthCode := range []string{"authorization_pending", "slow_down"} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": oauthCode})
+		}))
+		tok, pending, err := pollTokenDetailed(ctx, srv.Client(), srv.URL, "dev-123")
+		srv.Close()
+		if err != nil || !pending || tok.AccessToken != "" {
+			t.Fatalf("expected pending=true err=nil for %s on 400, got tok=%+v pending=%v err=%v", oauthCode, tok, pending, err)
+		}
+	}
+}
+
+func TestBearerWithClient_InMemoryTokenCacheAvoidsDiskRead(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "cached-agent.json")
+	exp := time.Now().Add(30 * time.Minute).UTC().Format(time.RFC3339)
+	if err := os.WriteFile(cfgPath, []byte(`{"access_token":"mem-cached-tok-1","refresh_token":"rt-1","expiry":"`+exp+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	getenv := func(k string) string {
+		if k == "IAZIO_AGENT_CONFIG" {
+			return cfgPath
+		}
+		return ""
+	}
+
+	tok1, err := BearerWithClient(t.Context(), nil, dir, getenv)
+	if err != nil || tok1 != "mem-cached-tok-1" {
+		t.Fatalf("first BearerWithClient failed: tok=%q err=%v", tok1, err)
+	}
+
+	// Remove the file from disk; subsequent call within TTL must succeed from in-memory cache.
+	if err := os.Remove(cfgPath); err != nil {
+		t.Fatal(err)
+	}
+	tok2, err := BearerWithClient(t.Context(), nil, dir, getenv)
+	if err != nil || tok2 != "mem-cached-tok-1" {
+		t.Fatalf("second BearerWithClient expected in-memory cached token without disk read, got tok=%q err=%v", tok2, err)
+	}
+}

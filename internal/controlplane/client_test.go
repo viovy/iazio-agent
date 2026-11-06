@@ -976,3 +976,67 @@ func TestClient_PostJSON_SpoolsDynamicTokenProviderBearerToken(t *testing.T) {
 		t.Fatalf("expected Authorization header from TokenProvider, got %q", spooled.Headers["Authorization"])
 	}
 }
+
+func TestClient_Loop_DeduplicatesPendingCommandsByID(t *testing.T) {
+	var hbCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/hosts/register":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case "/v1/hosts/host-dedup/heartbeat":
+			hbCount.Add(1)
+			w.WriteHeader(http.StatusOK)
+			// Return duplicate command IDs within the same heartbeat AND across repeated heartbeats.
+			_, _ = w.Write([]byte(`{"status":"ok","pending_commands":[{"id":"cmd-dup-1","command":"RESTART_SERVICE"},{"id":"cmd-dup-1","command":"RESTART_SERVICE"}]}`))
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var cmdExecCount atomic.Int32
+	cmdStarted := make(chan struct{}, 4)
+	releaseCmd := make(chan struct{})
+
+	c := Client{
+		BaseURL: srv.URL,
+		OnCommand: func(ctx context.Context, cmd CommandEnvelope) error {
+			cmdExecCount.Add(1)
+			cmdStarted <- struct{}{}
+			<-releaseCmd
+			return nil
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Loop(ctx, "host-dedup", "worker", 1*time.Second, nil)
+	}()
+
+	select {
+	case <-cmdStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for first command execution")
+	}
+
+	// Wait for at least a second heartbeat while the command is still in-flight.
+	deadline := time.Now().Add(3 * time.Second)
+	for hbCount.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if hbCount.Load() < 2 {
+		t.Fatalf("expected at least 2 heartbeats, got %d", hbCount.Load())
+	}
+
+	close(releaseCmd)
+	cancel()
+	<-done
+
+	if got := cmdExecCount.Load(); got != 1 {
+		t.Fatalf("expected command cmd-dup-1 to execute exactly once across duplicate heartbeats, got %d", got)
+	}
+}

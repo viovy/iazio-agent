@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/controlplane"
+	"github.com/viovy/iazio-agent/internal/elasticlog"
 	"github.com/viovy/iazio-agent/internal/inventory"
 	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/service"
@@ -4611,6 +4612,134 @@ EOF
 	st := probeRepoRuntime(context.Background(), repoDir, "sample-repo-03")
 	if !st.IsClean || !st.SubmodulesClean || st.ASEState != "IDLE" || st.ExecutionProvenance != "NONE" || st.Porcelain != "" {
 		t.Fatalf("expected post-ASE git-update autoremediation to clean repo and clear INDEPENDENT_USER_SESSION, got %+v", st)
+	}
+}
+
+func TestBuildPreDispatchHook_DoesNotTriggerWhenUpToDate(t *testing.T) {
+	sup := supervisor.New(time.Now)
+	var updateTriggered atomic.Int32
+	eu := supervisor.NewEagerToolUpdater(
+		sup,
+		nil,
+		"host-test",
+		func(ctx context.Context, targetTools []string, force bool) (supervisor.UpdateResult, error) {
+			updateTriggered.Add(1)
+			return supervisor.UpdateResult{}, nil
+		},
+		nil,
+	)
+
+	var updatingTools atomic.Bool
+	var pendingSelfRestart atomic.Bool
+	hook := buildPreDispatchHook(eu, &updatingTools, &pendingSelfRestart)
+
+	// When host is already StateUpToDate, pre-dispatch hook must NOT trigger EvaluateAndTriggerWithOpts.
+	if err := hook(context.Background(), &worker.Job{ID: "job-1", Type: worker.JobTypeStoryExecute}); err != nil {
+		t.Fatalf("hook returned unexpected error: %v", err)
+	}
+	if got := updateTriggered.Load(); got != 0 {
+		t.Fatalf("expected 0 eager update triggers when StateUpToDate, got %d", got)
+	}
+
+	// ToolsUpdate job should also be ignored
+	if err := hook(context.Background(), &worker.Job{ID: "job-2", Type: worker.JobTypeToolsUpdate}); err != nil {
+		t.Fatalf("hook returned unexpected error: %v", err)
+	}
+}
+
+func TestTryReserveOnJobWorktree_PreventsConcurrentPrepConflict(t *testing.T) {
+	var prepMu sync.Mutex
+	prepJobs := make(map[string]controlplane.ActiveJob)
+	sup := supervisor.New(time.Now)
+	wt := t.TempDir()
+
+	owner, busy := tryReserveOnJobWorktree(&prepMu, prepJobs, sup, nil, "job-1", wt)
+	if busy || owner != "" {
+		t.Fatalf("expected first reservation to succeed, got busy=%v owner=%q", busy, owner)
+	}
+
+	// Second job on the same worktree must be rejected while job-1 is in prep
+	owner2, busy2 := tryReserveOnJobWorktree(&prepMu, prepJobs, sup, nil, "job-2", wt)
+	if !busy2 || owner2 != "job-1" {
+		t.Fatalf("expected second reservation on same worktree to report busy with job-1, got busy=%v owner=%q", busy2, owner2)
+	}
+}
+
+func TestResolveRegisteredRepoWorktree_AndHealGitRepoValidation(t *testing.T) {
+	regDir := t.TempDir()
+	unregDir := t.TempDir()
+
+	getRepos := func() ([]supervisor.RepoConfigItem, error) {
+		return []supervisor.RepoConfigItem{
+			{Path: regDir, Alias: "meta-repo"},
+		}, nil
+	}
+
+	// Registered path or alias should resolve
+	if got, ok := resolveRegisteredRepoWorktree(context.Background(), getRepos, regDir); !ok || got != filepath.Clean(regDir) {
+		t.Fatalf("expected registered path to resolve, got %q ok=%v", got, ok)
+	}
+	if got, ok := resolveRegisteredRepoWorktree(context.Background(), getRepos, "meta-repo"); !ok || got != filepath.Clean(regDir) {
+		t.Fatalf("expected registered alias to resolve, got %q ok=%v", got, ok)
+	}
+
+	// Unregistered path must be rejected
+	if got, ok := resolveRegisteredRepoWorktree(context.Background(), getRepos, unregDir); ok {
+		t.Fatalf("expected unregistered path %q to be rejected, got %q", unregDir, got)
+	}
+
+	// Non-git directory passed to healGitRepo must not run destructive git commands
+	marker := filepath.Join(unregDir, "unmerged-work.txt")
+	if err := os.WriteFile(marker, []byte("keep me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	healGitRepo(context.Background(), unregDir)
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected non-git directory file to remain untouched by healGitRepo, got err=%v", err)
+	}
+}
+
+func TestRestartOrExecSelf_FlushesTelemetryAndClosesSink(t *testing.T) {
+	origTesting := isTesting
+	origExec := syscallExec
+	isTesting = true
+	syscallExec = func(argv0 string, argv []string, envv []string) error {
+		return errors.New("mock exec")
+	}
+	t.Cleanup(func() {
+		isTesting = origTesting
+		syscallExec = origExec
+	})
+
+	var flushed atomic.Bool
+	setGlobalTracerFlusher(func() {
+		flushed.Store(true)
+	})
+
+	var sinkReqs atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sinkReqs.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"errors":false}`))
+	}))
+	defer srv.Close()
+
+	sink := elasticlog.New(elasticlog.Config{
+		URL:         srv.URL,
+		ServiceName: "iazio-agent-test",
+		HostName:    "test-host",
+	})
+	sink.Info("before-self-restart", nil)
+	setActiveElasticSink(sink)
+
+	var out bytes.Buffer
+	restartOrExecSelf(&out)
+
+	if !flushed.Load() {
+		t.Fatal("expected telemetry tracer flusher to be invoked before restartOrExecSelf exits")
+	}
+	if sinkReqs.Load() == 0 {
+		t.Fatal("expected elasticlog sink to flush/close before restartOrExecSelf exits")
 	}
 }
 
