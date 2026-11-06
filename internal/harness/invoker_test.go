@@ -549,3 +549,42 @@ func TestStoryTrackingWriter_SplitChunksAndValidation(t *testing.T) {
 		t.Fatalf("expected Flush() to emit STORY-VIGO-0245, got %v", allocated)
 	}
 }
+
+func TestCLIInvoker_StreamingConversationCallbackAndPrefixStripping(t *testing.T) {
+	var allocatedConvs []string
+	var allocatedStories []string
+
+	fakeBin := filepath.Join(t.TempDir(), "fake-harness-conv")
+	script := `#!/bin/sh
+echo "CONVERSATION_ID: aff9bb70-6c84-4121-ba1e-68745328700a"
+echo "ALLOCATED_STORY_ID: STORY-IAZIO-0190" >&2
+echo "ACTIVE_CONVERSATION_ID: aff9bb70-6c84-4121-ba1e-68745328700a" >&2
+printf '{"status":"completed","exit_code":0,"story_id":"STORY-IAZIO-0190","conversation_id":"aff9bb70-6c84-4121-ba1e-68745328700a","summary":"done"}\n'
+`
+	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake-harness-conv: %v", err)
+	}
+
+	inv := NewCLIInvoker(fakeBin, t.TempDir()).
+		WithStoryCallback(func(sid string) {
+			allocatedStories = append(allocatedStories, sid)
+		}).(*CLIInvoker).
+		WithConversationCallback(func(cid string) {
+			allocatedConvs = append(allocatedConvs, cid)
+		})
+
+	res, err := inv.ExecutePrompt(context.Background(), json.RawMessage(`{"prompt":"test","repo":"iazio-mcp"}`))
+	if err != nil {
+		t.Fatalf("ExecutePrompt failed: %v", err)
+	}
+	if res.Status != "completed" || res.ConversationID != "aff9bb70-6c84-4121-ba1e-68745328700a" {
+		t.Fatalf("expected completed with conversation_id=aff9bb70-6c84-4121-ba1e-68745328700a, got %+v", res)
+	}
+	if len(allocatedConvs) == 0 || allocatedConvs[0] != "aff9bb70-6c84-4121-ba1e-68745328700a" {
+		t.Fatalf("expected streaming conversation callback to receive aff9bb70-6c84-4121-ba1e-68745328700a, got %v", allocatedConvs)
+	}
+	if len(allocatedStories) == 0 || allocatedStories[0] != "STORY-IAZIO-0190" {
+		t.Fatalf("expected streaming story callback on stderr to receive STORY-IAZIO-0190, got %v", allocatedStories)
+	}
+}
+

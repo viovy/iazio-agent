@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/procutil"
@@ -101,10 +102,11 @@ type Invoker interface {
 
 // CLIInvoker delegates story scaffolding and prompt runs to the iazio-harness binary.
 type CLIInvoker struct {
-	HarnessBinary    string
-	WorkDir          string
-	GracePeriod      time.Duration
-	OnStoryAllocated func(storyID string)
+	HarnessBinary           string
+	WorkDir                 string
+	GracePeriod             time.Duration
+	OnStoryAllocated        func(storyID string)
+	OnConversationAllocated func(convID string)
 }
 
 // NewCLIInvoker creates a CLIInvoker with default binary resolution.
@@ -156,7 +158,7 @@ func (c *CLIInvoker) CreateStory(ctx context.Context, payload json.RawMessage) (
 	}
 
 	var res StoryExecutionResult
-	if err := json.Unmarshal([]byte(stdout), &res); err != nil {
+	if err := json.Unmarshal(extractJSONObject(stdout), &res); err != nil {
 		return nil, fmt.Errorf("failed to parse iazio-harness story create output %q: %w", stdout, err)
 	}
 
@@ -177,7 +179,7 @@ func (c *CLIInvoker) ExecutePrompt(ctx context.Context, payload json.RawMessage)
 	}
 
 	var res PromptExecutionResult
-	if err := json.Unmarshal([]byte(stdout), &res); err != nil {
+	if err := json.Unmarshal(extractJSONObject(stdout), &res); err != nil {
 		// Fallback if harness emitted plain text
 		return &PromptExecutionResult{
 			Status: "completed",
@@ -266,7 +268,29 @@ func (c *CLIInvoker) WithStoryCallback(cb func(storyID string)) Invoker {
 	return &clone
 }
 
+// WithConversationCallback returns a shallow copy of the CLIInvoker with the specified conversation allocation callback.
+func (c *CLIInvoker) WithConversationCallback(cb func(convID string)) Invoker {
+	clone := *c
+	clone.OnConversationAllocated = cb
+	return &clone
+}
+
+func extractJSONObject(raw string) []byte {
+	trimmed := strings.TrimSpace(raw)
+	if strings.HasPrefix(trimmed, "{") {
+		return []byte(trimmed)
+	}
+	if idx := strings.Index(trimmed, "\n{"); idx != -1 {
+		return []byte(strings.TrimSpace(trimmed[idx+1:]))
+	}
+	if idx := strings.IndexByte(trimmed, '{'); idx != -1 {
+		return []byte(strings.TrimSpace(trimmed[idx:]))
+	}
+	return []byte(raw)
+}
+
 var validAllocatedStoryIDRegex = regexp.MustCompile(`^(?i)STORY-[A-Z0-9]+-[A-Z0-9][A-Z0-9-]*$`)
+var validAllocatedConvIDRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{5,127}$`)
 
 func isValidAllocatedStoryID(storyID string) bool {
 	s := strings.TrimSpace(storyID)
@@ -279,16 +303,29 @@ func isValidAllocatedStoryID(storyID string) bool {
 	return validAllocatedStoryIDRegex.MatchString(s)
 }
 
+func isValidAllocatedConvID(convID string) bool {
+	c := strings.TrimSpace(convID)
+	if c == "" || strings.EqualFold(c, "pending") || strings.EqualFold(c, "none") || strings.EqualFold(c, "new_conversation") || strings.EqualFold(c, "pending-allocation") {
+		return false
+	}
+	return validAllocatedConvIDRegex.MatchString(c)
+}
+
 type storyTrackingWriter struct {
-	buf              bytes.Buffer
-	lineBuf          bytes.Buffer
-	lastAllocatedID  string
-	onStoryAllocated func(string)
+	buf                     bytes.Buffer
+	lineBuf                 bytes.Buffer
+	cbMu                    *sync.Mutex
+	sharedLastStoryID       *string
+	sharedLastConvID        *string
+	lastAllocatedID         string
+	lastAllocatedConvID     string
+	onStoryAllocated        func(string)
+	onConversationAllocated func(string)
 }
 
 func (w *storyTrackingWriter) Write(p []byte) (n int, err error) {
 	n, err = w.buf.Write(p)
-	if w.onStoryAllocated != nil && len(p) > 0 {
+	if (w.onStoryAllocated != nil || w.onConversationAllocated != nil) && len(p) > 0 {
 		_, _ = w.lineBuf.Write(p)
 		for {
 			b := w.lineBuf.Bytes()
@@ -305,7 +342,7 @@ func (w *storyTrackingWriter) Write(p []byte) (n int, err error) {
 
 // Flush processes any remaining partial line in lineBuf after subprocess completion.
 func (w *storyTrackingWriter) Flush() {
-	if w.onStoryAllocated != nil && w.lineBuf.Len() > 0 {
+	if (w.onStoryAllocated != nil || w.onConversationAllocated != nil) && w.lineBuf.Len() > 0 {
 		line := w.lineBuf.String()
 		w.lineBuf.Reset()
 		w.scanLine(line)
@@ -313,22 +350,62 @@ func (w *storyTrackingWriter) Flush() {
 }
 
 func (w *storyTrackingWriter) scanLine(line string) {
-	if w.onStoryAllocated == nil || line == "" {
+	if line == "" {
 		return
 	}
-	for _, prefix := range []string{"ALLOCATED_STORY_ID:", "STORY_ID:", "Bound active story ID:", "Bound dynamically allocated story ID:"} {
-		if idx := strings.Index(line, prefix); idx != -1 {
-			rem := strings.TrimLeft(line[idx+len(prefix):], " \t\"'`")
-			if endIdx := strings.IndexAny(rem, "\r\n \t,;()\"'`{}[]"); endIdx != -1 {
-				rem = rem[:endIdx]
-			}
-			storyID := strings.TrimSpace(rem)
-			if isValidAllocatedStoryID(storyID) {
-				if storyID != w.lastAllocatedID {
-					w.lastAllocatedID = storyID
-					w.onStoryAllocated(storyID)
+	if w.onStoryAllocated != nil {
+		for _, prefix := range []string{"ALLOCATED_STORY_ID:", "STORY_ID:", "Bound active story ID:", "Bound dynamically allocated story ID:", "Bound governing story:"} {
+			if idx := strings.Index(line, prefix); idx != -1 {
+				rem := strings.TrimLeft(line[idx+len(prefix):], " \t\"'`")
+				if endIdx := strings.IndexAny(rem, "\r\n \t,;()\"'`{}[]"); endIdx != -1 {
+					rem = rem[:endIdx]
 				}
-				break
+				storyID := strings.TrimSpace(rem)
+				if isValidAllocatedStoryID(storyID) {
+					if w.cbMu != nil {
+						w.cbMu.Lock()
+					}
+					lastStory := &w.lastAllocatedID
+					if w.sharedLastStoryID != nil {
+						lastStory = w.sharedLastStoryID
+					}
+					if storyID != *lastStory {
+						*lastStory = storyID
+						w.onStoryAllocated(storyID)
+					}
+					if w.cbMu != nil {
+						w.cbMu.Unlock()
+					}
+					break
+				}
+			}
+		}
+	}
+	if w.onConversationAllocated != nil {
+		for _, prefix := range []string{"ACTIVE_CONVERSATION_ID:", "CONVERSATION_ID:", "Attached Antigravity conversation:"} {
+			if idx := strings.Index(line, prefix); idx != -1 {
+				rem := strings.TrimLeft(line[idx+len(prefix):], " \t\"'`")
+				if endIdx := strings.IndexAny(rem, "\r\n \t,;()\"'`{}[]"); endIdx != -1 {
+					rem = rem[:endIdx]
+				}
+				convID := strings.TrimSpace(rem)
+				if isValidAllocatedConvID(convID) {
+					if w.cbMu != nil {
+						w.cbMu.Lock()
+					}
+					lastConv := &w.lastAllocatedConvID
+					if w.sharedLastConvID != nil {
+						lastConv = w.sharedLastConvID
+					}
+					if convID != *lastConv {
+						*lastConv = convID
+						w.onConversationAllocated(convID)
+					}
+					if w.cbMu != nil {
+						w.cbMu.Unlock()
+					}
+					break
+				}
 			}
 		}
 	}
@@ -391,16 +468,30 @@ func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []
 	}
 
 	cmd.Stdin = bytes.NewReader(stdinData)
-	var stdoutWriter storyTrackingWriter
-	stdoutWriter.onStoryAllocated = c.OnStoryAllocated
-	var stderrBuf bytes.Buffer
+	var cbMu sync.Mutex
+	var sharedLastStory, sharedLastConv string
+	stdoutWriter := storyTrackingWriter{
+		cbMu:                    &cbMu,
+		sharedLastStoryID:       &sharedLastStory,
+		sharedLastConvID:        &sharedLastConv,
+		onStoryAllocated:        c.OnStoryAllocated,
+		onConversationAllocated: c.OnConversationAllocated,
+	}
+	stderrWriter := storyTrackingWriter{
+		cbMu:                    &cbMu,
+		sharedLastStoryID:       &sharedLastStory,
+		sharedLastConvID:        &sharedLastConv,
+		onStoryAllocated:        c.OnStoryAllocated,
+		onConversationAllocated: c.OnConversationAllocated,
+	}
 	cmd.Stdout = &stdoutWriter
-	cmd.Stderr = &stderrBuf
+	cmd.Stderr = &stderrWriter
 
 	err := cmd.Run()
 	stdoutWriter.Flush()
+	stderrWriter.Flush()
 	stdoutStr := stdoutWriter.buf.String()
-	stderrStr := stderrBuf.String()
+	stderrStr := stderrWriter.buf.String()
 
 	return stdoutStr, stderrStr, err
 }

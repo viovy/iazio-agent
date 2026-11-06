@@ -121,11 +121,13 @@ type CompleteRequest struct {
 
 // HeartbeatRequest extends the lease of an active claimed job.
 type HeartbeatRequest struct {
-	FencingToken int64  `json:"fencing_token,omitempty"`
-	LeaseToken   string `json:"lease_token,omitempty"`
-	StoryID      string `json:"story_id,omitempty"`
-	WorktreePath string `json:"worktree_path,omitempty"`
-	AgentPID     int    `json:"agent_pid,omitempty"`
+	FencingToken         int64  `json:"fencing_token,omitempty"`
+	LeaseToken           string `json:"lease_token,omitempty"`
+	StoryID              string `json:"story_id,omitempty"`
+	WorktreePath         string `json:"worktree_path,omitempty"`
+	AgentPID             int    `json:"agent_pid,omitempty"`
+	ConversationID       string `json:"conversation_id,omitempty"`
+	ActiveConversationID string `json:"active_conversation_id,omitempty"`
 }
 
 // StoryBindingRequest is sent to dynamically bind an allocated story ID to a running job.
@@ -318,18 +320,24 @@ func (c *HTTPControlPlaneClient) HeartbeatJob(ctx context.Context, jobID, leaseT
 	url := fmt.Sprintf("%s/api/v1/agent/jobs/%s/heartbeat", c.BaseURL, jobID)
 	sid := ""
 	wt := ""
+	cid := ""
 	if len(storyID) > 0 {
 		sid = storyID[0]
 	}
 	if len(storyID) > 1 {
 		wt = storyID[1]
 	}
+	if len(storyID) > 2 {
+		cid = strings.TrimSpace(storyID[2])
+	}
 	bodyBytes, err := json.Marshal(HeartbeatRequest{
-		FencingToken: fencingToken,
-		LeaseToken:   leaseToken,
-		StoryID:      sid,
-		WorktreePath: wt,
-		AgentPID:     os.Getpid(),
+		FencingToken:         fencingToken,
+		LeaseToken:           leaseToken,
+		StoryID:              sid,
+		WorktreePath:         wt,
+		AgentPID:             os.Getpid(),
+		ConversationID:       cid,
+		ActiveConversationID: cid,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal heartbeat request: %w", err)
@@ -696,6 +704,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 
 	var allocatedStoryMu sync.Mutex
 	currentStoryID := job.StoryID
+	currentConvID := resolvedConvID
 	if currentStoryID == "" && len(job.Payload) > 0 {
 		var pMap map[string]any
 		if err := json.Unmarshal(job.Payload, &pMap); err == nil {
@@ -716,18 +725,47 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 			return
 		}
 		currentStoryID = clean
+		cid := currentConvID
 		allocatedStoryMu.Unlock()
 
 		_ = d.client.BindStory(ctx, job.ID, StoryBindingRequest{
 			FencingToken: job.FencingToken,
 			StoryID:      clean,
 		})
+		if job.FencingToken > 0 || job.LeaseToken != "" {
+			_ = d.client.HeartbeatJob(ctx, job.ID, job.LeaseToken, job.FencingToken, clean, worktreeDir, cid)
+		}
+	}
+
+	onConversationDiscovered := func(convID string) {
+		clean := strings.TrimSpace(convID)
+		if clean == "" || clean == "pending" || clean == "none" || clean == "new_conversation" || clean == "pending-allocation" {
+			return
+		}
+		allocatedStoryMu.Lock()
+		if currentConvID == clean {
+			allocatedStoryMu.Unlock()
+			return
+		}
+		currentConvID = clean
+		sid := currentStoryID
+		allocatedStoryMu.Unlock()
+
+		_ = d.client.HeartbeatJob(ctx, job.ID, job.LeaseToken, job.FencingToken, sid, worktreeDir, clean)
+		if job.LeaseToken != "" {
+			_ = d.client.AckLease(ctx, job.ID, job.LeaseToken, os.Getpid(), clean)
+		}
 	}
 
 	if aware, ok := invoker.(interface {
 		WithStoryCallback(func(string)) harness.Invoker
 	}); ok {
 		invoker = aware.WithStoryCallback(onStoryDiscovered)
+	}
+	if convAware, ok := invoker.(interface {
+		WithConversationCallback(func(string)) harness.Invoker
+	}); ok {
+		invoker = convAware.WithConversationCallback(onConversationDiscovered)
 	}
 
 	hbCtx, hbCancel := context.WithCancel(ctx)
@@ -743,12 +781,13 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				case <-ticker.C:
 					allocatedStoryMu.Lock()
 					sid := currentStoryID
+					cid := currentConvID
 					allocatedStoryMu.Unlock()
-					if err := d.client.HeartbeatJob(hbCtx, job.ID, job.LeaseToken, job.FencingToken, sid, worktreeDir); err != nil {
+					if err := d.client.HeartbeatJob(hbCtx, job.ID, job.LeaseToken, job.FencingToken, sid, worktreeDir, cid); err != nil {
 						// Upstream control-plane errors (including 409 LEASE_FENCED after a control-plane redeploy/restart,
 						// 5xx, or transient network blips) must NEVER kill an active local agy/iazio-harness execution
 						// (job_38eeeb536a5a7130 root cause). Re-ack the lease to re-synchronize with the control plane.
-						_ = d.client.AckLease(hbCtx, job.ID, job.LeaseToken, os.Getpid(), resolvedConvID)
+						_ = d.client.AckLease(hbCtx, job.ID, job.LeaseToken, os.Getpid(), cid)
 					}
 				}
 			}
@@ -985,6 +1024,15 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 			telemetry.WithTag("job.id", job.ID),
 		)
 		if res != nil {
+			allocatedStoryMu.Lock()
+			discoveredCID := currentConvID
+			allocatedStoryMu.Unlock()
+			if res.ConversationID == "" && discoveredCID != "" {
+				res.ConversationID = discoveredCID
+			}
+			if res.ActiveConversationID == "" && discoveredCID != "" {
+				res.ActiveConversationID = discoveredCID
+			}
 			storyID := res.StoryID
 			if storyID == "" {
 				storyID = extractStoryID(res.Summary, res.Output)
