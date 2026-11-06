@@ -144,6 +144,47 @@ func TestExtractBinary_Zip(t *testing.T) {
 	}
 }
 
+func TestExtractBinary_SizeLimitEnforcement(t *testing.T) {
+	if defaultMaxExtractedBinarySize != 256<<20 {
+		t.Fatalf("expected defaultMaxExtractedBinarySize to be 256 MiB (%d), got %d", 256<<20, defaultMaxExtractedBinarySize)
+	}
+	if maxExtractedBinarySize != 256<<20 {
+		t.Fatalf("expected maxExtractedBinarySize to default to 256 MiB (%d), got %d", 256<<20, maxExtractedBinarySize)
+	}
+
+	origLimit := maxExtractedBinarySize
+	maxExtractedBinarySize = 1024
+	defer func() { maxExtractedBinarySize = origLimit }()
+
+	// 1. Entry exactly at limit (1024 bytes) succeeds for both tar.gz and zip
+	exactPayload := bytes.Repeat([]byte("A"), 1024)
+	tarExact := createTarGz(t, "iazio-agent", exactPayload)
+	outTar, err := extractBinary(tarExact, "iazio-agent-linux-amd64.tar.gz", "iazio-agent", "linux")
+	if err != nil || len(outTar) != 1024 {
+		t.Fatalf("expected exact-limit tar.gz entry to succeed, got len=%d err=%v", len(outTar), err)
+	}
+
+	zipExact := createZip(t, "iazio-agent.exe", exactPayload)
+	outZip, err := extractBinary(zipExact, "iazio-agent-windows-amd64.zip", "iazio-agent", "windows")
+	if err != nil || len(outZip) != 1024 {
+		t.Fatalf("expected exact-limit zip entry to succeed, got len=%d err=%v", len(outZip), err)
+	}
+
+	// 2. Entry exceeding limit (1025 bytes) fails with explicit size limit error for both tar.gz and zip
+	oversizedPayload := bytes.Repeat([]byte("B"), 1025)
+	tarOversized := createTarGz(t, "iazio-agent", oversizedPayload)
+	_, err = extractBinary(tarOversized, "iazio-agent-linux-amd64.tar.gz", "iazio-agent", "linux")
+	if err == nil || !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Fatalf("expected tar.gz size limit error, got %v", err)
+	}
+
+	zipOversized := createZip(t, "iazio-agent.exe", oversizedPayload)
+	_, err = extractBinary(zipOversized, "iazio-agent-windows-amd64.zip", "iazio-agent", "windows")
+	if err == nil || !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Fatalf("expected zip size limit error, got %v", err)
+	}
+}
+
 func TestFindMatchingAsset(t *testing.T) {
 	rel := &gitHubRelease{
 		TagName: "v1.5.0",

@@ -1241,6 +1241,25 @@ func verifyChecksum(data []byte, filename, checksumsText string) error {
 	return fmt.Errorf("no checksum entry found for %s in checksums file", filename)
 }
 
+const defaultMaxExtractedBinarySize int64 = 256 << 20 // 256 MiB
+
+var maxExtractedBinarySize int64 = defaultMaxExtractedBinarySize
+
+func readBoundedArchiveEntry(r io.Reader) ([]byte, error) {
+	limit := maxExtractedBinarySize
+	if limit <= 0 {
+		limit = defaultMaxExtractedBinarySize
+	}
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("extracted binary exceeds maximum size of %d bytes", limit)
+	}
+	return data, nil
+}
+
 func extractBinary(archiveData []byte, archiveName, binaryName, targetOS string) ([]byte, error) {
 	lowerArchive := strings.ToLower(archiveName)
 	expectedName := binaryName
@@ -1261,7 +1280,7 @@ func extractBinary(archiveData []byte, archiveName, binaryName, targetOS string)
 					return nil, err
 				}
 				defer rc.Close()
-				return io.ReadAll(rc)
+				return readBoundedArchiveEntry(rc)
 			}
 		}
 		return nil, fmt.Errorf("binary %q not found in zip", expectedName)
@@ -1285,7 +1304,7 @@ func extractBinary(archiveData []byte, archiveName, binaryName, targetOS string)
 			}
 			base := filepath.Base(hdr.Name)
 			if strings.EqualFold(base, expectedName) || (targetOS == "windows" && strings.EqualFold(base, strings.TrimSuffix(expectedName, ".exe"))) {
-				return io.ReadAll(tr)
+				return readBoundedArchiveEntry(tr)
 			}
 		}
 		return nil, fmt.Errorf("binary %q not found in tar.gz", expectedName)
