@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1642,3 +1643,97 @@ func TestDispatcher_ForwardsResolvedConversationIDAndDynamicToken(t *testing.T) 
 		t.Fatalf("expected dynamic token=dynamic-oauth-token-999, got %v", forwarded["token"])
 	}
 }
+
+func TestDispatcher_RealTimeConversationDiscoveryPropagatesHeartbeatAndAckLeaseWhileRunning(t *testing.T) {
+	var mu sync.Mutex
+	var heartbeatConvIDs []string
+	var ackConvIDs []string
+	var completedConvID string
+	var claimed bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/agent/jobs/claim":
+			mu.Lock()
+			already := claimed
+			claimed = true
+			mu.Unlock()
+			if already {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(Job{
+				ID:           "job-rt-conv-0190",
+				Type:         JobTypePromptExecute,
+				Repo:         ".",
+				TargetAgent:  "agy",
+				FencingToken: 27,
+				LeaseToken:   "lt-job-rt-conv-0190",
+				Payload:      json.RawMessage(`{"prompt":"/autonomous-story-execution STORY-IAZIO-0190"}`),
+			})
+		case "/api/v1/agent/jobs/job-rt-conv-0190/heartbeat":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			if c, _ := body["active_conversation_id"].(string); c != "" {
+				heartbeatConvIDs = append(heartbeatConvIDs, c)
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/agent/jobs/job-rt-conv-0190/ack-lease":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			if c, _ := body["active_conversation_id"].(string); c != "" {
+				ackConvIDs = append(ackConvIDs, c)
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/agent/jobs/job-rt-conv-0190/complete":
+			var body CompleteRequest
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			var res map[string]any
+			_ = json.Unmarshal(body.Result, &res)
+			mu.Lock()
+			completedConvID, _ = res["conversation_id"].(string)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	fakeBin := filepath.Join(t.TempDir(), "fake-harness-rt-0190")
+	script := `#!/bin/sh
+echo "CONVERSATION_ID: aff9bb70-6c84-4121-ba1e-68745328700a" >&2
+echo "ALLOCATED_STORY_ID: STORY-IAZIO-0190" >&2
+printf '{"status":"completed","exit_code":0,"summary":"ok"}\n'
+`
+	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake-harness-rt-0190: %v", err)
+	}
+
+	cli := NewHTTPControlPlaneClient(srv.URL, "tok", nil)
+	inv := harness.NewCLIInvoker(fakeBin, t.TempDir())
+	disp := NewDispatcher(cli, inv, "host-1")
+
+	processed, err := disp.PollAndProcess(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("expected PollAndProcess to succeed, got processed=%v err=%v", processed, err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(heartbeatConvIDs) == 0 || heartbeatConvIDs[0] != "aff9bb70-6c84-4121-ba1e-68745328700a" {
+		t.Fatalf("expected real-time HeartbeatJob with active_conversation_id=aff9bb70-6c84-4121-ba1e-68745328700a while running, got %v", heartbeatConvIDs)
+	}
+	if len(ackConvIDs) == 0 || ackConvIDs[len(ackConvIDs)-1] != "aff9bb70-6c84-4121-ba1e-68745328700a" {
+		t.Fatalf("expected real-time AckLease with active_conversation_id=aff9bb70-6c84-4121-ba1e-68745328700a while running, got %v", ackConvIDs)
+	}
+	if completedConvID != "aff9bb70-6c84-4121-ba1e-68745328700a" {
+		t.Fatalf("expected completed job result to retain discovered conversation_id=aff9bb70-6c84-4121-ba1e-68745328700a, got %q", completedConvID)
+	}
+}
+
