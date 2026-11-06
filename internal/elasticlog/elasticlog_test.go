@@ -1,8 +1,10 @@
 package elasticlog
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -222,5 +224,262 @@ func TestElasticSink_SendCentralTelemetryGateway(t *testing.T) {
 	}
 	if !strings.Contains(string(receivedBody), "gateway log message") {
 		t.Fatalf("expected body to contain message, got: %s", string(receivedBody))
+	}
+}
+
+func countSpoolFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read spool dir: %v", err)
+	}
+	var names []string
+	for _, de := range entries {
+		if strings.HasSuffix(de.Name(), ".jsonl") {
+			names = append(names, de.Name())
+		}
+	}
+	return names
+}
+
+func TestElasticSink_BoundedDrainPerFlush(t *testing.T) {
+	var receivedBatches atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedBatches.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"errors":false,"items":[]}`))
+	}))
+	defer ts.Close()
+
+	spoolDir := t.TempDir()
+	sink := New(Config{
+		URL:        "", // manual drain control
+		SpoolDir:   spoolDir,
+		HTTPClient: ts.Client(),
+	})
+	defer func() { _ = sink.Close() }()
+	sink.cfg.URL = ts.URL
+
+	totalBatches := 12
+	for i := 0; i < totalBatches; i++ {
+		sink.spoolBatch([]*Entry{{
+			Timestamp: time.Now().UTC(),
+			LogLevel:  string(LevelInfo),
+			Message:   fmt.Sprintf("spooled-%d", i),
+		}})
+	}
+
+	if got := len(countSpoolFiles(t, spoolDir)); got != totalBatches {
+		t.Fatalf("expected %d spooled files, got %d", totalBatches, got)
+	}
+
+	// First drain cycle must cap at maxDrainBatchesPerFlush (5)
+	sink.drainSpool(context.Background())
+	if got := int(receivedBatches.Load()); got != maxDrainBatchesPerFlush {
+		t.Fatalf("expected %d batches drained on first flush, got %d", maxDrainBatchesPerFlush, got)
+	}
+	if rem := len(countSpoolFiles(t, spoolDir)); rem != totalBatches-maxDrainBatchesPerFlush {
+		t.Fatalf("expected %d remaining spool files, got %d", totalBatches-maxDrainBatchesPerFlush, rem)
+	}
+
+	// Second drain cycle drains next 5
+	sink.drainSpool(context.Background())
+	if got := int(receivedBatches.Load()); got != 2*maxDrainBatchesPerFlush {
+		t.Fatalf("expected %d total batches drained after second flush, got %d", 2*maxDrainBatchesPerFlush, got)
+	}
+
+	// Third drain cycle drains remaining 2
+	sink.drainSpool(context.Background())
+	if got := int(receivedBatches.Load()); got != totalBatches {
+		t.Fatalf("expected %d total batches drained after third flush, got %d", totalBatches, got)
+	}
+	if rem := len(countSpoolFiles(t, spoolDir)); rem != 0 {
+		t.Fatalf("expected 0 remaining spool files, got %d", rem)
+	}
+}
+
+func TestElasticSink_PoisonPill400EvictionAndTransientRetention(t *testing.T) {
+	var deliveredGood atomic.Int32
+	var transientStatus atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodyStr := string(body)
+		switch {
+		case strings.Contains(bodyStr, "poison-400"):
+			w.WriteHeader(http.StatusBadRequest)
+		case strings.Contains(bodyStr, "poison-422"):
+			w.WriteHeader(http.StatusUnprocessableEntity)
+		case strings.Contains(bodyStr, "transient-err"):
+			status := int(transientStatus.Load())
+			if status == 0 {
+				status = http.StatusServiceUnavailable
+			}
+			w.WriteHeader(status)
+		default:
+			deliveredGood.Add(1)
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	spoolDir := t.TempDir()
+	sink := New(Config{
+		URL:        "",
+		SpoolDir:   spoolDir,
+		HTTPClient: ts.Client(),
+	})
+	defer func() { _ = sink.Close() }()
+	sink.cfg.URL = ts.URL
+
+	// Enqueue 2 poison-pill batches followed by a valid batch and a transient failure batch
+	sink.spoolBatch([]*Entry{{Timestamp: time.Now().UTC(), LogLevel: "INFO", Message: "poison-400"}})
+	sink.spoolBatch([]*Entry{{Timestamp: time.Now().UTC(), LogLevel: "INFO", Message: "poison-422"}})
+	sink.spoolBatch([]*Entry{{Timestamp: time.Now().UTC(), LogLevel: "INFO", Message: "good-message-1"}})
+	sink.spoolBatch([]*Entry{{Timestamp: time.Now().UTC(), LogLevel: "INFO", Message: "transient-err"}})
+	sink.spoolBatch([]*Entry{{Timestamp: time.Now().UTC(), LogLevel: "INFO", Message: "good-message-2"}})
+
+	transientStatus.Store(http.StatusTooManyRequests)
+	sink.drainSpool(context.Background())
+
+	// Both poison pills must be evicted and good-message-1 delivered before stopping at transient-err (429)
+	if deliveredGood.Load() != 1 {
+		t.Fatalf("expected good-message-1 to be delivered past poison pills, got %d", deliveredGood.Load())
+	}
+	remaining := countSpoolFiles(t, spoolDir)
+	if len(remaining) != 2 {
+		t.Fatalf("expected 2 remaining files (transient-err + good-message-2), got %d: %v", len(remaining), remaining)
+	}
+
+	// Verify 401 Unauthorized is also treated as transient (not evicted)
+	transientStatus.Store(http.StatusUnauthorized)
+	sink.drainSpool(context.Background())
+	if len(countSpoolFiles(t, spoolDir)) != 2 {
+		t.Fatalf("expected 401 batch to remain on disk for retry after token refresh")
+	}
+
+	// Now allow transient-err to succeed (200 OK)
+	transientStatus.Store(http.StatusOK)
+	sink.drainSpool(context.Background())
+	if len(countSpoolFiles(t, spoolDir)) != 0 {
+		t.Fatalf("expected all remaining spool files to drain once transient error resolved")
+	}
+	if deliveredGood.Load() != 2 {
+		t.Fatalf("expected good-message-2 to be delivered, total good=%d", deliveredGood.Load())
+	}
+}
+
+func TestElasticSink_SpoolRetentionCap(t *testing.T) {
+	// 1. File count cap (evicts oldest first)
+	spoolDirFiles := t.TempDir()
+	sinkFiles := New(Config{
+		URL:           "",
+		SpoolDir:      spoolDirFiles,
+		MaxSpoolFiles: 4,
+	})
+	defer func() { _ = sinkFiles.Close() }()
+
+	for i := 1; i <= 10; i++ {
+		sinkFiles.spoolBatch([]*Entry{{
+			Timestamp: time.Now().UTC(),
+			LogLevel:  "INFO",
+			Message:   fmt.Sprintf("msg-%02d", i),
+		}})
+	}
+
+	names := countSpoolFiles(t, spoolDirFiles)
+	if len(names) != 4 {
+		t.Fatalf("expected max 4 spool files retained, got %d: %v", len(names), names)
+	}
+	// Oldest (msg-01..msg-06) must be evicted; newest (msg-07..msg-10) must be retained
+	firstData, err := os.ReadFile(sinkFiles.SpoolDir() + "/" + names[0])
+	if err != nil {
+		t.Fatalf("read oldest retained file: %v", err)
+	}
+	if !strings.Contains(string(firstData), "msg-07") {
+		t.Fatalf("expected oldest retained file to contain msg-07, got %s", string(firstData))
+	}
+
+	// 2. Byte budget cap (evicts oldest first)
+	spoolDirBytes := t.TempDir()
+	sinkBytes := New(Config{
+		URL:           "",
+		SpoolDir:      spoolDirBytes,
+		MaxSpoolFiles: 200,
+		MaxSpoolBytes: 350, // enough for ~2 small batches
+	})
+	defer func() { _ = sinkBytes.Close() }()
+
+	for i := 1; i <= 6; i++ {
+		sinkBytes.spoolBatch([]*Entry{{
+			Timestamp: time.Now().UTC(),
+			LogLevel:  "INFO",
+			Message:   fmt.Sprintf("byte-budget-msg-%02d", i),
+		}})
+	}
+
+	byteFiles := countSpoolFiles(t, spoolDirBytes)
+	if len(byteFiles) == 0 || len(byteFiles) >= 6 {
+		t.Fatalf("expected byte cap to evict older files, got %d files", len(byteFiles))
+	}
+	var totalSize int64
+	for _, name := range byteFiles {
+		fi, err := os.Stat(spoolDirBytes + "/" + name)
+		if err != nil {
+			t.Fatalf("stat %s: %v", name, err)
+		}
+		totalSize += fi.Size()
+	}
+	if totalSize > 350 {
+		t.Fatalf("expected total spool bytes <= 350, got %d", totalSize)
+	}
+}
+
+func TestElasticSink_TLSConfigBehavior(t *testing.T) {
+	t.Setenv("IAZIO_TLS_INSECURE_SKIP_VERIFY", "")
+
+	// 1. Public HTTPS endpoint verifies certificates by default (InsecureSkipVerify == false)
+	publicSink := New(Config{
+		URL:      "https://central-telemetry-gateway.iazio.io/v1/telemetry/logs",
+		SpoolDir: t.TempDir(),
+	})
+	_ = publicSink.Close()
+	tr, ok := publicSink.client.Transport.(*http.Transport)
+	if !ok || tr.TLSClientConfig == nil {
+		t.Fatalf("expected *http.Transport with TLSClientConfig")
+	}
+	if tr.TLSClientConfig.InsecureSkipVerify {
+		t.Fatalf("expected InsecureSkipVerify=false for public HTTPS endpoint by default")
+	}
+
+	// 2. Explicit Config.InsecureSkipVerify=true enables skip verify
+	explicitSink := New(Config{
+		URL:                "https://central-telemetry-gateway.iazio.io/v1/telemetry/logs",
+		InsecureSkipVerify: true,
+		SpoolDir:           t.TempDir(),
+	})
+	_ = explicitSink.Close()
+	if !explicitSink.client.Transport.(*http.Transport).TLSClientConfig.InsecureSkipVerify {
+		t.Fatalf("expected InsecureSkipVerify=true when Config.InsecureSkipVerify=true")
+	}
+
+	// 3. Internal / local / loopback / RFC1918 private hosts allow self-signed homelab certs
+	for _, internalURL := range []string{
+		"https://es.homelab.internal:9200",
+		"https://es.local:9200",
+		"https://localhost:9200",
+		"https://127.0.0.1:9200",
+		"https://192.168.1.50:9200",
+		"https://10.0.0.15:9200",
+	} {
+		if !shouldSkipTLSVerify(Config{URL: internalURL}) {
+			t.Fatalf("expected shouldSkipTLSVerify=true for internal/private URL %s", internalURL)
+		}
+	}
+
+	// 4. Environment override IAZIO_TLS_INSECURE_SKIP_VERIFY=1 enables skip verify
+	t.Setenv("IAZIO_TLS_INSECURE_SKIP_VERIFY", "1")
+	if !shouldSkipTLSVerify(Config{URL: "https://logs.example.com"}) {
+		t.Fatalf("expected shouldSkipTLSVerify=true when IAZIO_TLS_INSECURE_SKIP_VERIFY=1")
 	}
 }

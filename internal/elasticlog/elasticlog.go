@@ -8,14 +8,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+const (
+	maxDrainBatchesPerFlush       = 5
+	maxSpoolFiles                 = 200
+	maxSpoolBytes           int64 = 50 << 20 // 50 MiB
 )
 
 // LogLevel represents severity level.
@@ -45,22 +54,26 @@ type Entry struct {
 
 // Config controls Elasticsearch log sink behavior.
 type Config struct {
-	URL           string
-	Index         string
-	Username      string
-	Password      string
-	ServiceName   string
-	Version       string
-	HostName      string
-	BufferSize    int
-	BatchSize     int
-	FlushInterval time.Duration
-	HTTPClient    *http.Client
-	SpoolDir      string
-	GatewayURL    string
-	IsGateway     bool
-	AuthToken     string
-	TokenFunc     func() string
+	URL                     string
+	Index                   string
+	Username                string
+	Password                string
+	ServiceName             string
+	Version                 string
+	HostName                string
+	BufferSize              int
+	BatchSize               int
+	FlushInterval           time.Duration
+	HTTPClient              *http.Client
+	SpoolDir                string
+	GatewayURL              string
+	IsGateway               bool
+	AuthToken               string
+	TokenFunc               func() string
+	InsecureSkipVerify      bool
+	MaxDrainBatchesPerFlush int
+	MaxSpoolFiles           int
+	MaxSpoolBytes           int64
 }
 
 // Sink is an asynchronous, non-blocking Elasticsearch log shipper with offline spooling.
@@ -76,6 +89,7 @@ type Sink struct {
 	client              *http.Client
 	spoolDir            string
 	spoolMu             sync.Mutex
+	spoolSeq            atomic.Uint64
 	isDown              atomic.Bool
 	consecutiveFailures atomic.Int32
 	lastFailureTime     atomic.Int64
@@ -98,6 +112,15 @@ func New(cfg Config) *Sink {
 	if cfg.FlushInterval <= 0 {
 		cfg.FlushInterval = 2 * time.Second
 	}
+	if cfg.MaxDrainBatchesPerFlush <= 0 {
+		cfg.MaxDrainBatchesPerFlush = maxDrainBatchesPerFlush
+	}
+	if cfg.MaxSpoolFiles <= 0 {
+		cfg.MaxSpoolFiles = maxSpoolFiles
+	}
+	if cfg.MaxSpoolBytes <= 0 {
+		cfg.MaxSpoolBytes = maxSpoolBytes
+	}
 	if cfg.HostName == "" {
 		h, err := os.Hostname()
 		if err == nil {
@@ -112,7 +135,7 @@ func New(cfg Config) *Sink {
 		client = &http.Client{
 			Timeout: 10 * time.Second,
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // homelab self-signed CA
+				TLSClientConfig: buildTLSConfig(cfg),
 			},
 		}
 	}
@@ -377,10 +400,73 @@ func (s *Sink) sendBulkDirect(ctx context.Context, entries []*Entry) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("telemetry/elasticsearch error: status %d", resp.StatusCode)
+		return &httpStatusError{StatusCode: resp.StatusCode}
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
+}
+
+type httpStatusError struct {
+	StatusCode int
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("telemetry/elasticsearch error: status %d", e.StatusCode)
+}
+
+func isPermanentSpoolError(err error) bool {
+	var statusErr *httpStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	switch statusErr.StatusCode {
+	case http.StatusBadRequest,
+		http.StatusNotFound,
+		http.StatusRequestEntityTooLarge,
+		http.StatusUnprocessableEntity:
+		return true
+	default:
+		return false
+	}
+}
+
+func buildTLSConfig(cfg Config) *tls.Config {
+	return &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: shouldSkipTLSVerify(cfg), //nolint:gosec // controlled via explicit config, env, or internal/private host
+	}
+}
+
+func shouldSkipTLSVerify(cfg Config) bool {
+	if cfg.InsecureSkipVerify {
+		return true
+	}
+	envVal := strings.TrimSpace(strings.ToLower(os.Getenv("IAZIO_TLS_INSECURE_SKIP_VERIFY")))
+	if envVal == "1" || envVal == "true" {
+		return true
+	}
+	rawURL := strings.TrimSpace(cfg.GatewayURL)
+	if rawURL == "" {
+		rawURL = strings.TrimSpace(cfg.URL)
+	}
+	if rawURL == "" {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	if host == "" {
+		return false
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".internal") || strings.HasSuffix(host, ".local") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+	}
+	return false
 }
 
 func (s *Sink) spoolBatch(entries []*Entry) {
@@ -390,19 +476,97 @@ func (s *Sink) spoolBatch(entries []*Entry) {
 	s.spoolMu.Lock()
 	defer s.spoolMu.Unlock()
 
-	spoolPath := filepath.Join(s.spoolDir, fmt.Sprintf("batch-%d.jsonl", time.Now().UnixNano()))
+	seq := s.spoolSeq.Add(1)
+	spoolPath := filepath.Join(s.spoolDir, fmt.Sprintf("batch-%019d-%06d.jsonl", time.Now().UnixNano(), seq))
 	f, err := os.Create(spoolPath)
 	if err != nil {
 		return
 	}
-	defer f.Close()
 
 	for _, e := range entries {
 		if data, err := json.Marshal(e); err == nil {
-			f.Write(data)
-			f.WriteString("\n")
+			_, _ = f.Write(data)
+			_, _ = f.WriteString("\n")
 		}
 	}
+	_ = f.Close()
+
+	s.enforceSpoolLimitsLocked()
+}
+
+type spoolFileInfo struct {
+	name    string
+	path    string
+	size    int64
+	modTime time.Time
+}
+
+func (s *Sink) enforceSpoolLimitsLocked() {
+	entries, err := os.ReadDir(s.spoolDir)
+	if err != nil || len(entries) == 0 {
+		return
+	}
+
+	maxFiles := s.cfg.MaxSpoolFiles
+	if maxFiles <= 0 {
+		maxFiles = maxSpoolFiles
+	}
+	maxBytes := s.cfg.MaxSpoolBytes
+	if maxBytes <= 0 {
+		maxBytes = maxSpoolBytes
+	}
+
+	files := make([]spoolFileInfo, 0, len(entries))
+	var totalBytes int64
+	for _, de := range entries {
+		if de.IsDir() || !strings.HasSuffix(de.Name(), ".jsonl") {
+			continue
+		}
+		info, err := de.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, spoolFileInfo{
+			name:    de.Name(),
+			path:    filepath.Join(s.spoolDir, de.Name()),
+			size:    info.Size(),
+			modTime: info.ModTime(),
+		})
+		totalBytes += info.Size()
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		if !files[i].modTime.Equal(files[j].modTime) {
+			return files[i].modTime.Before(files[j].modTime)
+		}
+		return files[i].name < files[j].name
+	})
+
+	for len(files) > maxFiles || (totalBytes > maxBytes && len(files) > 0) {
+		oldest := files[0]
+		files = files[1:]
+		_ = os.Remove(oldest.path)
+		totalBytes -= oldest.size
+	}
+}
+
+func parseSpoolBatch(path string) ([]*Entry, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var batch []*Entry
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var e Entry
+		if err := json.Unmarshal([]byte(line), &e); err == nil {
+			batch = append(batch, &e)
+		}
+	}
+	return batch, nil
 }
 
 func (s *Sink) drainSpool(ctx context.Context) {
@@ -417,30 +581,33 @@ func (s *Sink) drainSpool(ctx context.Context) {
 		return
 	}
 
+	maxDrain := s.cfg.MaxDrainBatchesPerFlush
+	if maxDrain <= 0 {
+		maxDrain = maxDrainBatchesPerFlush
+	}
+
+	drained := 0
 	for _, de := range entries {
+		if drained >= maxDrain {
+			break
+		}
 		if !strings.HasSuffix(de.Name(), ".jsonl") {
 			continue
 		}
 		p := filepath.Join(s.spoolDir, de.Name())
-		data, err := os.ReadFile(p)
+		batch, err := parseSpoolBatch(p)
 		if err != nil {
 			continue
 		}
-		var batch []*Entry
-		lines := strings.Split(string(data), "\n")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			var e Entry
-			if err := json.Unmarshal([]byte(line), &e); err == nil {
-				batch = append(batch, &e)
-			}
-		}
+		drained++
 		if len(batch) > 0 {
 			if err := s.sendBulkDirect(ctx, batch); err != nil {
-				// Still down, stop draining
+				if isPermanentSpoolError(err) {
+					// Evict poison-pill batch so it does not cause permanent head-of-line blocking
+					_ = os.Remove(p)
+					continue
+				}
+				// Transient error / still down: stop draining and retry later
 				return
 			}
 		}
