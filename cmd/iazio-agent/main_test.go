@@ -4548,7 +4548,71 @@ func TestApplyDarwin_StatusWritesToStdoutWriter(t *testing.T) {
 	}
 }
 
+func TestProbeRepoRuntime_TriggersGitUpdateAutoRemediationWhenASECompletedAndTreeDirty(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell mock script test runs on unix")
+	}
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	binDir := filepath.Join(fakeHome, ".iazio", "bin")
+	_ = os.MkdirAll(binDir, 0o755)
+	mockHarness := filepath.Join(binDir, "iazio-harness")
+	script := `#!/bin/sh
+if [ "$1" = "repo" ] && [ "$2" = "remediate" ]; then
+  cat << 'EOF'
+{
+  "success": true,
+  "skipped": false,
+  "fleet_status": {
+    "branch": "main",
+    "head_sha": "def5678",
+    "is_clean": true,
+    "submodules_clean": true,
+    "dirty_files_count": 0,
+    "untracked_files_count": 0,
+    "modified_files": [],
+    "dirty_submodules": [],
+    "ase_state": "IDLE",
+    "active_story_id": "",
+    "agent_tool": "agy",
+    "tool_liveness": "LIVE",
+    "execution_provenance": "INDEPENDENT_USER_SESSION"
+  }
+}
+EOF
+  exit 0
+fi
+cat << 'EOF'
+{
+  "branch": "main",
+  "head_sha": "abc1234",
+  "is_clean": false,
+  "submodules_clean": false,
+  "dirty_files_count": 2,
+  "modified_files": [".session_story_id"],
+  "dirty_submodules": ["sub-infra (uncommitted changes)"],
+  "ase_state": "FAILED_DIRTY",
+  "active_story_id": "",
+  "agent_tool": "agy",
+  "tool_liveness": "LIVE",
+  "execution_provenance": "INDEPENDENT_USER_SESSION"
+}
+EOF
+`
+	if err := os.WriteFile(mockHarness, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
+	repoDir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(repoDir, ".autopilot"), 0o755)
+	_ = os.WriteFile(filepath.Join(repoDir, ".autopilot", "state.json"), []byte(`{"state":"IDLE","verification_status":"PASSED"}`), 0o644)
+
+	st := probeRepoRuntime(context.Background(), repoDir, "sample-repo-03")
+	if !st.IsClean || !st.SubmodulesClean || st.ASEState != "IDLE" || st.ExecutionProvenance != "NONE" || st.Porcelain != "" {
+		t.Fatalf("expected post-ASE git-update autoremediation to clean repo and clear INDEPENDENT_USER_SESSION, got %+v", st)
+	}
+}
 
 
 

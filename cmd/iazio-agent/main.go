@@ -1183,6 +1183,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 									if hj.JobID == "" || seen[hj.JobID] || hj.Status != watchdog.StatusRunning {
 										continue
 									}
+									if isStaleOrSyntheticHarnessActiveJob(hj) {
+										continue
+									}
 									livePID := hj.HarnessPID
 									if livePID <= 0 {
 										livePID = hj.PID
@@ -2823,6 +2826,226 @@ func isStoryCompletedOnDiskFallback(repoPath, storyID string) bool {
 	return false
 }
 
+func isStaleOrSyntheticHarnessActiveJob(hj watchdog.TrackedJob) bool {
+	id := strings.TrimSpace(hj.JobID)
+	if id == "" || id == "job-cp-fallback" || strings.HasPrefix(id, "job-reap-") || strings.HasPrefix(id, "job-missing-") {
+		return true
+	}
+	wt := hj.WorktreePath
+	if strings.Contains(wt, "TestExecuteJob_") || strings.Contains(wt, "/T/Test") || strings.Contains(wt, `\Temp\Test`) {
+		return true
+	}
+	// Guard against recycled OS PIDs for old harness-active-jobs.json entries (>2h without lock ownership)
+	if !hj.UpdatedAt.IsZero() && time.Since(hj.UpdatedAt) > 2*time.Hour {
+		if wt == "" {
+			return true
+		}
+		info, err := repolock.Read(wt)
+		if err != nil || info.JobID != id {
+			return true
+		}
+	}
+	return false
+}
+
+type harnessFleetStatusPayload struct {
+	Branch               string   `json:"branch"`
+	HeadSHA              string   `json:"head_sha"`
+	IsClean              bool     `json:"is_clean"`
+	Ahead                int      `json:"ahead"`
+	Behind               int      `json:"behind"`
+	DirtyFilesCount      int      `json:"dirty_files_count"`
+	UntrackedFilesCount  int      `json:"untracked_files_count"`
+	HasActiveGitLock     bool     `json:"has_active_git_lock"`
+	ModifiedFiles        []string `json:"modified_files"`
+	UntrackedFiles       []string `json:"untracked_files"`
+	SubmodulesClean      bool     `json:"submodules_clean"`
+	DirtySubmodules      []string `json:"dirty_submodules"`
+	NonMainSubmodules    []string `json:"non_main_submodules"`
+	ASEState             string   `json:"ase_state"`
+	ActiveStoryID        string   `json:"active_story_id"`
+	StoryID              string   `json:"story_id"`
+	AgentTool            string   `json:"agent_tool"`
+	ToolLiveness         string   `json:"tool_liveness"`
+	ExecutionProvenance  string   `json:"execution_provenance"`
+	ActiveConversationID string   `json:"active_conversation_id"`
+	MetadataYmlRaw       string   `json:"metadata_yml_raw"`
+	MetadataYmlSHA       string   `json:"metadata_yml_sha"`
+	MetadataYmlModTime   string   `json:"metadata_yml_mod_time"`
+	GitVersion           string   `json:"git_version"`
+}
+
+func applyHarnessFleetStatusPayload(res harnessFleetStatusPayload, repoPath string, st *controlplane.RepoRuntimeStatus) {
+	st.Branch = res.Branch
+	st.HeadSHA = res.HeadSHA
+	st.IsClean = res.IsClean
+	st.Ahead = res.Ahead
+	st.Behind = res.Behind
+	st.DirtyFilesCount = res.DirtyFilesCount
+	if st.DirtyFilesCount == 0 && len(res.ModifiedFiles) > 0 {
+		st.DirtyFilesCount = len(res.ModifiedFiles)
+	}
+	st.UntrackedFilesCount = res.UntrackedFilesCount
+	if st.UntrackedFilesCount == 0 && len(res.UntrackedFiles) > 0 {
+		st.UntrackedFilesCount = len(res.UntrackedFiles)
+	}
+	st.HasActiveGitLock = res.HasActiveGitLock
+	st.SubmodulesClean = res.SubmodulesClean
+	st.DirtySubmodules = res.DirtySubmodules
+	st.NonMainSubmodules = res.NonMainSubmodules
+	st.ASEState = res.ASEState
+	if st.ASEState == "" {
+		st.ASEState = "IDLE"
+	}
+	st.ActiveStoryID = res.ActiveStoryID
+	if st.ActiveStoryID == "" {
+		st.ActiveStoryID = res.StoryID
+	}
+	if st.ActiveStoryID == "" {
+		statePath := filepath.Join(repoPath, ".autopilot", "state.json")
+		if b, err := os.ReadFile(statePath); err == nil {
+			var s struct {
+				State   string `json:"state"`
+				StoryID string `json:"story_id"`
+			}
+			if json.Unmarshal(b, &s) == nil && s.StoryID != "" {
+				st.ActiveStoryID = s.StoryID
+				if st.ASEState == "" || st.ASEState == "IDLE" {
+					st.ASEState = s.State
+				}
+			}
+		}
+	}
+	st.ActiveTool = res.AgentTool
+	st.ToolLiveness = res.ToolLiveness
+	st.ExecutionProvenance = res.ExecutionProvenance
+	if (st.ASEState == "IDLE" || st.ASEState == "FAILED_DIRTY") && st.ExecutionProvenance == "INDEPENDENT_USER_SESSION" {
+		st.ExecutionProvenance = "NONE"
+	}
+	st.ActiveConversationID = res.ActiveConversationID
+	if res.MetadataYmlRaw != "" {
+		st.MetadataYmlRaw = res.MetadataYmlRaw
+		st.MetadataYmlSHA = res.MetadataYmlSHA
+		st.MetadataYmlModTime = res.MetadataYmlModTime
+	}
+	if res.GitVersion != "" {
+		st.GitVersion = res.GitVersion
+	}
+	if len(res.ModifiedFiles) > 0 || len(res.UntrackedFiles) > 0 {
+		var pLines []string
+		for _, m := range res.ModifiedFiles {
+			pLines = append(pLines, "M "+m)
+		}
+		for _, u := range res.UntrackedFiles {
+			pLines = append(pLines, "?? "+u)
+		}
+		st.Porcelain = strings.Join(pLines, "\n")
+	} else {
+		st.Porcelain = ""
+	}
+}
+
+func isASEFlowCompletedAndLastJobSucceeded(repoPath string, st controlplane.RepoRuntimeStatus) bool {
+	if st.ASEState == "RUNNING" || st.ASEState == "IN_PROGRESS" || strings.EqualFold(st.ASEState, "active") || st.HasActiveGitLock {
+		return false
+	}
+	if st.Branch != "main" && st.Branch != "master" {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(repoPath, ".autopilot", "lock")); err == nil {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(repoPath, ".ase", "active.lock")); err == nil {
+		return false
+	}
+	if lockInfo, err := repolock.Read(repoPath); err == nil && lockInfo.PID > 0 && watchdog.IsProcessAlive(lockInfo.PID) {
+		return false
+	}
+
+	hasCompletedASEEvidence := false
+	statePath := filepath.Join(repoPath, ".autopilot", "state.json")
+	if b, err := os.ReadFile(statePath); err == nil {
+		var s struct {
+			State              string `json:"state"`
+			StoryID            string `json:"story_id"`
+			VerificationStatus string `json:"verification_status"`
+		}
+		if json.Unmarshal(b, &s) == nil {
+			if strings.EqualFold(s.State, "RUNNING") || strings.EqualFold(s.State, "IN_PROGRESS") ||
+				strings.EqualFold(s.State, "FAILED") || strings.EqualFold(s.VerificationStatus, "FAILED") {
+				return false
+			}
+			if s.StoryID != "" && !isStoryCompletedOnDiskFallback(repoPath, s.StoryID) {
+				return false
+			}
+			if strings.EqualFold(s.VerificationStatus, "PASSED") || strings.EqualFold(s.State, "DONE") || strings.EqualFold(s.State, "COMPLETED") {
+				hasCompletedASEEvidence = true
+			}
+		}
+	}
+	aseStatePath := filepath.Join(repoPath, ".autopilot", "ase-state.json")
+	if b, err := os.ReadFile(aseStatePath); err == nil {
+		var as struct {
+			Status string `json:"status"`
+			Phase  string `json:"phase"`
+		}
+		if json.Unmarshal(b, &as) == nil {
+			if strings.EqualFold(as.Status, "RUNNING") || strings.EqualFold(as.Status, "FAILED") {
+				return false
+			}
+			if strings.EqualFold(as.Status, "DONE") || strings.EqualFold(as.Phase, "completed") {
+				hasCompletedASEEvidence = true
+			}
+		}
+	}
+
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		cleanRepo := filepath.Clean(repoPath)
+		var latestJob *watchdog.TrackedJob
+		for _, stateFile := range []string{
+			filepath.Join(home, ".iazio", "harness-active-jobs.json"),
+			filepath.Join(home, ".iazio", "watchdog-state.json"),
+		} {
+			if raw, rErr := os.ReadFile(stateFile); rErr == nil {
+				var jobs []watchdog.TrackedJob
+				if json.Unmarshal(raw, &jobs) == nil {
+					for i := range jobs {
+						j := jobs[i]
+						if filepath.Clean(j.WorktreePath) != cleanRepo {
+							continue
+						}
+						if latestJob == nil || j.UpdatedAt.After(latestJob.UpdatedAt) {
+							copyJ := j
+							latestJob = &copyJ
+						}
+					}
+				}
+			}
+		}
+		if latestJob != nil {
+			if latestJob.Status == watchdog.StatusRunning || latestJob.Status == watchdog.StatusAutoResuming || latestJob.Status == watchdog.StatusResumed {
+				return false
+			}
+			if latestJob.Status == watchdog.StatusFailed || latestJob.Status == watchdog.StatusTerminatedUnexpectedly || latestJob.ExitCode != 0 {
+				return false
+			}
+			if latestJob.Status == watchdog.StatusCompleted && latestJob.ExitCode == 0 {
+				hasCompletedASEEvidence = true
+			}
+		}
+	}
+
+	return hasCompletedASEEvidence
+}
+
+func cleanOrRestoreFallbackSessionStoryFile(repoPath, sessionFile string) {
+	if procutil.Command("git", "-C", repoPath, "ls-files", "--error-unmatch", ".session_story_id").Run() == nil {
+		_ = procutil.Command("git", "-C", repoPath, "checkout", "HEAD", "--", ".session_story_id").Run()
+		return
+	}
+	_ = os.Remove(sessionFile)
+}
+
 func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.RepoRuntimeStatus {
 	st := controlplane.RepoRuntimeStatus{
 		RepoPath:      repoPath,
@@ -2836,91 +3059,26 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 	harnessBin := resolveHarnessBinaryPath()
 	harnessCmd := procutil.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--auto-remediate", "--json")
 	if out, err := harnessCmd.Output(); err == nil && len(out) > 0 {
-		var res struct {
-			Branch               string   `json:"branch"`
-			HeadSHA              string   `json:"head_sha"`
-			IsClean              bool     `json:"is_clean"`
-			Ahead                int      `json:"ahead"`
-			Behind               int      `json:"behind"`
-			DirtyFilesCount      int      `json:"dirty_files_count"`
-			UntrackedFilesCount  int      `json:"untracked_files_count"`
-			HasActiveGitLock     bool     `json:"has_active_git_lock"`
-			ModifiedFiles        []string `json:"modified_files"`
-			UntrackedFiles       []string `json:"untracked_files"`
-			SubmodulesClean      bool     `json:"submodules_clean"`
-			DirtySubmodules      []string `json:"dirty_submodules"`
-			NonMainSubmodules    []string `json:"non_main_submodules"`
-			ASEState             string   `json:"ase_state"`
-			ActiveStoryID        string   `json:"active_story_id"`
-			StoryID              string   `json:"story_id"`
-			AgentTool            string   `json:"agent_tool"`
-			ToolLiveness         string   `json:"tool_liveness"`
-			ExecutionProvenance  string   `json:"execution_provenance"`
-			ActiveConversationID string   `json:"active_conversation_id"`
-			MetadataYmlRaw       string   `json:"metadata_yml_raw"`
-			MetadataYmlSHA       string   `json:"metadata_yml_sha"`
-			MetadataYmlModTime   string   `json:"metadata_yml_mod_time"`
-			GitVersion           string   `json:"git_version"`
-		}
+		var res harnessFleetStatusPayload
 		if json.Unmarshal(out, &res) == nil && res.Branch != "" {
 			harnessSucceeded = true
-			st.Branch = res.Branch
-			st.HeadSHA = res.HeadSHA
-			st.IsClean = res.IsClean
-			st.Ahead = res.Ahead
-			st.Behind = res.Behind
-			st.DirtyFilesCount = res.DirtyFilesCount
-			if st.DirtyFilesCount == 0 && len(res.ModifiedFiles) > 0 {
-				st.DirtyFilesCount = len(res.ModifiedFiles)
-			}
-			st.UntrackedFilesCount = res.UntrackedFilesCount
-			if st.UntrackedFilesCount == 0 && len(res.UntrackedFiles) > 0 {
-				st.UntrackedFilesCount = len(res.UntrackedFiles)
-			}
-			st.HasActiveGitLock = res.HasActiveGitLock
-			st.SubmodulesClean = res.SubmodulesClean
-			st.DirtySubmodules = res.DirtySubmodules
-			st.NonMainSubmodules = res.NonMainSubmodules
-			st.ASEState = res.ASEState
-			if st.ASEState == "" {
-				st.ASEState = "IDLE"
-			}
-			st.ActiveStoryID = res.ActiveStoryID
-			if st.ActiveStoryID == "" {
-				st.ActiveStoryID = res.StoryID
-			}
-			if st.ActiveStoryID == "" {
-				statePath := filepath.Join(repoPath, ".autopilot", "state.json")
-				if b, err := os.ReadFile(statePath); err == nil {
-					var s struct {
-						State   string `json:"state"`
-						StoryID string `json:"story_id"`
+			applyHarnessFleetStatusPayload(res, repoPath, &st)
+
+			// If git tree or submodules have dirty files after a completed ASE flow whose last job succeeded without errors,
+			// trigger iazio-harness to execute "autopilot git-update" with autoremediation.
+			hasDirtyTree := !st.IsClean || !st.SubmodulesClean || st.DirtyFilesCount > 0 || st.UntrackedFilesCount > 0 || len(st.DirtySubmodules) > 0
+			if hasDirtyTree && isASEFlowCompletedAndLastJobSucceeded(repoPath, st) {
+				remCmd := procutil.CommandContext(ctx, harnessBin, "repo", "remediate", "--repo", repoPath, "--strategy", "git-update", "--json")
+				if remOut, remErr := remCmd.Output(); remErr == nil && len(remOut) > 0 {
+					var remRes struct {
+						Success     bool                       `json:"success"`
+						Skipped     bool                       `json:"skipped"`
+						FleetStatus *harnessFleetStatusPayload `json:"fleet_status"`
 					}
-					if json.Unmarshal(b, &s) == nil && s.StoryID != "" {
-						st.ActiveStoryID = s.StoryID
-						if st.ASEState == "" || st.ASEState == "IDLE" {
-							st.ASEState = s.State
-						}
+					if json.Unmarshal(remOut, &remRes) == nil && remRes.Success && !remRes.Skipped && remRes.FleetStatus != nil && remRes.FleetStatus.Branch != "" {
+						applyHarnessFleetStatusPayload(*remRes.FleetStatus, repoPath, &st)
 					}
 				}
-			}
-			st.ActiveTool = res.AgentTool
-			st.ToolLiveness = res.ToolLiveness
-			st.ExecutionProvenance = res.ExecutionProvenance
-			st.ActiveConversationID = res.ActiveConversationID
-			st.MetadataYmlRaw = res.MetadataYmlRaw
-			st.MetadataYmlSHA = res.MetadataYmlSHA
-			st.MetadataYmlModTime = res.MetadataYmlModTime
-			st.GitVersion = res.GitVersion
-			if len(res.ModifiedFiles) > 0 || len(res.UntrackedFiles) > 0 {
-				var pLines []string
-				for _, m := range res.ModifiedFiles {
-					pLines = append(pLines, "M "+m)
-				}
-				for _, u := range res.UntrackedFiles {
-					pLines = append(pLines, "?? "+u)
-				}
-				st.Porcelain = strings.Join(pLines, "\n")
 			}
 		}
 	}
@@ -3010,7 +3168,7 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 			storyID := strings.TrimSpace(string(sessionBytes))
 			if strings.HasPrefix(storyID, "STORY-") {
 				if isStoryCompletedOnDiskFallback(repoPath, storyID) {
-					_ = os.Remove(sessionFile)
+					cleanOrRestoreFallbackSessionStoryFile(repoPath, sessionFile)
 					_ = os.Remove(filepath.Join(repoPath, "tmp", "ase-resume-"+storyID+".json"))
 				} else {
 					if st.ActiveStoryID == "" {

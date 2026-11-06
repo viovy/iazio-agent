@@ -251,10 +251,18 @@ func isSyntheticTestTrackedJob(j *TrackedJob) bool {
 	if j == nil {
 		return false
 	}
-	if j.WorktreePath == "/nonexistent/worktree/path/for/test" || strings.Contains(j.WorktreePath, "/TestExecuteRun") {
+	id := strings.TrimSpace(j.JobID)
+	if id == "job-cp-fallback" || strings.HasPrefix(id, "job-reap-") || strings.HasPrefix(id, "job-missing-") {
 		return true
 	}
-	if (j.JobID == "job-invalid" || j.JobID == "job-auto-heal") && strings.HasPrefix(j.APIURL, "http://127.0.0.1:") {
+	if j.WorktreePath == "/nonexistent/worktree/path/for/test" ||
+		strings.Contains(j.WorktreePath, "/TestExecuteRun") ||
+		strings.Contains(j.WorktreePath, "TestExecuteJob_") ||
+		strings.Contains(j.WorktreePath, "/T/Test") ||
+		strings.Contains(j.WorktreePath, `\Temp\Test`) {
+		return true
+	}
+	if (id == "job-invalid" || id == "job-auto-heal") && strings.HasPrefix(j.APIURL, "http://127.0.0.1:") {
 		return true
 	}
 	return false
@@ -858,8 +866,15 @@ func (w *Watchdog) MarkCompleted(jobID string) {
 func (w *Watchdog) ActiveJobs() []TrackedJob {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	now := w.now().UTC()
 	var list []TrackedJob
 	for _, j := range w.jobs {
+		if j == nil || isSyntheticTestTrackedJob(j) {
+			continue
+		}
+		if j.Status == StatusTerminatedUnexpectedly && !j.UpdatedAt.IsZero() && now.Sub(j.UpdatedAt) > 15*time.Minute {
+			continue
+		}
 		if j.Status == StatusRunning || j.Status == StatusResumed || j.Status == StatusTerminatedUnexpectedly || j.Status == StatusAutoResuming {
 			list = append(list, *j)
 		}
