@@ -20,10 +20,20 @@ var (
 	verCacheMu sync.RWMutex
 	verCache   = make(map[string]cachedVersion)
 
-	winSvcCacheMu  sync.RWMutex
-	winSvcCache    = make(map[string]cachedWinSvc)
-	winSvcCacheTTL = 15 * time.Second
+	winSvcCacheMu               sync.RWMutex
+	winSvcCache                 = make(map[string]cachedWinSvc)
+	winSvcCacheTTL              = 15 * time.Second
+	defaultServiceCommandRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
+
+	semverExtractRegex = regexp.MustCompile(`v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?)|([0-9]+\.[0-9]+\.[0-9]+)`)
 )
+
+// InvalidateServiceCache clears the cached tool service statuses across all platforms.
+func InvalidateServiceCache() {
+	winSvcCacheMu.Lock()
+	winSvcCache = make(map[string]cachedWinSvc)
+	winSvcCacheMu.Unlock()
+}
 
 type cachedWinSvc struct {
 	fetchedAt time.Time
@@ -95,8 +105,7 @@ func InspectInstalledVersion(binaryPath string) string {
 	if data, err := os.ReadFile(binaryPath + ".version"); err == nil {
 		v := strings.TrimSpace(string(data))
 		if v != "" {
-			re := regexp.MustCompile(`v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?)|([0-9]+\.[0-9]+\.[0-9]+)`)
-			if match := re.FindString(v); match != "" {
+			if match := semverExtractRegex.FindString(v); match != "" {
 				norm := normalizeShortBuildSHA(strings.TrimPrefix(match, "v"))
 				if norm != v {
 					_ = os.WriteFile(binaryPath+".version", []byte(norm), 0644)
@@ -141,9 +150,8 @@ func InspectInstalledVersion(binaryPath string) string {
 		out, err = cmd.Output()
 	}
 	ver := "installed"
-	reSemver := regexp.MustCompile(`v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?)|([0-9]+\.[0-9]+\.[0-9]+)`)
 	if err == nil {
-		if match := reSemver.FindString(string(out)); match != "" {
+		if match := semverExtractRegex.FindString(string(out)); match != "" {
 			ver = normalizeShortBuildSHA(strings.TrimPrefix(match, "v"))
 		} else {
 			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
@@ -156,9 +164,9 @@ func InspectInstalledVersion(binaryPath string) string {
 	if ver != "installed" && ver != "" {
 		sidecarVer := ver
 		if prevHexSHA != "" {
-			if reSemver.FindString(ver) != "" && !strings.Contains(ver, "+") {
+			if semverExtractRegex.FindString(ver) != "" && !strings.Contains(ver, "+") {
 				sidecarVer = ver + "+" + prevHexSHA
-			} else if reSemver.FindString(ver) == "" {
+			} else if semverExtractRegex.FindString(ver) == "" {
 				sidecarVer = ""
 			}
 		}
@@ -257,11 +265,34 @@ func InspectToolService(toolName, goos string, runner ...func(name string, args 
 		customRun = runner[0]
 	}
 	home, _ := os.UserHomeDir()
+	storeSvcCache := func(key string, inst bool, sType, sStatus string, c []string) {
+		if customRun != nil {
+			return
+		}
+		winSvcCacheMu.Lock()
+		winSvcCache[key] = cachedWinSvc{
+			fetchedAt: time.Now(),
+			installed: inst,
+			svcType:   sType,
+			svcStatus: sStatus,
+			caps:      append([]string(nil), c...),
+		}
+		winSvcCacheMu.Unlock()
+	}
 	switch goos {
 	case "linux":
 		if home != "" {
 			unitPath := filepath.Join(home, ".config", "systemd", "user", toolName+".service")
 			if data, err := os.ReadFile(unitPath); err == nil {
+				cacheKey := "linux|" + home + "|" + toolName
+				if customRun == nil {
+					winSvcCacheMu.RLock()
+					cached, ok := winSvcCache[cacheKey]
+					winSvcCacheMu.RUnlock()
+					if ok && time.Since(cached.fetchedAt) < winSvcCacheTTL {
+						return cached.installed, cached.svcType, cached.svcStatus, append([]string(nil), cached.caps...)
+					}
+				}
 				installed = true
 				svcType = "user_service"
 				content := string(data)
@@ -287,6 +318,8 @@ func InspectToolService(toolName, goos string, runner ...func(name string, args 
 				var out []byte
 				if customRun != nil {
 					out, _ = customRun("systemctl", "--user", "is-active", toolName+".service")
+				} else if defaultServiceCommandRunner != nil {
+					out, _ = defaultServiceCommandRunner(ctx, "systemctl", "--user", "is-active", toolName+".service")
 				} else {
 					cmd := procutil.CommandContext(ctx, "systemctl", "--user", "is-active", toolName+".service")
 					out, _ = cmd.Output()
@@ -297,6 +330,7 @@ func InspectToolService(toolName, goos string, runner ...func(name string, args 
 				} else {
 					svcStatus = "inactive"
 				}
+				storeSvcCache(cacheKey, installed, svcType, svcStatus, caps)
 				return
 			}
 		}
@@ -339,12 +373,25 @@ func InspectToolService(toolName, goos string, runner ...func(name string, args 
 			}
 		}
 
+		cacheKey := fmt.Sprintf("darwin|%s|%s|%t|%t", home, toolName, foundUserPlist, foundSystemPlist)
+		if customRun == nil {
+			winSvcCacheMu.RLock()
+			cached, ok := winSvcCache[cacheKey]
+			winSvcCacheMu.RUnlock()
+			if ok && time.Since(cached.fetchedAt) < winSvcCacheTTL {
+				return cached.installed, cached.svcType, cached.svcStatus, append([]string(nil), cached.caps...)
+			}
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
 		runCmd := func(name string, args ...string) ([]byte, error) {
 			if customRun != nil {
 				return customRun(name, args...)
+			}
+			if defaultServiceCommandRunner != nil {
+				return defaultServiceCommandRunner(ctx, name, args...)
 			}
 			return procutil.CommandContext(ctx, name, args...).CombinedOutput()
 		}
@@ -355,7 +402,7 @@ func InspectToolService(toolName, goos string, runner ...func(name string, args 
 		for _, label := range []string{"io.iazio." + toolName, toolName} {
 			if out, err := runCmd("launchctl", "print", domain+"/"+label); err == nil {
 				outStr := string(out)
-				if customRun == nil && home != "" && strings.Contains(outStr, "path = ") && !strings.Contains(outStr, home) {
+				if customRun == nil && defaultServiceCommandRunner == nil && home != "" && strings.Contains(outStr, "path = ") && !strings.Contains(outStr, home) {
 					hostSessionMismatch = true
 					break
 				}
@@ -433,8 +480,10 @@ func InspectToolService(toolName, goos string, runner ...func(name string, args 
 		}
 		if installed {
 			caps = append(caps, "auto_restart", "path_watcher", "self_update", "dev_install", "user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1")
+			storeSvcCache(cacheKey, installed, svcType, svcStatus, caps)
 			return
 		}
+		storeSvcCache(cacheKey, false, "none", "not_installed", nil)
 	case "windows":
 		cacheKey := home + "|" + toolName
 		if customRun == nil {
@@ -456,6 +505,8 @@ func InspectToolService(toolName, goos string, runner ...func(name string, args 
 		var err error
 		if customRun != nil {
 			out, err = customRun("schtasks", "/Query", "/TN", toolName, "/FO", "LIST")
+		} else if defaultServiceCommandRunner != nil {
+			out, err = defaultServiceCommandRunner(ctx, "schtasks", "/Query", "/TN", toolName, "/FO", "LIST")
 		} else {
 			cmd := procutil.CommandContext(ctx, "schtasks", "/Query", "/TN", toolName, "/FO", "LIST")
 			out, err = cmd.Output()
@@ -480,17 +531,7 @@ func InspectToolService(toolName, goos string, runner ...func(name string, args 
 				svcStatus = "active"
 			}
 			caps = append(caps, "watchdog", "auto_restart", "self_update", "dev_install", "user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1")
-			if customRun == nil {
-				winSvcCacheMu.Lock()
-				winSvcCache[cacheKey] = cachedWinSvc{
-					fetchedAt: time.Now(),
-					installed: installed,
-					svcType:   svcType,
-					svcStatus: svcStatus,
-					caps:      append([]string(nil), caps...),
-				}
-				winSvcCacheMu.Unlock()
-			}
+			storeSvcCache(cacheKey, installed, svcType, svcStatus, caps)
 			return
 		}
 		// Fallback on transient schtasks timeout or error: preserve cached state or live PID state

@@ -4490,6 +4490,65 @@ func TestProbeFallbackAndResolveWorktreeAndTokenBranches(t *testing.T) {
 	}
 }
 
+func TestResolveTelemetryDestination_BearerAndContext(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"central_telemetry_gateway_url":"https://gw-dynamic.iazio.io"}`))
+	}))
+	defer srv.Close()
+
+	gwURL, isGateway := resolveTelemetryDestination(srv.URL, func(k string) string {
+		if k == "IAZIO_AUTH_TOKEN" {
+			return "telemetry-bearer-999"
+		}
+		return ""
+	}, context.Background())
+	if gotAuth != "Bearer telemetry-bearer-999" {
+		t.Fatalf("expected Authorization 'Bearer telemetry-bearer-999', got %q", gotAuth)
+	}
+	if gwURL != "https://gw-dynamic.iazio.io" || !isGateway {
+		t.Fatalf("unexpected telemetry destination: gw=%q isGateway=%v", gwURL, isGateway)
+	}
+
+	// Cancelled context aborts HTTP probe immediately and falls back to env/config
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	esFallback, gwFallback := resolveTelemetryDestination(srv.URL, func(k string) string {
+		if k == "IAZIO_ELASTICSEARCH_URL" {
+			return "http://es-fallback:9200"
+		}
+		return ""
+	}, cancelledCtx)
+	if gwFallback || esFallback != "http://es-fallback:9200" {
+		t.Fatalf("expected cancelled context to fall back to IAZIO_ELASTICSEARCH_URL, got es=%q gw=%v", esFallback, gwFallback)
+	}
+}
+
+func TestApplyDarwin_StatusWritesToStdoutWriter(t *testing.T) {
+	origExecOut := execCommandOutput
+	t.Cleanup(func() { execCommandOutput = origExecOut })
+	execCommandOutput = func(name string, args ...string) ([]byte, error) {
+		return []byte("{\n\tpid = 4321\n\tstate = running\n}\n"), nil
+	}
+
+	var buf bytes.Buffer
+	if err := applyDarwin("status", "", &buf); err != nil {
+		t.Fatalf("applyDarwin status failed: %v", err)
+	}
+	for _, want := range []string{
+		"running (io.iazio.iazio-agent)",
+		"active (io.iazio.iazio-agent-watcher)",
+		"active (io.iazio.iazio-agent-watchdog)",
+	} {
+		if !strings.Contains(buf.String(), want) {
+			t.Fatalf("expected applyDarwin status output to contain %q, got %q", want, buf.String())
+		}
+	}
+}
+
+
 
 
 

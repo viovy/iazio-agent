@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2441,3 +2442,138 @@ func TestNonInteractiveDaemonPrefersOfficialRelease(t *testing.T) {
 		t.Fatalf("expected release cache to coalesce 5 calls into 1 HTTP hit, got %d", apiHits)
 	}
 }
+
+type trackingReadCloser struct {
+	io.Reader
+	closed *atomic.Int32
+}
+
+func (t *trackingReadCloser) Close() error {
+	t.closed.Add(1)
+	return nil
+}
+
+func TestFetchRelease_ClosesResp2BodyOnNon200Fallback(t *testing.T) {
+	var resp1Closed, resp2Closed atomic.Int32
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/tags/1.2.3") {
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Body:       &trackingReadCloser{Reader: strings.NewReader("not found"), closed: &resp1Closed},
+					Header:     make(http.Header),
+				}, nil
+			}
+			if strings.HasSuffix(r.URL.Path, "/tags/v1.2.3") {
+				return &http.Response{
+					StatusCode: http.StatusBadGateway,
+					Body:       &trackingReadCloser{Reader: strings.NewReader("bad gateway"), closed: &resp2Closed},
+					Header:     make(http.Header),
+				}, nil
+			}
+			return nil, fmt.Errorf("unexpected path %s", r.URL.Path)
+		}),
+	}
+
+	_, err := fetchRelease(context.Background(), client, "viovy/iazio-agent", "1.2.3", "tok")
+	if err == nil {
+		t.Fatal("expected error when both tag lookups return non-200")
+	}
+	if resp1Closed.Load() != 1 {
+		t.Fatalf("expected primary response body to be closed once, got %d", resp1Closed.Load())
+	}
+	if resp2Closed.Load() != 1 {
+		t.Fatalf("expected v-prefix fallback response body to be closed once on non-200, got %d", resp2Closed.Load())
+	}
+}
+
+func TestDownloadAsset_LimitReaderBoundsOversizedPayload(t *testing.T) {
+	origLimit := maxExtractedBinarySize
+	maxExtractedBinarySize = 512
+	t.Cleanup(func() { maxExtractedBinarySize = origLimit })
+
+	var bodyClosed atomic.Int32
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/exact.bin") {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       &trackingReadCloser{Reader: bytes.NewReader(bytes.Repeat([]byte("x"), 512)), closed: &bodyClosed},
+					Header:     make(http.Header),
+				}, nil
+			}
+			// Return 2048 bytes when limit is 512
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       &trackingReadCloser{Reader: bytes.NewReader(bytes.Repeat([]byte("y"), 2048)), closed: &bodyClosed},
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+
+	data, err := downloadAsset(context.Background(), client, &gitHubAsset{
+		Name:               "exact.bin",
+		BrowserDownloadURL: "https://example.local/exact.bin",
+	}, "tok")
+	if err != nil || len(data) != 512 {
+		t.Fatalf("expected exact-limit download to succeed with 512 bytes, got len=%d err=%v", len(data), err)
+	}
+
+	_, err = downloadAsset(context.Background(), client, &gitHubAsset{
+		Name:               "oversized.bin",
+		BrowserDownloadURL: "https://example.local/oversized.bin",
+	}, "tok")
+	if err == nil || !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Fatalf("expected oversized asset error, got %v", err)
+	}
+	if bodyClosed.Load() != 2 {
+		t.Fatalf("expected both response bodies to be closed, got %d", bodyClosed.Load())
+	}
+}
+
+func TestPerformUpdateWithResult_DynamicControlPlaneBearerHeader(t *testing.T) {
+	var capturedAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/fleet/manifest" {
+			capturedAuth = r.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(ManifestResponse{
+				Profile: "generic",
+				Tools:   []ManifestToolItem{},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	_, err := performUpdateWithResult(
+		context.Background(),
+		UpdateOptions{
+			Suite:   true,
+			DryRun:  true,
+			Profile: "generic",
+			API:     srv.URL,
+			BinDir:  t.TempDir(),
+		},
+		&stdout,
+		&stderr,
+		func(k string) string {
+			if k == "IAZIO_AUTH_TOKEN" {
+				return "dynamic-cp-token-777"
+			}
+			if k == "HOME" {
+				return t.TempDir()
+			}
+			return ""
+		},
+	)
+	if err != nil {
+		t.Fatalf("performUpdateWithResult failed: %v", err)
+	}
+	if capturedAuth != "Bearer dynamic-cp-token-777" {
+		t.Fatalf("expected Authorization header 'Bearer dynamic-cp-token-777', got %q", capturedAuth)
+	}
+}
+

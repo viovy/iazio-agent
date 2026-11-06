@@ -333,3 +333,45 @@ func TestDrift_DevBuildPlusSHAAndManifestSanitization(t *testing.T) {
 		t.Errorf("expected second outdated tool to be autopilot-git-flow, got %+v", outdated[1])
 	}
 }
+
+func TestHTTPDriftFetcher_DynamicBearerAuth(t *testing.T) {
+	var receivedAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"tools":[{"name":"autopilot","binary_name":"autopilot","target_version":"0.0.580"}]}`))
+	}))
+	defer srv.Close()
+
+	currentTok := "rotated-token-v1"
+	fetcher := &HTTPDriftFetcher{
+		API:       srv.URL,
+		Client:    srv.Client(),
+		Profile:   "generic",
+		AuthToken: "static-fallback-token",
+		TokenProvider: func(ctx context.Context) string {
+			return currentTok
+		},
+	}
+
+	if _, err := fetcher.FetchManifest(context.Background()); err != nil {
+		t.Fatalf("FetchManifest failed: %v", err)
+	}
+	if receivedAuth != "Bearer rotated-token-v1" {
+		t.Fatalf("expected Bearer rotated-token-v1, got %q", receivedAuth)
+	}
+
+	// Rotate token and expire cache -> next fetch uses rotated token; if TokenProvider returns empty, falls back to AuthToken
+	currentTok = ""
+	fetcher.mu.Lock()
+	fetcher.expiresAt = time.Now().Add(-1 * time.Second)
+	fetcher.mu.Unlock()
+
+	if _, err := fetcher.FetchManifest(context.Background()); err != nil {
+		t.Fatalf("FetchManifest fallback failed: %v", err)
+	}
+	if receivedAuth != "Bearer static-fallback-token" {
+		t.Fatalf("expected Bearer static-fallback-token fallback, got %q", receivedAuth)
+	}
+}
+

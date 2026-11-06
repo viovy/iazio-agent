@@ -297,7 +297,8 @@ func (s *Sink) sendBulk(ctx context.Context, entries []*Entry) error {
 	}
 
 	// If currently detected as down, check if backoff duration has passed
-	if s.isDown.Load() {
+	wasDown := s.isDown.Load()
+	if wasDown {
 		fails := s.consecutiveFailures.Load()
 		backoffSec := 2 << min(fails, 5) // max 64s
 		lastFail := s.lastFailureTime.Load()
@@ -308,10 +309,12 @@ func (s *Sink) sendBulk(ctx context.Context, entries []*Entry) error {
 		}
 	}
 
-	// Try to drain previously spooled entries first
-	s.drainSpool(ctx)
+	if !wasDown {
+		// Healthy state: drain previously spooled entries first
+		s.drainSpool(ctx)
+	}
 
-	// Attempt direct push
+	// Attempt direct push (acts as health probe before draining spool when recovering from wasDown)
 	err := s.sendBulkDirect(ctx, entries)
 	if err != nil {
 		s.isDown.Store(true)
@@ -325,6 +328,9 @@ func (s *Sink) sendBulk(ctx context.Context, entries []*Entry) error {
 	// Success: restore healthy state
 	s.isDown.Store(false)
 	s.consecutiveFailures.Store(0)
+	if wasDown {
+		s.drainSpool(ctx)
+	}
 	return nil
 }
 

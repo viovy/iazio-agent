@@ -483,3 +483,75 @@ func TestElasticSink_TLSConfigBehavior(t *testing.T) {
 		t.Fatalf("expected shouldSkipTLSVerify=true when IAZIO_TLS_INSECURE_SKIP_VERIFY=1")
 	}
 }
+
+func TestElasticSink_RecoveryProbesDirectBeforeDrainSpool(t *testing.T) {
+	var serverHealthy atomic.Bool
+	var requestBodies []string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requestBodies = append(requestBodies, string(body))
+		if !serverHealthy.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"errors":false,"items":[]}`))
+	}))
+	defer ts.Close()
+
+	spoolDir := t.TempDir()
+	sink := New(Config{
+		URL:        "",
+		SpoolDir:   spoolDir,
+		HTTPClient: ts.Client(),
+	})
+	defer func() { _ = sink.Close() }()
+	sink.cfg.URL = ts.URL
+
+	// 1. Pre-populate a spooled batch while sink is marked down and backoff has expired
+	sink.spoolBatch([]*Entry{{
+		Timestamp: time.Now().UTC(),
+		LogLevel:  "INFO",
+		Message:   "spooled-offline-entry",
+	}})
+	sink.isDown.Store(true)
+	sink.lastFailureTime.Store(0)
+
+	// 2. Endpoint is STILL unhealthy (503): sendBulk must probe live batch first and NOT touch spooled files
+	serverHealthy.Store(false)
+	sink.sendBulk(context.Background(), []*Entry{{
+		Timestamp: time.Now().UTC(),
+		LogLevel:  "INFO",
+		Message:   "live-probe-while-down",
+	}})
+
+	if len(requestBodies) != 1 || !strings.Contains(requestBodies[0], "live-probe-while-down") {
+		t.Fatalf("expected exactly 1 live probe request without draining spool when endpoint is still down, got %d requests: %v", len(requestBodies), requestBodies)
+	}
+	if got := len(countSpoolFiles(t, spoolDir)); got != 2 {
+		t.Fatalf("expected original spool file + failed live probe (2 files) on disk, got %d", got)
+	}
+
+	// 3. Endpoint recovers (200 OK): sendBulk sends live batch first, then drains the 2 spooled files
+	requestBodies = nil
+	serverHealthy.Store(true)
+	sink.lastFailureTime.Store(0)
+
+	sink.sendBulk(context.Background(), []*Entry{{
+		Timestamp: time.Now().UTC(),
+		LogLevel:  "INFO",
+		Message:   "live-probe-recovered",
+	}})
+
+	if len(requestBodies) != 3 {
+		t.Fatalf("expected 3 requests (1 live probe + 2 drained spool files), got %d: %v", len(requestBodies), requestBodies)
+	}
+	if !strings.Contains(requestBodies[0], "live-probe-recovered") {
+		t.Fatalf("expected first request on recovery to be live-probe-recovered, got %s", requestBodies[0])
+	}
+	if got := len(countSpoolFiles(t, spoolDir)); got != 0 {
+		t.Fatalf("expected 0 remaining spool files after recovery drain, got %d", got)
+	}
+}
+

@@ -297,6 +297,9 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 	if err != nil {
 		return res, fmt.Errorf("create manifest request: %w", err)
 	}
+	if cpToken := strings.TrimSpace(resolveControlPlaneToken(getenv)); cpToken != "" {
+		req.Header.Set("Authorization", "Bearer "+cpToken)
+	}
 
 	var manifest ManifestResponse
 	client := &http.Client{Timeout: 5 * time.Minute}
@@ -955,6 +958,8 @@ func withReleaseCache(ctx context.Context) context.Context {
 	})
 }
 
+var targetVersionRegex = regexp.MustCompile(`v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?)|([0-9]+\.[0-9]+\.[0-9]+)`)
+
 func cleanTargetVersion(v string) string {
 	v = strings.TrimSpace(v)
 	if v == "" || strings.EqualFold(v, "latest") {
@@ -963,8 +968,7 @@ func cleanTargetVersion(v string) string {
 	if strings.Contains(strings.ToLower(v), "dev") {
 		return ""
 	}
-	re := regexp.MustCompile(`v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?)|([0-9]+\.[0-9]+\.[0-9]+)`)
-	if match := re.FindString(v); match != "" {
+	if match := targetVersionRegex.FindString(v); match != "" {
 		return strings.TrimPrefix(match, "v")
 	}
 	return strings.TrimPrefix(v, "v")
@@ -1019,16 +1023,20 @@ func fetchRelease(ctx context.Context, client *http.Client, repo, version, token
 		// Try with v prefix
 		vURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/v%s", repo, strings.TrimPrefix(tag, "v"))
 		req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, vURL, nil)
-		req2.Header.Set("Accept", "application/vnd.github.v3+json")
-		req2.Header.Set("User-Agent", "iazio-agent/1.0")
-		if token != "" {
-			req2.Header.Set("Authorization", "Bearer "+token)
-		}
-		if resp2, err2 := client.Do(req2); err2 == nil && resp2.StatusCode == http.StatusOK {
-			defer resp2.Body.Close()
-			var r gitHubRelease
-			if err := json.NewDecoder(resp2.Body).Decode(&r); err == nil {
-				return storeCached(&r), nil
+		if req2 != nil {
+			req2.Header.Set("Accept", "application/vnd.github.v3+json")
+			req2.Header.Set("User-Agent", "iazio-agent/1.0")
+			if token != "" {
+				req2.Header.Set("Authorization", "Bearer "+token)
+			}
+			if resp2, err2 := client.Do(req2); err2 == nil {
+				defer resp2.Body.Close()
+				if resp2.StatusCode == http.StatusOK {
+					var r gitHubRelease
+					if err := json.NewDecoder(resp2.Body).Decode(&r); err == nil {
+						return storeCached(&r), nil
+					}
+				}
 			}
 		}
 	}
@@ -1207,9 +1215,16 @@ func downloadAsset(ctx context.Context, client *http.Client, asset *gitHubAsset,
 		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, reqURL)
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	limit := maxExtractedBinarySize
+	if limit <= 0 {
+		limit = defaultMaxExtractedBinarySize
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("downloaded asset %s exceeds maximum size of %d bytes", asset.Name, limit)
 	}
 
 	if cache != nil && isArchiveAsset(asset.Name) {

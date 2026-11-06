@@ -44,11 +44,13 @@ type DriftFetcher interface {
 
 // HTTPDriftFetcher implements DriftFetcher by querying the HTTP control plane endpoint.
 type HTTPDriftFetcher struct {
-	Client  *http.Client
-	API     string
-	Profile string
-	OS      string
-	Arch    string
+	Client        *http.Client
+	API           string
+	Profile       string
+	OS            string
+	Arch          string
+	AuthToken     string
+	TokenProvider func(context.Context) string
 
 	mu        sync.Mutex
 	cached    *FleetManifest
@@ -58,6 +60,9 @@ type HTTPDriftFetcher struct {
 // FetchManifest retrieves the latest manifest from the API endpoint.
 // It caches results for 10 seconds to avoid redundant round-trips within the same pass (S5).
 func (h *HTTPDriftFetcher) FetchManifest(ctx context.Context) (*FleetManifest, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	h.mu.Lock()
 	if h.cached != nil && time.Now().Before(h.expiresAt) {
 		m := h.cached
@@ -91,6 +96,15 @@ func (h *HTTPDriftFetcher) FetchManifest(ctx context.Context) (*FleetManifest, e
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create manifest request: %w", err)
+	}
+	token := strings.TrimSpace(h.AuthToken)
+	if h.TokenProvider != nil {
+		if dynTok := strings.TrimSpace(h.TokenProvider(ctx)); dynTok != "" {
+			token = dynTok
+		}
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
