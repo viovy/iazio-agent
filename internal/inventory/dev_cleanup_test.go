@@ -315,3 +315,45 @@ func TestFindPIDsExecutingFile_WindowsWmicAndPowerShellFallback(t *testing.T) {
 		t.Fatalf("expected [6301] when wmic returns no PIDs, got %v", pids)
 	}
 }
+
+func TestManagedTools_IncludesAutopilotBaselinePlugins(t *testing.T) {
+	toolSet := make(map[string]bool, len(ManagedTools))
+	for _, m := range ManagedTools {
+		toolSet[m] = true
+	}
+	for _, plugin := range BaselineNames() {
+		if strings.HasPrefix(plugin, "autopilot-") && !toolSet[plugin] {
+			t.Fatalf("expected ManagedTools to include baseline plugin %q", plugin)
+		}
+	}
+
+	tmpDir := t.TempDir()
+	canonicalDir := filepath.Join(tmpDir, "bin")
+	shadowDir := filepath.Join(tmpDir, "shadow")
+	_ = os.MkdirAll(canonicalDir, 0o755)
+	_ = os.MkdirAll(shadowDir, 0o755)
+
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	staleOld := filepath.Join(canonicalDir, "autopilot-fleet.old"+ext)
+	staleShadow := filepath.Join(shadowDir, "autopilot-review-scheme"+ext)
+	_ = os.WriteFile(staleOld, []byte("old-plugin"), 0o755)
+	_ = os.WriteFile(staleShadow, []byte("shadow-plugin"), 0o755)
+
+	candidates := ScanDevAndShadowBinaries([]string{canonicalDir, shadowDir}, canonicalDir)
+	foundOld, foundShadow := false, false
+	for _, c := range candidates {
+		if c.Path == staleOld {
+			foundOld = true
+		}
+		if c.Path == staleShadow {
+			foundShadow = true
+		}
+	}
+	if !foundOld || !foundShadow {
+		t.Fatalf("expected stale autopilot-* plugin binaries to be flagged (foundOld=%v, foundShadow=%v): %+v", foundOld, foundShadow, candidates)
+	}
+}
+

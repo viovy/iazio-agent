@@ -375,7 +375,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		}
 		telemetry.ConfigureZipkinFromAPI(api)
 		host := resolveHostID(getenv, os.Hostname, nil)
-		destURL, isGateway := resolveTelemetryDestination(api, getenv)
+		destURL, isGateway := resolveTelemetryDestination(api, getenv, ctx)
 		authToken := resolveControlPlaneToken(getenv)
 		var sink *elasticlog.Sink
 		if destURL != "" {
@@ -454,7 +454,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}
 			}
 			authProber := inventory.NewAuthStatusProber(authStatusInterval, func(fetchCtx context.Context) (map[string]bool, error) {
-				return fetchManifestAuthEnabledTools(fetchCtx, api, profile, authToken)
+				return fetchManifestAuthEnabledTools(fetchCtx, api, profile, resolveControlPlaneToken(getenv))
 			})
 			getTools := func() []controlplane.Tool {
 				home, _ := os.UserHomeDir()
@@ -671,11 +671,13 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 
 			if api != "" {
 				driftFetcher := &supervisor.HTTPDriftFetcher{
-					Client:  &http.Client{Timeout: 10 * time.Second},
-					API:     api,
-					Profile: profile,
-					OS:      runtime.GOOS,
-					Arch:    runtime.GOARCH,
+					Client:        &http.Client{Timeout: 10 * time.Second},
+					API:           api,
+					Profile:       profile,
+					OS:            runtime.GOOS,
+					Arch:          runtime.GOARCH,
+					AuthToken:     authToken,
+					TokenProvider: func(context.Context) string { return resolveControlPlaneToken(getenv) },
 				}
 				isToolInBackoff := func(tool string) bool {
 					return eagerUpdater != nil && (eagerUpdater.IsToolInBackoff(tool))
@@ -834,6 +836,24 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			var pendingRemoteForce bool
 			var pendingRemoteTargetVersion string
 			var hasPendingRemote bool
+			var pendingRemoteSeq uint64
+
+			snapshotPendingRemote := func() ([]string, bool, string, bool, uint64) {
+				pendingRemoteMu.Lock()
+				defer pendingRemoteMu.Unlock()
+				return append([]string(nil), pendingRemoteTools...), pendingRemoteForce, pendingRemoteTargetVersion, hasPendingRemote, pendingRemoteSeq
+			}
+
+			clearPendingRemoteIfSeq := func(expectedSeq uint64) {
+				pendingRemoteMu.Lock()
+				if pendingRemoteSeq == expectedSeq {
+					hasPendingRemote = false
+					pendingRemoteTools = nil
+					pendingRemoteForce = false
+					pendingRemoteTargetVersion = ""
+				}
+				pendingRemoteMu.Unlock()
+			}
 
 			if updateInterval > 0 {
 				go func() {
@@ -847,22 +867,12 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						lastUpdateMu.Lock()
 						lastUpdateCheck = time.Now().UTC()
 						lastUpdateMu.Unlock()
-						pendingRemoteMu.Lock()
-						t := pendingRemoteTools
-						f := pendingRemoteForce
-						v := pendingRemoteTargetVersion
-						isRemote := hasPendingRemote
-						pendingRemoteMu.Unlock()
+						t, f, v, isRemote, seq := snapshotPendingRemote()
 
 						if isRemote {
 							res, deferred, err := doToolUpdateDetailed(runCtx, t, f, v)
 							if !deferred {
-								pendingRemoteMu.Lock()
-								hasPendingRemote = false
-								pendingRemoteTools = nil
-								pendingRemoteForce = false
-								pendingRemoteTargetVersion = ""
-								pendingRemoteMu.Unlock()
+								clearPendingRemoteIfSeq(seq)
 							}
 							if err != nil || deferred {
 								return false
@@ -908,7 +918,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}
 			}
 			spooler, _ := controlplane.NewOfflineReportSpooler(spoolDir, nil)
-			authToken := resolveControlPlaneToken(getenv)
 			tokenProvider := func(context.Context) string {
 				return resolveControlPlaneToken(getenv)
 			}
@@ -975,33 +984,27 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						}
 					}
 					pendingRemoteMu.Lock()
-					pendingRemoteTools = tools
+					pendingRemoteSeq++
+					seq := pendingRemoteSeq
+					pendingRemoteTools = append([]string(nil), tools...)
 					pendingRemoteForce = force
 					pendingRemoteTargetVersion = tv
 					hasPendingRemote = true
+					tSnap := append([]string(nil), pendingRemoteTools...)
+					fSnap := pendingRemoteForce
+					vSnap := pendingRemoteTargetVersion
 					pendingRemoteMu.Unlock()
 
-					go func() {
-						pendingRemoteMu.Lock()
-						t := pendingRemoteTools
-						f := pendingRemoteForce
-						v := pendingRemoteTargetVersion
-						pendingRemoteMu.Unlock()
-
+					go func(expectedSeq uint64, t []string, f bool, v string) {
 						res, deferred, err := doToolUpdateDetailed(runCtx, t, f, v)
 						if !deferred {
-							pendingRemoteMu.Lock()
-							pendingRemoteTools = nil
-							pendingRemoteForce = false
-							pendingRemoteTargetVersion = ""
-							hasPendingRemote = false
-							pendingRemoteMu.Unlock()
+							clearPendingRemoteIfSeq(expectedSeq)
 						}
 						if err == nil && !deferred && res.AgentUpdated {
 							restartOrExecSelf(stdout)
 							cancel()
 						}
-					}()
+					}(seq, tSnap, fSnap, vSnap)
 					return nil
 				},
 				OnCommand: func(ctx context.Context, cmd controlplane.CommandEnvelope) error {
@@ -1254,11 +1257,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			}
 
 			if api != "" {
-				cpSpooler, _ := controlplane.NewOfflineReportSpooler(spoolDir, nil)
-				if cpSpooler != nil {
-					cpSpooler.TokenProvider = tokenProvider
-				}
-				cpClient := worker.NewHTTPControlPlaneClient(api, authToken, nil, cpSpooler)
+				cpClient := worker.NewHTTPControlPlaneClient(api, authToken, nil, spooler)
 				cpClient.TokenProvider = tokenProvider
 				cliInvoker := harness.NewCLIInvoker("", "")
 				disp = worker.NewDispatcher(cpClient, cliInvoker, host)
@@ -1289,21 +1288,11 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					if eagerUpdater != nil {
 						eagerUpdater.TriggerEvaluation("post_job_completion")
 					}
-					pendingRemoteMu.Lock()
-					rem := hasPendingRemote
-					t := pendingRemoteTools
-					f := pendingRemoteForce
-					v := pendingRemoteTargetVersion
-					pendingRemoteMu.Unlock()
+					t, f, v, rem, seq := snapshotPendingRemote()
 					if rem {
 						res, deferred, err := doToolUpdateDetailed(runCtx, t, f, v)
 						if !deferred {
-							pendingRemoteMu.Lock()
-							hasPendingRemote = false
-							pendingRemoteTools = nil
-							pendingRemoteForce = false
-							pendingRemoteTargetVersion = ""
-							pendingRemoteMu.Unlock()
+							clearPendingRemoteIfSeq(seq)
 						}
 						if err == nil && !deferred && res.AgentUpdated {
 							pendingSelfRestart.Store(true)
@@ -1423,22 +1412,12 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 
 								if shouldCheck && !updatingTools.Load() {
 									go func() {
-										pendingRemoteMu.Lock()
-										t := pendingRemoteTools
-										f := pendingRemoteForce
-										v := pendingRemoteTargetVersion
-										rem := hasPendingRemote
-										pendingRemoteMu.Unlock()
+										t, f, v, rem, seq := snapshotPendingRemote()
 
 										if rem {
 											res, deferred, err := doToolUpdateDetailed(runCtx, t, f, v)
 											if !deferred {
-												pendingRemoteMu.Lock()
-												hasPendingRemote = false
-												pendingRemoteTools = nil
-												pendingRemoteForce = false
-												pendingRemoteTargetVersion = ""
-												pendingRemoteMu.Unlock()
+												clearPendingRemoteIfSeq(seq)
 											}
 											if err == nil && !deferred && res.AgentUpdated {
 												restartOrExecSelf(stdout)
@@ -1823,13 +1802,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			}
 			return loopErr
 		}
-
-		if ctx.Err() != nil {
-			return nil
-		}
-		sup := supervisor.New(time.Now)
-		_ = sup.Lock("run")
-		<-ctx.Done()
 		return nil
 	default:
 		return fmt.Errorf("unknown command %s", args[0])
@@ -2030,7 +2002,7 @@ func runService(args []string, stdout io.Writer, getenv func(string) string) err
 	}
 	switch goos {
 	case "darwin":
-		return applyDarwin(action, bin)
+		return applyDarwin(action, bin, stdout)
 	case "windows":
 		if action == "install" {
 			return service.InstallWindows(bin)
@@ -2091,7 +2063,11 @@ func applyLinux(action, bin string, stdout io.Writer, force bool) error {
 	return err
 }
 
-func applyDarwin(action, bin string) error {
+func applyDarwin(action, bin string, stdout ...io.Writer) error {
+	var outWriter io.Writer = os.Stdout
+	if len(stdout) > 0 && stdout[0] != nil {
+		outWriter = stdout[0]
+	}
 	switch action {
 	case "install", "restart":
 		_ = bootoutDarwin(false)
@@ -2110,13 +2086,13 @@ func applyDarwin(action, bin string) error {
 			return fmt.Errorf("service not loaded: %s", strings.TrimSpace(string(out)))
 		}
 		if strings.Contains(string(out), "pid =") && !strings.Contains(string(out), "job state = exited") {
-			fmt.Println("running (io.iazio.iazio-agent)")
+			fmt.Fprintln(outWriter, "running (io.iazio.iazio-agent)")
 			wOut, wErr := execCommandOutput("launchctl", "print", darwinWatcherTarget())
 			if wErr == nil && !strings.Contains(string(wOut), "job state = exited") {
-				fmt.Println("active (io.iazio.iazio-agent-watcher)")
+				fmt.Fprintln(outWriter, "active (io.iazio.iazio-agent-watcher)")
 			}
 			if wdOut, wdErr := execCommandOutput("launchctl", "print", darwinWatchdogTarget()); wdErr == nil && !strings.Contains(string(wdOut), "job state = exited") {
-				fmt.Println("active (io.iazio.iazio-agent-watchdog)")
+				fmt.Fprintln(outWriter, "active (io.iazio.iazio-agent-watchdog)")
 			}
 			return nil
 		}
@@ -2348,39 +2324,11 @@ func copyBinary(src, dest string) error {
 	if lfi, err := os.Lstat(dest); err == nil && (lfi.Mode()&os.ModeSymlink != 0) {
 		_ = os.Remove(dest)
 	}
-	in, err := os.Open(src)
+	data, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-	tmp := fmt.Sprintf("%s.tmp.%d", dest, time.Now().UnixNano())
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := out.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, dest); err != nil {
-		if runtime.GOOS == "windows" {
-			oldPath := dest + ".old"
-			_ = os.Remove(oldPath)
-			if renErr := os.Rename(dest, oldPath); renErr == nil {
-				if err2 := os.Rename(tmp, dest); err2 == nil {
-					_ = os.Remove(oldPath)
-					return nil
-				}
-			}
-		}
-		return err
-	}
-	return nil
+	return installExecutableSafeDirect(dest, data)
 }
 
 func isServiceControlCommand(name string) bool {
@@ -3646,7 +3594,7 @@ func buildInspectOutdatedHook(
 	}
 }
 
-func resolveTelemetryDestination(apiURL string, getenv func(string) string) (string, bool) {
+func resolveTelemetryDestination(apiURL string, getenv func(string) string, ctx ...context.Context) (string, bool) {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
@@ -3657,9 +3605,23 @@ func resolveTelemetryDestination(apiURL string, getenv func(string) string) (str
 	}
 
 	if trimmedAPI := strings.TrimRight(strings.TrimSpace(apiURL), "/"); trimmedAPI != "" {
+		baseCtx := context.Background()
+		if len(ctx) > 0 && ctx[0] != nil {
+			baseCtx = ctx[0]
+		}
 		client := &http.Client{Timeout: 2 * time.Second}
+		token := strings.TrimSpace(resolveControlPlaneToken(getenv))
 		for _, path := range []string{"/v1/telemetry/config", "/api/v1/telemetry/config", "/v1/status"} {
-			resp, err := client.Get(trimmedAPI + path)
+			reqCtx, cancel := context.WithTimeout(baseCtx, 2*time.Second)
+			req, reqErr := http.NewRequestWithContext(reqCtx, http.MethodGet, trimmedAPI+path, nil)
+			if reqErr != nil {
+				cancel()
+				continue
+			}
+			if token != "" {
+				req.Header.Set("Authorization", "Bearer "+token)
+			}
+			resp, err := client.Do(req)
 			if err == nil {
 				var gwURL string
 				if resp.StatusCode == http.StatusOK {
@@ -3671,9 +3633,12 @@ func resolveTelemetryDestination(apiURL string, getenv func(string) string) (str
 					}
 				}
 				_ = resp.Body.Close()
+				cancel()
 				if gwURL != "" {
 					return gwURL, true
 				}
+			} else {
+				cancel()
 			}
 		}
 	}

@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -595,3 +596,61 @@ func TestInspectToolService_DarwinExitCodesAndRunningState(t *testing.T) {
 		t.Fatalf("expected installed=true, status=installed for (never exited), got installed=%v, status=%q", installed, status)
 	}
 }
+
+func TestInspectToolService_CrossPlatformTTLCache(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Prepare Linux unit file and Darwin LaunchAgent plist so both OS paths reach the command runner
+	linuxUnitDir := filepath.Join(home, ".config", "systemd", "user")
+	if err := os.MkdirAll(linuxUnitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(linuxUnitDir, "iazio-agent.service"), []byte("[Service]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	darwinPlistDir := filepath.Join(home, "Library", "LaunchAgents")
+	if err := os.MkdirAll(darwinPlistDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(darwinPlistDir, "io.iazio.agent.plist"), []byte("<plist/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origRunner := defaultServiceCommandRunner
+	t.Cleanup(func() {
+		defaultServiceCommandRunner = origRunner
+		InvalidateServiceCache()
+	})
+	InvalidateServiceCache()
+
+	callsByOS := map[string]int{}
+	defaultServiceCommandRunner = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		switch name {
+		case "systemctl":
+			callsByOS["linux"]++
+			return []byte("active\n"), nil
+		case "launchctl":
+			callsByOS["darwin"]++
+			return []byte("{\n\tstate = running\n}\n"), nil
+		case "schtasks":
+			callsByOS["windows"]++
+			return []byte("TaskName: IazioAgent\r\nStatus: Running\r\n"), nil
+		default:
+			return nil, nil
+		}
+	}
+
+	for _, targetOS := range []string{"linux", "darwin", "windows"} {
+		for i := 0; i < 4; i++ {
+			installed, _, status, _ := InspectToolService("iazio-agent", targetOS)
+			if !installed || status != "active" {
+				t.Fatalf("os=%s iter=%d: expected installed=true status=active, got installed=%v status=%q", targetOS, i, installed, status)
+			}
+		}
+		if callsByOS[targetOS] != 1 {
+			t.Fatalf("os=%s: expected 1 subprocess call across 4 inspections within 15s TTL, got %d", targetOS, callsByOS[targetOS])
+		}
+	}
+}
+

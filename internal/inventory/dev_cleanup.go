@@ -35,13 +35,27 @@ type CleanupReport struct {
 }
 
 // ManagedTools are the core fleet tools subject to eager update and dev binary cleanup.
-var ManagedTools = []string{
-	"iazio-agent",
-	"iazio-harvester",
-	"iazio-mcp",
-	"iazio-harness",
-	"autopilot",
-}
+var ManagedTools = func() []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, t := range []string{
+		"iazio-agent",
+		"iazio-harvester",
+		"iazio-mcp",
+		"iazio-harness",
+		"autopilot",
+	} {
+		seen[t] = true
+		out = append(out, t)
+	}
+	for _, b := range BaselineNames() {
+		if strings.HasPrefix(b, "autopilot-") && !seen[b] {
+			seen[b] = true
+			out = append(out, b)
+		}
+	}
+	return out
+}()
 
 type shaCacheEntry struct {
 	modTime   time.Time
@@ -263,7 +277,7 @@ func ScanDevAndShadowBinaries(searchDirs []string, canonicalBinDir string) []Dev
 				} else if stagingExtRegexes[t].MatchString(fileName) {
 					matched = true
 					variant = "staging_extension"
-				} else if dotIazioRegex.MatchString(fileName) && strings.Contains(fileName, t) {
+				} else if dotIazioRegex.MatchString(fileName) && strings.Contains(fileName, t) && (t != "autopilot" || !strings.Contains(fileName, "autopilot-")) {
 					matched = true
 					variant = "staging_extension"
 				}
