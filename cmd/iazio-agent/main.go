@@ -12,7 +12,9 @@ import (
 	"github.com/viovy/viovy-core-go/pkg/userservice"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -411,9 +413,14 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		if profile == "" {
 			profile = "generic"
 		}
-		telemetry.ConfigureZipkinFromAPI(api)
+		if !isTestBinary() || isLoopbackTelemetryURL(api) {
+			telemetry.ConfigureZipkinFromAPI(api)
+		}
 		host := resolveHostID(getenv, os.Hostname, nil)
 		destURL, isGateway := resolveTelemetryDestination(api, getenv, ctx)
+		if isTestBinary() && !isLoopbackTelemetryURL(destURL) {
+			destURL = ""
+		}
 		authToken := resolveControlPlaneToken(getenv)
 		var sink *elasticlog.Sink
 		if destURL != "" {
@@ -3926,6 +3933,32 @@ func buildInspectOutdatedHook(
 		}
 		return supervisor.FindOutdatedTools(manifest, inventory.InspectInstalledVersion, binDir, checkTools, targetOS)
 	}
+}
+
+func isLoopbackTelemetryURL(rawURL string) bool {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return false
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
 }
 
 func resolveTelemetryDestination(apiURL string, getenv func(string) string, ctx ...context.Context) (string, bool) {

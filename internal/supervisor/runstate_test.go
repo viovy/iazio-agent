@@ -100,8 +100,8 @@ func TestSup_ScanAndReattachRuns(t *testing.T) {
 	liveJobID := "job-reattach-live"
 	liveWorktree := "/test/repo/live"
 
-	// Start a real harness process that will stay alive during reattach test
-	cmd := exec.Command("sh", "-c", "trap 'exit 0' TERM; while true; do sleep 1; done", "iazio-harness-"+liveJobID)
+	// Start a real process tagged with liveJobID that will stay alive during reattach test
+	cmd := exec.Command("sh", "-c", "trap 'exit 0' TERM; while true; do sleep 1; done", liveJobID)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("failed starting sleep process: %v", err)
 	}
