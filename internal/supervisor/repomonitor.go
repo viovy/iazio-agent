@@ -724,6 +724,11 @@ func InspectRepoGitState(ctx context.Context, repoPath, alias string) RepoGitSta
 	return st
 }
 
+// InspectWorktreeGitState inspects the git state of a worktree path with a background context.
+func InspectWorktreeGitState(repoPath string) RepoGitState {
+	return InspectRepoGitState(context.Background(), repoPath, "")
+}
+
 // ComputeWorktreeDirtyFingerprint computes a deterministic fingerprint combining git_head_sha,
 // git_tree_sha, and the current dirty status porcelain across the worktree and submodules.
 func ComputeWorktreeDirtyFingerprint(ctx context.Context, repoPath string) (headSHA, treeSHA, fingerprint string) {

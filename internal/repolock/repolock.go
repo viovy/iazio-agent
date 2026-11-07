@@ -148,6 +148,48 @@ func (h *LockHandle) Release() error {
 	return nil
 }
 
+func ensureGitInfoExclude(worktree string) {
+	gitPath := filepath.Join(worktree, ".git")
+	fi, err := os.Stat(gitPath)
+	if err != nil {
+		return
+	}
+	gitDir := gitPath
+	if !fi.IsDir() {
+		if b, rErr := os.ReadFile(gitPath); rErr == nil {
+			content := strings.TrimSpace(string(b))
+			if strings.HasPrefix(content, "gitdir:") {
+				target := strings.TrimSpace(strings.TrimPrefix(content, "gitdir:"))
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(worktree, target)
+				}
+				gitDir = target
+			}
+		}
+	}
+	infoDir := filepath.Join(gitDir, "info")
+	if err := os.MkdirAll(infoDir, 0o755); err != nil {
+		return
+	}
+	excludePath := filepath.Join(infoDir, "exclude")
+	existing, _ := os.ReadFile(excludePath)
+	text := string(existing)
+	var toAdd []string
+	for _, entry := range []string{".iazio/", ".iazio-repolock"} {
+		if !strings.Contains(text, entry) {
+			toAdd = append(toAdd, entry)
+		}
+	}
+	if len(toAdd) == 0 {
+		return
+	}
+	if len(text) > 0 && !strings.HasSuffix(text, "\n") {
+		text += "\n"
+	}
+	text += strings.Join(toAdd, "\n") + "\n"
+	_ = os.WriteFile(excludePath, []byte(text), 0o644)
+}
+
 // Acquire attempts to acquire an exclusive lock on the repository worktree.
 // If another process is actively running (determined by OS flock or alive PID), it returns ErrRepoBusy.
 // If a previous execution crashed (PID dead), it allows the caller to adopt/resume the lock.
@@ -155,6 +197,7 @@ func Acquire(worktree string, info LockInfo, isAlive func(int) bool) (*LockHandl
 	if worktree == "" {
 		return nil, errors.New("empty worktree path")
 	}
+	ensureGitInfoExclude(worktree)
 	iazioDir := filepath.Join(worktree, ".iazio")
 	if err := os.MkdirAll(iazioDir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create .iazio directory: %w", err)
@@ -175,7 +218,9 @@ func Acquire(worktree string, info LockInfo, isAlive func(int) bool) (*LockHandl
 
 	// Read existing metadata to detect running processes or crashes
 	existing, readErr := Read(worktree)
-	if readErr == nil && existing.JobID != "" && existing.JobID != info.JobID {
+	existingStatus := strings.ToUpper(strings.TrimSpace(existing.Status))
+	if readErr == nil && existing.JobID != "" && existing.JobID != info.JobID &&
+		existingStatus != "COMPLETED" && existingStatus != "FAILED" && existingStatus != "IDLE" {
 		checkPID := existing.PID
 		if existing.HarnessPID > 0 {
 			checkPID = existing.HarnessPID

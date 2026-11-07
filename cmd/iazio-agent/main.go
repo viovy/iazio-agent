@@ -732,6 +732,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			eagerUpdater.SetHostGate(hostGate)
 
 			execDetector := supervisor.NewMultiSignalExecutionDetector(sup, hostGate, getRepos, nil)
+			if isTestBinary() {
+				execDetector.SetProcessScanner(nil)
+			}
 			eagerUpdater.SetExecutionDetector(execDetector)
 			eagerUpdater.SetReadinessReporter(func(c context.Context, h string, r supervisor.EagerUpdateReadinessReport) error {
 				if api == "" {
@@ -1001,6 +1004,16 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				TokenProvider:      tokenProvider,
 				Spooler:            spooler,
 				EagerUpdateEnabled: updateInterval > 0 || eagerUpdater != nil,
+				PrePollBarrier: func(ctx context.Context) bool {
+					if hostGate != nil && hostGate.State() == supervisor.GateStateUpdatingTools {
+						return false
+					}
+					if eagerUpdater != nil {
+						_, ok := eagerUpdater.EnsureUpToDateBeforeClaim(ctx)
+						return ok
+					}
+					return true
+				},
 				LastEagerUpdateAt: func() *time.Time {
 					lastUpdateMu.Lock()
 					defer lastUpdateMu.Unlock()
@@ -1343,6 +1356,25 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				cliInvoker := harness.NewCLIInvoker("", "")
 				disp = worker.NewDispatcher(cpClient, cliInvoker, host)
 				disp.SetHostGate(hostGate)
+				if eagerUpdater != nil {
+					disp.SetEagerReadinessGate(func(c context.Context) (bool, string) {
+						rep, ok := eagerUpdater.EnsureUpToDateBeforeClaim(c)
+						return ok, rep.Details
+					})
+				}
+				client.IdleWorktrees = func() []string {
+					repos, err := getRepos()
+					if err != nil || len(repos) == 0 {
+						return nil
+					}
+					candidates := make([]string, 0, len(repos))
+					for _, r := range repos {
+						if strings.TrimSpace(r.Path) != "" {
+							candidates = append(candidates, r.Path)
+						}
+					}
+					return disp.CollectIdleWorktrees(candidates)
+				}
 				disp.SetHarvestFlusher(func(hCtx context.Context, convID string) (int, string, error) {
 					return flushHarvestConversationDetailed(hCtx, convID)
 				})
@@ -1666,32 +1698,11 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					inFlightPrepMu.Unlock()
 				}()
 
-				var prepRepoLock *repolock.LockHandle
-				if a.WorktreePath != "" {
-					if h, lockErr := repolock.Acquire(a.WorktreePath, repolock.LockInfo{
-						JobID:          a.ID,
-						ScheduleID:     a.ScheduleID,
-						PID:            os.Getpid(),
-						ToolPID:        lockInfo.ToolPID,
-						ConversationID: convID,
-						StoryID:        a.StoryID,
-						Status:         "RUNNING",
-					}, watchdog.IsProcessAlive); lockErr == nil {
-						prepRepoLock = h
-					}
-				}
-				releasePrepRepoLock := func() {
-					if prepRepoLock != nil {
-						_ = prepRepoLock.Release()
-						prepRepoLock = nil
-					}
-				}
-				defer releasePrepRepoLock()
-
 				if hostGate != nil {
 					releaseOnJobGateLease(a.ID)
 					relGate, gateErr := hostGate.AcquireExecutionLease(runCtx, a.ID, a.WorktreePath)
 					if gateErr != nil {
+						_ = client.AbandonJob(runCtx, a.ID, "REPO_BUSY")
 						return gateErr
 					}
 					onJobGateMu.Lock()
@@ -1704,6 +1715,32 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						releaseOnJobGateLease(a.ID)
 					}
 				}()
+
+				var prepRepoLock *repolock.LockHandle
+				if a.WorktreePath != "" {
+					if h, lockErr := repolock.Acquire(a.WorktreePath, repolock.LockInfo{
+						JobID:          a.ID,
+						ScheduleID:     a.ScheduleID,
+						PID:            os.Getpid(),
+						ToolPID:        lockInfo.ToolPID,
+						ConversationID: convID,
+						StoryID:        a.StoryID,
+						Status:         "RUNNING",
+					}, watchdog.IsProcessAlive); lockErr == nil {
+						prepRepoLock = h
+					} else {
+						releaseOnJobGateLease(a.ID)
+						_ = client.AbandonJob(runCtx, a.ID, "REPO_BUSY")
+						return lockErr
+					}
+				}
+				releasePrepRepoLock := func() {
+					if prepRepoLock != nil {
+						_ = prepRepoLock.Release()
+						prepRepoLock = nil
+					}
+				}
+				defer releasePrepRepoLock()
 
 				prepCtx, prepCancel := context.WithCancel(runCtx)
 				defer prepCancel()

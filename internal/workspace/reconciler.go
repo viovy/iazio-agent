@@ -382,6 +382,10 @@ func computeManifest(ctx context.Context, workspacePath string) (WorkspaceManife
 			}
 			statusCode := trimmed[:2]
 			filePath := strings.TrimSpace(trimmed[3:])
+			slashPath := strings.TrimPrefix(filepath.ToSlash(filePath), "./")
+			if slashPath == ".iazio" || strings.HasPrefix(slashPath, ".iazio/") {
+				continue
+			}
 			if statusCode == "??" {
 				manifest.UntrackedFiles = append(manifest.UntrackedFiles, filePath)
 			} else {
@@ -429,9 +433,22 @@ func ResetAndSanitizeFreshWorkspace(ctx context.Context, workspacePath, jobID st
 		requestedBranch = strings.TrimSpace(targetBranch[0])
 	}
 
-	// 1. Check if git status --porcelain is dirty
+	// 1. Check if git status --porcelain is dirty (ignoring .iazio lock directory)
 	cmdStatus := procutil.CommandContext(ctx, "git", "-C", workspacePath, "status", "--porcelain")
-	statusOut, _ := cmdStatus.Output()
+	rawStatusOut, _ := cmdStatus.Output()
+	var filteredStatusLines []string
+	for _, line := range strings.Split(string(rawStatusOut), "\n") {
+		trimmed := strings.TrimRight(line, "\r\n")
+		if len(trimmed) < 4 {
+			continue
+		}
+		fp := strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(trimmed[3:])), "./")
+		if fp == ".iazio" || strings.HasPrefix(fp, ".iazio/") {
+			continue
+		}
+		filteredStatusLines = append(filteredStatusLines, trimmed)
+	}
+	statusOut := []byte(strings.Join(filteredStatusLines, "\n"))
 	if len(bytes.TrimSpace(statusOut)) > 0 {
 		// Archive dirty changes to .autopilot/recovery/<timestamp>-<job_id>.patch
 		recoveryDir := filepath.Join(workspacePath, ".autopilot", "recovery")
@@ -449,9 +466,9 @@ func ResetAndSanitizeFreshWorkspace(ctx context.Context, workspacePath, jobID st
 			_ = os.WriteFile(patchPath, statusOut, 0644)
 		}
 
-		// Hard reset and clean root
+		// Hard reset and clean root (preserving .iazio lock directory)
 		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "reset", "--hard", "HEAD").Run()
-		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "clean", "-fd").Run()
+		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "clean", "-fd", "-e", ".iazio").Run()
 
 		// Fetch all remotes and reset to clean origin/main if available (unless a specific target branch is requested)
 		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "fetch", "--all", "--prune").Run()
