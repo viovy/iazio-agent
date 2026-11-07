@@ -148,24 +148,34 @@ func (h *LockHandle) Release() error {
 	return nil
 }
 
-func ensureGitInfoExclude(worktree string) {
+func resolveWorktreeGitDir(worktree string) string {
 	gitPath := filepath.Join(worktree, ".git")
 	fi, err := os.Stat(gitPath)
 	if err != nil {
-		return
+		return ""
 	}
-	gitDir := gitPath
-	if !fi.IsDir() {
-		if b, rErr := os.ReadFile(gitPath); rErr == nil {
-			content := strings.TrimSpace(string(b))
-			if strings.HasPrefix(content, "gitdir:") {
-				target := strings.TrimSpace(strings.TrimPrefix(content, "gitdir:"))
-				if !filepath.IsAbs(target) {
-					target = filepath.Join(worktree, target)
-				}
-				gitDir = target
-			}
-		}
+	if fi.IsDir() {
+		return gitPath
+	}
+	b, rErr := os.ReadFile(gitPath)
+	if rErr != nil {
+		return gitPath
+	}
+	content := strings.TrimSpace(string(b))
+	if !strings.HasPrefix(content, "gitdir:") {
+		return gitPath
+	}
+	target := strings.TrimSpace(strings.TrimPrefix(content, "gitdir:"))
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(worktree, target)
+	}
+	return target
+}
+
+func ensureGitInfoExclude(worktree string) {
+	gitDir := resolveWorktreeGitDir(worktree)
+	if gitDir == "" {
+		return
 	}
 	infoDir := filepath.Join(gitDir, "info")
 	if err := os.MkdirAll(infoDir, 0o755); err != nil {

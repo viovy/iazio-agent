@@ -1004,16 +1004,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				TokenProvider:      tokenProvider,
 				Spooler:            spooler,
 				EagerUpdateEnabled: updateInterval > 0 || eagerUpdater != nil,
-				PrePollBarrier: func(ctx context.Context) bool {
-					if hostGate != nil && hostGate.State() == supervisor.GateStateUpdatingTools {
-						return false
-					}
-					if eagerUpdater != nil {
-						_, ok := eagerUpdater.EnsureUpToDateBeforeClaim(ctx)
-						return ok
-					}
-					return true
-				},
+				PrePollBarrier:     makePrePollBarrier(hostGate, eagerUpdater),
 				LastEagerUpdateAt: func() *time.Time {
 					lastUpdateMu.Lock()
 					defer lastUpdateMu.Unlock()
@@ -1356,25 +1347,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				cliInvoker := harness.NewCLIInvoker("", "")
 				disp = worker.NewDispatcher(cpClient, cliInvoker, host)
 				disp.SetHostGate(hostGate)
-				if eagerUpdater != nil {
-					disp.SetEagerReadinessGate(func(c context.Context) (bool, string) {
-						rep, ok := eagerUpdater.EnsureUpToDateBeforeClaim(c)
-						return ok, rep.Details
-					})
-				}
-				client.IdleWorktrees = func() []string {
-					repos, err := getRepos()
-					if err != nil || len(repos) == 0 {
-						return nil
-					}
-					candidates := make([]string, 0, len(repos))
-					for _, r := range repos {
-						if strings.TrimSpace(r.Path) != "" {
-							candidates = append(candidates, r.Path)
-						}
-					}
-					return disp.CollectIdleWorktrees(candidates)
-				}
+				wireDispatcherReadinessAndIdleWorktrees(disp, &client, eagerUpdater, getRepos)
 				disp.SetHarvestFlusher(func(hCtx context.Context, convID string) (int, string, error) {
 					return flushHarvestConversationDetailed(hCtx, convID)
 				})
@@ -1677,7 +1650,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						fmt.Fprintf(stderr, "[agent] refusing concurrent job %s on %s: worktree actively locked by job %s (pid %d)\n",
 							a.ID, a.WorktreePath, lockInfo.JobID, checkPID)
 					}
-					_ = client.AbandonJob(runCtx, a.ID, "REPO_BUSY")
+					_ = client.AbandonJob(runCtx, a.ID, reasonRepoBusy)
 					return fmt.Errorf("repository %s busy with job %s", a.WorktreePath, lockInfo.JobID)
 				}
 
@@ -1689,7 +1662,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						fmt.Fprintf(stderr, "[agent] refusing concurrent job %s on %s: worktree already reserved by job %s\n",
 							a.ID, a.WorktreePath, busyOwner)
 					}
-					_ = client.AbandonJob(runCtx, a.ID, "REPO_BUSY")
+					_ = client.AbandonJob(runCtx, a.ID, reasonRepoBusy)
 					return fmt.Errorf("repository %s busy with job %s", a.WorktreePath, busyOwner)
 				}
 				defer func() {
@@ -1702,7 +1675,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					releaseOnJobGateLease(a.ID)
 					relGate, gateErr := hostGate.AcquireExecutionLease(runCtx, a.ID, a.WorktreePath)
 					if gateErr != nil {
-						_ = client.AbandonJob(runCtx, a.ID, "REPO_BUSY")
+						_ = client.AbandonJob(runCtx, a.ID, reasonRepoBusy)
 						return gateErr
 					}
 					onJobGateMu.Lock()
@@ -1730,7 +1703,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						prepRepoLock = h
 					} else {
 						releaseOnJobGateLease(a.ID)
-						_ = client.AbandonJob(runCtx, a.ID, "REPO_BUSY")
+						_ = client.AbandonJob(runCtx, a.ID, reasonRepoBusy)
 						return lockErr
 					}
 				}
@@ -4136,4 +4109,41 @@ func resolveTelemetryDestination(apiURL string, getenv func(string) string, ctx 
 	}
 
 	return "", false
+}
+
+const reasonRepoBusy = "REPO_BUSY"
+
+func makePrePollBarrier(hostGate *supervisor.HostExecutionAndUpdateGate, eagerUpdater *supervisor.EagerToolUpdater) func(context.Context) bool {
+	return func(ctx context.Context) bool {
+		if hostGate != nil && hostGate.State() == supervisor.GateStateUpdatingTools {
+			return false
+		}
+		if eagerUpdater != nil {
+			_, ok := eagerUpdater.EnsureUpToDateBeforeClaim(ctx)
+			return ok
+		}
+		return true
+	}
+}
+
+func wireDispatcherReadinessAndIdleWorktrees(disp *worker.Dispatcher, client *controlplane.Client, eagerUpdater *supervisor.EagerToolUpdater, getRepos func() ([]supervisor.RepoCheckout, error)) {
+	if eagerUpdater != nil {
+		disp.SetEagerReadinessGate(func(c context.Context) (bool, string) {
+			rep, ok := eagerUpdater.EnsureUpToDateBeforeClaim(c)
+			return ok, rep.Details
+		})
+	}
+	client.IdleWorktrees = func() []string {
+		repos, err := getRepos()
+		if err != nil || len(repos) == 0 {
+			return nil
+		}
+		candidates := make([]string, 0, len(repos))
+		for _, r := range repos {
+			if strings.TrimSpace(r.Path) != "" {
+				candidates = append(candidates, r.Path)
+			}
+		}
+		return disp.CollectIdleWorktrees(candidates)
+	}
 }

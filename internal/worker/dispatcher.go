@@ -555,27 +555,42 @@ func (d *Dispatcher) clearActiveJob(jobID string) {
 	delete(d.activeJobs, jobID)
 }
 
+const reasonRepoBusy = "REPO_BUSY"
+
+func normalizeWorktreeKey(wt string) string {
+	trimmed := strings.TrimSpace(wt)
+	if trimmed == "" || trimmed == "." {
+		return ""
+	}
+	return filepath.Clean(trimmed)
+}
+
+func (d *Dispatcher) hasConflictingWorktreeLocked(jobID, cleanWT string) bool {
+	if cleanWT == "" {
+		return false
+	}
+	for existingJobID, wt := range d.inFlightPrepJobs {
+		if existingJobID != jobID && normalizeWorktreeKey(wt) == cleanWT {
+			return true
+		}
+	}
+	for existingJobID, aj := range d.activeJobs {
+		if existingJobID != jobID && normalizeWorktreeKey(aj.WorktreePath) == cleanWT {
+			return true
+		}
+	}
+	return false
+}
+
 func (d *Dispatcher) tryReserveInFlightWorktree(jobID, worktreePath string) bool {
 	if strings.TrimSpace(jobID) == "" {
 		return true
 	}
-	cleanWT := strings.TrimSpace(worktreePath)
-	if cleanWT != "" && cleanWT != "." {
-		cleanWT = filepath.Clean(cleanWT)
-	}
+	cleanWT := normalizeWorktreeKey(worktreePath)
 	d.activeJobsMu.Lock()
 	defer d.activeJobsMu.Unlock()
-	if cleanWT != "" && cleanWT != "." {
-		for existingJobID, wt := range d.inFlightPrepJobs {
-			if existingJobID != jobID && wt != "" && wt != "." && filepath.Clean(wt) == cleanWT {
-				return false
-			}
-		}
-		for existingJobID, aj := range d.activeJobs {
-			if existingJobID != jobID && aj.WorktreePath != "" && aj.WorktreePath != "." && filepath.Clean(aj.WorktreePath) == cleanWT {
-				return false
-			}
-		}
+	if d.hasConflictingWorktreeLocked(jobID, cleanWT) {
+		return false
 	}
 	if d.inFlightPrepJobs == nil {
 		d.inFlightPrepJobs = make(map[string]string)
@@ -592,110 +607,110 @@ func (d *Dispatcher) clearInFlightWorktree(jobID string) {
 
 // IsWorktreeInFlight returns true if wt is currently used by any job in activeJobs or inFlightPrepJobs.
 func (d *Dispatcher) IsWorktreeInFlight(wt string) bool {
-	cleanWT := strings.TrimSpace(wt)
-	if cleanWT == "" || cleanWT == "." {
+	cleanWT := normalizeWorktreeKey(wt)
+	if cleanWT == "" {
 		return false
 	}
-	cleanWT = filepath.Clean(cleanWT)
 	d.activeJobsMu.Lock()
 	defer d.activeJobsMu.Unlock()
-	for _, prepWT := range d.inFlightPrepJobs {
-		if prepWT != "" && prepWT != "." && filepath.Clean(prepWT) == cleanWT {
-			return true
-		}
+	return d.hasConflictingWorktreeLocked("", cleanWT)
+}
+
+func isDotLockHeldByOther(cleanWT, jobID string) bool {
+	b, err := os.ReadFile(filepath.Join(cleanWT, ".iazio-repolock"))
+	if err != nil {
+		return false
 	}
-	for _, aj := range d.activeJobs {
-		if aj.WorktreePath != "" && aj.WorktreePath != "." && filepath.Clean(aj.WorktreePath) == cleanWT {
-			return true
-		}
+	var meta struct {
+		HolderPID int    `json:"holder_pid"`
+		PID       int    `json:"pid"`
+		JobID     string `json:"job_id"`
 	}
-	return false
+	if json.Unmarshal(b, &meta) != nil {
+		return true
+	}
+	pid := meta.HolderPID
+	if pid <= 0 {
+		pid = meta.PID
+	}
+	if pid <= 0 {
+		return true
+	}
+	return (meta.JobID == "" || meta.JobID != jobID) && watchdog.IsProcessAlive(pid)
+}
+
+func isRepoLockHeldByOther(cleanWT, jobID string) bool {
+	info, err := repolock.Read(cleanWT)
+	if err != nil {
+		return false
+	}
+	status := strings.ToUpper(strings.TrimSpace(info.Status))
+	if status == "COMPLETED" || status == "FAILED" || status == "IDLE" {
+		return false
+	}
+	if info.JobID != "" && info.JobID == jobID {
+		return false
+	}
+	return (info.PID > 0 && watchdog.IsProcessAlive(info.PID)) ||
+		(info.HarnessPID > 0 && watchdog.IsProcessAlive(info.HarnessPID)) ||
+		(info.ToolPID > 0 && watchdog.IsProcessAlive(info.ToolPID))
 }
 
 func isWorktreeLockedByOther(wt, jobID string) bool {
-	cleanWT := filepath.Clean(strings.TrimSpace(wt))
-	if cleanWT == "" || cleanWT == "." {
+	cleanWT := normalizeWorktreeKey(wt)
+	if cleanWT == "" {
 		return false
 	}
 	if _, err := os.Stat(filepath.Join(cleanWT, ".git", "index.lock")); err == nil {
 		return true
 	}
-	dotLockPath := filepath.Join(cleanWT, ".iazio-repolock")
-	if b, err := os.ReadFile(dotLockPath); err == nil {
-		var meta struct {
-			HolderPID int    `json:"holder_pid"`
-			PID       int    `json:"pid"`
-			JobID     string `json:"job_id"`
-		}
-		if json.Unmarshal(b, &meta) == nil && (meta.HolderPID > 0 || meta.PID > 0) {
-			pid := meta.HolderPID
-			if pid <= 0 {
-				pid = meta.PID
-			}
-			if (meta.JobID == "" || meta.JobID != jobID) && watchdog.IsProcessAlive(pid) {
-				return true
-			}
-		} else {
-			return true
+	return isDotLockHeldByOther(cleanWT, jobID) || isRepoLockHeldByOther(cleanWT, jobID)
+}
+
+func (d *Dispatcher) defaultWorktreeCandidates() []string {
+	var raw []string
+	for _, p := range d.repoMap {
+		if strings.TrimSpace(p) != "" {
+			raw = append(raw, p)
 		}
 	}
-	if info, err := repolock.Read(cleanWT); err == nil {
-		status := strings.ToUpper(strings.TrimSpace(info.Status))
-		if status != "COMPLETED" && status != "FAILED" && status != "IDLE" && (info.JobID == "" || info.JobID != jobID) {
-			if (info.PID > 0 && watchdog.IsProcessAlive(info.PID)) ||
-				(info.HarnessPID > 0 && watchdog.IsProcessAlive(info.HarnessPID)) ||
-				(info.ToolPID > 0 && watchdog.IsProcessAlive(info.ToolPID)) {
-				return true
-			}
-		}
+	if strings.TrimSpace(d.workspace) != "" {
+		raw = append(raw, d.workspace)
 	}
-	return false
+	return raw
+}
+
+func (d *Dispatcher) isCandidateWorktreeIdle(clean string) bool {
+	fi, err := os.Stat(clean)
+	if err != nil || !fi.IsDir() {
+		return false
+	}
+	if d.IsWorktreeInFlight(clean) || isWorktreeLockedByOther(clean, "") {
+		return false
+	}
+	if b, err := os.ReadFile(filepath.Join(clean, ".session_story_id")); err == nil && strings.TrimSpace(string(b)) != "" {
+		return false
+	}
+	return supervisor.InspectWorktreeGitState(clean).IsClean
 }
 
 // CollectIdleWorktrees filters candidate worktrees and returns genuinely IDLE, clean, non-locked worktree paths.
 func (d *Dispatcher) CollectIdleWorktrees(candidates []string) []string {
-	var raw []string
-	if len(candidates) > 0 {
-		raw = append(raw, candidates...)
-	} else {
-		for _, p := range d.repoMap {
-			if strings.TrimSpace(p) != "" {
-				raw = append(raw, p)
-			}
-		}
-		if strings.TrimSpace(d.workspace) != "" {
-			raw = append(raw, d.workspace)
-		}
+	raw := candidates
+	if len(raw) == 0 {
+		raw = d.defaultWorktreeCandidates()
 	}
 	seen := make(map[string]bool, len(raw))
 	out := make([]string, 0, len(raw))
 	for _, wt := range raw {
-		trimmed := strings.TrimSpace(wt)
-		if trimmed == "" {
-			continue
-		}
-		clean := filepath.Clean(trimmed)
-		if seen[clean] {
+		clean := normalizeWorktreeKey(wt)
+		if clean == "" || seen[clean] {
 			continue
 		}
 		seen[clean] = true
-		fi, err := os.Stat(clean)
-		if err != nil || !fi.IsDir() {
-			continue
+		if d.isCandidateWorktreeIdle(clean) {
+			out = append(out, clean)
 		}
-		if d.IsWorktreeInFlight(clean) {
-			continue
-		}
-		if isWorktreeLockedByOther(clean, "") {
-			continue
-		}
-		if b, err := os.ReadFile(filepath.Join(clean, ".session_story_id")); err == nil && strings.TrimSpace(string(b)) != "" {
-			continue
-		}
-		if st := supervisor.InspectWorktreeGitState(clean); !st.IsClean {
-			continue
-		}
-		out = append(out, clean)
 	}
 	return out
 }
@@ -795,6 +810,105 @@ func (d *Dispatcher) SetWorkspace(ws string) {
 	d.workspace = ws
 }
 
+func (d *Dispatcher) isHostMaintenanceActive() bool {
+	if d.hostGate == nil {
+		return false
+	}
+	if sg, ok := d.hostGate.(interface{ State() supervisor.GateState }); ok {
+		return sg.State() == supervisor.GateStateUpdatingTools
+	}
+	if mg, ok := d.hostGate.(interface{ IsMaintenanceHeld() bool }); ok {
+		return mg.IsMaintenanceHeld()
+	}
+	return false
+}
+
+func (d *Dispatcher) checkPreClaimBarrier(ctx context.Context) (ClaimRequest, bool) {
+	if d.isHostMaintenanceActive() {
+		return ClaimRequest{}, false
+	}
+	if d.eagerReadinessGate != nil {
+		if ready, _ := d.eagerReadinessGate(ctx); !ready {
+			return ClaimRequest{}, false
+		}
+	}
+	claimReq := ClaimRequest{
+		HostID:   d.hostID,
+		JobTypes: d.jobTypes,
+	}
+	if d.idleWorktreesProvider != nil {
+		var idle []string
+		for _, wt := range d.idleWorktreesProvider() {
+			if trimmed := strings.TrimSpace(wt); trimmed != "" && !d.IsWorktreeInFlight(trimmed) {
+				idle = append(idle, trimmed)
+			}
+		}
+		if len(idle) == 0 {
+			return ClaimRequest{}, false
+		}
+		claimReq.IdleWorktrees = idle
+	}
+	return claimReq, true
+}
+
+func extractPayloadStringField(payload json.RawMessage, key string) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var pMap map[string]any
+	if json.Unmarshal(payload, &pMap) != nil || pMap == nil {
+		return ""
+	}
+	val, _ := pMap[key].(string)
+	return strings.TrimSpace(val)
+}
+
+func (d *Dispatcher) resolveJobWorktree(job *Job) (string, harness.Invoker) {
+	invoker := d.invoker
+	var resolvedFromCallback string
+	if d.worktreeResolver != nil {
+		resolvedFromCallback = strings.TrimSpace(d.worktreeResolver(job.Repo))
+	}
+	if explicitWT := strings.TrimSpace(job.WorktreePath); explicitWT != "" {
+		return explicitWT, invoker.WithWorkDir(explicitWT)
+	}
+	if resolvedFromCallback != "" {
+		return resolvedFromCallback, invoker.WithWorkDir(resolvedFromCallback)
+	}
+	if payloadWT := extractPayloadStringField(job.Payload, "worktree_path"); payloadWT != "" {
+		return payloadWT, invoker.WithWorkDir(payloadWT)
+	}
+	return ".", invoker
+}
+
+func (d *Dispatcher) acquireWorktreeRepoLock(ctx context.Context, job *Job, worktreeDir, resolvedConvID, initialStoryID string) (*repolock.LockHandle, bool) {
+	if worktreeDir == "" || worktreeDir == "." {
+		return nil, true
+	}
+	fi, statErr := os.Stat(worktreeDir)
+	if statErr != nil || !fi.IsDir() {
+		return nil, true
+	}
+	if isWorktreeLockedByOther(worktreeDir, job.ID) {
+		fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: worktree %s locked by other\n", job.ID, worktreeDir)
+		_ = d.declineJob(ctx, job.ID, reasonRepoBusy)
+		return nil, false
+	}
+	h, lockErr := repolock.Acquire(worktreeDir, repolock.LockInfo{
+		JobID:          job.ID,
+		PID:            os.Getpid(),
+		ConversationID: resolvedConvID,
+		StoryID:        initialStoryID,
+		Status:         "RUNNING",
+	}, watchdog.IsProcessAlive)
+	if lockErr != nil {
+		fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: repolock.Acquire error on %s: %v\n", job.ID, worktreeDir, lockErr)
+		_ = d.declineJob(ctx, job.ID, reasonRepoBusy)
+		return nil, false
+	}
+	return h, true
+}
+
 // PollAndProcess claims one job and processes it. Returns (true, err) if a job was processed,
 // or (false, nil) if no job was available.
 func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
@@ -805,40 +919,9 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		return false, errors.New("harness invoker not configured")
 	}
 
-	// Pre-Claim Barrier: check host maintenance gate, eager update readiness gate, and idle worktrees before claiming
-	if d.hostGate != nil {
-		if sg, ok := d.hostGate.(interface{ State() supervisor.GateState }); ok {
-			if sg.State() == supervisor.GateStateUpdatingTools {
-				return false, nil
-			}
-		} else if mg, ok := d.hostGate.(interface{ IsMaintenanceHeld() bool }); ok {
-			if mg.IsMaintenanceHeld() {
-				return false, nil
-			}
-		}
-	}
-	if d.eagerReadinessGate != nil {
-		if ready, _ := d.eagerReadinessGate(ctx); !ready {
-			return false, nil
-		}
-	}
-
-	claimReq := ClaimRequest{
-		HostID:   d.hostID,
-		JobTypes: d.jobTypes,
-	}
-	if d.idleWorktreesProvider != nil {
-		rawIdle := d.idleWorktreesProvider()
-		idle := make([]string, 0, len(rawIdle))
-		for _, wt := range rawIdle {
-			if trimmed := strings.TrimSpace(wt); trimmed != "" && !d.IsWorktreeInFlight(trimmed) {
-				idle = append(idle, trimmed)
-			}
-		}
-		if len(idle) == 0 {
-			return false, nil
-		}
-		claimReq.IdleWorktrees = idle
+	claimReq, canClaim := d.checkPreClaimBarrier(ctx)
+	if !canClaim {
+		return false, nil
 	}
 
 	job, err := d.client.ClaimJob(ctx, claimReq)
@@ -862,27 +945,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	ctx, span := telemetry.StartSpan(ctx, "dispatcher.processJob", spanOpts...)
 	defer span.End()
 
-	invoker := d.invoker
-	worktreeDir := "."
-	var resolvedFromCallback string
-	if d.worktreeResolver != nil {
-		resolvedFromCallback = strings.TrimSpace(d.worktreeResolver(job.Repo))
-	}
-	if explicitWT := strings.TrimSpace(job.WorktreePath); explicitWT != "" {
-		worktreeDir = explicitWT
-		invoker = invoker.WithWorkDir(explicitWT)
-	} else if resolvedFromCallback != "" {
-		worktreeDir = resolvedFromCallback
-		invoker = invoker.WithWorkDir(resolvedFromCallback)
-	} else if len(job.Payload) > 0 {
-		var pMap map[string]any
-		if json.Unmarshal(job.Payload, &pMap) == nil && pMap != nil {
-			if payloadWT, ok := pMap["worktree_path"].(string); ok && strings.TrimSpace(payloadWT) != "" {
-				worktreeDir = strings.TrimSpace(payloadWT)
-				invoker = invoker.WithWorkDir(worktreeDir)
-			}
-		}
-	}
+	worktreeDir, invoker := d.resolveJobWorktree(job)
 	if (worktreeDir == "" || worktreeDir == ".") && d.worktreeResolver != nil {
 		if job.Repo != "" && job.Repo != "." && (job.Type == JobTypeStoryCreate || job.Type == JobTypeStoryExecute || job.Type == JobTypePromptExecute) {
 			if filepath.IsAbs(job.Repo) {
@@ -913,7 +976,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	// 3. Acquire repolock on worktreeDir
 	if !d.tryReserveInFlightWorktree(job.ID, worktreeDir) {
 		fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: worktree %s already in-flight\n", job.ID, worktreeDir)
-		_ = d.declineJob(ctx, job.ID, "REPO_BUSY")
+		_ = d.declineJob(ctx, job.ID, reasonRepoBusy)
 		return false, nil
 	}
 	defer d.clearInFlightWorktree(job.ID)
@@ -926,7 +989,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 			d.clearInFlightWorktree(job.ID)
 			if job.LeaseToken != "" || (worktreeDir != "" && worktreeDir != ".") {
 				fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: hostGate lease error: %v\n", job.ID, leaseErr)
-				_ = d.declineJob(ctx, job.ID, "REPO_BUSY")
+				_ = d.declineJob(ctx, job.ID, reasonRepoBusy)
 				return false, nil
 			}
 			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: leaseErr.Error()})
@@ -941,52 +1004,23 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 
 	resolvedConvID := job.ResolvedConversationID()
 	initialStoryID := strings.TrimSpace(job.StoryID)
-	if initialStoryID == "" && len(job.Payload) > 0 {
-		var pMap map[string]any
-		if json.Unmarshal(job.Payload, &pMap) == nil && pMap != nil {
-			if sid, ok := pMap["story_id"].(string); ok {
-				initialStoryID = strings.TrimSpace(sid)
-			}
-		}
+	if initialStoryID == "" {
+		initialStoryID = extractPayloadStringField(job.Payload, "story_id")
 	}
 
-	var repoLockHandle *repolock.LockHandle
-	if worktreeDir != "" && worktreeDir != "." {
-		if fi, statErr := os.Stat(worktreeDir); statErr == nil && fi.IsDir() {
-			if isWorktreeLockedByOther(worktreeDir, job.ID) {
-				fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: worktree %s locked by other\n", job.ID, worktreeDir)
-				if relGateLease != nil {
-					relGateLease()
-					relGateLease = nil
-				}
-				d.clearInFlightWorktree(job.ID)
-				_ = d.declineJob(ctx, job.ID, "REPO_BUSY")
-				return false, nil
-			}
-			h, lockErr := repolock.Acquire(worktreeDir, repolock.LockInfo{
-				JobID:          job.ID,
-				PID:            os.Getpid(),
-				ConversationID: resolvedConvID,
-				StoryID:        initialStoryID,
-				Status:         "RUNNING",
-			}, watchdog.IsProcessAlive)
-			if lockErr != nil {
-				fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: repolock.Acquire error on %s: %v\n", job.ID, worktreeDir, lockErr)
-				if relGateLease != nil {
-					relGateLease()
-					relGateLease = nil
-				}
-				d.clearInFlightWorktree(job.ID)
-				_ = d.declineJob(ctx, job.ID, "REPO_BUSY")
-				return false, nil
-			}
-			repoLockHandle = h
-			defer func() {
-				if repoLockHandle != nil {
-					_ = repoLockHandle.Release()
-				}
-			}()
+	repoLockHandle, lockOK := d.acquireWorktreeRepoLock(ctx, job, worktreeDir, resolvedConvID, initialStoryID)
+	if !lockOK {
+		if relGateLease != nil {
+			relGateLease()
+			relGateLease = nil
 		}
+		d.clearInFlightWorktree(job.ID)
+		return false, nil
+	}
+	if repoLockHandle != nil {
+		defer func() {
+			_ = repoLockHandle.Release()
+		}()
 	}
 
 	d.setActiveJob(job.ID, worktreeDir, os.Getpid())

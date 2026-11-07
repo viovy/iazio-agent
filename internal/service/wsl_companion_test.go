@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestWSLCompanionSupervisor_CheckAndHeal(t *testing.T) {
@@ -111,4 +112,14 @@ func TestWSLCompanionSupervisor_HealingFailure_Diagnostics(t *testing.T) {
 	if !strings.Contains(status.LastCheckError, "service install") {
 		t.Fatalf("expected LastCheckError to contain diagnostic info, got: %s", status.LastCheckError)
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	supervisor.StartSupervisor(ctx, 5*time.Millisecond)
+	<-ctx.Done()
+	time.Sleep(10 * time.Millisecond)
+
+	sDefault := NewWSLCompanionSupervisor("Ubuntu", nil)
+	_, _ = sDefault.runner("true")
 }
+

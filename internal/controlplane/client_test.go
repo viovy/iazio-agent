@@ -1040,3 +1040,134 @@ func TestClient_Loop_DeduplicatesPendingCommandsByID(t *testing.T) {
 		t.Fatalf("expected command cmd-dup-1 to execute exactly once across duplicate heartbeats, got %d", got)
 	}
 }
+
+func TestClient_AckLease_HeartbeatJob_FailoverJob_DeclineJob_And_PrePollBarrier(t *testing.T) {
+	var mu sync.Mutex
+	seenPaths := make(map[string]map[string]any)
+	var pollCount int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		seenPaths[r.URL.Path] = body
+		if strings.HasSuffix(r.URL.Path, "/poll") {
+			pollCount++
+		}
+		mu.Unlock()
+		if strings.HasSuffix(r.URL.Path, "/poll") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	c := Client{
+		BaseURL: srv.URL,
+		IdleWorktrees: func() []string {
+			return []string{"/work/wt-1", "/work/wt-2"}
+		},
+	}
+
+	if err := c.AckLease(ctx, "job-1", "lt-1", 4321, "conv-1"); err != nil {
+		t.Fatalf("AckLease failed: %v", err)
+	}
+	if err := c.HeartbeatJob(ctx, "job-1", "lt-1"); err != nil {
+		t.Fatalf("HeartbeatJob failed: %v", err)
+	}
+	if err := c.FailoverJob(ctx, "job-1", AttemptFailure{Host: "h1", Tool: "agy", Reason: "crash"}); err != nil {
+		t.Fatalf("FailoverJob failed: %v", err)
+	}
+	if err := c.DeclineJob(ctx, "job-1", "REPO_BUSY"); err != nil {
+		t.Fatalf("DeclineJob failed: %v", err)
+	}
+	if _, ok, err := c.NextLease(ctx, "h1"); err != nil || ok {
+		t.Fatalf("NextLease failed: ok=%v err=%v", ok, err)
+	}
+
+	mu.Lock()
+	pollBody := seenPaths["/v1/hosts/h1/poll"]
+	_, hasAck := seenPaths["/v1/jobs/job-1/ack-lease"]
+	_, hasHB := seenPaths["/v1/jobs/job-1/heartbeat"]
+	_, hasFO := seenPaths["/v1/jobs/job-1/failover"]
+	_, hasDec := seenPaths["/v1/jobs/job-1/decline"]
+	mu.Unlock()
+
+	if !hasAck || !hasHB || !hasFO || !hasDec {
+		t.Fatalf("missing expected endpoint calls: ack=%v hb=%v fo=%v dec=%v", hasAck, hasHB, hasFO, hasDec)
+	}
+	idleWTs, ok := pollBody["idle_worktrees"].([]any)
+	if !ok || len(idleWTs) != 2 {
+		t.Fatalf("expected 2 idle_worktrees in poll body, got %v", pollBody)
+	}
+
+	// PrePollBarrier returning false prevents polling in Loop
+	mu.Lock()
+	pollCount = 0
+	mu.Unlock()
+	loopCtx, loopCancel := context.WithTimeout(ctx, 35*time.Millisecond)
+	defer loopCancel()
+	cBarrier := Client{
+		BaseURL: srv.URL,
+		PrePollBarrier: func(context.Context) bool {
+			return false
+		},
+	}
+	_ = cBarrier.Loop(loopCtx, "h1", "worker", 10*time.Millisecond, nil)
+	mu.Lock()
+	gotPolls := pollCount
+	mu.Unlock()
+	if gotPolls != 0 {
+		t.Fatalf("expected 0 polls when PrePollBarrier returns false, got %d", gotPolls)
+	}
+
+	// OfflineReportSpooler.StartAutoDrain coverage
+	spooler, err := NewOfflineReportSpooler(t.TempDir(), srv.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = spooler.Spool(SpooledRequest{
+		URL:    srv.URL + "/v1/jobs/job-1/heartbeat",
+		Method: http.MethodPost,
+		Body:   []byte(`{}`),
+	})
+	drainCtx, drainCancel := context.WithTimeout(ctx, 25*time.Millisecond)
+	defer drainCancel()
+	spooler.StartAutoDrain(drainCtx, 5*time.Millisecond)
+	<-drainCtx.Done()
+	time.Sleep(10 * time.Millisecond)
+
+	// Additional Client endpoint & Spooler edge-case coverage
+	_ = c.PostJobReadiness(ctx, "job-1", map[string]any{"orphans_reaped": 0}, map[string]any{"clean_locks": true}, map[string]any{"ok": true})
+	_ = c.PostChunk(ctx, "job-1", "stdout", "hello\n")
+	_ = c.PostExit(ctx, "job-1", ExitOptions{ExitCode: 0, Reason: "ok"})
+	_ = c.PostEagerReadiness(ctx, "h1", map[string]any{"eager_update_state": "UP_TO_DATE"})
+	_ = c.ResumeRepo(ctx, "h1", "/work/wt-1")
+	_ = c.AbandonJob(ctx, "job-1", "timeout")
+	_ = c.ResumeJob(ctx, "job-1")
+	_ = c.RemediateRepo(ctx, "h1", "/work/wt-1")
+	_, _ = c.PostPreflight(ctx, "h1", "/work/wt-1", map[string]any{"ok": true})
+	_, _ = c.PostFinish(ctx, "h1", "/work/wt-1", "job-1", FinishReport{Kind: "story", ASEComplete: true})
+
+	spoolDir2 := t.TempDir()
+	spooler2, err := NewOfflineReportSpooler(spoolDir2, srv.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	spooler2.TokenProvider = func(context.Context) string { return "fresh-token" }
+	_ = os.WriteFile(spoolDir2+"/0001-corrupt.json", []byte("{bad-json"), 0o600)
+	_ = spooler2.Spool(SpooledRequest{
+		URL:     srv.URL + "/v1/jobs/job-1/heartbeat",
+		Method:  http.MethodPost,
+		Headers: map[string]string{"X-Test": "1"},
+		Body:    []byte(`{}`),
+	})
+	if drained, dErr := spooler2.Drain(ctx); dErr != nil || drained != 1 {
+		t.Fatalf("expected 1 drained request, got drained=%d err=%v", drained, dErr)
+	}
+}
+
+

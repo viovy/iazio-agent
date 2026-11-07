@@ -1965,4 +1965,179 @@ func TestDispatcher_AtomicLocalReservationBeforeAckLease_AndDeclineOnBusy(t *tes
 	}
 }
 
+type abandonOnlyControlPlane struct {
+	*mockControlPlane
+	abandoned map[string]string
+}
+
+func (a *abandonOnlyControlPlane) AbandonJob(_ context.Context, jobID, reason string) error {
+	a.abandoned[jobID] = reason
+	return nil
+}
+
+type plainControlPlane struct {
+	delegate *mockControlPlane
+}
+
+func (p *plainControlPlane) ClaimJob(ctx context.Context, req ClaimRequest) (*Job, error) {
+	return p.delegate.ClaimJob(ctx, req)
+}
+func (p *plainControlPlane) CompleteJob(ctx context.Context, jobID string, req CompleteRequest) error {
+	return p.delegate.CompleteJob(ctx, jobID, req)
+}
+func (p *plainControlPlane) HeartbeatJob(ctx context.Context, jobID, leaseToken string, fencingToken int64, storyID ...string) error {
+	return p.delegate.HeartbeatJob(ctx, jobID, leaseToken, fencingToken, storyID...)
+}
+func (p *plainControlPlane) BindStory(ctx context.Context, jobID string, req StoryBindingRequest) error {
+	return p.delegate.BindStory(ctx, jobID, req)
+}
+func (p *plainControlPlane) AckLease(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) error {
+	return p.delegate.AckLease(ctx, jobID, leaseToken, agentPID, activeConvID)
+}
+func (p *plainControlPlane) FailoverJob(ctx context.Context, jobID string, req controlplane.AttemptFailure) error {
+	return p.delegate.FailoverJob(ctx, jobID, req)
+}
+
+type abandonWrapper struct {
+	plainControlPlane
+	abandoned map[string]string
+}
+
+func (a *abandonWrapper) AbandonJob(_ context.Context, jobID, reason string) error {
+	a.abandoned[jobID] = reason
+	return nil
+}
+
+func TestHTTPControlPlaneClient_DeclineJob_And_DispatcherHelpers(t *testing.T) {
+	ctx := context.Background()
+
+	var hitPaths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitPaths = append(hitPaths, r.URL.Path)
+		switch r.URL.Path {
+		case "/v1/jobs/job-200/decline":
+			w.WriteHeader(http.StatusOK)
+		case "/v1/jobs/job-404-fallback/decline":
+			w.WriteHeader(http.StatusNotFound)
+		case "/api/v1/agent/jobs/job-404-fallback/decline":
+			w.WriteHeader(http.StatusNoContent)
+		case "/v1/jobs/job-500/decline":
+			http.Error(w, "boom", http.StatusBadRequest)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	cli := NewHTTPControlPlaneClient(srv.URL, "tok", srv.Client())
+	cli.MaxRetries = 0
+
+	// 1. Direct 200 OK on /v1/jobs/{id}/decline
+	if err := cli.DeclineJob(ctx, "job-200", "REPO_BUSY"); err != nil {
+		t.Fatalf("DeclineJob 200 failed: %v", err)
+	}
+	// 2. 404 fallback to /api/v1/agent/jobs/{id}/decline
+	if err := cli.DeclineJob(ctx, "job-404-fallback", "REPO_BUSY"); err != nil {
+		t.Fatalf("DeclineJob 404 fallback failed: %v", err)
+	}
+	// 3. Error status
+	if err := cli.DeclineJob(ctx, "job-500", "REPO_BUSY"); err == nil {
+		t.Fatal("expected error from DeclineJob on 400 status")
+	}
+
+	// 4. Dispatcher.ActiveJobs, SetRepoMap, SetWorkspace, CollectIdleWorktrees with repoMap/workspace fallback
+	wt1 := initTestFleetWorkspace(t)
+	wt2 := initTestFleetWorkspace(t)
+	d := NewDispatcher(newMockControlPlane(), &mockInvoker{}, "host-1")
+	d.SetRepoMap(map[string]string{"r1": wt1})
+	d.SetWorkspace(wt2)
+	idle := d.CollectIdleWorktrees(nil)
+	if len(idle) != 2 {
+		t.Fatalf("expected 2 idle worktrees from repoMap+workspace fallback, got %v", idle)
+	}
+
+	d.setActiveJob("", wt1, 123) // empty jobID no-op
+	d.setActiveJob("active-1", wt1, 1234)
+	if len(d.ActiveJobs()) != 1 || d.ActiveJobs()[0].JobID != "active-1" {
+		t.Fatalf("unexpected ActiveJobs: %+v", d.ActiveJobs())
+	}
+	if !d.IsWorktreeInFlight(wt1) {
+		t.Fatal("expected active job worktree to be in-flight")
+	}
+	if d.IsWorktreeInFlight("") || d.IsWorktreeInFlight(".") {
+		t.Fatal("expected empty or '.' worktree not to be in-flight")
+	}
+	if !d.tryReserveInFlightWorktree("", wt1) {
+		t.Fatal("expected empty jobID in tryReserveInFlightWorktree to return true")
+	}
+	if d.tryReserveInFlightWorktree("other-job", wt1) {
+		t.Fatal("expected tryReserveInFlightWorktree to fail when wt1 is in activeJobs")
+	}
+	d.clearActiveJob("active-1")
+
+	// 5. isWorktreeLockedByOther edge cases
+	if isWorktreeLockedByOther("", "j1") || isWorktreeLockedByOther(".", "j1") {
+		t.Fatal("expected empty/dot worktree not to be locked")
+	}
+	wtLock := initTestFleetWorkspace(t)
+	// .git/index.lock
+	idxLock := filepath.Join(wtLock, ".git", "index.lock")
+	_ = os.WriteFile(idxLock, []byte("lock"), 0o644)
+	if !isWorktreeLockedByOther(wtLock, "j1") {
+		t.Fatal("expected .git/index.lock to report locked")
+	}
+	_ = os.Remove(idxLock)
+
+	// .iazio-repolock with alive PID
+	dotLock := filepath.Join(wtLock, ".iazio-repolock")
+	_ = os.WriteFile(dotLock, []byte(`{"pid":`+strings.TrimSpace(string(rune(0)))+`}`), 0o644)
+	_ = os.WriteFile(dotLock, []byte("plain-lock"), 0o644)
+	if !isWorktreeLockedByOther(wtLock, "j1") {
+		t.Fatal("expected non-JSON .iazio-repolock to report locked")
+	}
+	_ = os.Remove(dotLock)
+
+	// 6. declineJob with nil client, plain client, and AbandonJob wrapper
+	dNil := &Dispatcher{}
+	_ = dNil.declineJob(ctx, "j1", "REPO_BUSY")
+	dPlain := NewDispatcher(&plainControlPlane{delegate: newMockControlPlane()}, &mockInvoker{}, "h1")
+	_ = dPlain.declineJob(ctx, "j1", "REPO_BUSY")
+	ab := &abandonWrapper{plainControlPlane: plainControlPlane{delegate: newMockControlPlane()}, abandoned: make(map[string]string)}
+	dAb := NewDispatcher(ab, &mockInvoker{}, "h1")
+	_ = dAb.declineJob(ctx, "j-ab", "REPO_BUSY")
+	if ab.abandoned["j-ab"] != "REPO_BUSY" {
+		t.Fatalf("expected AbandonJob fallback to record REPO_BUSY, got %v", ab.abandoned)
+	}
+
+	// 7. PollAndProcess declines when worktree has .git/index.lock or hostGate fails with LeaseToken != ""
+	cp := newMockControlPlane()
+	_ = os.WriteFile(idxLock, []byte("lock"), 0o644)
+	defer os.Remove(idxLock)
+	cp.claimFunc = func(context.Context, ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:           "job-idx-locked",
+			Type:         JobTypePromptExecute,
+			WorktreePath: wtLock,
+			LeaseToken:   "lt-idx",
+			Payload:      json.RawMessage(`{"story_id":"STORY-1"}`),
+		}, nil
+	}
+	dIdx := NewDispatcher(cp, &mockInvoker{}, "h1")
+	dIdx.SetHostGate(&mockHostGate{})
+	processed, err := dIdx.PollAndProcess(ctx)
+	if err != nil || processed || cp.declinedJobs["job-idx-locked"] != "REPO_BUSY" {
+		t.Fatalf("expected job-idx-locked to be declined with REPO_BUSY, got processed=%v err=%v declined=%v", processed, err, cp.declinedJobs)
+	}
+
+	// 8. PollAndProcess declines when hostGate.AcquireExecutionLease fails and job.LeaseToken != ""
+	dGateFail := NewDispatcher(cp, &mockInvoker{}, "h1")
+	dGateFail.SetHostGate(&mockHostGate{block: true})
+	delete(cp.declinedJobs, "job-idx-locked")
+	processed, err = dGateFail.PollAndProcess(ctx)
+	if err != nil || processed || cp.declinedJobs["job-idx-locked"] != "REPO_BUSY" {
+		t.Fatalf("expected hostGate block with LeaseToken to decline with REPO_BUSY, got processed=%v err=%v declined=%v", processed, err, cp.declinedJobs)
+	}
+}
+
+
 

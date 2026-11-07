@@ -1073,3 +1073,72 @@ func TestWatchdog_NonStoryOrdinaryPrompt_CompletesImmediatelyWithoutASEGates(t *
 		t.Fatalf("expected JobStatus to return StatusCompleted, got %v (ok=%v)", status, ok)
 	}
 }
+
+func TestWatchdog_LifecycleAndLivenessHelpers(t *testing.T) {
+	tmpDir := t.TempDir()
+	w := New(Options{
+		StateFile: filepath.Join(tmpDir, "wd-lifecycle.json"),
+		IsAlive:   func(int) bool { return true },
+	})
+
+	w.Track(TrackedJob{
+		JobID:        "job-life-1",
+		PID:          os.Getpid(),
+		WorktreePath: tmpDir,
+		Status:       StatusRunning,
+	})
+	if !w.IsTracked("job-life-1") {
+		t.Fatal("expected job-life-1 to be tracked")
+	}
+	_ = w.ActiveJobs()
+	w.MarkCompleted("job-life-1")
+	if w.IsTracked("job-life-1") {
+		t.Fatal("expected completed job not to be reported as active in IsTracked")
+	}
+
+	w.Track(TrackedJob{
+		JobID:        "job-life-2",
+		PID:          os.Getpid(),
+		WorktreePath: tmpDir,
+		Status:       StatusRunning,
+	})
+	w.AbortJob("job-life-2", "aborted_by_test")
+	if st, ok := w.JobStatus("job-life-2"); !ok || st != StatusFailed {
+		t.Fatalf("expected StatusFailed after AbortJob, got %q (ok=%v)", st, ok)
+	}
+	if _, ok := w.JobStatus("non-existent"); ok {
+		t.Fatal("expected false for non-existent job")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	w.StartWatchguard(ctx, 10*time.Millisecond)
+	<-ctx.Done()
+	w.WaitWatchguard()
+
+	// ConversationLivenessMonitor helpers
+	liveDir := filepath.Join(tmpDir, "liveness")
+	brainDir := filepath.Join(tmpDir, "brain")
+	convID := "conv-liveness-1"
+	_ = os.MkdirAll(liveDir, 0o755)
+	_ = os.MkdirAll(filepath.Join(brainDir, convID, ".system_generated", "logs"), 0o755)
+	_ = os.WriteFile(
+		filepath.Join(brainDir, convID, ".system_generated", "logs", "transcript.jsonl"),
+		[]byte("{\"step\":1}\n{\"step\":2}\n"),
+		0o644,
+	)
+	_ = os.MkdirAll(filepath.Join(tmpDir, ".git", "logs"), 0o755)
+	_ = os.WriteFile(filepath.Join(tmpDir, ".git", "logs", "HEAD"), []byte("ref\n"), 0o644)
+
+	mon := &ConversationLivenessMonitor{
+		StallTimeout: time.Millisecond,
+		LivenessDir:  liveDir,
+		BrainDir:     brainDir,
+		Now:          func() time.Time { return time.Now().UTC().Add(time.Hour) },
+	}
+	snap := mon.CheckLiveness(tmpDir, "agy-"+convID, os.Getpid(), time.Now().UTC().Add(-2*time.Hour))
+	if !snap.IsStalled || snap.LastTranscriptTurn == "" {
+		t.Fatalf("expected stalled snapshot with transcript turn, got %+v", snap)
+	}
+}
+
