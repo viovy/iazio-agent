@@ -3230,6 +3230,15 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 				} else if strings.HasPrefix(l, "# branch.oid ") {
 					st.HeadSHA = strings.TrimPrefix(l, "# branch.oid ")
 				} else if !strings.HasPrefix(l, "# ") {
+					if strings.HasPrefix(l, "? ") {
+						untrackedPath := strings.TrimSpace(strings.TrimPrefix(l, "? "))
+						slash := strings.TrimPrefix(strings.ReplaceAll(untrackedPath, "\\", "/"), "./")
+						if slash == ".iazio" || strings.HasPrefix(slash, ".iazio/") ||
+							slash == ".autopilot" || strings.HasPrefix(slash, ".autopilot/") ||
+							supervisor.IsEphemeralArtifactPath(slash) {
+							continue
+						}
+					}
 					porcelainLines = append(porcelainLines, l)
 				}
 			}
