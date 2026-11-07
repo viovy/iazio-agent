@@ -791,10 +791,7 @@ func updateSingleTool(
 		repo = "viovy/" + repo
 	}
 
-	allowSourceFallback := envFn("IAZIO_AGENT_NONINTERACTIVE") != "1" ||
-		envFn("IAZIO_FORCE_SOURCE_BUILD") == "1" ||
-		envFn("AUTOPILOT_FORCE_SOURCE_BUILD") == "1" ||
-		envFn("IAZIO_ALLOW_SOURCE_FALLBACK") == "1"
+	allowSourceFallback := envFn("IAZIO_AGENT_NONINTERACTIVE") != "1"
 
 	rel, err := fetchRelease(ctx, client, repo, tool.TargetVersion, ghToken)
 	if err != nil {
@@ -834,23 +831,16 @@ func updateSingleTool(
 		return false, fmt.Errorf("download: %w", err)
 	}
 
-	if csAsset := findChecksumsAsset(rel); csAsset != nil {
-		csData, csErr := downloadAsset(ctx, client, csAsset, ghToken)
-		if csErr != nil {
-			return false, fmt.Errorf("download checksums (%s): %w", csAsset.Name, csErr)
-		}
-		if vErr := verifyChecksum(data, asset.Name, string(csData)); vErr != nil {
-			if force && envFn("IAZIO_ALLOW_UNVERIFIED_UPDATES") == "1" {
-				fmt.Fprintf(stdout, "  [!] %s: checksum verification failed (%v), skipping hash verification due to --force and IAZIO_ALLOW_UNVERIFIED_UPDATES=1\n", tool.Name, vErr)
-			} else {
-				return false, fmt.Errorf("integrity verification failed for %s: %w", asset.Name, vErr)
-			}
-		}
-	} else {
-		if !(force && envFn("IAZIO_ALLOW_UNVERIFIED_UPDATES") == "1") {
-			return false, fmt.Errorf("integrity verification failed: no checksums asset found in release %s for %s (fail-closed, set IAZIO_ALLOW_UNVERIFIED_UPDATES=1 with --force to override)", latestVer, tool.Name)
-		}
-		fmt.Fprintf(stdout, "  [!] %s: no checksums file found in release %s, skipping hash verification due to --force and IAZIO_ALLOW_UNVERIFIED_UPDATES=1\n", tool.Name, latestVer)
+	csAsset := findChecksumsAsset(rel)
+	if csAsset == nil {
+		return false, fmt.Errorf("integrity verification failed: no checksums asset found in release %s for %s (fail-closed)", latestVer, tool.Name)
+	}
+	csData, csErr := downloadAsset(ctx, client, csAsset, ghToken)
+	if csErr != nil {
+		return false, fmt.Errorf("download checksums (%s): %w", csAsset.Name, csErr)
+	}
+	if vErr := verifyChecksum(data, asset.Name, string(csData)); vErr != nil {
+		return false, fmt.Errorf("integrity verification failed for %s: %w", asset.Name, vErr)
 	}
 
 	binBytes, err := extractBinary(data, asset.Name, tool.BinaryName, runtime.GOOS)
@@ -1677,14 +1667,14 @@ func shouldBuildFromSourceDuringStory(ctx context.Context, sourceRepo string, en
 	if envFn == nil {
 		envFn = os.Getenv
 	}
-	if envFn("IAZIO_FORCE_SOURCE_BUILD") == "1" || envFn("AUTOPILOT_FORCE_SOURCE_BUILD") == "1" {
-		return true, "forced via environment"
+	if envFn("IAZIO_AGENT_NONINTERACTIVE") == "1" {
+		return false, "background service daemon prefers official release (Path B)"
 	}
 	if envFn("IAZIO_PREFER_RELEASE_DOWNLOAD") == "1" || envFn("AUTOPILOT_PREFER_RELEASE_DOWNLOAD") == "1" {
 		return false, "release download preferred via environment"
 	}
-	if envFn("IAZIO_AGENT_NONINTERACTIVE") == "1" {
-		return false, "background service daemon prefers official release (Path B)"
+	if envFn("IAZIO_FORCE_SOURCE_BUILD") == "1" || envFn("AUTOPILOT_FORCE_SOURCE_BUILD") == "1" {
+		return true, "forced via environment"
 	}
 	if sourceRepo == "" {
 		return false, "no local source repo"

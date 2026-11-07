@@ -405,6 +405,7 @@ func (w *Watchdog) OnProcessExit(jobID string, pid, exitCode int, waitErr error)
 		if isASEJob {
 			gateRes := gate.Verify(gate.GateOptions{
 				WorktreePath:           job.WorktreePath,
+				DocsHubPath:            job.DocsHubPath,
 				StoryID:                job.StoryID,
 				RequireTestsPassed:     job.AutoResumePolicy.RequireTestsPassed || (job.StoryID != "" && job.AutoResumePolicy.Enabled),
 				RequireReleaseVerified: job.AutoResumePolicy.RequireReleaseVerified || (job.StoryID != "" && job.AutoResumePolicy.Enabled),

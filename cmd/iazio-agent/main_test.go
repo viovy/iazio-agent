@@ -1957,11 +1957,15 @@ func TestHelpers_DocAndSubmoduleCheck(t *testing.T) {
 	if !isGitSubmoduleDir(tmp) {
 		t.Fatalf("expected git dir to return true")
 	}
-	if !isDocOrEphemeralFile("docs/stories/story.md") {
-		t.Fatalf("expected doc file to return true")
+	for _, nonExempt := range []string{"docs", "docs/", "docs/stories/story.md", "README.md", "cmd/main.go", "agent.log"} {
+		if isDocOrEphemeralFile(nonExempt) {
+			t.Fatalf("expected %q to NOT be exempt (return false)", nonExempt)
+		}
 	}
-	if isDocOrEphemeralFile("cmd/main.go") {
-		t.Fatalf("expected go file to return false")
+	for _, exempt := range []string{"tmp/scratch.txt", ".system_generated/trace.json", ".gemini/state.json", ".agents/workflow.md"} {
+		if !isDocOrEphemeralFile(exempt) {
+			t.Fatalf("expected ephemeral scratch path %q to return true", exempt)
+		}
 	}
 }
 
@@ -2039,12 +2043,20 @@ func TestScanRepoFleetStatus_Cases(t *testing.T) {
 		t.Fatalf("expected empty git repo to be clean")
 	}
 
+	ephemeralFile := filepath.Join(tmp, "tmp", "scratch.txt")
+	_ = os.MkdirAll(filepath.Dir(ephemeralFile), 0755)
+	_ = os.WriteFile(ephemeralFile, []byte("scratch"), 0644)
+	if !scanRepoFleetStatus(ctx, tmp) {
+		t.Fatalf("expected git repo with untracked tmp/ scratch file to be clean")
+	}
+
 	docFile := filepath.Join(tmp, "docs", "note.md")
 	_ = os.MkdirAll(filepath.Dir(docFile), 0755)
 	_ = os.WriteFile(docFile, []byte("note"), 0644)
-	if !scanRepoFleetStatus(ctx, tmp) {
-		t.Fatalf("expected git repo with untracked doc to be clean")
+	if scanRepoFleetStatus(ctx, tmp) {
+		t.Fatalf("expected git repo with untracked docs/note.md to be dirty")
 	}
+	_ = os.RemoveAll(filepath.Join(tmp, "docs"))
 
 	codeFile := filepath.Join(tmp, "foo.go")
 	_ = os.WriteFile(codeFile, []byte("package main"), 0644)
@@ -2464,9 +2476,14 @@ func TestScanRepoFleetStatus_HarnessJSON(t *testing.T) {
 		t.Fatal("expected clean repo status for CLEAN_SUBMODULE_DRIFT")
 	}
 
-	_ = os.WriteFile(harnessScript, []byte("#!/bin/sh\necho '{\"worktree_state\":\"DIRTY_UNTRACKED_ONLY\",\"submodules_clean\":true,\"untracked_files\":[\"docs/note.md\",\"README.md\"]}'\n"), 0o755)
+	_ = os.WriteFile(harnessScript, []byte("#!/bin/sh\necho '{\"worktree_state\":\"DIRTY_UNTRACKED_ONLY\",\"submodules_clean\":true,\"untracked_files\":[\"tmp/scratch.txt\",\".gemini/state.json\"]}'\n"), 0o755)
 	if !scanRepoFleetStatus(ctx, repoDir) {
-		t.Fatal("expected clean repo status for doc untracked files")
+		t.Fatal("expected clean repo status for ephemeral scratch untracked files")
+	}
+
+	_ = os.WriteFile(harnessScript, []byte("#!/bin/sh\necho '{\"worktree_state\":\"DIRTY_UNTRACKED_ONLY\",\"submodules_clean\":true,\"untracked_files\":[\"docs/note.md\",\"README.md\"]}'\n"), 0o755)
+	if scanRepoFleetStatus(ctx, repoDir) {
+		t.Fatal("expected dirty repo status for untracked docs/markdown files")
 	}
 
 	_ = os.WriteFile(harnessScript, []byte("#!/bin/sh\necho '{\"worktree_state\":\"DIRTY_UNTRACKED_ONLY\",\"submodules_clean\":true,\"untracked_files\":[\"main.go\"]}'\n"), 0o755)
@@ -3194,11 +3211,16 @@ func TestHealHarvesterServiceIfNeeded(t *testing.T) {
 		t.Fatal("expected restartToolServiceFn not to be called when reconcile brings service to active")
 	}
 
-	if shouldEnsureCanonicalSingleHome([]string{"--version"}) || shouldEnsureCanonicalSingleHome([]string{"version"}) || shouldEnsureCanonicalSingleHome([]string{"service", "reconcile"}) {
+	t.Setenv("XPC_SERVICE_NAME", "")
+	if shouldEnsureCanonicalSingleHome(nil) || shouldEnsureCanonicalSingleHome([]string{"--version"}) || shouldEnsureCanonicalSingleHome([]string{"version"}) || shouldEnsureCanonicalSingleHome([]string{"service", "reconcile"}) {
 		t.Fatal("expected lightweight CLI subcommands not to trigger ensureCanonicalSingleHome")
 	}
 	if !shouldEnsureCanonicalSingleHome([]string{"run"}) || !shouldEnsureCanonicalSingleHome([]string{"update"}) {
 		t.Fatal("expected run and update to trigger ensureCanonicalSingleHome")
+	}
+	t.Setenv("XPC_SERVICE_NAME", "io.iazio.iazio-agent")
+	if !shouldEnsureCanonicalSingleHome([]string{"version"}) {
+		t.Fatal("expected XPC_SERVICE_NAME=io.iazio.* to trigger ensureCanonicalSingleHome")
 	}
 }
 
@@ -4043,9 +4065,14 @@ func TestScanRepoFleetStatusAndShouldBuildFromSource(t *testing.T) {
 		t.Fatal("expected CLEAN worktree_state to return true")
 	}
 
-	writeHarnessJSON(`{"worktree_state":"DIRTY_UNTRACKED_ONLY","submodules_clean":true,"untracked_files":["docs/readme.md"]}`)
+	writeHarnessJSON(`{"worktree_state":"DIRTY_UNTRACKED_ONLY","submodules_clean":true,"untracked_files":["tmp/scratch.txt",".agents/cache.json"]}`)
 	if !scanRepoFleetStatus(ctx, repoDir) {
-		t.Fatal("expected DIRTY_UNTRACKED_ONLY with docs only to return true")
+		t.Fatal("expected DIRTY_UNTRACKED_ONLY with ephemeral scratch files only to return true")
+	}
+
+	writeHarnessJSON(`{"worktree_state":"DIRTY_UNTRACKED_ONLY","submodules_clean":true,"untracked_files":["docs/readme.md"]}`)
+	if scanRepoFleetStatus(ctx, repoDir) {
+		t.Fatal("expected DIRTY_UNTRACKED_ONLY with docs/readme.md to return false")
 	}
 
 	writeHarnessJSON(`{"worktree_state":"DIRTY_UNTRACKED_ONLY","submodules_clean":true,"untracked_files":["cmd/app.go"]}`)
@@ -4058,9 +4085,14 @@ func TestScanRepoFleetStatusAndShouldBuildFromSource(t *testing.T) {
 		t.Fatal("expected DIRTY_MODIFIED to return false")
 	}
 
-	writeHarnessJSON(`{"is_clean":true,"submodules_clean":true,"untracked_files":["docs/story.md"]}`)
+	writeHarnessJSON(`{"is_clean":true,"submodules_clean":true,"untracked_files":[".system_generated/trace.json"]}`)
 	if !scanRepoFleetStatus(ctx, repoDir) {
-		t.Fatal("expected legacy IsClean with docs to return true")
+		t.Fatal("expected legacy IsClean with ephemeral file to return true")
+	}
+
+	writeHarnessJSON(`{"is_clean":true,"submodules_clean":true,"untracked_files":["docs/story.md"]}`)
+	if scanRepoFleetStatus(ctx, repoDir) {
+		t.Fatal("expected legacy IsClean with untracked story markdown to return false")
 	}
 
 	writeHarnessJSON(`{"is_clean":false,"modified_files":["main.go"]}`)
@@ -4828,6 +4860,52 @@ func TestStory0195_ResolveGitUpdateIntervalAndStep0ProbeCleanup(t *testing.T) {
 		}
 	}
 }
+
+func TestIsTestBinary_IgnoresTestModeEnvOverride(t *testing.T) {
+	origTesting := isTesting
+	origArgs := os.Args
+	defer func() {
+		isTesting = origTesting
+		os.Args = origArgs
+	}()
+
+	isTesting = false
+	os.Args = []string{"/usr/local/bin/iazio-agent", "run"}
+	t.Setenv("IAZIO_TEST_MODE", "1")
+
+	if isTestBinary() {
+		t.Fatal("expected isTestBinary() to return false for production binary even when IAZIO_TEST_MODE=1 is set")
+	}
+
+	os.Args = []string{"/usr/local/bin/iazio-agent", "-test.run=TestFoo"}
+	if !isTestBinary() {
+		t.Fatal("expected isTestBinary() to return true when -test. flag is present")
+	}
+
+	os.Args = []string{"___test_build_iazio_agent"}
+	if !isTestBinary() {
+		t.Fatal("expected isTestBinary() to return true for ___test prefix")
+	}
+
+	isTesting = true
+	os.Args = []string{"/usr/local/bin/iazio-agent"}
+	if !isTestBinary() {
+		t.Fatal("expected isTestBinary() to return true when isTesting=true")
+	}
+
+	// Test shutdown hooks and telemetry flush helpers
+	flushed := false
+	setGlobalTracerFlusher(func() { flushed = true })
+	setActiveElasticSink(elasticlog.New(elasticlog.Config{SpoolDir: t.TempDir()}))
+	flushTelemetryAndCloseSink()
+	if !flushed {
+		t.Fatal("expected global tracer flusher to be invoked")
+	}
+	// Second call when nil is safe no-op
+	flushTelemetryAndCloseSink()
+}
+
+
 
 
 

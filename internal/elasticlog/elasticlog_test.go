@@ -463,24 +463,33 @@ func TestElasticSink_TLSConfigBehavior(t *testing.T) {
 		t.Fatalf("expected InsecureSkipVerify=true when Config.InsecureSkipVerify=true")
 	}
 
-	// 3. Internal / local / loopback / RFC1918 private hosts allow self-signed homelab certs
-	for _, internalURL := range []string{
-		"https://es.homelab.internal:9200",
-		"https://es.local:9200",
+	// 3. Loopback hosts (localhost, 127.0.0.1, ::1) allow skipping TLS verify
+	for _, loopbackURL := range []string{
 		"https://localhost:9200",
 		"https://127.0.0.1:9200",
-		"https://192.168.1.50:9200",
-		"https://10.0.0.15:9200",
+		"https://[::1]:9200",
 	} {
-		if !shouldSkipTLSVerify(Config{URL: internalURL}) {
-			t.Fatalf("expected shouldSkipTLSVerify=true for internal/private URL %s", internalURL)
+		if !shouldSkipTLSVerify(Config{URL: loopbackURL}) {
+			t.Fatalf("expected shouldSkipTLSVerify=true for loopback URL %s", loopbackURL)
 		}
 	}
 
-	// 4. Environment override IAZIO_TLS_INSECURE_SKIP_VERIFY=1 enables skip verify
+	// 4. Non-loopback .internal / .local / private IPs must NOT auto-skip TLS verification
+	for _, nonLoopbackURL := range []string{
+		"https://es.homelab.internal:9200",
+		"https://es.local:9200",
+		"https://192.168.1.50:9200",
+		"https://10.0.0.15:9200",
+	} {
+		if shouldSkipTLSVerify(Config{URL: nonLoopbackURL}) {
+			t.Fatalf("expected shouldSkipTLSVerify=false for non-loopback URL %s", nonLoopbackURL)
+		}
+	}
+
+	// 5. Environment variable IAZIO_TLS_INSECURE_SKIP_VERIFY=1 must NOT bypass TLS verification
 	t.Setenv("IAZIO_TLS_INSECURE_SKIP_VERIFY", "1")
-	if !shouldSkipTLSVerify(Config{URL: "https://logs.example.com"}) {
-		t.Fatalf("expected shouldSkipTLSVerify=true when IAZIO_TLS_INSECURE_SKIP_VERIFY=1")
+	if shouldSkipTLSVerify(Config{URL: "https://logs.example.com"}) {
+		t.Fatalf("expected shouldSkipTLSVerify=false even when IAZIO_TLS_INSECURE_SKIP_VERIFY=1")
 	}
 }
 
