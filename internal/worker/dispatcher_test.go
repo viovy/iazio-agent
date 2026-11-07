@@ -1861,7 +1861,7 @@ func TestDispatcher_CollectIdleWorktrees_FiltersBusyLockedAndDirty(t *testing.T)
 
 	got := d.CollectIdleWorktrees([]string{
 		"",
-		"/nonexistent/worktree/path",
+		filepath.Join(t.TempDir(), "nonexistent-worktree-path"),
 		cleanIdle,
 		cleanIdle, // duplicate
 		inFlightWT,

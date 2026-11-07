@@ -185,7 +185,7 @@ func TestResetAndSanitizeFreshWorkspace(t *testing.T) {
 			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
 		}
 	}
-	runGit("init")
+	runGit("init", "-b", "main")
 	runGit("config", "user.name", "Test")
 	runGit("config", "user.email", "test@iazio.local")
 
