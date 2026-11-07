@@ -101,7 +101,7 @@ var initialUpdateDelay = 5 * time.Second
 var isTesting = false
 
 func isTestBinary() bool {
-	if isTesting || os.Getenv("IAZIO_TEST_MODE") == "1" {
+	if isTesting {
 		return true
 	}
 	if len(os.Args) > 0 {
@@ -2546,15 +2546,14 @@ type repoAuditResult struct {
 func isDocOrEphemeralFile(f string) bool {
 	clean := filepath.ToSlash(strings.TrimSpace(f))
 	clean = strings.TrimPrefix(clean, "./")
-	return clean == "docs" ||
-		clean == "docs/" ||
-		strings.HasPrefix(clean, "docs/") ||
+	return clean == "tmp" ||
 		strings.HasPrefix(clean, "tmp/") ||
+		clean == ".system_generated" ||
 		strings.HasPrefix(clean, ".system_generated/") ||
+		clean == ".gemini" ||
 		strings.HasPrefix(clean, ".gemini/") ||
-		strings.HasPrefix(clean, ".agents/") ||
-		strings.HasSuffix(clean, ".log") ||
-		strings.HasSuffix(clean, ".md")
+		clean == ".agents" ||
+		strings.HasPrefix(clean, ".agents/")
 }
 
 func isGitSubmoduleDir(path string) bool {
@@ -2599,14 +2598,17 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 				return true
 			}
 			if res.WorktreeState == "DIRTY_UNTRACKED_ONLY" {
-				onlyDocs := true
+				if len(res.UntrackedFiles) == 0 {
+					return false
+				}
+				onlyEphemeral := true
 				for _, f := range res.UntrackedFiles {
 					if !isDocOrEphemeralFile(f) {
-						onlyDocs = false
+						onlyEphemeral = false
 						break
 					}
 				}
-				if onlyDocs && res.SubmodulesClean {
+				if onlyEphemeral && res.SubmodulesClean {
 					return true
 				}
 				return false
@@ -2615,14 +2617,14 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 				return false
 			}
 			if res.IsClean && res.SubmodulesClean && len(res.ModifiedFiles) == 0 && len(res.DirtySubmodules) == 0 {
-				onlyDocs := true
+				onlyEphemeral := true
 				for _, f := range res.UntrackedFiles {
 					if !isDocOrEphemeralFile(f) {
-						onlyDocs = false
+						onlyEphemeral = false
 						break
 					}
 				}
-				if onlyDocs {
+				if onlyEphemeral {
 					return true
 				}
 				return false
@@ -2634,7 +2636,7 @@ func scanRepoFleetStatus(ctx context.Context, repoPath string) bool {
 	}
 
 	// Fallback git porcelain check:
-	// Allow untracked docs/logs and submodule commit pointer drift (CLEAN_SUBMODULE_DRIFT)
+	// Allow untracked gitignored ephemeral scratch directories and submodule commit pointer drift (CLEAN_SUBMODULE_DRIFT)
 	gitCmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain")
 	out, err := gitCmd.CombinedOutput()
 	if err != nil {

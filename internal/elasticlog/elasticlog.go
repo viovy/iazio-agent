@@ -439,16 +439,12 @@ func isPermanentSpoolError(err error) bool {
 func buildTLSConfig(cfg Config) *tls.Config {
 	return &tls.Config{
 		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: shouldSkipTLSVerify(cfg), //nolint:gosec // controlled via explicit config, env, or internal/private host
+		InsecureSkipVerify: shouldSkipTLSVerify(cfg), //nolint:gosec // controlled via explicit config or loopback host
 	}
 }
 
 func shouldSkipTLSVerify(cfg Config) bool {
 	if cfg.InsecureSkipVerify {
-		return true
-	}
-	envVal := strings.TrimSpace(strings.ToLower(os.Getenv("IAZIO_TLS_INSECURE_SKIP_VERIFY")))
-	if envVal == "1" || envVal == "true" {
 		return true
 	}
 	rawURL := strings.TrimSpace(cfg.GatewayURL)
@@ -466,11 +462,11 @@ func shouldSkipTLSVerify(cfg Config) bool {
 	if host == "" {
 		return false
 	}
-	if host == "localhost" || strings.HasSuffix(host, ".internal") || strings.HasSuffix(host, ".local") {
+	if host == "localhost" {
 		return true
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+		return ip.IsLoopback()
 	}
 	return false
 }

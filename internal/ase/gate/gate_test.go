@@ -9,6 +9,14 @@ import (
 
 func TestVerify_AllClean(t *testing.T) {
 	tmpDir := t.TempDir()
+	storiesDir := filepath.Join(tmpDir, "docs", "stories")
+	if err := os.MkdirAll(storiesDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	storyFile := filepath.Join(storiesDir, "2026-10-25-gov-3684-test.story.md")
+	if err := os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-3684\nstatus: DONE\n---\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	mockGit := func(args ...string) (string, error) {
 		cmd := args[0]
@@ -19,8 +27,6 @@ func TestVerify_AllClean(t *testing.T) {
 			return "main", nil
 		case "submodule":
 			return " abcdef0 submod (heads/main)", nil
-		case "log":
-			return "commit12345", nil
 		default:
 			return "", nil
 		}
@@ -317,9 +323,9 @@ func TestVerify_FrontmatterOnlyStatusDone(t *testing.T) {
 	}
 }
 
-func TestVerify_UninitializedSubmoduleAndGitLogNoLimit(t *testing.T) {
+func TestVerify_UninitializedSubmoduleAndMissingStoriesFailsClosed(t *testing.T) {
 	tmpDir := t.TempDir()
-	var logArgs []string
+	logCalled := false
 
 	mockGit := func(args ...string) (string, error) {
 		switch args[0] {
@@ -330,7 +336,7 @@ func TestVerify_UninitializedSubmoduleAndGitLogNoLimit(t *testing.T) {
 		case "submodule":
 			return "-abcdef0 uninitialized-submod", nil
 		case "log":
-			logArgs = append([]string(nil), args...)
+			logCalled = true
 			return "deadbeef", nil
 		default:
 			return "", nil
@@ -345,9 +351,198 @@ func TestVerify_UninitializedSubmoduleAndGitLogNoLimit(t *testing.T) {
 	if res.SubmodulesClean {
 		t.Fatalf("expected SubmodulesClean=false for '-' uninitialized submodule, got %+v", res)
 	}
-	for _, a := range logArgs {
-		if a == "-n" || a == "10" {
-			t.Fatalf("expected git log without -n 10 limit, got args %v", logArgs)
+	if res.StoryDone {
+		t.Fatalf("expected StoryDone=false when docs/stories does not exist and DocsHubPath is empty, got %+v", res)
+	}
+	if logCalled {
+		t.Fatalf("expected git log fallback NOT to be called in isStoryCompleted")
+	}
+}
+
+func TestVerify_DocsHubStoryResolutionAndStrictFrontmatter(t *testing.T) {
+	worktreeDir := t.TempDir() // submodule worktree without docs/stories
+	docsHubDir := t.TempDir()
+	hubStoriesDir := filepath.Join(docsHubDir, "docs", "stories")
+	if err := os.MkdirAll(hubStoriesDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	storyFile := filepath.Join(hubStoriesDir, "2026-11-07-gov-6001-bypass.story.md")
+
+	mockGit := func(args ...string) (string, error) {
+		switch args[0] {
+		case "status":
+			return "", nil
+		case "rev-parse":
+			return "main", nil
+		case "submodule":
+			return "", nil
+		default:
+			return "", nil
 		}
+	}
+
+	// 1. Unclosed frontmatter delimiter must fail closed even if status: DONE appears
+	if err := os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-6001\nstatus: DONE\n# missing closing delimiter\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res := Verify(GateOptions{
+		WorktreePath: worktreeDir,
+		DocsHubPath:  docsHubDir,
+		StoryID:      "STORY-GOV-6001",
+		GitRunner:    mockGit,
+	})
+	if res.StoryDone || res.Passed {
+		t.Fatalf("expected unclosed YAML frontmatter to fail closed, got %+v", res)
+	}
+
+	// 2. Story in DocsHubPath with status: READY must fail closed
+	if err := os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-6001\nstatus: READY\n---\nstatus: DONE\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res = Verify(GateOptions{
+		WorktreePath: worktreeDir,
+		DocsHubPath:  docsHubDir,
+		StoryID:      "STORY-GOV-6001",
+		GitRunner:    mockGit,
+	})
+	if res.StoryDone || res.Passed {
+		t.Fatalf("expected READY story in DocsHubPath to fail closed, got %+v", res)
+	}
+
+	// 3. Story in DocsHubPath with status: DONE between --- delimiters passes
+	if err := os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-6001\nstatus: DONE\n---\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res = Verify(GateOptions{
+		WorktreePath: worktreeDir,
+		DocsHubPath:  docsHubDir,
+		StoryID:      "STORY-GOV-6001",
+		GitRunner:    mockGit,
+	})
+	if !res.StoryDone || !res.Passed {
+		t.Fatalf("expected DONE story in DocsHubPath to pass, got %+v", res)
+	}
+}
+
+func TestVerify_PorcelainExactPathMatching(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Legitimate transient paths: exact coverage.out or .scannerwork segment
+	cleanGit := func(args ...string) (string, error) {
+		switch args[0] {
+		case "status":
+			return "?? coverage.out\n?? internal/gate/coverage.out\n?? .scannerwork/\n?? sub/.scannerwork/report.txt", nil
+		case "rev-parse":
+			return "main", nil
+		case "submodule":
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+	resClean := Verify(GateOptions{
+		WorktreePath: tmpDir,
+		GitRunner:    cleanGit,
+	})
+	if !resClean.Passed || !resClean.GitClean {
+		t.Fatalf("expected exact coverage.out and .scannerwork paths to be ignored, got %+v", resClean)
+	}
+
+	// Bypass attempts using substring matches
+	bypassCases := []string{
+		"?? hack_coverage.out.go",
+		"?? my_coverage.out",
+		"?? coverage.out/backdoor.go",
+		"?? coverage.out/",
+		"?? .scannerwork_bypass.go",
+		"?? fake.scannerwork",
+		"R  coverage.out -> evil.go",
+	}
+	for _, line := range bypassCases {
+		dirtyGit := func(args ...string) (string, error) {
+			switch args[0] {
+			case "status":
+				return line, nil
+			case "rev-parse":
+				return "main", nil
+			case "submodule":
+				return "", nil
+			default:
+				return "", nil
+			}
+		}
+		res := Verify(GateOptions{
+			WorktreePath: tmpDir,
+			GitRunner:    dirtyGit,
+		})
+		if res.Passed || res.GitClean {
+			t.Fatalf("expected porcelain line %q to mark worktree dirty, got %+v", line, res)
+		}
+	}
+}
+
+func TestVerify_StampHEADBoundVerification(t *testing.T) {
+	tmpDir := t.TempDir()
+	reportsDir := filepath.Join(tmpDir, "tmp", "reports")
+	if err := os.MkdirAll(reportsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	testStamp := filepath.Join(reportsDir, "validate-local-ok.stamp")
+	relStamp := filepath.Join(reportsDir, "verify-live-release-ok.stamp")
+
+	currentHEAD := "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4"
+	mockGit := func(args ...string) (string, error) {
+		switch args[0] {
+		case "status":
+			return "", nil
+		case "rev-parse":
+			if len(args) > 1 && args[1] == "--abbrev-ref" {
+				return "main", nil
+			}
+			return currentHEAD, nil
+		case "submodule":
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+
+	// 1. Empty stamp files fail closed
+	_ = os.WriteFile(testStamp, []byte("   \n"), 0644)
+	_ = os.WriteFile(relStamp, []byte(""), 0644)
+	resEmpty := Verify(GateOptions{
+		WorktreePath:           tmpDir,
+		RequireTestsPassed:     true,
+		RequireReleaseVerified: true,
+		GitRunner:              mockGit,
+	})
+	if resEmpty.Passed || resEmpty.TestsPassed || resEmpty.ReleaseVerified {
+		t.Fatalf("expected empty stamp files to fail closed, got %+v", resEmpty)
+	}
+
+	// 2. Stale/mismatched SHA in stamp fails closed
+	_ = os.WriteFile(testStamp, []byte("deadbeef1234567890"), 0644)
+	_ = os.WriteFile(relStamp, []byte("head_sha=0123456789abcdef"), 0644)
+	resStale := Verify(GateOptions{
+		WorktreePath:           tmpDir,
+		RequireTestsPassed:     true,
+		RequireReleaseVerified: true,
+		GitRunner:              mockGit,
+	})
+	if resStale.Passed || resStale.TestsPassed || resStale.ReleaseVerified {
+		t.Fatalf("expected stale SHA in stamp files to fail closed, got %+v", resStale)
+	}
+
+	// 3. Matching HEAD SHA (full or short prefix / key-value) passes
+	_ = os.WriteFile(testStamp, []byte(currentHEAD+"\n"), 0644)
+	_ = os.WriteFile(relStamp, []byte("head_sha="+currentHEAD[:12]+"\n"), 0644)
+	resMatch := Verify(GateOptions{
+		WorktreePath:           tmpDir,
+		RequireTestsPassed:     true,
+		RequireReleaseVerified: true,
+		GitRunner:              mockGit,
+	})
+	if !resMatch.Passed || !resMatch.TestsPassed || !resMatch.ReleaseVerified {
+		t.Fatalf("expected matching HEAD SHA in stamp files to pass, got %+v", resMatch)
 	}
 }

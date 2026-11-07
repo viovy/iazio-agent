@@ -1063,9 +1063,10 @@ func TestUpdateTool_ChecksumMismatchRejection(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
+	t.Setenv("IAZIO_ALLOW_UNVERIFIED_UPDATES", "1")
 	updated, err := updateSingleTool(context.Background(), client, tool, binDir, "", true, &stdout, &stderr)
 	if err == nil {
-		t.Fatalf("expected error on checksum mismatch, got updated=%v", updated)
+		t.Fatalf("expected error on checksum mismatch even when IAZIO_ALLOW_UNVERIFIED_UPDATES=1, got updated=%v", updated)
 	}
 	if !strings.Contains(err.Error(), "integrity verification failed") {
 		t.Fatalf("expected integrity verification error, got: %v", err)
@@ -1147,16 +1148,13 @@ func TestUpdateSingleTool_MissingChecksumsAssetFailsClosed(t *testing.T) {
 		t.Fatalf("expected error to mention 'no checksums asset found', got: %v", err)
 	}
 
-	// 2. Explicit operator override allows installation (G2)
+	// 2. IAZIO_ALLOW_UNVERIFIED_UPDATES=1 env override is removed and must ALSO fail closed
 	t.Setenv("IAZIO_ALLOW_UNVERIFIED_UPDATES", "1")
 	stdout.Reset()
 	stderr.Reset()
 	updated, err = updateSingleTool(context.Background(), client, tool, binDir, "", true, &stdout, &stderr)
-	if err != nil {
-		t.Fatalf("expected update to succeed with IAZIO_ALLOW_UNVERIFIED_UPDATES=1 override, got: %v", err)
-	}
-	if !updated {
-		t.Fatalf("expected tool to be updated with override")
+	if err == nil || updated {
+		t.Fatalf("expected update to fail closed even when IAZIO_ALLOW_UNVERIFIED_UPDATES=1 is set, got updated=%v err=%v", updated, err)
 	}
 }
 
@@ -2416,6 +2414,51 @@ func TestNonInteractiveDaemonPrefersOfficialRelease(t *testing.T) {
 	})
 	if ok || !strings.Contains(reason, "background service daemon") {
 		t.Fatalf("expected noninteractive daemon to skip Path A source build, got ok=%v reason=%q", ok, reason)
+	}
+
+	// Verify IAZIO_FORCE_SOURCE_BUILD and AUTOPILOT_FORCE_SOURCE_BUILD cannot bypass IAZIO_AGENT_NONINTERACTIVE=1
+	for _, forceKey := range []string{"IAZIO_FORCE_SOURCE_BUILD", "AUTOPILOT_FORCE_SOURCE_BUILD"} {
+		okForce, reasonForce := shouldBuildFromSourceDuringStory(ctx, tmpDir, func(k string) string {
+			if k == "IAZIO_AGENT_NONINTERACTIVE" || k == forceKey {
+				return "1"
+			}
+			return ""
+		})
+		if okForce || !strings.Contains(reasonForce, "background service daemon") {
+			t.Fatalf("expected %s=1 to NOT bypass IAZIO_AGENT_NONINTERACTIVE=1, got ok=%v reason=%q", forceKey, okForce, reasonForce)
+		}
+	}
+
+	// Verify updateSingleTool in noninteractive mode does not fall back to source build even when force/fallback env vars are set
+	failClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Body:       io.NopCloser(strings.NewReader("404")),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+	fakeRepo := filepath.Join(tmpDir, "my-tool")
+	_ = os.MkdirAll(filepath.Join(fakeRepo, ".git"), 0755)
+	_ = os.MkdirAll(filepath.Join(fakeRepo, "cmd", "my-tool"), 0755)
+	var out bytes.Buffer
+	updated, err := updateSingleTool(ctx, failClient, ManifestToolItem{
+		Name:       "my-tool",
+		Repository: "viovy/my-tool",
+		BinaryName: "my-tool",
+	}, t.TempDir(), "", true, &out, &out, func(k string) string {
+		switch k {
+		case "IAZIO_FLEET_ROOT":
+			return tmpDir
+		case "IAZIO_AGENT_NONINTERACTIVE", "IAZIO_FORCE_SOURCE_BUILD", "AUTOPILOT_FORCE_SOURCE_BUILD", "IAZIO_ALLOW_SOURCE_FALLBACK":
+			return "1"
+		default:
+			return ""
+		}
+	})
+	if err == nil || updated || strings.Contains(out.String(), "falling back to source repo build") {
+		t.Fatalf("expected noninteractive updateSingleTool to reject source build fallback even with env overrides, got updated=%v err=%v out=%s", updated, err, out.String())
 	}
 
 	// Release cache test
