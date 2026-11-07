@@ -225,8 +225,12 @@ func (u *EagerToolUpdater) EvaluateReadiness(ctx context.Context) EagerUpdateRea
 	}
 
 	if u.InspectOutdatedTools != nil {
-		if outdated, err := u.InspectOutdatedTools(ctx); err == nil && len(outdated) > 0 {
-			rep.OutdatedTools = outdated
+		if outdated, err := u.InspectOutdatedTools(ctx); err == nil {
+			if len(outdated) > 0 {
+				rep.OutdatedTools = outdated
+			} else {
+				u.recordSuiteSuccess()
+			}
 		}
 	}
 
@@ -369,21 +373,30 @@ func (u *EagerToolUpdater) RunCheckAndUpdate(ctx context.Context, force bool) (U
 // EnsureUpToDateBeforeClaim evaluates eager update readiness prior to claiming a job.
 // If the host is idle and clean with tool drift detected, it synchronously runs the tool update
 // under the maintenance lease and re-evaluates readiness before allowing a claim.
+// When another worktree on a multi-repo host is actively executing a job (DEFERRED_HARNESS_ACTIVE),
+// another worktree is dirty (DEFERRED_GIT_DIRTY), or a prior update backed off (BACKOFF_AFTER_FAILURE),
+// idle clean worktrees remain eligible to claim jobs so multi-repo hosts do not deadlock.
 func (u *EagerToolUpdater) EnsureUpToDateBeforeClaim(ctx context.Context) (EagerUpdateReadinessReport, bool) {
 	report := u.EvaluateReadiness(ctx)
+	if u.IsRestartPending() || report.EagerUpdateState == StateRestartPending {
+		report.EagerUpdateState = StateRestartPending
+		report.Details = "agent self-update applied; restart pending"
+		u.persistReadiness(ctx, report)
+		return report, false
+	}
+	if u.IsUpdating() || report.EagerUpdateState == StateUpdating {
+		return report, false
+	}
 	switch report.EagerUpdateState {
-	case StateUpToDate:
-		if u.IsRestartPending() {
-			report.EagerUpdateState = StateRestartPending
-			report.Details = "agent self-update applied; restart pending"
-			u.persistReadiness(ctx, report)
-			return report, false
-		}
+	case StateUpToDate, StateDeferredHarnessActive, StateDeferredGitDirty, StateBackoffAfterFailure:
 		return report, true
 	case StateDriftDetected:
 		_, _, _ = u.RunCheckAndUpdate(ctx, false)
 		after := u.EvaluateReadiness(ctx)
-		return after, after.EagerUpdateState == StateUpToDate && !u.IsRestartPending()
+		if u.IsRestartPending() || after.EagerUpdateState == StateRestartPending || after.EagerUpdateState == StateUpdating {
+			return after, false
+		}
+		return after, after.EagerUpdateState != StateDriftDetected
 	default:
 		return report, false
 	}

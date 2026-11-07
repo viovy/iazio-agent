@@ -170,7 +170,7 @@ func TestEagerToolUpdater_EnsureUpToDateBeforeClaim_BlocksWhenAgentUpdatedOrBusy
 		t.Fatalf("expected EnsureUpToDateBeforeClaim on clean up-to-date host to return true, got ok=%v state=%s", ok, upToDateRep.EagerUpdateState)
 	}
 
-	// StateDeferredHarnessActive -> returns (report, false)
+	// StateDeferredHarnessActive on a multi-repo host -> returns (report, true) so other idle worktrees are not deadlocked
 	relExec, err := gate.AcquireExecutionLease(ctx, "job-active-1", "/work/repo")
 	if err != nil {
 		t.Fatalf("AcquireExecutionLease failed: %v", err)
@@ -181,14 +181,31 @@ func TestEagerToolUpdater_EnsureUpToDateBeforeClaim_BlocksWhenAgentUpdatedOrBusy
 	_ = gate.WaitingCount()
 	u.SetExecutionDetector(NewMultiSignalExecutionDetector(sup, gate, nil, nil))
 	busyRep, ok := u.EnsureUpToDateBeforeClaim(ctx)
-	if ok || busyRep.EagerUpdateState != StateDeferredHarnessActive {
-		t.Fatalf("expected EnsureUpToDateBeforeClaim to return false when harness active, got ok=%v state=%s", ok, busyRep.EagerUpdateState)
+	if !ok || busyRep.EagerUpdateState != StateDeferredHarnessActive {
+		t.Fatalf("expected EnsureUpToDateBeforeClaim to allow multi-repo claim when StateDeferredHarnessActive, got ok=%v state=%s", ok, busyRep.EagerUpdateState)
 	}
 	gate.ReleaseExecutionLease("job-active-1")
 	gate.ReleaseExecutionLease("") // no-op
 	relExec()
 	if gate.State() != GateStateIdle {
 		t.Fatalf("expected GateStateIdle after ReleaseExecutionLease, got %s", gate.State())
+	}
+
+	// Stale suite failure backoff is cleared when InspectOutdatedTools confirms 0 outdated tools
+	u.recordSuiteFailure()
+	recoveredRep := u.EvaluateReadiness(ctx)
+	if recoveredRep.EagerUpdateState != StateUpToDate {
+		t.Fatalf("expected EvaluateReadiness to clear stale suite backoff when 0 tools are outdated, got %s", recoveredRep.EagerUpdateState)
+	}
+
+	// When in StateBackoffAfterFailure (e.g., InspectOutdatedTools failed after suite failure), EnsureUpToDateBeforeClaim fails open
+	u.recordSuiteFailure()
+	u.InspectOutdatedTools = func(context.Context) ([]OutdatedToolInfo, error) {
+		return nil, os.ErrNotExist
+	}
+	backoffRep, backoffOK := u.EnsureUpToDateBeforeClaim(ctx)
+	if !backoffOK || backoffRep.EagerUpdateState != StateBackoffAfterFailure {
+		t.Fatalf("expected EnsureUpToDateBeforeClaim to fail-open on StateBackoffAfterFailure, got ok=%v state=%s", backoffOK, backoffRep.EagerUpdateState)
 	}
 
 	// RepoStateMonitor helpers & InspectWorktreeGitState coverage

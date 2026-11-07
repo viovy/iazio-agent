@@ -2137,6 +2137,27 @@ func TestHTTPControlPlaneClient_DeclineJob_And_DispatcherHelpers(t *testing.T) {
 	if err != nil || processed || cp.declinedJobs["job-idx-locked"] != "REPO_BUSY" {
 		t.Fatalf("expected hostGate block with LeaseToken to decline with REPO_BUSY, got processed=%v err=%v declined=%v", processed, err, cp.declinedJobs)
 	}
+
+	// 9. SetWorktreeBusyDetector and workspace sentinel (.autopilot/active_job.json) exclude busy worktrees
+	d.SetWorktreeBusyDetector(func(p string) bool {
+		return p == filepath.Clean(wt1)
+	})
+	idleAfterBusy := d.CollectIdleWorktrees(nil)
+	if len(idleAfterBusy) != 1 || idleAfterBusy[0] != filepath.Clean(wt2) {
+		t.Fatalf("expected only wt2 to be idle when wt1 is marked busy by worktreeBusyDetector, got %v", idleAfterBusy)
+	}
+	d.SetWorktreeBusyDetector(nil)
+
+	sentinelPath := filepath.Join(wt2, ".autopilot", "active_job.json")
+	_ = os.MkdirAll(filepath.Dir(sentinelPath), 0o755)
+	_ = os.WriteFile(sentinelPath, []byte(`{"job_id":"job-ext"}`), 0o644)
+	if !isWorktreeLockedByOther(wt2, "other-job") {
+		t.Fatal("expected active workspace sentinel to mark worktree locked")
+	}
+	if isWorktreeLockedByOther(wt2, "job-ext") {
+		t.Fatal("expected workspace sentinel with matching jobID not to lock against itself")
+	}
+	_ = os.Remove(sentinelPath)
 }
 
 
