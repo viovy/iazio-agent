@@ -111,7 +111,8 @@ func (c *Collector) Collect(ctx context.Context, worktree, docsHub, kind string)
 	return r, nil
 }
 
-// CleanPorcelain strips internal runtime scratch files (such as .iazio/ or .autopilot/ or tmp/) from porcelain status.
+// CleanPorcelain strips internal runtime scratch files (such as .iazio/, .autopilot/, tmp/,
+// .session_story_id, TestResults/Diagnostics/pr-closeout-proof-*.json, or cov_auth) from porcelain status.
 func CleanPorcelain(porc string) string {
 	if strings.TrimSpace(porc) == "" {
 		return ""
@@ -122,9 +123,27 @@ func CleanPorcelain(porc string) string {
 		if trimmed == "" {
 			continue
 		}
+		target := ""
 		if strings.HasPrefix(trimmed, "?? ") {
-			target := strings.TrimSpace(trimmed[3:])
+			target = strings.TrimSpace(trimmed[3:])
 			if strings.HasPrefix(target, ".iazio") || strings.HasPrefix(target, ".autopilot") || strings.HasPrefix(target, "tmp/") {
+				continue
+			}
+		} else if len(trimmed) > 2 {
+			fields := strings.Fields(trimmed)
+			if len(fields) >= 2 {
+				target = fields[len(fields)-1]
+			}
+		}
+		if target != "" {
+			slash := strings.TrimPrefix(strings.ReplaceAll(target, "\\", "/"), "./")
+			idx := strings.LastIndex(slash, "/")
+			base := slash
+			if idx >= 0 {
+				base = slash[idx+1:]
+			}
+			if base == ".session_story_id" || base == "cov_auth" || strings.HasPrefix(base, "cov_") ||
+				(strings.HasPrefix(base, "pr-closeout-proof-") && strings.HasSuffix(base, ".json")) {
 				continue
 			}
 		}
