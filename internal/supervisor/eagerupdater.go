@@ -117,6 +117,7 @@ type EagerToolUpdater struct {
 	lastPartialFailureKey string
 	updating              bool
 	pendingSelfRestart    bool
+	onAgentUpdated        func()
 	pendingRequests       []PendingToolRequest // discrete requests preserved per tool (R4, R5, N5)
 	hasPending            bool
 	requireCleanFleetGit  bool
