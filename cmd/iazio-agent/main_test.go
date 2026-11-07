@@ -4743,5 +4743,23 @@ func TestRestartOrExecSelf_FlushesTelemetryAndClosesSink(t *testing.T) {
 	}
 }
 
+func TestStory0193_IsLoopbackTelemetryURLIsolation(t *testing.T) {
+	if !isLoopbackTelemetryURL("http://127.0.0.1:8080/central-telemetry-gateway") {
+		t.Fatal("expected 127.0.0.1 to be recognized as loopback")
+	}
+	if !isLoopbackTelemetryURL("http://localhost:9200") {
+		t.Fatal("expected localhost to be recognized as loopback")
+	}
+	if !isLoopbackTelemetryURL("http://[::1]:8080") {
+		t.Fatal("expected [::1] to be recognized as loopback")
+	}
+	if isLoopbackTelemetryURL("https://tian.go.ro/central-telemetry-gateway") {
+		t.Fatal("expected production gateway URL not to be recognized as loopback")
+	}
+	if isLoopbackTelemetryURL("http://localhost.evil.tld:8080") || isLoopbackTelemetryURL("http://127.0.0.1.nip.io:8080") {
+		t.Fatal("expected spoofed hostname prefix URLs not to be recognized as loopback")
+	}
+}
+
 
 
