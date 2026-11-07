@@ -13,6 +13,15 @@ var (
 	ErrExecutionLeaseTimeout = errors.New("timed out waiting for maintenance lease to release")
 )
 
+// GateState represents the current operating state of the HostExecutionAndUpdateGate.
+type GateState string
+
+const (
+	GateStateIdle          GateState = "IDLE"
+	GateStateExecutingJobs GateState = "EXECUTING_JOBS"
+	GateStateUpdatingTools GateState = "UPDATING_TOOLS"
+)
+
 // ActiveExecution records an active harness job lease.
 type ActiveExecution struct {
 	JobID        string    `json:"job_id"`
@@ -128,6 +137,30 @@ func (g *HostExecutionAndUpdateGate) IsMaintenanceHeld() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.maintenance
+}
+
+// State returns the current gate state (IDLE, EXECUTING_JOBS, or UPDATING_TOOLS).
+func (g *HostExecutionAndUpdateGate) State() GateState {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.maintenance {
+		return GateStateUpdatingTools
+	}
+	if len(g.activeJobs) > 0 {
+		return GateStateExecutingJobs
+	}
+	return GateStateIdle
+}
+
+// ReleaseExecutionLease releases an active shared execution lease by jobID if present.
+func (g *HostExecutionAndUpdateGate) ReleaseExecutionLease(jobID string) {
+	if jobID == "" {
+		return
+	}
+	g.mu.Lock()
+	delete(g.activeJobs, jobID)
+	g.cond.Broadcast()
+	g.mu.Unlock()
 }
 
 // ActiveExecutions returns a copy of currently executing jobs holding a shared lease.

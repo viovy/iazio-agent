@@ -168,3 +168,136 @@ func TestIsLockFileHeld_OpenFD(t *testing.T) {
 
 	_ = isLockFileHeld(lockPath)
 }
+
+func TestResetAndSanitizeFreshWorkspace(t *testing.T) {
+	ctx := context.Background()
+
+	// Empty path
+	if res, err := ResetAndSanitizeFreshWorkspace(ctx, "", "job-empty"); err != nil || res == nil {
+		t.Fatalf("expected nil error on empty workspace, got res=%v err=%v", res, err)
+	}
+
+	tempDir := t.TempDir()
+	runGit := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = tempDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+		}
+	}
+	runGit("init", "-b", "main")
+	runGit("config", "user.name", "Test")
+	runGit("config", "user.email", "test@iazio.local")
+
+	tracked := filepath.Join(tempDir, "README.md")
+	if err := os.WriteFile(tracked, []byte("initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "README.md")
+	runGit("commit", "-m", "initial commit")
+
+	// Create .iazio lock dir (should be ignored and preserved) and dirty tracked + untracked files
+	iazioFile := filepath.Join(tempDir, ".iazio", "repo.lock")
+	if err := os.MkdirAll(filepath.Dir(iazioFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(iazioFile, []byte(`{"status":"RUNNING"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tracked, []byte("modified dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	untracked := filepath.Join(tempDir, "untracked.txt")
+	if err := os.WriteFile(untracked, []byte("untracked content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := ResetAndSanitizeFreshWorkspace(ctx, tempDir, "job-reset-1", "main")
+	if err != nil {
+		t.Fatalf("ResetAndSanitizeFreshWorkspace failed: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	// Verify .iazio/repo.lock was preserved while untracked.txt was cleaned and README.md was reset
+	if _, err := os.Stat(iazioFile); err != nil {
+		t.Fatalf("expected .iazio/repo.lock to be preserved across ResetAndSanitizeFreshWorkspace, got %v", err)
+	}
+	if _, err := os.Stat(untracked); !os.IsNotExist(err) {
+		t.Fatalf("expected untracked.txt to be cleaned, got err=%v", err)
+	}
+	content, err := os.ReadFile(tracked)
+	if err != nil || string(content) != "initial\n" {
+		t.Fatalf("expected README.md to be reset to 'initial\\n', got %q (err=%v)", string(content), err)
+	}
+}
+
+func TestWorkspaceHelpers_GitDirSubmodulesAndLocks(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. isLockFileHeld on non-existent, closed, and open file
+	lockPath := filepath.Join(tempDir, "test.lock")
+	if isLockFileHeld(lockPath) {
+		t.Fatal("expected non-existent lock file not to be held")
+	}
+	if err := os.WriteFile(lockPath, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if isLockFileHeld(lockPath) {
+		t.Fatal("expected closed lock file not to be held")
+	}
+	f, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isLockFileHeld(lockPath) {
+		_ = f.Close()
+		t.Skip("environment /proc fd scan did not detect open lock file")
+	}
+	_ = f.Close()
+
+	// 2. resolveGitDir with .git file pointing to relative gitdir + modules locks & interrupted ops
+	actualGitDir := filepath.Join(tempDir, ".actual-git")
+	modDir := filepath.Join(actualGitDir, "modules", "sub-a")
+	if err := os.MkdirAll(filepath.Join(modDir, "rebase-merge"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modDir, "MERGE_HEAD"), []byte("deadbeef\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	modLock := filepath.Join(modDir, "index.lock")
+	if err := os.WriteFile(modLock, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dotGitFile := filepath.Join(tempDir, ".git")
+	if err := os.WriteFile(dotGitFile, []byte("gitdir: .actual-git\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resolved := resolveGitDir(tempDir, dotGitFile, false)
+	if resolved != actualGitDir {
+		t.Fatalf("expected resolved gitDir %q, got %q", actualGitDir, resolved)
+	}
+	if !hasRemainingGitLocks(tempDir, dotGitFile, false) {
+		t.Fatal("expected hasRemainingGitLocks to detect module index.lock")
+	}
+	removed := cleanGitLocks(tempDir, dotGitFile, false)
+	if len(removed) != 1 || removed[0] != modLock {
+		t.Fatalf("expected cleanGitLocks to remove %q, got %v", modLock, removed)
+	}
+	if hasRemainingGitLocks(tempDir, dotGitFile, false) {
+		t.Fatal("expected no remaining git locks after cleanGitLocks")
+	}
+	_, interruptedSubs := detectInterruptedGitOps(tempDir, dotGitFile, false)
+	if len(interruptedSubs) < 2 {
+		t.Fatalf("expected at least 2 interrupted submodule entries, got %v", interruptedSubs)
+	}
+
+	// 3. hasRunningGitProcess when no git process is running
+	if hasRunningGitProcess(tempDir) {
+		t.Fatal("expected no running git process in tempDir")
+	}
+}
+
+

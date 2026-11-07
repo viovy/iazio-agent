@@ -20,7 +20,10 @@ import (
 	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-agent/internal/harness"
 	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-agent/internal/repolock"
+	"github.com/viovy/iazio-agent/internal/supervisor"
 	"github.com/viovy/iazio-agent/internal/telemetry"
+	"github.com/viovy/iazio-agent/internal/watchdog"
 	"github.com/viovy/iazio-agent/internal/workspace"
 )
 
@@ -46,6 +49,7 @@ type Job struct {
 	ID                    string          `json:"id"`
 	Type                  string          `json:"type"`
 	Repo                  string          `json:"repo"`
+	WorktreePath          string          `json:"worktree_path,omitempty"`
 	TargetHost            string          `json:"target_host,omitempty"`
 	TargetAgent           string          `json:"target_agent,omitempty"`
 	Payload               json.RawMessage `json:"payload"`
@@ -106,8 +110,9 @@ func (j *Job) ResolvedConversationID() string {
 
 // ClaimRequest is sent to claim pending jobs.
 type ClaimRequest struct {
-	HostID   string   `json:"host_id,omitempty"`
-	JobTypes []string `json:"job_types,omitempty"`
+	HostID        string   `json:"host_id,omitempty"`
+	JobTypes      []string `json:"job_types,omitempty"`
+	IdleWorktrees []string `json:"idle_worktrees,omitempty"`
 }
 
 // CompleteRequest reports the final outcome of a job.
@@ -440,6 +445,34 @@ func (c *HTTPControlPlaneClient) FailoverJob(ctx context.Context, jobID string, 
 	return nil
 }
 
+// DeclineJob calls POST /v1/jobs/{job_id}/decline (falling back to /api/v1/agent/jobs/{job_id}/decline on 404).
+func (c *HTTPControlPlaneClient) DeclineJob(ctx context.Context, jobID, reason string) error {
+	bodyBytes, err := json.Marshal(map[string]string{"reason": reason})
+	if err != nil {
+		return fmt.Errorf("marshal decline request: %w", err)
+	}
+	url := fmt.Sprintf("%s/v1/jobs/%s/decline", c.BaseURL, jobID)
+	resp, err := c.doWithRetry(ctx, http.MethodPost, url, bodyBytes)
+	if err != nil {
+		return fmt.Errorf("execute decline request: %w", err)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		fallbackURL := fmt.Sprintf("%s/api/v1/agent/jobs/%s/decline", c.BaseURL, jobID)
+		resp, err = c.doWithRetry(ctx, http.MethodPost, fallbackURL, bodyBytes)
+		if err != nil {
+			return fmt.Errorf("execute fallback decline request: %w", err)
+		}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("decline returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
 // RepoSyncer defines the contract for triggering an on-demand codebase delta sync for a repository.
 type RepoSyncer interface {
 	TriggerRepoSync(repoName string)
@@ -468,20 +501,25 @@ type HostExecutionGate interface {
 
 // Dispatcher coordinates claiming jobs from the control plane and routing them to iazio-harness.
 type Dispatcher struct {
-	client           ControlPlaneClient
-	invoker          harness.Invoker
-	hostID           string
-	jobTypes         []string
-	syncer           RepoSyncer
-	worktreeResolver WorktreeResolver
-	toolUpdater      ToolUpdater
-	preDispatchHook  PreDispatchHook
-	postJobHook      PostJobHook
-	hostGate         HostExecutionGate
-	jobTimeout       time.Duration
-	flusher          HarvestFlusher
-	activeJobsMu     sync.Mutex
-	activeJobs       map[string]controlplane.ActiveJob
+	client                ControlPlaneClient
+	invoker               harness.Invoker
+	hostID                string
+	jobTypes              []string
+	syncer                RepoSyncer
+	worktreeResolver      WorktreeResolver
+	toolUpdater           ToolUpdater
+	preDispatchHook       PreDispatchHook
+	postJobHook           PostJobHook
+	hostGate              HostExecutionGate
+	eagerReadinessGate    func(ctx context.Context) (bool, string)
+	idleWorktreesProvider func() []string
+	repoMap               map[string]string
+	workspace             string
+	jobTimeout            time.Duration
+	flusher               HarvestFlusher
+	activeJobsMu          sync.Mutex
+	activeJobs            map[string]controlplane.ActiveJob
+	inFlightPrepJobs      map[string]string
 }
 
 // ActiveJobs returns the list of jobs currently being processed by the dispatcher.
@@ -517,6 +555,183 @@ func (d *Dispatcher) clearActiveJob(jobID string) {
 	delete(d.activeJobs, jobID)
 }
 
+const reasonRepoBusy = "REPO_BUSY"
+
+func normalizeWorktreeKey(wt string) string {
+	trimmed := strings.TrimSpace(wt)
+	if trimmed == "" || trimmed == "." {
+		return ""
+	}
+	return filepath.Clean(trimmed)
+}
+
+func (d *Dispatcher) hasConflictingWorktreeLocked(jobID, cleanWT string) bool {
+	if cleanWT == "" {
+		return false
+	}
+	for existingJobID, wt := range d.inFlightPrepJobs {
+		if existingJobID != jobID && normalizeWorktreeKey(wt) == cleanWT {
+			return true
+		}
+	}
+	for existingJobID, aj := range d.activeJobs {
+		if existingJobID != jobID && normalizeWorktreeKey(aj.WorktreePath) == cleanWT {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *Dispatcher) tryReserveInFlightWorktree(jobID, worktreePath string) bool {
+	if strings.TrimSpace(jobID) == "" {
+		return true
+	}
+	cleanWT := normalizeWorktreeKey(worktreePath)
+	d.activeJobsMu.Lock()
+	defer d.activeJobsMu.Unlock()
+	if d.hasConflictingWorktreeLocked(jobID, cleanWT) {
+		return false
+	}
+	if d.inFlightPrepJobs == nil {
+		d.inFlightPrepJobs = make(map[string]string)
+	}
+	d.inFlightPrepJobs[jobID] = cleanWT
+	return true
+}
+
+func (d *Dispatcher) clearInFlightWorktree(jobID string) {
+	d.activeJobsMu.Lock()
+	defer d.activeJobsMu.Unlock()
+	delete(d.inFlightPrepJobs, jobID)
+}
+
+// IsWorktreeInFlight returns true if wt is currently used by any job in activeJobs or inFlightPrepJobs.
+func (d *Dispatcher) IsWorktreeInFlight(wt string) bool {
+	cleanWT := normalizeWorktreeKey(wt)
+	if cleanWT == "" {
+		return false
+	}
+	d.activeJobsMu.Lock()
+	defer d.activeJobsMu.Unlock()
+	return d.hasConflictingWorktreeLocked("", cleanWT)
+}
+
+func isDotLockHeldByOther(cleanWT, jobID string) bool {
+	b, err := os.ReadFile(filepath.Join(cleanWT, ".iazio-repolock"))
+	if err != nil {
+		return false
+	}
+	var meta struct {
+		HolderPID int    `json:"holder_pid"`
+		PID       int    `json:"pid"`
+		JobID     string `json:"job_id"`
+	}
+	if json.Unmarshal(b, &meta) != nil {
+		return true
+	}
+	pid := meta.HolderPID
+	if pid <= 0 {
+		pid = meta.PID
+	}
+	if pid <= 0 {
+		return true
+	}
+	return (meta.JobID == "" || meta.JobID != jobID) && watchdog.IsProcessAlive(pid)
+}
+
+func isRepoLockHeldByOther(cleanWT, jobID string) bool {
+	info, err := repolock.Read(cleanWT)
+	if err != nil {
+		return false
+	}
+	status := strings.ToUpper(strings.TrimSpace(info.Status))
+	if status == "COMPLETED" || status == "FAILED" || status == "IDLE" {
+		return false
+	}
+	if info.JobID != "" && info.JobID == jobID {
+		return false
+	}
+	return (info.PID > 0 && watchdog.IsProcessAlive(info.PID)) ||
+		(info.HarnessPID > 0 && watchdog.IsProcessAlive(info.HarnessPID)) ||
+		(info.ToolPID > 0 && watchdog.IsProcessAlive(info.ToolPID))
+}
+
+func isWorktreeLockedByOther(wt, jobID string) bool {
+	cleanWT := normalizeWorktreeKey(wt)
+	if cleanWT == "" {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(cleanWT, ".git", "index.lock")); err == nil {
+		return true
+	}
+	return isDotLockHeldByOther(cleanWT, jobID) || isRepoLockHeldByOther(cleanWT, jobID)
+}
+
+func (d *Dispatcher) defaultWorktreeCandidates() []string {
+	var raw []string
+	for _, p := range d.repoMap {
+		if strings.TrimSpace(p) != "" {
+			raw = append(raw, p)
+		}
+	}
+	if strings.TrimSpace(d.workspace) != "" {
+		raw = append(raw, d.workspace)
+	}
+	return raw
+}
+
+func (d *Dispatcher) isCandidateWorktreeIdle(clean string) bool {
+	fi, err := os.Stat(clean)
+	if err != nil || !fi.IsDir() {
+		return false
+	}
+	if d.IsWorktreeInFlight(clean) || isWorktreeLockedByOther(clean, "") {
+		return false
+	}
+	if b, err := os.ReadFile(filepath.Join(clean, ".session_story_id")); err == nil && strings.TrimSpace(string(b)) != "" {
+		return false
+	}
+	return supervisor.InspectWorktreeGitState(clean).IsClean
+}
+
+// CollectIdleWorktrees filters candidate worktrees and returns genuinely IDLE, clean, non-locked worktree paths.
+func (d *Dispatcher) CollectIdleWorktrees(candidates []string) []string {
+	raw := candidates
+	if len(raw) == 0 {
+		raw = d.defaultWorktreeCandidates()
+	}
+	seen := make(map[string]bool, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, wt := range raw {
+		clean := normalizeWorktreeKey(wt)
+		if clean == "" || seen[clean] {
+			continue
+		}
+		seen[clean] = true
+		if d.isCandidateWorktreeIdle(clean) {
+			out = append(out, clean)
+		}
+	}
+	return out
+}
+
+func (d *Dispatcher) declineJob(ctx context.Context, jobID, reason string) error {
+	if d.client == nil || strings.TrimSpace(jobID) == "" {
+		return nil
+	}
+	if decliner, ok := d.client.(interface {
+		DeclineJob(ctx context.Context, jobID, reason string) error
+	}); ok {
+		return decliner.DeclineJob(ctx, jobID, reason)
+	}
+	if abandoner, ok := d.client.(interface {
+		AbandonJob(ctx context.Context, jobID, reason string) error
+	}); ok {
+		return abandoner.AbandonJob(ctx, jobID, reason)
+	}
+	return nil
+}
+
 // NewDispatcher constructs a new Dispatcher, optionally accepting a RepoSyncer for immediate post-job sync hooks.
 func NewDispatcher(client ControlPlaneClient, invoker harness.Invoker, hostID string, syncer ...RepoSyncer) *Dispatcher {
 	var s RepoSyncer
@@ -524,12 +739,14 @@ func NewDispatcher(client ControlPlaneClient, invoker harness.Invoker, hostID st
 		s = syncer[0]
 	}
 	return &Dispatcher{
-		client:     client,
-		invoker:    invoker,
-		hostID:     hostID,
-		jobTypes:   []string{JobTypeStoryCreate, JobTypeStoryExecute, JobTypePromptExecute, JobTypeToolsUpdate},
-		syncer:     s,
-		jobTimeout: 0,
+		client:           client,
+		invoker:          invoker,
+		hostID:           hostID,
+		jobTypes:         []string{JobTypeStoryCreate, JobTypeStoryExecute, JobTypePromptExecute, JobTypeToolsUpdate},
+		syncer:           s,
+		jobTimeout:       0,
+		activeJobs:       make(map[string]controlplane.ActiveJob),
+		inFlightPrepJobs: make(map[string]string),
 	}
 }
 
@@ -573,6 +790,125 @@ func (d *Dispatcher) SetHostGate(g HostExecutionGate) {
 	d.hostGate = g
 }
 
+// SetEagerReadinessGate configures an optional pre-claim eager update readiness barrier.
+func (d *Dispatcher) SetEagerReadinessGate(fn func(ctx context.Context) (bool, string)) {
+	d.eagerReadinessGate = fn
+}
+
+// SetIdleWorktreesProvider configures an optional provider returning currently idle worktrees on this host.
+func (d *Dispatcher) SetIdleWorktreesProvider(fn func() []string) {
+	d.idleWorktreesProvider = fn
+}
+
+// SetRepoMap configures the known repo-to-worktree mapping on the Dispatcher.
+func (d *Dispatcher) SetRepoMap(m map[string]string) {
+	d.repoMap = m
+}
+
+// SetWorkspace configures the default host workspace path on the Dispatcher.
+func (d *Dispatcher) SetWorkspace(ws string) {
+	d.workspace = ws
+}
+
+func (d *Dispatcher) isHostMaintenanceActive() bool {
+	if d.hostGate == nil {
+		return false
+	}
+	if sg, ok := d.hostGate.(interface{ State() supervisor.GateState }); ok {
+		return sg.State() == supervisor.GateStateUpdatingTools
+	}
+	if mg, ok := d.hostGate.(interface{ IsMaintenanceHeld() bool }); ok {
+		return mg.IsMaintenanceHeld()
+	}
+	return false
+}
+
+func (d *Dispatcher) checkPreClaimBarrier(ctx context.Context) (ClaimRequest, bool) {
+	if d.isHostMaintenanceActive() {
+		return ClaimRequest{}, false
+	}
+	if d.eagerReadinessGate != nil {
+		if ready, _ := d.eagerReadinessGate(ctx); !ready {
+			return ClaimRequest{}, false
+		}
+	}
+	claimReq := ClaimRequest{
+		HostID:   d.hostID,
+		JobTypes: d.jobTypes,
+	}
+	if d.idleWorktreesProvider != nil {
+		var idle []string
+		for _, wt := range d.idleWorktreesProvider() {
+			if trimmed := strings.TrimSpace(wt); trimmed != "" && !d.IsWorktreeInFlight(trimmed) {
+				idle = append(idle, trimmed)
+			}
+		}
+		if len(idle) == 0 {
+			return ClaimRequest{}, false
+		}
+		claimReq.IdleWorktrees = idle
+	}
+	return claimReq, true
+}
+
+func extractPayloadStringField(payload json.RawMessage, key string) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var pMap map[string]any
+	if json.Unmarshal(payload, &pMap) != nil || pMap == nil {
+		return ""
+	}
+	val, _ := pMap[key].(string)
+	return strings.TrimSpace(val)
+}
+
+func (d *Dispatcher) resolveJobWorktree(job *Job) (string, harness.Invoker) {
+	invoker := d.invoker
+	var resolvedFromCallback string
+	if d.worktreeResolver != nil {
+		resolvedFromCallback = strings.TrimSpace(d.worktreeResolver(job.Repo))
+	}
+	if explicitWT := strings.TrimSpace(job.WorktreePath); explicitWT != "" {
+		return explicitWT, invoker.WithWorkDir(explicitWT)
+	}
+	if resolvedFromCallback != "" {
+		return resolvedFromCallback, invoker.WithWorkDir(resolvedFromCallback)
+	}
+	if payloadWT := extractPayloadStringField(job.Payload, "worktree_path"); payloadWT != "" {
+		return payloadWT, invoker.WithWorkDir(payloadWT)
+	}
+	return ".", invoker
+}
+
+func (d *Dispatcher) acquireWorktreeRepoLock(ctx context.Context, job *Job, worktreeDir, resolvedConvID, initialStoryID string) (*repolock.LockHandle, bool) {
+	if worktreeDir == "" || worktreeDir == "." {
+		return nil, true
+	}
+	fi, statErr := os.Stat(worktreeDir)
+	if statErr != nil || !fi.IsDir() {
+		return nil, true
+	}
+	if isWorktreeLockedByOther(worktreeDir, job.ID) {
+		fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: worktree %s locked by other\n", job.ID, worktreeDir)
+		_ = d.declineJob(ctx, job.ID, reasonRepoBusy)
+		return nil, false
+	}
+	h, lockErr := repolock.Acquire(worktreeDir, repolock.LockInfo{
+		JobID:          job.ID,
+		PID:            os.Getpid(),
+		ConversationID: resolvedConvID,
+		StoryID:        initialStoryID,
+		Status:         "RUNNING",
+	}, watchdog.IsProcessAlive)
+	if lockErr != nil {
+		fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: repolock.Acquire error on %s: %v\n", job.ID, worktreeDir, lockErr)
+		_ = d.declineJob(ctx, job.ID, reasonRepoBusy)
+		return nil, false
+	}
+	return h, true
+}
+
 // PollAndProcess claims one job and processes it. Returns (true, err) if a job was processed,
 // or (false, nil) if no job was available.
 func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
@@ -583,10 +919,12 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		return false, errors.New("harness invoker not configured")
 	}
 
-	job, err := d.client.ClaimJob(ctx, ClaimRequest{
-		HostID:   d.hostID,
-		JobTypes: d.jobTypes,
-	})
+	claimReq, canClaim := d.checkPreClaimBarrier(ctx)
+	if !canClaim {
+		return false, nil
+	}
+
+	job, err := d.client.ClaimJob(ctx, claimReq)
 	if err != nil {
 		return false, fmt.Errorf("claim job failed: %w", err)
 	}
@@ -607,13 +945,9 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	ctx, span := telemetry.StartSpan(ctx, "dispatcher.processJob", spanOpts...)
 	defer span.End()
 
-	invoker := d.invoker
-	worktreeDir := "."
-	if d.worktreeResolver != nil {
-		if wt := d.worktreeResolver(job.Repo); wt != "" {
-			worktreeDir = wt
-			invoker = invoker.WithWorkDir(wt)
-		} else if job.Repo != "" && job.Repo != "." && (job.Type == JobTypeStoryCreate || job.Type == JobTypeStoryExecute || job.Type == JobTypePromptExecute) {
+	worktreeDir, invoker := d.resolveJobWorktree(job)
+	if (worktreeDir == "" || worktreeDir == ".") && d.worktreeResolver != nil {
+		if job.Repo != "" && job.Repo != "." && (job.Type == JobTypeStoryCreate || job.Type == JobTypeStoryExecute || job.Type == JobTypePromptExecute) {
 			if filepath.IsAbs(job.Repo) {
 				if fi, err := os.Stat(job.Repo); err == nil && fi.IsDir() {
 					worktreeDir = job.Repo
@@ -635,10 +969,63 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	if (effectiveRepo == "" || effectiveRepo == "." || effectiveRepo == "root") && worktreeDir != "" && worktreeDir != "." {
 		effectiveRepo = worktreeDir
 	}
+
+	// Atomic local worktree reservation BEFORE AckLease:
+	// 1. Reserve inFlightPrepJobs (verifying worktreeDir is not already in inFlightPrepJobs or activeJobs)
+	// 2. Acquire hostGate execution lease
+	// 3. Acquire repolock on worktreeDir
+	if !d.tryReserveInFlightWorktree(job.ID, worktreeDir) {
+		fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: worktree %s already in-flight\n", job.ID, worktreeDir)
+		_ = d.declineJob(ctx, job.ID, reasonRepoBusy)
+		return false, nil
+	}
+	defer d.clearInFlightWorktree(job.ID)
+
+	var relGateLease func()
+	if d.hostGate != nil && (job.Type == JobTypeStoryCreate || job.Type == JobTypeStoryExecute || job.Type == JobTypePromptExecute) {
+		var leaseErr error
+		relGateLease, leaseErr = d.hostGate.AcquireExecutionLease(ctx, job.ID, effectiveRepo, job.FencingToken)
+		if leaseErr != nil {
+			d.clearInFlightWorktree(job.ID)
+			if job.LeaseToken != "" || (worktreeDir != "" && worktreeDir != ".") {
+				fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: hostGate lease error: %v\n", job.ID, leaseErr)
+				_ = d.declineJob(ctx, job.ID, reasonRepoBusy)
+				return false, nil
+			}
+			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: leaseErr.Error()})
+			return true, leaseErr
+		}
+		defer func() {
+			if relGateLease != nil {
+				relGateLease()
+			}
+		}()
+	}
+
+	resolvedConvID := job.ResolvedConversationID()
+	initialStoryID := strings.TrimSpace(job.StoryID)
+	if initialStoryID == "" {
+		initialStoryID = extractPayloadStringField(job.Payload, "story_id")
+	}
+
+	repoLockHandle, lockOK := d.acquireWorktreeRepoLock(ctx, job, worktreeDir, resolvedConvID, initialStoryID)
+	if !lockOK {
+		if relGateLease != nil {
+			relGateLease()
+			relGateLease = nil
+		}
+		d.clearInFlightWorktree(job.ID)
+		return false, nil
+	}
+	if repoLockHandle != nil {
+		defer func() {
+			_ = repoLockHandle.Release()
+		}()
+	}
+
 	d.setActiveJob(job.ID, worktreeDir, os.Getpid())
 	defer d.clearActiveJob(job.ID)
 
-	resolvedConvID := job.ResolvedConversationID()
 	isResumeJob := job.ParentJobID != "" || resolvedConvID != "" || job.Attempts > 1 || job.InfraRequeueCount > 0 || job.Type == "resume" || strings.Contains(string(job.Payload), `"kind":"resume"`) || strings.Contains(string(job.Payload), `"Kind":"resume"`) || strings.Contains(string(job.Payload), `"parent_job_id"`) || strings.Contains(string(job.Payload), `"resume_conversation_id"`)
 
 	// Pre-job workspace sanitization: non-destructive lock clearing, interrupted git ops recovery, dirty patch archiving, and line ending hygiene
@@ -703,16 +1090,8 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	defer execCancel()
 
 	var allocatedStoryMu sync.Mutex
-	currentStoryID := job.StoryID
+	currentStoryID := initialStoryID
 	currentConvID := resolvedConvID
-	if currentStoryID == "" && len(job.Payload) > 0 {
-		var pMap map[string]any
-		if err := json.Unmarshal(job.Payload, &pMap); err == nil {
-			if sid, ok := pMap["story_id"].(string); ok {
-				currentStoryID = sid
-			}
-		}
-	}
 
 	onStoryDiscovered := func(storyID string) {
 		clean := strings.TrimSpace(storyID)
@@ -805,16 +1184,6 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		if hookErr := d.preDispatchHook(execCtx, job); hookErr != nil {
 			span.SetTag("pre_dispatch_hook.error", hookErr.Error())
 		}
-	}
-
-	// Shared execution lease acquisition for harness jobs (prevents collision with binary updates)
-	if d.hostGate != nil && (job.Type == JobTypeStoryCreate || job.Type == JobTypeStoryExecute || job.Type == JobTypePromptExecute) {
-		relLease, leaseErr := d.hostGate.AcquireExecutionLease(execCtx, job.ID, effectiveRepo, job.FencingToken)
-		if leaseErr != nil {
-			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: leaseErr.Error()})
-			return true, leaseErr
-		}
-		defer relLease()
 	}
 
 	switch job.Type {

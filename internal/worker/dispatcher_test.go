@@ -15,6 +15,8 @@ import (
 
 	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-agent/internal/harness"
+	"github.com/viovy/iazio-agent/internal/repolock"
+	"github.com/viovy/iazio-agent/internal/supervisor"
 )
 
 type mockInvoker struct {
@@ -67,15 +69,21 @@ type mockControlPlane struct {
 	claimFunc    func(ctx context.Context, req ClaimRequest) (*Job, error)
 	completeFunc func(ctx context.Context, jobID string, req CompleteRequest) error
 	bindFunc     func(ctx context.Context, jobID string, req StoryBindingRequest) error
+	ackLeaseFunc func(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) error
+	declineFunc  func(ctx context.Context, jobID, reason string) error
 
 	completedJobs map[string]CompleteRequest
 	boundStories  map[string]StoryBindingRequest
+	ackedJobs     map[string]string
+	declinedJobs  map[string]string
 }
 
 func newMockControlPlane() *mockControlPlane {
 	return &mockControlPlane{
 		completedJobs: make(map[string]CompleteRequest),
 		boundStories:  make(map[string]StoryBindingRequest),
+		ackedJobs:     make(map[string]string),
+		declinedJobs:  make(map[string]string),
 	}
 }
 
@@ -107,6 +115,18 @@ func (m *mockControlPlane) BindStory(ctx context.Context, jobID string, req Stor
 }
 
 func (m *mockControlPlane) AckLease(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) error {
+	m.ackedJobs[jobID] = leaseToken
+	if m.ackLeaseFunc != nil {
+		return m.ackLeaseFunc(ctx, jobID, leaseToken, agentPID, activeConvID)
+	}
+	return nil
+}
+
+func (m *mockControlPlane) DeclineJob(ctx context.Context, jobID, reason string) error {
+	m.declinedJobs[jobID] = reason
+	if m.declineFunc != nil {
+		return m.declineFunc(ctx, jobID, reason)
+	}
 	return nil
 }
 
@@ -1736,4 +1756,388 @@ printf '{"status":"completed","exit_code":0,"summary":"ok"}\n'
 		t.Fatalf("expected completed job result to retain discovered conversation_id=aff9bb70-6c84-4121-ba1e-68745328700a, got %q", completedConvID)
 	}
 }
+
+func TestDispatcher_PreClaimBarrier_EagerReadinessAndIdleWorktrees(t *testing.T) {
+	ctx := context.Background()
+	cp := newMockControlPlane()
+
+	claimCalls := 0
+	var lastClaimReq ClaimRequest
+	cp.claimFunc = func(_ context.Context, req ClaimRequest) (*Job, error) {
+		claimCalls++
+		lastClaimReq = req
+		return nil, nil
+	}
+
+	inv := &mockInvoker{}
+	d := NewDispatcher(cp, inv, "host-1")
+
+	// 1. Eager readiness gate returning false blocks ClaimJob
+	ready := false
+	d.SetEagerReadinessGate(func(context.Context) (bool, string) {
+		return ready, "DRIFT_DETECTED"
+	})
+	processed, err := d.PollAndProcess(ctx)
+	if err != nil || processed {
+		t.Fatalf("expected PollAndProcess to skip when eagerReadinessGate is false, got processed=%v err=%v", processed, err)
+	}
+	if claimCalls != 0 {
+		t.Fatalf("expected 0 ClaimJob calls when eagerReadinessGate is false, got %d", claimCalls)
+	}
+
+	// 2. HostGate in GateStateUpdatingTools blocks ClaimJob
+	ready = true
+	realGate := supervisor.NewHostExecutionAndUpdateGate()
+	relMaint, ok := realGate.TryAcquireMaintenanceLease("test")
+	if !ok {
+		t.Fatal("expected TryAcquireMaintenanceLease to succeed")
+	}
+	d.SetHostGate(realGate)
+	processed, err = d.PollAndProcess(ctx)
+	if err != nil || processed || claimCalls != 0 {
+		t.Fatalf("expected PollAndProcess to skip while hostGate is in GateStateUpdatingTools, got processed=%v err=%v claimCalls=%d", processed, err, claimCalls)
+	}
+	relMaint()
+
+	// 3. IdleWorktreesProvider returning empty slice blocks ClaimJob
+	var idleList []string
+	d.SetIdleWorktreesProvider(func() []string {
+		return idleList
+	})
+	processed, err = d.PollAndProcess(ctx)
+	if err != nil || processed || claimCalls != 0 {
+		t.Fatalf("expected PollAndProcess to skip when IdleWorktreesProvider returns empty, got processed=%v err=%v claimCalls=%d", processed, err, claimCalls)
+	}
+
+	// 4. IdleWorktreesProvider returning non-empty slice advertises IdleWorktrees in ClaimRequest
+	idleList = []string{"/work/slot-1", "/work/slot-2"}
+	processed, err = d.PollAndProcess(ctx)
+	if err != nil || processed {
+		t.Fatalf("expected PollAndProcess with no jobs to return false, nil; got processed=%v err=%v", processed, err)
+	}
+	if claimCalls != 1 {
+		t.Fatalf("expected 1 ClaimJob call once barrier is ready and idle worktrees exist, got %d", claimCalls)
+	}
+	if len(lastClaimReq.IdleWorktrees) != 2 || lastClaimReq.IdleWorktrees[0] != "/work/slot-1" || lastClaimReq.IdleWorktrees[1] != "/work/slot-2" {
+		t.Fatalf("expected IdleWorktrees=[/work/slot-1 /work/slot-2], got %v", lastClaimReq.IdleWorktrees)
+	}
+}
+
+func TestDispatcher_CollectIdleWorktrees_FiltersBusyLockedAndDirty(t *testing.T) {
+	cleanIdle := initTestFleetWorkspace(t)
+	inFlightWT := initTestFleetWorkspace(t)
+	lockedWT := initTestFleetWorkspace(t)
+	sessionWT := initTestFleetWorkspace(t)
+	dirtyWT := initTestFleetWorkspace(t)
+
+	// Mark lockedWT with .iazio-repolock held by current process
+	if err := os.WriteFile(filepath.Join(lockedWT, ".iazio-repolock"), []byte(`{"holder_pid":999999999}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Mark lockedWT with live repolock
+	h, err := repolock.Acquire(lockedWT, repolock.LockInfo{
+		JobID:  "other-job",
+		PID:    os.Getpid(),
+		Status: "RUNNING",
+	}, func(int) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = h.Release() }()
+
+	// Mark sessionWT with active .session_story_id
+	if err := os.WriteFile(filepath.Join(sessionWT, ".session_story_id"), []byte("STORY-IAZIO-0196\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mark dirtyWT with uncommitted tracked modification
+	if err := os.WriteFile(filepath.Join(dirtyWT, "README.md"), []byte("dirty change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewDispatcher(newMockControlPlane(), &mockInvoker{}, "host-1")
+	d.tryReserveInFlightWorktree("in-flight-job", inFlightWT)
+	defer d.clearInFlightWorktree("in-flight-job")
+
+	got := d.CollectIdleWorktrees([]string{
+		"",
+		filepath.Join(t.TempDir(), "nonexistent-worktree-path"),
+		cleanIdle,
+		cleanIdle, // duplicate
+		inFlightWT,
+		lockedWT,
+		sessionWT,
+		dirtyWT,
+	})
+	if len(got) != 1 || got[0] != filepath.Clean(cleanIdle) {
+		t.Fatalf("expected only [%s] to be returned as idle, got %v", filepath.Clean(cleanIdle), got)
+	}
+}
+
+func TestDispatcher_AtomicLocalReservationBeforeAckLease_AndDeclineOnBusy(t *testing.T) {
+	ctx := context.Background()
+	wt := initTestFleetWorkspace(t)
+
+	cp := newMockControlPlane()
+	gate := supervisor.NewHostExecutionAndUpdateGate()
+
+	var inv *mockInvoker
+	var d *Dispatcher
+
+	ackCalled := false
+	cp.ackLeaseFunc = func(_ context.Context, jobID, _ string, _ int, _ string) error {
+		ackCalled = true
+		// Verify that BEFORE/DURING AckLease:
+		// 1. inFlightPrepJobs has reserved wt
+		if !d.IsWorktreeInFlight(wt) {
+			t.Errorf("expected worktree %s to be reserved in inFlightPrepJobs before AckLease", wt)
+		}
+		// 2. hostGate holds execution lease
+		if gate.State() != supervisor.GateStateExecutingJobs {
+			t.Errorf("expected hostGate state=%s during AckLease, got %s", supervisor.GateStateExecutingJobs, gate.State())
+		}
+		// 3. repolock is held by jobID on wt
+		info, err := repolock.Read(wt)
+		if err != nil || info.JobID != jobID || info.Status != "RUNNING" {
+			t.Errorf("expected repolock to be held by %s before AckLease, got info=%+v err=%v", jobID, info, err)
+		}
+		return nil
+	}
+
+	cp.claimFunc = func(_ context.Context, _ ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:           "job-atomic-1",
+			Type:         JobTypePromptExecute,
+			Repo:         "fleet",
+			WorktreePath: wt,
+			LeaseToken:   "lease-atomic-1",
+			FencingToken: 10,
+			Payload:      json.RawMessage(`{"prompt":"test"}`),
+		}, nil
+	}
+
+	inv = &mockInvoker{}
+	d = NewDispatcher(cp, inv, "host-1")
+	d.SetHostGate(gate)
+
+	processed, err := d.PollAndProcess(ctx)
+	if err != nil || !processed {
+		t.Fatalf("expected PollAndProcess to succeed, got processed=%v err=%v", processed, err)
+	}
+	if !ackCalled {
+		t.Fatal("expected AckLease to be called after local reservation")
+	}
+	if d.IsWorktreeInFlight(wt) {
+		t.Fatal("expected inFlightPrepJobs to be cleaned up after PollAndProcess")
+	}
+	if gate.State() != supervisor.GateStateIdle {
+		t.Fatalf("expected hostGate to be IDLE after PollAndProcess, got %s", gate.State())
+	}
+
+	// Now simulate wt already reserved in inFlightPrepJobs by another job -> must DeclineJob("REPO_BUSY") WITHOUT AckLease
+	ackCalled = false
+	delete(cp.ackedJobs, "job-busy-2")
+	delete(cp.declinedJobs, "job-busy-2")
+	d.tryReserveInFlightWorktree("other-active-job", wt)
+	defer d.clearInFlightWorktree("other-active-job")
+
+	cp.claimFunc = func(_ context.Context, _ ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:           "job-busy-2",
+			Type:         JobTypePromptExecute,
+			Repo:         "fleet",
+			WorktreePath: wt,
+			LeaseToken:   "lease-busy-2",
+			FencingToken: 11,
+			Payload:      json.RawMessage(`{"prompt":"test"}`),
+		}, nil
+	}
+
+	processed, err = d.PollAndProcess(ctx)
+	if err != nil || processed {
+		t.Fatalf("expected PollAndProcess to decline and return (false, nil) when worktree is busy, got processed=%v err=%v", processed, err)
+	}
+	if ackCalled {
+		t.Fatal("expected AckLease NOT to be called when local worktree reservation fails")
+	}
+	if cp.declinedJobs["job-busy-2"] != "REPO_BUSY" {
+		t.Fatalf("expected DeclineJob(job-busy-2, REPO_BUSY), got %q", cp.declinedJobs["job-busy-2"])
+	}
+}
+
+type abandonOnlyControlPlane struct {
+	*mockControlPlane
+	abandoned map[string]string
+}
+
+func (a *abandonOnlyControlPlane) AbandonJob(_ context.Context, jobID, reason string) error {
+	a.abandoned[jobID] = reason
+	return nil
+}
+
+type plainControlPlane struct {
+	delegate *mockControlPlane
+}
+
+func (p *plainControlPlane) ClaimJob(ctx context.Context, req ClaimRequest) (*Job, error) {
+	return p.delegate.ClaimJob(ctx, req)
+}
+func (p *plainControlPlane) CompleteJob(ctx context.Context, jobID string, req CompleteRequest) error {
+	return p.delegate.CompleteJob(ctx, jobID, req)
+}
+func (p *plainControlPlane) HeartbeatJob(ctx context.Context, jobID, leaseToken string, fencingToken int64, storyID ...string) error {
+	return p.delegate.HeartbeatJob(ctx, jobID, leaseToken, fencingToken, storyID...)
+}
+func (p *plainControlPlane) BindStory(ctx context.Context, jobID string, req StoryBindingRequest) error {
+	return p.delegate.BindStory(ctx, jobID, req)
+}
+func (p *plainControlPlane) AckLease(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) error {
+	return p.delegate.AckLease(ctx, jobID, leaseToken, agentPID, activeConvID)
+}
+func (p *plainControlPlane) FailoverJob(ctx context.Context, jobID string, req controlplane.AttemptFailure) error {
+	return p.delegate.FailoverJob(ctx, jobID, req)
+}
+
+type abandonWrapper struct {
+	plainControlPlane
+	abandoned map[string]string
+}
+
+func (a *abandonWrapper) AbandonJob(_ context.Context, jobID, reason string) error {
+	a.abandoned[jobID] = reason
+	return nil
+}
+
+func TestHTTPControlPlaneClient_DeclineJob_And_DispatcherHelpers(t *testing.T) {
+	ctx := context.Background()
+
+	var hitPaths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitPaths = append(hitPaths, r.URL.Path)
+		switch r.URL.Path {
+		case "/v1/jobs/job-200/decline":
+			w.WriteHeader(http.StatusOK)
+		case "/v1/jobs/job-404-fallback/decline":
+			w.WriteHeader(http.StatusNotFound)
+		case "/api/v1/agent/jobs/job-404-fallback/decline":
+			w.WriteHeader(http.StatusNoContent)
+		case "/v1/jobs/job-500/decline":
+			http.Error(w, "boom", http.StatusBadRequest)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	cli := NewHTTPControlPlaneClient(srv.URL, "tok", srv.Client())
+	cli.MaxRetries = 0
+
+	// 1. Direct 200 OK on /v1/jobs/{id}/decline
+	if err := cli.DeclineJob(ctx, "job-200", "REPO_BUSY"); err != nil {
+		t.Fatalf("DeclineJob 200 failed: %v", err)
+	}
+	// 2. 404 fallback to /api/v1/agent/jobs/{id}/decline
+	if err := cli.DeclineJob(ctx, "job-404-fallback", "REPO_BUSY"); err != nil {
+		t.Fatalf("DeclineJob 404 fallback failed: %v", err)
+	}
+	// 3. Error status
+	if err := cli.DeclineJob(ctx, "job-500", "REPO_BUSY"); err == nil {
+		t.Fatal("expected error from DeclineJob on 400 status")
+	}
+
+	// 4. Dispatcher.ActiveJobs, SetRepoMap, SetWorkspace, CollectIdleWorktrees with repoMap/workspace fallback
+	wt1 := initTestFleetWorkspace(t)
+	wt2 := initTestFleetWorkspace(t)
+	d := NewDispatcher(newMockControlPlane(), &mockInvoker{}, "host-1")
+	d.SetRepoMap(map[string]string{"r1": wt1})
+	d.SetWorkspace(wt2)
+	idle := d.CollectIdleWorktrees(nil)
+	if len(idle) != 2 {
+		t.Fatalf("expected 2 idle worktrees from repoMap+workspace fallback, got %v", idle)
+	}
+
+	d.setActiveJob("", wt1, 123) // empty jobID no-op
+	d.setActiveJob("active-1", wt1, 1234)
+	if len(d.ActiveJobs()) != 1 || d.ActiveJobs()[0].JobID != "active-1" {
+		t.Fatalf("unexpected ActiveJobs: %+v", d.ActiveJobs())
+	}
+	if !d.IsWorktreeInFlight(wt1) {
+		t.Fatal("expected active job worktree to be in-flight")
+	}
+	if d.IsWorktreeInFlight("") || d.IsWorktreeInFlight(".") {
+		t.Fatal("expected empty or '.' worktree not to be in-flight")
+	}
+	if !d.tryReserveInFlightWorktree("", wt1) {
+		t.Fatal("expected empty jobID in tryReserveInFlightWorktree to return true")
+	}
+	if d.tryReserveInFlightWorktree("other-job", wt1) {
+		t.Fatal("expected tryReserveInFlightWorktree to fail when wt1 is in activeJobs")
+	}
+	d.clearActiveJob("active-1")
+
+	// 5. isWorktreeLockedByOther edge cases
+	if isWorktreeLockedByOther("", "j1") || isWorktreeLockedByOther(".", "j1") {
+		t.Fatal("expected empty/dot worktree not to be locked")
+	}
+	wtLock := initTestFleetWorkspace(t)
+	// .git/index.lock
+	idxLock := filepath.Join(wtLock, ".git", "index.lock")
+	_ = os.WriteFile(idxLock, []byte("lock"), 0o644)
+	if !isWorktreeLockedByOther(wtLock, "j1") {
+		t.Fatal("expected .git/index.lock to report locked")
+	}
+	_ = os.Remove(idxLock)
+
+	// .iazio-repolock with alive PID
+	dotLock := filepath.Join(wtLock, ".iazio-repolock")
+	_ = os.WriteFile(dotLock, []byte(`{"pid":`+strings.TrimSpace(string(rune(0)))+`}`), 0o644)
+	_ = os.WriteFile(dotLock, []byte("plain-lock"), 0o644)
+	if !isWorktreeLockedByOther(wtLock, "j1") {
+		t.Fatal("expected non-JSON .iazio-repolock to report locked")
+	}
+	_ = os.Remove(dotLock)
+
+	// 6. declineJob with nil client, plain client, and AbandonJob wrapper
+	dNil := &Dispatcher{}
+	_ = dNil.declineJob(ctx, "j1", "REPO_BUSY")
+	dPlain := NewDispatcher(&plainControlPlane{delegate: newMockControlPlane()}, &mockInvoker{}, "h1")
+	_ = dPlain.declineJob(ctx, "j1", "REPO_BUSY")
+	ab := &abandonWrapper{plainControlPlane: plainControlPlane{delegate: newMockControlPlane()}, abandoned: make(map[string]string)}
+	dAb := NewDispatcher(ab, &mockInvoker{}, "h1")
+	_ = dAb.declineJob(ctx, "j-ab", "REPO_BUSY")
+	if ab.abandoned["j-ab"] != "REPO_BUSY" {
+		t.Fatalf("expected AbandonJob fallback to record REPO_BUSY, got %v", ab.abandoned)
+	}
+
+	// 7. PollAndProcess declines when worktree has .git/index.lock or hostGate fails with LeaseToken != ""
+	cp := newMockControlPlane()
+	_ = os.WriteFile(idxLock, []byte("lock"), 0o644)
+	defer os.Remove(idxLock)
+	cp.claimFunc = func(context.Context, ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:           "job-idx-locked",
+			Type:         JobTypePromptExecute,
+			WorktreePath: wtLock,
+			LeaseToken:   "lt-idx",
+			Payload:      json.RawMessage(`{"story_id":"STORY-1"}`),
+		}, nil
+	}
+	dIdx := NewDispatcher(cp, &mockInvoker{}, "h1")
+	dIdx.SetHostGate(&mockHostGate{})
+	processed, err := dIdx.PollAndProcess(ctx)
+	if err != nil || processed || cp.declinedJobs["job-idx-locked"] != "REPO_BUSY" {
+		t.Fatalf("expected job-idx-locked to be declined with REPO_BUSY, got processed=%v err=%v declined=%v", processed, err, cp.declinedJobs)
+	}
+
+	// 8. PollAndProcess declines when hostGate.AcquireExecutionLease fails and job.LeaseToken != ""
+	dGateFail := NewDispatcher(cp, &mockInvoker{}, "h1")
+	dGateFail.SetHostGate(&mockHostGate{block: true})
+	delete(cp.declinedJobs, "job-idx-locked")
+	processed, err = dGateFail.PollAndProcess(ctx)
+	if err != nil || processed || cp.declinedJobs["job-idx-locked"] != "REPO_BUSY" {
+		t.Fatalf("expected hostGate block with LeaseToken to decline with REPO_BUSY, got processed=%v err=%v declined=%v", processed, err, cp.declinedJobs)
+	}
+}
+
+
 

@@ -499,4 +499,28 @@ func TestIsWorktreeDirty_And_EdgeCases(t *testing.T) {
 	if err := h.Release(); err != nil {
 		t.Fatalf("second Release failed: %v", err)
 	}
+
+	// 4. ensureGitInfoExclude on directory .git and gitfile .git
+	wtGitDir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(wtGitDir, ".git", "info"), 0o755)
+	_ = os.WriteFile(filepath.Join(wtGitDir, ".git", "info", "exclude"), []byte("# comment"), 0o644)
+	ensureGitInfoExclude(wtGitDir)
+	ensureGitInfoExclude(wtGitDir) // idempotent second call
+	exclBytes, err := os.ReadFile(filepath.Join(wtGitDir, ".git", "info", "exclude"))
+	if err != nil || !strings.Contains(string(exclBytes), ".iazio/") || !strings.Contains(string(exclBytes), ".iazio-repolock") {
+		t.Fatalf("expected .iazio/ and .iazio-repolock in exclude, got %q (err=%v)", string(exclBytes), err)
+	}
+
+	wtSub := t.TempDir()
+	actualGitDir := filepath.Join(wtSub, "real-git-dir")
+	_ = os.MkdirAll(actualGitDir, 0o755)
+	subWorktree := filepath.Join(wtSub, "sub")
+	_ = os.MkdirAll(subWorktree, 0o755)
+	_ = os.WriteFile(filepath.Join(subWorktree, ".git"), []byte("gitdir: ../real-git-dir\n"), 0o644)
+	ensureGitInfoExclude(subWorktree)
+	subExclBytes, err := os.ReadFile(filepath.Join(actualGitDir, "info", "exclude"))
+	if err != nil || !strings.Contains(string(subExclBytes), ".iazio/") {
+		t.Fatalf("expected .iazio/ in submodule gitdir exclude, got %q (err=%v)", string(subExclBytes), err)
+	}
 }
+

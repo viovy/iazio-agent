@@ -26,7 +26,9 @@ type EagerUpdateState string
 
 const (
 	StateUpToDate              EagerUpdateState = "UP_TO_DATE"
+	StateDriftDetected         EagerUpdateState = "DRIFT_DETECTED"
 	StateUpdating              EagerUpdateState = "UPDATING"
+	StateRestartPending        EagerUpdateState = "RESTART_PENDING"
 	StateDeferredHarnessActive EagerUpdateState = "DEFERRED_HARNESS_ACTIVE"
 	StateDeferredGitDirty      EagerUpdateState = "DEFERRED_GIT_DIRTY"
 	StateBackoffAfterFailure   EagerUpdateState = "BACKOFF_AFTER_FAILURE"
@@ -114,6 +116,7 @@ type EagerToolUpdater struct {
 	lastDeferredKey       string
 	lastPartialFailureKey string
 	updating              bool
+	pendingSelfRestart    bool
 	pendingRequests       []PendingToolRequest // discrete requests preserved per tool (R4, R5, N5)
 	hasPending            bool
 	requireCleanFleetGit  bool
@@ -182,6 +185,20 @@ func (u *EagerToolUpdater) SetRequireCleanFleetGit(v bool) {
 	u.requireCleanFleetGit = v
 }
 
+// IsRestartPending reports whether an agent self-update has been applied and awaits restart.
+func (u *EagerToolUpdater) IsRestartPending() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.pendingSelfRestart
+}
+
+// SetRestartPending sets whether an agent self-update has been applied and awaits restart.
+func (u *EagerToolUpdater) SetRestartPending(v bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.pendingSelfRestart = v
+}
+
 // LastReadiness returns the most recently captured eager update readiness report.
 func (u *EagerToolUpdater) LastReadiness() EagerUpdateReadinessReport {
 	u.mu.Lock()
@@ -215,11 +232,19 @@ func (u *EagerToolUpdater) EvaluateReadiness(ctx context.Context) EagerUpdateRea
 
 	u.mu.Lock()
 	isUpdating := u.updating
+	restartPending := u.pendingSelfRestart
 	u.mu.Unlock()
 
 	if isUpdating {
 		rep.EagerUpdateState = StateUpdating
 		rep.Details = "binary update in progress"
+		u.persistReadiness(ctx, rep)
+		return rep
+	}
+
+	if restartPending {
+		rep.EagerUpdateState = StateRestartPending
+		rep.Details = "agent self-update applied; restart pending"
 		u.persistReadiness(ctx, rep)
 		return rep
 	}
@@ -295,10 +320,30 @@ func (u *EagerToolUpdater) EvaluateReadiness(ctx context.Context) EagerUpdateRea
 		}
 	}
 
+	var outdatedToolNames []string
+	for _, ot := range rep.OutdatedTools {
+		if strings.TrimSpace(ot.ToolName) != "" {
+			outdatedToolNames = append(outdatedToolNames, ot.ToolName)
+		}
+	}
+
 	// 3. Check failure backoff
-	if u.shouldBackoff(nil, false) {
+	if u.shouldBackoff(nil, false) || (len(outdatedToolNames) > 0 && u.shouldBackoff(outdatedToolNames, false)) {
 		rep.EagerUpdateState = StateBackoffAfterFailure
 		rep.Details = "eager update backing off after previous failure"
+		u.persistReadiness(ctx, rep)
+		return rep
+	}
+
+	hasDrift := len(rep.OutdatedTools) > 0
+	if !hasDrift && u.InspectOutdatedTools == nil && u.CheckDrift != nil {
+		if drift, err := u.CheckDrift(ctx, nil); err == nil && drift {
+			hasDrift = true
+		}
+	}
+	if hasDrift {
+		rep.EagerUpdateState = StateDriftDetected
+		rep.Details = "tool drift detected; eager update required before claiming jobs"
 		u.persistReadiness(ctx, rep)
 		return rep
 	}
@@ -307,6 +352,41 @@ func (u *EagerToolUpdater) EvaluateReadiness(ctx context.Context) EagerUpdateRea
 	rep.Details = "all preconditions met; tools are up to date or eligible for update"
 	u.persistReadiness(ctx, rep)
 	return rep
+}
+
+// RunCheckAndUpdate executes an eager tool update pass and records pending self-restart when the agent binary is updated.
+func (u *EagerToolUpdater) RunCheckAndUpdate(ctx context.Context, force bool) (UpdateResult, bool, error) {
+	res, deferred, err := u.EvaluateAndTriggerWithOpts(ctx, TriggerOptions{
+		Force:       force,
+		BypassDirty: false,
+	})
+	if res.AgentUpdated {
+		u.SetRestartPending(true)
+	}
+	return res, deferred, err
+}
+
+// EnsureUpToDateBeforeClaim evaluates eager update readiness prior to claiming a job.
+// If the host is idle and clean with tool drift detected, it synchronously runs the tool update
+// under the maintenance lease and re-evaluates readiness before allowing a claim.
+func (u *EagerToolUpdater) EnsureUpToDateBeforeClaim(ctx context.Context) (EagerUpdateReadinessReport, bool) {
+	report := u.EvaluateReadiness(ctx)
+	switch report.EagerUpdateState {
+	case StateUpToDate:
+		if u.IsRestartPending() {
+			report.EagerUpdateState = StateRestartPending
+			report.Details = "agent self-update applied; restart pending"
+			u.persistReadiness(ctx, report)
+			return report, false
+		}
+		return report, true
+	case StateDriftDetected:
+		_, _, _ = u.RunCheckAndUpdate(ctx, false)
+		after := u.EvaluateReadiness(ctx)
+		return after, after.EagerUpdateState == StateUpToDate && !u.IsRestartPending()
+	default:
+		return report, false
+	}
 }
 
 func (u *EagerToolUpdater) persistReadiness(ctx context.Context, rep EagerUpdateReadinessReport) {
@@ -345,7 +425,7 @@ func (u *EagerToolUpdater) StartHybridTriggerLoop(ctx context.Context, onAgentUp
 				timerActive = false
 				_ = pendingSource
 				rep := u.EvaluateReadiness(ctx)
-				if rep.EagerUpdateState == StateUpToDate {
+				if rep.EagerUpdateState == StateUpToDate || rep.EagerUpdateState == StateDriftDetected {
 					res, _, err := u.EvaluateAndTriggerWithOpts(ctx, TriggerOptions{
 						BypassDirty: false,
 						Force:       false,
@@ -638,6 +718,7 @@ func (u *EagerToolUpdater) EvaluateAndTriggerWithOpts(ctx context.Context, opts 
 		passRes, passDeferred, passErr := u.runSinglePass(ctx, curTools, curForce, curBypassDirty, curVersion)
 		if passRes.AgentUpdated {
 			aggregateRes.AgentUpdated = true
+			u.SetRestartPending(true)
 		}
 		for _, ut := range passRes.UpdatedTools {
 			found := false
@@ -925,6 +1006,9 @@ func (u *EagerToolUpdater) runSinglePass(ctx context.Context, targetTools []stri
 		res, updateErr = u.doUpdateDetailed(ctx, effectiveTargets, force, tv)
 	} else if u.doUpdate != nil {
 		res, updateErr = u.doUpdate(ctx, effectiveTargets, force)
+	}
+	if res.AgentUpdated {
+		u.SetRestartPending(true)
 	}
 	durationMs := time.Since(start).Milliseconds()
 

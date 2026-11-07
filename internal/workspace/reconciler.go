@@ -350,6 +350,31 @@ func detectInterruptedGitOps(workspacePath, gitDir string, isDir bool) (string, 
 	return interruptedOp, interruptedSubmodules
 }
 
+const (
+	iazioDirName   = ".iazio"
+	iazioDirPrefix = ".iazio/"
+)
+
+func isIazioLockPath(filePath string) bool {
+	slashPath := strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(filePath)), "./")
+	return slashPath == iazioDirName || strings.HasPrefix(slashPath, iazioDirPrefix)
+}
+
+func filterNonIazioPorcelainLines(raw string) []string {
+	var filtered []string
+	for _, line := range strings.Split(raw, "\n") {
+		trimmed := strings.TrimRight(line, "\r\n")
+		if len(trimmed) < 4 {
+			continue
+		}
+		if isIazioLockPath(trimmed[3:]) {
+			continue
+		}
+		filtered = append(filtered, trimmed)
+	}
+	return filtered
+}
+
 func computeManifest(ctx context.Context, workspacePath string) (WorkspaceManifest, error) {
 	manifest := WorkspaceManifest{
 		CleanLocks:          true,
@@ -374,12 +399,7 @@ func computeManifest(ctx context.Context, workspacePath string) (WorkspaceManife
 	// Status porcelain
 	cmdStatus := procutil.CommandContext(ctx, "git", "-C", workspacePath, "status", "--porcelain")
 	if out, err := cmdStatus.Output(); err == nil {
-		lines := strings.Split(string(out), "\n")
-		for _, l := range lines {
-			trimmed := strings.TrimRight(l, "\r\n")
-			if len(trimmed) < 4 {
-				continue
-			}
+		for _, trimmed := range filterNonIazioPorcelainLines(string(out)) {
 			statusCode := trimmed[:2]
 			filePath := strings.TrimSpace(trimmed[3:])
 			if statusCode == "??" {
@@ -429,9 +449,11 @@ func ResetAndSanitizeFreshWorkspace(ctx context.Context, workspacePath, jobID st
 		requestedBranch = strings.TrimSpace(targetBranch[0])
 	}
 
-	// 1. Check if git status --porcelain is dirty
+	// 1. Check if git status --porcelain is dirty (ignoring .iazio lock directory)
 	cmdStatus := procutil.CommandContext(ctx, "git", "-C", workspacePath, "status", "--porcelain")
-	statusOut, _ := cmdStatus.Output()
+	rawStatusOut, _ := cmdStatus.Output()
+	filteredStatusLines := filterNonIazioPorcelainLines(string(rawStatusOut))
+	statusOut := []byte(strings.Join(filteredStatusLines, "\n"))
 	if len(bytes.TrimSpace(statusOut)) > 0 {
 		// Archive dirty changes to .autopilot/recovery/<timestamp>-<job_id>.patch
 		recoveryDir := filepath.Join(workspacePath, ".autopilot", "recovery")
@@ -441,6 +463,7 @@ func ResetAndSanitizeFreshWorkspace(ctx context.Context, workspacePath, jobID st
 
 		// Stage untracked files with intent-to-add so git diff HEAD captures all untracked files into the patch
 		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "add", "-N", ".").Run()
+		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "reset", "HEAD", "--", iazioDirName).Run()
 
 		cmdDiff := procutil.CommandContext(ctx, "git", "-C", workspacePath, "diff", "HEAD")
 		if diffOut, err := cmdDiff.Output(); err == nil && len(diffOut) > 0 {
@@ -449,9 +472,9 @@ func ResetAndSanitizeFreshWorkspace(ctx context.Context, workspacePath, jobID st
 			_ = os.WriteFile(patchPath, statusOut, 0644)
 		}
 
-		// Hard reset and clean root
+		// Hard reset and clean root (preserving .iazio lock directory)
 		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "reset", "--hard", "HEAD").Run()
-		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "clean", "-fd").Run()
+		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "clean", "-fd", "-e", iazioDirName).Run()
 
 		// Fetch all remotes and reset to clean origin/main if available (unless a specific target branch is requested)
 		_ = procutil.CommandContext(ctx, "git", "-C", workspacePath, "fetch", "--all", "--prune").Run()

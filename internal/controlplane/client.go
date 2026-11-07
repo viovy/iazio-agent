@@ -77,6 +77,8 @@ type Client struct {
 	EagerUpdateEnabled    bool
 	LastEagerUpdateAt     func() *time.Time
 	DiscoveredDevBinaries func() []string
+	PrePollBarrier        func(ctx context.Context) bool
+	IdleWorktrees         func() []string
 }
 
 func (c Client) bearerToken(ctx context.Context) string {
@@ -236,9 +238,15 @@ type Assignment struct {
 // NextLease asks for the next job for this host. ok is false when the queue is empty.
 func (c Client) NextLease(ctx context.Context, hostID string) (Assignment, bool, error) {
 	maxRetries, backoff := c.retryParams()
+	bodyBytes := []byte("{}")
+	if c.IdleWorktrees != nil {
+		if b, err := json.Marshal(map[string]any{"idle_worktrees": c.IdleWorktrees()}); err == nil {
+			bodyBytes = b
+		}
+	}
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/v1/hosts/"+hostID+"/poll", strings.NewReader("{}"))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/v1/hosts/"+hostID+"/poll", bytes.NewReader(bodyBytes))
 		if err != nil {
 			return Assignment{}, false, err
 		}
@@ -449,6 +457,19 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 			case <-ctx.Done():
 				return nil
 			case <-time.After(2 * time.Second):
+				continue
+			}
+		}
+
+		if c.PrePollBarrier != nil && !c.PrePollBarrier(ctx) {
+			waitDur := 2 * time.Second
+			if every > 0 && every < waitDur {
+				waitDur = every
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(waitDur):
 				continue
 			}
 		}

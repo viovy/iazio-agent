@@ -166,3 +166,85 @@ func TestTerminateProcessGroup_LiveChild(t *testing.T) {
 	}
 	_ = cmd.Wait()
 }
+
+func TestTerminateProcessGroup_SigkillEscalationAndDeadPID(t *testing.T) {
+	if isPIDAlive(0) || isPIDAlive(-5) || isPIDAlive(99999999) {
+		t.Fatal("expected non-positive or non-existent PID to report not alive")
+	}
+
+	// Start a shell process that traps SIGTERM and ignores it so TerminateProcessGroup escalates to SIGKILL
+	cmd := exec.Command("sh", "-c", "trap '' TERM; sleep 30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start sh: %v", err)
+	}
+	pid := cmd.Process.Pid
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+	// Give the subshell a brief moment to install the trap
+	time.Sleep(50 * time.Millisecond)
+
+	if err := TerminateProcessGroup(pid, 150*time.Millisecond); err != nil {
+		t.Fatalf("expected SIGKILL escalation to terminate process %d, got: %v", pid, err)
+	}
+	_ = cmd.Wait()
+}
+
+func TestReapWorkspaceOrphansAndLocks_EmptyAndProcessReap(t *testing.T) {
+	ctx := context.Background()
+	res, err := ReapWorkspaceOrphansAndLocks(ctx, "   ", "   ")
+	if err != nil || res == nil || res.OrphansReaped != 0 || res.LocksReleased != 0 {
+		t.Fatalf("expected no-op for empty workspace and conversationID, got res=%+v err=%v", res, err)
+	}
+
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	convID := "conv-reap-full-999"
+
+	// Create locks in .iazio/conversations and .gemini/brain/<convID>
+	iazioConvDir := filepath.Join(tempHome, ".iazio", "conversations")
+	if err := os.MkdirAll(iazioConvDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	iazioLock := filepath.Join(iazioConvDir, convID+"-extra.lock")
+	if err := os.WriteFile(iazioLock, []byte("lock"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	legacyBrainDir := filepath.Join(tempHome, ".gemini", "brain", convID)
+	if err := os.MkdirAll(legacyBrainDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacyLock := filepath.Join(legacyBrainDir, ".lock")
+	if err := os.WriteFile(legacyLock, []byte("lock"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Spawn an orphan process in tempWorkspace whose command line also mentions convID
+	tempWorkspace := t.TempDir()
+	cmd := exec.Command("sh", "-c", "sleep 10 # "+convID)
+	cmd.Dir = tempWorkspace
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start sh: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	reapRes, reapErr := ReapWorkspaceOrphansAndLocks(ctx, tempWorkspace, convID)
+	if reapErr != nil {
+		t.Fatalf("ReapWorkspaceOrphansAndLocks failed: %v", reapErr)
+	}
+	if reapRes.OrphansReaped < 1 {
+		t.Fatalf("expected at least 1 orphan process reaped, got %+v", reapRes)
+	}
+	if reapRes.LocksReleased < 2 {
+		t.Fatalf("expected at least 2 locks released, got %+v", reapRes)
+	}
+	_ = cmd.Wait()
+}
+
