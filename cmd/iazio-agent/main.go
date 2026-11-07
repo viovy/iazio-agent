@@ -4126,7 +4126,7 @@ func makePrePollBarrier(hostGate *supervisor.HostExecutionAndUpdateGate, eagerUp
 	}
 }
 
-func wireDispatcherReadinessAndIdleWorktrees(disp *worker.Dispatcher, client *controlplane.Client, eagerUpdater *supervisor.EagerToolUpdater, getRepos func() ([]supervisor.RepoCheckout, error)) {
+func wireDispatcherReadinessAndIdleWorktrees(disp *worker.Dispatcher, client *controlplane.Client, eagerUpdater *supervisor.EagerToolUpdater, getRepos func() ([]supervisor.RepoConfigItem, error)) {
 	if eagerUpdater != nil {
 		disp.SetEagerReadinessGate(func(c context.Context) (bool, string) {
 			rep, ok := eagerUpdater.EnsureUpToDateBeforeClaim(c)
