@@ -22,3 +22,5 @@ tmp/
 .scannerwork/
 .autopilot/
 .session_story_id
+TestResults/Diagnostics/pr-closeout-proof-*.json
+cov_auth

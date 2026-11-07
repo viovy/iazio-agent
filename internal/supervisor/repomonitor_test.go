@@ -1602,3 +1602,261 @@ func TestInspectSingleGitDirectory_IgnoreSubmodulesWhenGitmodulesPresent(t *test
 		t.Fatalf("expected 1 untracked file (.gitmodules), got %d", res.UntrackedFilesCount)
 	}
 }
+
+func TestGitUpdateInterval_ClampAndParse(t *testing.T) {
+	if got := ParseGitUpdateInterval(""); got != 30*time.Minute {
+		t.Fatalf("expected default 30m for empty interval, got %v", got)
+	}
+	if got := ParseGitUpdateInterval("invalid"); got != 30*time.Minute {
+		t.Fatalf("expected default 30m for invalid interval, got %v", got)
+	}
+	if got := ParseGitUpdateInterval("5m"); got != 15*time.Minute {
+		t.Fatalf("expected 5m clamped to 15m, got %v", got)
+	}
+	if got := ParseGitUpdateInterval("25m"); got != 25*time.Minute {
+		t.Fatalf("expected 25m preserved, got %v", got)
+	}
+	if got := ParseGitUpdateInterval("2h"); got != 1*time.Hour {
+		t.Fatalf("expected 2h clamped to 1h, got %v", got)
+	}
+
+	sup := New(time.Now)
+	mon := NewRepoStateMonitor(sup, "test-host", 2*time.Minute, nil, nil, nil, nil)
+	mon.SetGitUpdateInterval(10 * time.Minute)
+	if mon.GitUpdateInterval() != 15*time.Minute {
+		t.Fatalf("expected SetGitUpdateInterval(10m) to clamp to 15m, got %v", mon.GitUpdateInterval())
+	}
+	mon.SetGitUpdateInterval(90 * time.Minute)
+	if mon.GitUpdateInterval() != 1*time.Hour {
+		t.Fatalf("expected SetGitUpdateInterval(90m) to clamp to 1h, got %v", mon.GitUpdateInterval())
+	}
+}
+
+func TestStep0_SanitizeIdleEphemeralArtifacts_AndSkipWhenInProgress(t *testing.T) {
+	tempDir := t.TempDir()
+	initTestGitRepo(t, tempDir)
+	ctx := context.Background()
+
+	// Create ephemeral artifacts while ASE story is DONE
+	if err := os.MkdirAll(filepath.Join(tempDir, ".autopilot"), 0755); err != nil {
+		t.Fatalf("mkdir .autopilot: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, ".autopilot", "ase-state.json"), []byte(`{"story_id":"STORY-TEST-001","status":"DONE","phase":"completed"}`), 0644); err != nil {
+		t.Fatalf("write ase-state.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, ".session_story_id"), []byte("STORY-TEST-001\n"), 0644); err != nil {
+		t.Fatalf("write .session_story_id: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "cov_auth"), []byte("mode: set\n"), 0644); err != nil {
+		t.Fatalf("write cov_auth: %v", err)
+	}
+	diagDir := filepath.Join(tempDir, "TestResults", "Diagnostics")
+	if err := os.MkdirAll(diagDir, 0755); err != nil {
+		t.Fatalf("mkdir diagDir: %v", err)
+	}
+	proofFile := filepath.Join(diagDir, "pr-closeout-proof-pr-42.json")
+	if err := os.WriteFile(proofFile, []byte(`{"ok":true}`), 0644); err != nil {
+		t.Fatalf("write proofFile: %v", err)
+	}
+
+	cleaned, ok := SanitizeIdleEphemeralArtifacts(ctx, tempDir, nil, nil)
+	if !ok {
+		t.Fatalf("expected SanitizeIdleEphemeralArtifacts to succeed when ASE story is DONE")
+	}
+	if len(cleaned) < 3 {
+		t.Fatalf("expected at least 3 cleaned artifacts, got %v", cleaned)
+	}
+	for _, f := range []string{
+		filepath.Join(tempDir, ".session_story_id"),
+		filepath.Join(tempDir, "cov_auth"),
+		proofFile,
+	} {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be removed, stat err=%v", f, err)
+		}
+	}
+
+	// Now mark an active IN_PROGRESS story in .autopilot/ase-state.json: must skip sanitization and git-update
+	if err := os.WriteFile(filepath.Join(tempDir, ".autopilot", "ase-state.json"), []byte(`{"story_id":"STORY-TEST-002","status":"IN_PROGRESS","phase":"implementation"}`), 0644); err != nil {
+		t.Fatalf("write in-progress ase-state.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, ".session_story_id"), []byte("STORY-TEST-002\n"), 0644); err != nil {
+		t.Fatalf("write .session_story_id: %v", err)
+	}
+	if IsWorktreeIdleForGitUpdate(tempDir, nil, nil) {
+		t.Fatalf("expected IsWorktreeIdleForGitUpdate=false when .autopilot/ase-state.json has IN_PROGRESS story")
+	}
+	_, okInProg := SanitizeIdleEphemeralArtifacts(ctx, tempDir, nil, nil)
+	if okInProg {
+		t.Fatalf("expected SanitizeIdleEphemeralArtifacts to skip when IN_PROGRESS story is active")
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, ".session_story_id")); err != nil {
+		t.Fatalf("expected .session_story_id to be preserved while IN_PROGRESS story is active")
+	}
+}
+
+func TestStep1_CleanShellAutopilotGitUpdate_AndAutoResume(t *testing.T) {
+	tempDir := t.TempDir()
+	initTestGitRepo(t, tempDir)
+	ctx := context.Background()
+
+	// Dirty the worktree with an untracked file and an ephemeral .session_story_id
+	dirtyPath := filepath.Join(tempDir, "feature.txt")
+	_ = os.WriteFile(dirtyPath, []byte("uncommitted"), 0644)
+	_ = os.WriteFile(filepath.Join(tempDir, ".session_story_id"), []byte("STORY-DONE-1\n"), 0644)
+
+	var shellCalls int
+	var agyCalls int
+	var resumedRepos []string
+	var reportedStatuses []controlplane.RepoRuntimeStatus
+
+	sup := New(time.Now)
+	mon := NewRepoStateMonitor(
+		sup,
+		"host-1",
+		2*time.Minute,
+		func() ([]RepoConfigItem, error) {
+			return []RepoConfigItem{{Path: tempDir, Alias: "meta-repo-02"}}, nil
+		},
+		func(ctx context.Context, hostID string, statuses []controlplane.RepoRuntimeStatus) error {
+			reportedStatuses = append(reportedStatuses, statuses...)
+			return nil
+		},
+		nil,
+		nil,
+	)
+
+	mon.ConfigureGitUpdate(
+		20*time.Minute,
+		func(ctx context.Context, repoPath string) (string, error) {
+			shellCalls++
+			// Simulate "autopilot git-update" cleaning the worktree
+			_ = os.Remove(dirtyPath)
+			return "autopilot git-update: fast-forwarded main", nil
+		},
+		func(ctx context.Context, repoPath, prompt, diagnosticOutput string) (string, error) {
+			agyCalls++
+			return "", nil
+		},
+		func(ctx context.Context, hostID, repoPath string) error {
+			resumedRepos = append(resumedRepos, repoPath)
+			return nil
+		},
+	)
+
+	results := mon.RunGitUpdateCycle(ctx)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result from RunGitUpdateCycle, got %d", len(results))
+	}
+	res := results[0]
+	if !res.Stage1Executed || !res.Stage1Success {
+		t.Fatalf("expected Stage 1 shell git-update to execute and succeed, got %+v", res)
+	}
+	if res.Stage2Escalated || agyCalls != 0 {
+		t.Fatalf("expected Stage 2 agy escalation NOT to run when Stage 1 succeeded, agyCalls=%d", agyCalls)
+	}
+	if shellCalls != 1 {
+		t.Fatalf("expected 1 shell git-update call, got %d", shellCalls)
+	}
+	if !res.QueueResumed || len(resumedRepos) != 1 || resumedRepos[0] != filepath.Clean(tempDir) {
+		t.Fatalf("expected halted queue to be auto-resumed upon clean Stage 1 completion, got resumed=%v", resumedRepos)
+	}
+	if len(reportedStatuses) == 0 || !reportedStatuses[len(reportedStatuses)-1].IsClean {
+		t.Fatalf("expected clean status reported to control plane, got %+v", reportedStatuses)
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, ".session_story_id")); !os.IsNotExist(err) {
+		t.Fatalf("expected Step 0 to remove .session_story_id")
+	}
+}
+
+func TestStep2_AgyEscalationOnStep1Failure_With60MinFingerprintCooldownAndAutoResume(t *testing.T) {
+	tempDir := t.TempDir()
+	initTestGitRepo(t, tempDir)
+	ctx := context.Background()
+
+	dirtyPath := filepath.Join(tempDir, "conflict.txt")
+	if err := os.WriteFile(dirtyPath, []byte("conflict state v1"), 0644); err != nil {
+		t.Fatalf("write conflict.txt: %v", err)
+	}
+
+	var shellCalls int
+	var agyCalls int
+	var capturedPrompts []string
+	var capturedDiags []string
+	var resumedRepos []string
+	var shouldAgyClean bool
+
+	nowTime := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+
+	sup := New(time.Now)
+	mon := NewRepoStateMonitor(
+		sup,
+		"host-1",
+		2*time.Minute,
+		func() ([]RepoConfigItem, error) {
+			return []RepoConfigItem{{Path: tempDir, Alias: "meta-repo-02"}}, nil
+		},
+		nil,
+		nil,
+		nil,
+	)
+	mon.SetNowFunc(func() time.Time { return nowTime })
+
+	mon.ConfigureGitUpdate(
+		30*time.Minute,
+		func(ctx context.Context, repoPath string) (string, error) {
+			shellCalls++
+			return "error: cannot pull with rebase: You have unstaged changes.", errors.New("exit status 1")
+		},
+		func(ctx context.Context, repoPath, prompt, diagnosticOutput string) (string, error) {
+			agyCalls++
+			capturedPrompts = append(capturedPrompts, prompt)
+			capturedDiags = append(capturedDiags, diagnosticOutput)
+			if shouldAgyClean {
+				_ = os.Remove(dirtyPath)
+				return "agy remediated dirty worktree", nil
+			}
+			return "agy failed due to upstream outage", errors.New("exit status 1")
+		},
+		func(ctx context.Context, hostID, repoPath string) error {
+			resumedRepos = append(resumedRepos, repoPath)
+			return nil
+		},
+	)
+
+	// Attempt 1 (t=0m): Step 1 fails -> Step 2 escalates to agy with canonical prompt, but agy leaves repo dirty
+	res1 := mon.UpdateAndRemediateWorktree(ctx, RepoConfigItem{Path: tempDir, Alias: "meta-repo-02"})
+	if !res1.Stage1Executed || res1.Stage1Success {
+		t.Fatalf("expected Stage 1 to fail on attempt 1, got %+v", res1)
+	}
+	if !res1.Stage2Escalated || agyCalls != 1 {
+		t.Fatalf("expected Stage 2 agy escalation on attempt 1, agyCalls=%d", agyCalls)
+	}
+	if capturedPrompts[0] != `execute shell prompt "autopilot git-update"` {
+		t.Fatalf("expected canonical agy prompt, got %q", capturedPrompts[0])
+	}
+	if !strings.Contains(capturedDiags[0], "cannot pull with rebase") {
+		t.Fatalf("expected Step 1 failure diagnostic passed to agy, got %q", capturedDiags[0])
+	}
+
+	// Attempt 2 (t=20m, same dirty fingerprint): circuit-breaker cooldown must block duplicate agy escalation
+	nowTime = nowTime.Add(20 * time.Minute)
+	res2 := mon.UpdateAndRemediateWorktree(ctx, RepoConfigItem{Path: tempDir, Alias: "meta-repo-02"})
+	if !res2.Stage2CooldownSkipped || res2.Stage2Escalated || agyCalls != 1 {
+		t.Fatalf("expected 60m circuit-breaker cooldown to skip Stage 2 for identical fingerprint at t=20m, got %+v (agyCalls=%d)", res2, agyCalls)
+	}
+
+	// Attempt 3 (t=61m, after 60m cooldown expires): agy escalation is permitted again and cleans the worktree
+	nowTime = nowTime.Add(41 * time.Minute)
+	shouldAgyClean = true
+	res3 := mon.UpdateAndRemediateWorktree(ctx, RepoConfigItem{Path: tempDir, Alias: "meta-repo-02"})
+	if !res3.Stage2Escalated || !res3.Stage2Success || agyCalls != 2 {
+		t.Fatalf("expected Stage 2 agy escalation to run and succeed after 60m cooldown, got %+v (agyCalls=%d)", res3, agyCalls)
+	}
+	if !res3.QueueResumed || len(resumedRepos) != 1 {
+		t.Fatalf("expected queue to auto-resume after Stage 2 clean completion, got resumed=%v", resumedRepos)
+	}
+	if !res3.FinalState.IsClean {
+		t.Fatalf("expected FinalState.IsClean=true after Stage 2 remediation")
+	}
+}

@@ -4761,5 +4761,73 @@ func TestStory0193_IsLoopbackTelemetryURLIsolation(t *testing.T) {
 	}
 }
 
+func TestStory0195_ResolveGitUpdateIntervalAndStep0ProbeCleanup(t *testing.T) {
+	var stderr bytes.Buffer
+	envMap := map[string]string{}
+	getenv := func(k string) string { return envMap[k] }
+
+	// Default 30m
+	if d := resolveGitUpdateInterval([]string{"run"}, getenv, &stderr); d != 30*time.Minute {
+		t.Fatalf("expected default 30m, got %v", d)
+	}
+
+	// Env var IAZIO_GIT_UPDATE_INTERVAL clamped below 15m -> 15m
+	envMap["IAZIO_GIT_UPDATE_INTERVAL"] = "5m"
+	if d := resolveGitUpdateInterval([]string{"run"}, getenv, &stderr); d != 15*time.Minute {
+		t.Fatalf("expected 5m clamped to 15m, got %v", d)
+	}
+
+	// CLI flag --git-update-interval overrides env var
+	if d := resolveGitUpdateInterval([]string{"run", "--git-update-interval", "45m"}, getenv, &stderr); d != 45*time.Minute {
+		t.Fatalf("expected 45m from CLI flag, got %v", d)
+	}
+
+	// CLI flag --git-update-interval= clamped above 1h -> 1h
+	if d := resolveGitUpdateInterval([]string{"run", "--git-update-interval=90m"}, getenv, &stderr); d != 1*time.Hour {
+		t.Fatalf("expected 90m clamped to 1h, got %v", d)
+	}
+
+	// Step 0 ephemeral artifact sanitization in probeRepoRuntime when idle/DONE
+	repoDir := t.TempDir()
+	runGit := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", repoDir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Test",
+			"GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=Test",
+			"GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+		}
+	}
+	runGit("init", "-b", "main")
+	_ = os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("ok\n"), 0644)
+	runGit("add", "README.md")
+	runGit("commit", "-m", "init")
+
+	_ = os.MkdirAll(filepath.Join(repoDir, ".autopilot"), 0755)
+	_ = os.WriteFile(filepath.Join(repoDir, ".autopilot", "ase-state.json"), []byte(`{"story_id":"STORY-IAZIO-0195","status":"DONE","phase":"completed"}`), 0644)
+	_ = os.WriteFile(filepath.Join(repoDir, ".session_story_id"), []byte("STORY-IAZIO-0195\n"), 0644)
+	_ = os.WriteFile(filepath.Join(repoDir, "cov_auth"), []byte("mode: set\n"), 0644)
+	_ = os.MkdirAll(filepath.Join(repoDir, "TestResults", "Diagnostics"), 0755)
+	proofPath := filepath.Join(repoDir, "TestResults", "Diagnostics", "pr-closeout-proof-1.json")
+	_ = os.WriteFile(proofPath, []byte(`{}`), 0644)
+
+	st := probeRepoRuntime(context.Background(), repoDir, "meta-repo-02")
+	if !st.IsClean {
+		t.Fatalf("expected probeRepoRuntime to sanitize ephemeral artifacts and report IsClean=true, got %+v", st)
+	}
+	for _, p := range []string{
+		filepath.Join(repoDir, ".session_story_id"),
+		filepath.Join(repoDir, "cov_auth"),
+		proofPath,
+	} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("expected ephemeral artifact %s to be cleaned, stat err=%v", p, err)
+		}
+	}
+}
+
 
 

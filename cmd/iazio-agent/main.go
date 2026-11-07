@@ -373,6 +373,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		if raw := getenv("IAZIO_AGENT_UPDATE_SUITE"); raw != "" {
 			updateSuite = raw == "1" || strings.ToLower(raw) == "true"
 		}
+		gitUpdateInterval := resolveGitUpdateInterval(args, getenv, stderr)
 
 		for i := 1; i < len(args); i++ {
 			switch {
@@ -400,6 +401,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				} else if val == "0" || strings.ToLower(val) == "disabled" {
 					updateInterval = 0
 				}
+			case args[i] == "--git-update-interval" && i+1 < len(args):
+				i++
+			case strings.HasPrefix(args[i], "--git-update-interval="):
+				// parsed via resolveGitUpdateInterval
 			case args[i] == "--update-suite":
 				updateSuite = true
 			case args[i] == "--log-file" && i+1 < len(args):
@@ -640,6 +645,23 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					if eagerUpdater != nil && !updatingTools.Load() {
 						eagerUpdater.TriggerEvaluation("periodic_fleet_clean")
 					}
+				},
+			)
+			shellGitUpdateFn := supervisor.DefaultShellGitUpdate
+			agyEscalationFn := supervisor.DefaultAgyEscalation
+			if isTestBinary() {
+				shellGitUpdateFn = func(context.Context, string) (string, error) { return "", nil }
+				agyEscalationFn = func(context.Context, string, string, string) (string, error) { return "", nil }
+			}
+			repoMonitor.ConfigureGitUpdate(
+				gitUpdateInterval,
+				shellGitUpdateFn,
+				agyEscalationFn,
+				func(c context.Context, h, repoPath string) error {
+					if api == "" {
+						return nil
+					}
+					return client.ResumeRepo(c, h, repoPath)
 				},
 			)
 
@@ -1585,6 +1607,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			wd.StartWatchguard(runCtx, 5*time.Second)
 			defer func() {
 				cancel()
+				repoMonitor.Wait()
 				wd.WaitWatchguard()
 			}()
 
@@ -3063,7 +3086,7 @@ func isASEFlowCompletedAndLastJobSucceeded(repoPath string, st controlplane.Repo
 			Phase  string `json:"phase"`
 		}
 		if json.Unmarshal(b, &as) == nil {
-			if strings.EqualFold(as.Status, "RUNNING") || strings.EqualFold(as.Status, "FAILED") {
+			if strings.EqualFold(as.Status, "RUNNING") || strings.EqualFold(as.Status, "IN_PROGRESS") || strings.EqualFold(as.Status, "FAILED") {
 				return false
 			}
 			if strings.EqualFold(as.Status, "DONE") || strings.EqualFold(as.Phase, "completed") {
@@ -3119,6 +3142,37 @@ func cleanOrRestoreFallbackSessionStoryFile(repoPath, sessionFile string) {
 	_ = os.Remove(sessionFile)
 }
 
+func resolveGitUpdateInterval(args []string, getenv func(string) string, stderr io.Writer) time.Duration {
+	raw := ""
+	if getenv != nil {
+		raw = strings.TrimSpace(getenv("IAZIO_GIT_UPDATE_INTERVAL"))
+	}
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--git-update-interval" && i+1 < len(args):
+			i++
+			raw = strings.TrimSpace(args[i])
+		case strings.HasPrefix(args[i], "--git-update-interval="):
+			raw = strings.TrimSpace(strings.TrimPrefix(args[i], "--git-update-interval="))
+		}
+	}
+	if raw == "" {
+		return supervisor.DefaultGitUpdateInterval
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "[RepoMonitor] WARN: invalid git-update interval %q; defaulting to %v\n", raw, supervisor.DefaultGitUpdateInterval)
+		}
+		return supervisor.DefaultGitUpdateInterval
+	}
+	clamped := supervisor.ClampGitUpdateInterval(d)
+	if clamped != d && stderr != nil {
+		fmt.Fprintf(stderr, "[RepoMonitor] WARN: git-update interval %v outside permitted range [15m..1h]; clamping to %v\n", d, clamped)
+	}
+	return clamped
+}
+
 func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.RepoRuntimeStatus {
 	st := controlplane.RepoRuntimeStatus{
 		RepoPath:      repoPath,
@@ -3126,6 +3180,9 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 		IsClean:       true,
 		LastCheckedAt: time.Now(),
 	}
+
+	// Step 0: Before preflight/runtime status probing halts a worktree, sanitize idle ephemeral artifacts.
+	_, _ = supervisor.SanitizeIdleEphemeralArtifacts(ctx, repoPath, nil, watchdog.IsProcessAlive)
 
 	// Delegate repo evaluation and Tier 1/Tier 2 self-remediation to iazio-harness (SSOT Intelligence Engine).
 	harnessSucceeded := false
@@ -3173,6 +3230,15 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 				} else if strings.HasPrefix(l, "# branch.oid ") {
 					st.HeadSHA = strings.TrimPrefix(l, "# branch.oid ")
 				} else if !strings.HasPrefix(l, "# ") {
+					if strings.HasPrefix(l, "? ") {
+						untrackedPath := strings.TrimSpace(strings.TrimPrefix(l, "? "))
+						slash := strings.TrimPrefix(strings.ReplaceAll(untrackedPath, "\\", "/"), "./")
+						if slash == ".iazio" || strings.HasPrefix(slash, ".iazio/") ||
+							slash == ".autopilot" || strings.HasPrefix(slash, ".autopilot/") ||
+							supervisor.IsEphemeralArtifactPath(slash) {
+							continue
+						}
+					}
 					porcelainLines = append(porcelainLines, l)
 				}
 			}
