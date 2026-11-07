@@ -513,6 +513,7 @@ type Dispatcher struct {
 	hostGate              HostExecutionGate
 	eagerReadinessGate    func(ctx context.Context) (bool, string)
 	idleWorktreesProvider func() []string
+	worktreeBusyDetector  func(worktreePath string) bool
 	repoMap               map[string]string
 	workspace             string
 	jobTimeout            time.Duration
@@ -656,6 +657,43 @@ func isRepoLockHeldByOther(cleanWT, jobID string) bool {
 		(info.ToolPID > 0 && watchdog.IsProcessAlive(info.ToolPID))
 }
 
+func hasActiveWorkspaceSentinel(cleanWT, jobID string) bool {
+	sentinels := []string{
+		filepath.Join(cleanWT, ".autopilot", "active_job.json"),
+		filepath.Join(cleanWT, ".autopilot", "job.lock"),
+		filepath.Join(cleanWT, ".autopilot", "lock"),
+		filepath.Join(cleanWT, ".harness.lock"),
+		filepath.Join(cleanWT, "tmp", "harness.lock"),
+	}
+	for _, sPath := range sentinels {
+		fi, err := os.Stat(sPath)
+		if err != nil {
+			continue
+		}
+		if b, rErr := os.ReadFile(sPath); rErr == nil {
+			var parsed struct {
+				JobID string `json:"job_id"`
+				PID   int    `json:"pid"`
+			}
+			if json.Unmarshal(b, &parsed) == nil {
+				if parsed.JobID != "" && parsed.JobID == jobID {
+					continue
+				}
+				if parsed.PID > 0 {
+					if watchdog.IsProcessAlive(parsed.PID) {
+						return true
+					}
+					continue
+				}
+			}
+		}
+		if time.Since(fi.ModTime()) < 15*time.Minute {
+			return true
+		}
+	}
+	return false
+}
+
 func isWorktreeLockedByOther(wt, jobID string) bool {
 	cleanWT := normalizeWorktreeKey(wt)
 	if cleanWT == "" {
@@ -664,7 +702,13 @@ func isWorktreeLockedByOther(wt, jobID string) bool {
 	if _, err := os.Stat(filepath.Join(cleanWT, ".git", "index.lock")); err == nil {
 		return true
 	}
-	return isDotLockHeldByOther(cleanWT, jobID) || isRepoLockHeldByOther(cleanWT, jobID)
+	return isDotLockHeldByOther(cleanWT, jobID) || isRepoLockHeldByOther(cleanWT, jobID) || hasActiveWorkspaceSentinel(cleanWT, jobID)
+}
+
+// SetWorktreeBusyDetector registers an optional callback that reports whether a worktree
+// has an active external CLI/harness process running inside it.
+func (d *Dispatcher) SetWorktreeBusyDetector(fn func(worktreePath string) bool) {
+	d.worktreeBusyDetector = fn
 }
 
 func (d *Dispatcher) defaultWorktreeCandidates() []string {
@@ -689,6 +733,9 @@ func (d *Dispatcher) isCandidateWorktreeIdle(clean string) bool {
 		return false
 	}
 	if b, err := os.ReadFile(filepath.Join(clean, ".session_story_id")); err == nil && strings.TrimSpace(string(b)) != "" {
+		return false
+	}
+	if d.worktreeBusyDetector != nil && d.worktreeBusyDetector(clean) {
 		return false
 	}
 	return supervisor.InspectWorktreeGitState(clean).IsClean

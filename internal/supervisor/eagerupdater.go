@@ -117,6 +117,7 @@ type EagerToolUpdater struct {
 	lastPartialFailureKey string
 	updating              bool
 	pendingSelfRestart    bool
+	onAgentUpdated        func()
 	pendingRequests       []PendingToolRequest // discrete requests preserved per tool (R4, R5, N5)
 	hasPending            bool
 	requireCleanFleetGit  bool
@@ -225,8 +226,12 @@ func (u *EagerToolUpdater) EvaluateReadiness(ctx context.Context) EagerUpdateRea
 	}
 
 	if u.InspectOutdatedTools != nil {
-		if outdated, err := u.InspectOutdatedTools(ctx); err == nil && len(outdated) > 0 {
-			rep.OutdatedTools = outdated
+		if outdated, err := u.InspectOutdatedTools(ctx); err == nil {
+			if len(outdated) > 0 {
+				rep.OutdatedTools = outdated
+			} else {
+				u.recordSuiteSuccess()
+			}
 		}
 	}
 
@@ -366,24 +371,53 @@ func (u *EagerToolUpdater) RunCheckAndUpdate(ctx context.Context, force bool) (U
 	return res, deferred, err
 }
 
+func (u *EagerToolUpdater) triggerPendingSelfRestartIfIdle(ctx context.Context) {
+	u.mu.Lock()
+	restartPending := u.pendingSelfRestart
+	cb := u.onAgentUpdated
+	u.mu.Unlock()
+	if !restartPending || cb == nil {
+		return
+	}
+	if u.detector != nil {
+		if isExec, _ := u.detector.DetectActiveExecutions(ctx); isExec {
+			return
+		}
+	} else if u.sup != nil && u.sup.HasRunningHarness() {
+		return
+	}
+	cb()
+}
+
 // EnsureUpToDateBeforeClaim evaluates eager update readiness prior to claiming a job.
 // If the host is idle and clean with tool drift detected, it synchronously runs the tool update
 // under the maintenance lease and re-evaluates readiness before allowing a claim.
+// When another worktree on a multi-repo host is actively executing a job (DEFERRED_HARNESS_ACTIVE),
+// another worktree is dirty (DEFERRED_GIT_DIRTY), or a prior update backed off (BACKOFF_AFTER_FAILURE),
+// idle clean worktrees remain eligible to claim jobs so multi-repo hosts do not deadlock.
 func (u *EagerToolUpdater) EnsureUpToDateBeforeClaim(ctx context.Context) (EagerUpdateReadinessReport, bool) {
 	report := u.EvaluateReadiness(ctx)
+	if u.IsRestartPending() || report.EagerUpdateState == StateRestartPending {
+		report.EagerUpdateState = StateRestartPending
+		report.Details = "agent self-update applied; restart pending"
+		u.persistReadiness(ctx, report)
+		u.triggerPendingSelfRestartIfIdle(ctx)
+		return report, false
+	}
+	if u.IsUpdating() || report.EagerUpdateState == StateUpdating {
+		return report, false
+	}
 	switch report.EagerUpdateState {
-	case StateUpToDate:
-		if u.IsRestartPending() {
-			report.EagerUpdateState = StateRestartPending
-			report.Details = "agent self-update applied; restart pending"
-			u.persistReadiness(ctx, report)
-			return report, false
-		}
+	case StateUpToDate, StateDeferredHarnessActive, StateDeferredGitDirty, StateBackoffAfterFailure:
 		return report, true
 	case StateDriftDetected:
 		_, _, _ = u.RunCheckAndUpdate(ctx, false)
 		after := u.EvaluateReadiness(ctx)
-		return after, after.EagerUpdateState == StateUpToDate && !u.IsRestartPending()
+		if u.IsRestartPending() || after.EagerUpdateState == StateRestartPending || after.EagerUpdateState == StateUpdating {
+			u.triggerPendingSelfRestartIfIdle(ctx)
+			return after, false
+		}
+		return after, after.EagerUpdateState != StateDriftDetected
 	default:
 		return report, false
 	}
@@ -401,6 +435,9 @@ func (u *EagerToolUpdater) persistReadiness(ctx context.Context, rep EagerUpdate
 
 // StartHybridTriggerLoop runs the debounced 4-way trigger engine (Gap 5).
 func (u *EagerToolUpdater) StartHybridTriggerLoop(ctx context.Context, onAgentUpdated func()) {
+	u.mu.Lock()
+	u.onAgentUpdated = onAgentUpdated
+	u.mu.Unlock()
 	go func() {
 		debounceTimer := time.NewTimer(500 * time.Millisecond)
 		debounceTimer.Stop()
@@ -425,6 +462,10 @@ func (u *EagerToolUpdater) StartHybridTriggerLoop(ctx context.Context, onAgentUp
 				timerActive = false
 				_ = pendingSource
 				rep := u.EvaluateReadiness(ctx)
+				if rep.EagerUpdateState == StateRestartPending {
+					u.triggerPendingSelfRestartIfIdle(ctx)
+					continue
+				}
 				if rep.EagerUpdateState == StateUpToDate || rep.EagerUpdateState == StateDriftDetected {
 					res, _, err := u.EvaluateAndTriggerWithOpts(ctx, TriggerOptions{
 						BypassDirty: false,
