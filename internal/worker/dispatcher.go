@@ -646,7 +646,7 @@ func isRepoLockHeldByOther(cleanWT, jobID string) bool {
 		return false
 	}
 	status := strings.ToUpper(strings.TrimSpace(info.Status))
-	if status == "COMPLETED" || status == "FAILED" || status == "IDLE" {
+	if status == "COMPLETED" || status == "FAILED" || status == "IDLE" || repolock.IsExpiredMaintenanceLock(info) {
 		return false
 	}
 	if info.JobID != "" && info.JobID == jobID {
@@ -892,10 +892,14 @@ func (d *Dispatcher) checkPreClaimBarrier(ctx context.Context) (ClaimRequest, bo
 		}
 		if len(idle) == 0 {
 			if d.toolUpdater != nil {
-				return ClaimRequest{
-					HostID:   d.hostID,
-					JobTypes: []string{JobTypeToolsUpdate},
-				}, true
+				for _, jt := range d.jobTypes {
+					if jt == JobTypeToolsUpdate {
+						return ClaimRequest{
+							HostID:   d.hostID,
+							JobTypes: []string{JobTypeToolsUpdate},
+						}, true
+					}
+				}
 			}
 			return ClaimRequest{}, false
 		}
@@ -916,23 +920,63 @@ func extractPayloadStringField(payload json.RawMessage, key string) string {
 	return strings.TrimSpace(val)
 }
 
+func isWorktreeBusyForJob(d *Dispatcher, wt, jobID string) bool {
+	trimmed := strings.TrimSpace(wt)
+	if trimmed == "" || trimmed == "." {
+		return false
+	}
+	if d != nil && d.IsWorktreeInFlight(trimmed) {
+		return true
+	}
+	cleanWT := filepath.Clean(trimmed)
+	return isRepoLockHeldByOther(cleanWT, jobID) || hasActiveWorkspaceSentinel(cleanWT, jobID)
+}
+
+func (d *Dispatcher) selectIdleWorktreeFallback(jobID string) string {
+	if d == nil || d.idleWorktreesProvider == nil {
+		return ""
+	}
+	for _, wt := range d.idleWorktreesProvider() {
+		trimmed := strings.TrimSpace(wt)
+		if trimmed != "" && !isWorktreeBusyForJob(d, trimmed, jobID) {
+			return trimmed
+		}
+	}
+	return ""
+}
+
 func (d *Dispatcher) resolveJobWorktree(job *Job) (string, harness.Invoker) {
 	invoker := d.invoker
-	if job != nil && job.Type == JobTypeToolsUpdate {
+	if job == nil || job.Type == JobTypeToolsUpdate {
 		return ".", invoker
+	}
+	if explicitWT := strings.TrimSpace(job.WorktreePath); explicitWT != "" {
+		if !isWorktreeBusyForJob(d, explicitWT, job.ID) {
+			return explicitWT, invoker.WithWorkDir(explicitWT)
+		}
+		if fallbackWT := d.selectIdleWorktreeFallback(job.ID); fallbackWT != "" {
+			return fallbackWT, invoker.WithWorkDir(fallbackWT)
+		}
+		return explicitWT, invoker.WithWorkDir(explicitWT)
 	}
 	var resolvedFromCallback string
 	if d.worktreeResolver != nil {
 		resolvedFromCallback = strings.TrimSpace(d.worktreeResolver(job.Repo))
 	}
-	if explicitWT := strings.TrimSpace(job.WorktreePath); explicitWT != "" {
-		return explicitWT, invoker.WithWorkDir(explicitWT)
-	}
 	if resolvedFromCallback != "" {
+		if !isWorktreeBusyForJob(d, resolvedFromCallback, job.ID) {
+			return resolvedFromCallback, invoker.WithWorkDir(resolvedFromCallback)
+		}
+		if fallbackWT := d.selectIdleWorktreeFallback(job.ID); fallbackWT != "" {
+			return fallbackWT, invoker.WithWorkDir(fallbackWT)
+		}
 		return resolvedFromCallback, invoker.WithWorkDir(resolvedFromCallback)
 	}
 	if payloadWT := extractPayloadStringField(job.Payload, "worktree_path"); payloadWT != "" {
 		return payloadWT, invoker.WithWorkDir(payloadWT)
+	}
+	if fallbackWT := d.selectIdleWorktreeFallback(job.ID); fallbackWT != "" {
+		return fallbackWT, invoker.WithWorkDir(fallbackWT)
 	}
 	return ".", invoker
 }

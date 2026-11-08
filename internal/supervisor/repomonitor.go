@@ -320,7 +320,7 @@ func IsWorktreeIdleForGitUpdate(repoPath string, sup *Sup, isPIDAlive func(int) 
 	}
 	if lockInfo, err := repolock.Read(cleanPath); err == nil {
 		lockStatus := strings.ToUpper(strings.TrimSpace(lockInfo.Status))
-		if lockStatus != "COMPLETED" && lockStatus != "FAILED" && lockStatus != "IDLE" {
+		if lockStatus != "COMPLETED" && lockStatus != "FAILED" && lockStatus != "IDLE" && !repolock.IsExpiredMaintenanceLock(lockInfo) {
 			if (lockInfo.PID > 0 && isPIDAlive(lockInfo.PID)) ||
 				(lockInfo.HarnessPID > 0 && isPIDAlive(lockInfo.HarnessPID)) ||
 				(lockInfo.ToolPID > 0 && isPIDAlive(lockInfo.ToolPID)) {
@@ -511,6 +511,10 @@ func extractPorcelainV2Path(line string) string {
 }
 
 func inspectSingleGitDirectoryWithIdle(ctx context.Context, dir string, canSanitizeEphemeral bool) singleDirGitResult {
+	return inspectSingleGitDirectoryWithOptions(ctx, dir, canSanitizeEphemeral, true)
+}
+
+func inspectSingleGitDirectoryWithOptions(ctx context.Context, dir string, canSanitizeEphemeral bool, computeAheadBehind bool) singleDirGitResult {
 	res := singleDirGitResult{IsClean: true}
 
 	// 1. Sentinel checks for active git operations or locks
@@ -627,7 +631,7 @@ func inspectSingleGitDirectoryWithIdle(ctx context.Context, dir string, canSanit
 		}
 	}
 
-	if !sawBranchAB && (res.Branch == "main" || res.Branch == "master") {
+	if computeAheadBehind && !sawBranchAB && (res.Branch == "main" || res.Branch == "master") {
 		remoteRef := "refs/remotes/origin/" + res.Branch
 		if procutil.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--verify", "--quiet", remoteRef).Run() == nil {
 			if abOut, abErr := procutil.CommandContext(ctx, "git", "-C", dir, "rev-list", "--left-right", "--count", "HEAD..."+remoteRef).Output(); abErr == nil {
@@ -679,35 +683,49 @@ func InspectRepoGitState(ctx context.Context, repoPath, alias string) RepoGitSta
 		st.Error = rootRes.Error
 	}
 
-	// 2. Discover and inspect nested sub-repositories / submodules recursively
+	// 2. Discover and inspect nested sub-repositories / submodules concurrently
 	subRepoRelPaths := DiscoverSubRepositories(repoPath)
-	for _, relPath := range subRepoRelPaths {
-		subFullPath := filepath.Join(repoPath, relPath)
-		subRes := inspectSingleGitDirectoryWithIdle(ctx, subFullPath, idle)
-		subState := SubRepoGitState{
-			SubRepoPath:         subFullPath,
-			RelPath:             relPath,
-			Branch:              subRes.Branch,
-			HeadSHA:             subRes.HeadSHA,
-			IsClean:             subRes.IsClean,
-			DirtyFilesCount:     subRes.DirtyFilesCount,
-			UntrackedFilesCount: subRes.UntrackedFilesCount,
-			Ahead:               subRes.Ahead,
-			Behind:              subRes.Behind,
-			HasActiveGitLock:    subRes.HasActiveGitLock,
-			Error:               subRes.Error,
+	if len(subRepoRelPaths) > 0 {
+		results := make([]SubRepoGitState, len(subRepoRelPaths))
+		sem := make(chan struct{}, 8)
+		var wg sync.WaitGroup
+		for i, relPath := range subRepoRelPaths {
+			wg.Add(1)
+			go func(idx int, rel string) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				subFullPath := filepath.Join(repoPath, rel)
+				subRes := inspectSingleGitDirectoryWithOptions(ctx, subFullPath, idle, false)
+				results[idx] = SubRepoGitState{
+					SubRepoPath:         subFullPath,
+					RelPath:             rel,
+					Branch:              subRes.Branch,
+					HeadSHA:             subRes.HeadSHA,
+					IsClean:             subRes.IsClean,
+					DirtyFilesCount:     subRes.DirtyFilesCount,
+					UntrackedFilesCount: subRes.UntrackedFilesCount,
+					Ahead:               subRes.Ahead,
+					Behind:              subRes.Behind,
+					HasActiveGitLock:    subRes.HasActiveGitLock,
+					Error:               subRes.Error,
+				}
+			}(i, relPath)
 		}
-		st.SubRepos[relPath] = subState
+		wg.Wait()
 
-		if !subState.IsClean {
-			st.SubmodulesClean = false
-			st.DirtySubmodules = append(st.DirtySubmodules, relPath)
-			if subState.HasActiveGitLock {
-				st.HasActiveGitLock = true
+		for _, subState := range results {
+			st.SubRepos[subState.RelPath] = subState
+			if !subState.IsClean {
+				st.SubmodulesClean = false
+				st.DirtySubmodules = append(st.DirtySubmodules, subState.RelPath)
+				if subState.HasActiveGitLock {
+					st.HasActiveGitLock = true
+				}
 			}
+			st.DirtyFilesCount += subState.DirtyFilesCount
+			st.UntrackedFilesCount += subState.UntrackedFilesCount
 		}
-		st.DirtyFilesCount += subState.DirtyFilesCount
-		st.UntrackedFilesCount += subState.UntrackedFilesCount
 	}
 	sort.Strings(st.DirtySubmodules)
 
