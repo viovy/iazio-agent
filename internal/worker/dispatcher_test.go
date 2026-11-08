@@ -2160,6 +2160,59 @@ func TestHTTPControlPlaneClient_DeclineJob_And_DispatcherHelpers(t *testing.T) {
 	_ = os.Remove(sentinelPath)
 }
 
+func TestDispatcher_ToolsUpdateClaimableWhenAllWorktreesDirty_StoryGOV5195(t *testing.T) {
+	ctx := context.Background()
+	cp := newMockControlPlane()
+
+	var claimedReqs []ClaimRequest
+	cp.claimFunc = func(_ context.Context, req ClaimRequest) (*Job, error) {
+		claimedReqs = append(claimedReqs, req)
+		return &Job{
+			ID:           "job_tools_update_gov5195",
+			Type:         JobTypeToolsUpdate,
+			Repo:         "fleet",
+			FencingToken: 99,
+			Payload:      json.RawMessage(`{"tools":["codex"],"force":true}`),
+		}, nil
+	}
+
+	inv := &mockInvoker{}
+	d := NewDispatcher(cp, inv, "docker1")
+	d.SetIdleWorktreesProvider(func() []string {
+		return nil // simulate all git worktrees dirty or busy
+	})
+	// When toolUpdater is configured, checkPreClaimBarrier still claims host-level agent.tools.update jobs
+	// and resolveJobWorktree bypasses git worktree resolution for repo="fleet".
+	d.SetWorktreeResolver(func(repo string) string {
+		return "/nonexistent/locked/worktree"
+	})
+	updatedTools := 0
+	d.SetToolUpdater(func(_ context.Context, tools []string, force bool, targetVersion ...string) error {
+		updatedTools += len(tools)
+		return nil
+	})
+
+	processed, err := d.PollAndProcess(ctx)
+	if err != nil {
+		t.Fatalf("PollAndProcess returned error: %v", err)
+	}
+	if !processed {
+		t.Fatalf("expected PollAndProcess to claim and process agent.tools.update even when idle worktrees is empty")
+	}
+	if len(claimedReqs) != 1 {
+		t.Fatalf("expected 1 ClaimJob request, got %d", len(claimedReqs))
+	}
+	if len(claimedReqs[0].JobTypes) != 1 || claimedReqs[0].JobTypes[0] != JobTypeToolsUpdate {
+		t.Fatalf("expected ClaimRequest.JobTypes=[%s], got %v", JobTypeToolsUpdate, claimedReqs[0].JobTypes)
+	}
+	if updatedTools != 1 {
+		t.Fatalf("expected toolUpdater to run for 1 tool, got %d", updatedTools)
+	}
+	if _, ok := cp.completedJobs["job_tools_update_gov5195"]; !ok {
+		t.Fatalf("expected job_tools_update_gov5195 to be completed, completedJobs=%v", cp.completedJobs)
+	}
+}
+
 func TestStoryGOV5196_ToolsUpdateWhenIdleWorktreesEmpty_AndExpiredMaintenanceLocks(t *testing.T) {
 	ctx := context.Background()
 	cp := newMockControlPlane()
