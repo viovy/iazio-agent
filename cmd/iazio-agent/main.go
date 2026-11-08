@@ -78,6 +78,13 @@ func setActiveElasticSink(s *elasticlog.Sink) {
 	shutdownHooksMu.Unlock()
 }
 
+func getActiveElasticSink() *elasticlog.Sink {
+	shutdownHooksMu.Lock()
+	s := activeElasticSink
+	shutdownHooksMu.Unlock()
+	return s
+}
+
 func flushTelemetryAndCloseSink() {
 	shutdownHooksMu.Lock()
 	flusher := globalTracerFlusher
@@ -3052,8 +3059,11 @@ func applyHarnessFleetStatusPayload(res harnessFleetStatusPayload, repoPath stri
 	}
 	st.ActiveTool = res.AgentTool
 	st.ToolLiveness = res.ToolLiveness
+	if st.ToolLiveness == "" {
+		st.ToolLiveness = "NONE"
+	}
 	st.ExecutionProvenance = res.ExecutionProvenance
-	if (st.ASEState == "IDLE" || st.ASEState == "FAILED_DIRTY") && st.ExecutionProvenance == "INDEPENDENT_USER_SESSION" {
+	if st.ExecutionProvenance == "" || ((st.ASEState == "IDLE" || st.ASEState == "FAILED_DIRTY") && st.ExecutionProvenance == "INDEPENDENT_USER_SESSION") {
 		st.ExecutionProvenance = "NONE"
 	}
 	st.ActiveConversationID = res.ActiveConversationID
@@ -3228,10 +3238,13 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 	// Delegate repo evaluation and Tier 1/Tier 2 self-remediation to iazio-harness (SSOT Intelligence Engine).
 	harnessSucceeded := false
 	harnessBin := resolveHarnessBinaryPath()
-	harnessCmd := procutil.CommandContext(ctx, harnessBin, "fleet-status", "--repo", repoPath, "--auto-remediate", "--json")
-	if out, err := harnessCmd.Output(); err == nil && len(out) > 0 {
+	harnessCtx, cancelHarness := context.WithTimeout(ctx, 45*time.Second)
+	harnessCmd := procutil.CommandContext(harnessCtx, harnessBin, "fleet-status", "--repo", repoPath, "--auto-remediate", "--json")
+	harnessOut, harnessErr := harnessCmd.Output()
+	cancelHarness()
+	if harnessErr == nil && len(harnessOut) > 0 {
 		var res harnessFleetStatusPayload
-		if json.Unmarshal(out, &res) == nil && res.Branch != "" {
+		if json.Unmarshal(harnessOut, &res) == nil && res.Branch != "" {
 			harnessSucceeded = true
 			applyHarnessFleetStatusPayload(res, repoPath, &st)
 
@@ -3239,8 +3252,11 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 			// trigger iazio-harness to execute "autopilot git-update" with autoremediation.
 			hasDirtyTree := !st.IsClean || !st.SubmodulesClean || st.DirtyFilesCount > 0 || st.UntrackedFilesCount > 0 || len(st.DirtySubmodules) > 0
 			if hasDirtyTree && isASEFlowCompletedAndLastJobSucceeded(repoPath, st) {
-				remCmd := procutil.CommandContext(ctx, harnessBin, "repo", "remediate", "--repo", repoPath, "--strategy", "git-update", "--json")
-				if remOut, remErr := remCmd.Output(); remErr == nil && len(remOut) > 0 {
+				remCtx, cancelRem := context.WithTimeout(ctx, 45*time.Second)
+				remCmd := procutil.CommandContext(remCtx, harnessBin, "repo", "remediate", "--repo", repoPath, "--strategy", "git-update", "--json")
+				remOut, remErr := remCmd.Output()
+				cancelRem()
+				if remErr == nil && len(remOut) > 0 {
 					var remRes struct {
 						Success     bool                       `json:"success"`
 						Skipped     bool                       `json:"skipped"`
@@ -3251,6 +3267,14 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 					}
 				}
 			}
+		}
+	} else if harnessErr != nil {
+		if sink := getActiveElasticSink(); sink != nil {
+			sink.Info("probeRepoRuntime fleet-status fallback", map[string]any{
+				"repo_path": repoPath,
+				"alias":     alias,
+				"error":     harnessErr.Error(),
+			})
 		}
 	}
 
@@ -3378,6 +3402,28 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 		}
 		if st.ASEState == "" {
 			st.ASEState = "IDLE"
+		}
+		if st.ExecutionProvenance == "" {
+			st.ExecutionProvenance = "NONE"
+		}
+		if st.ToolLiveness == "" {
+			st.ToolLiveness = "NONE"
+		}
+	}
+
+	if st.ASEState == "RUNNING" && st.ExecutionProvenance == "INDEPENDENT_USER_SESSION" {
+		if sink := getActiveElasticSink(); sink != nil {
+			sink.Info("adhoc ASE session detected on repository", map[string]any{
+				"repo_path":            repoPath,
+				"alias":                alias,
+				"branch":               st.Branch,
+				"ase_state":            st.ASEState,
+				"active_story_id":      st.ActiveStoryID,
+				"active_tool":          st.ActiveTool,
+				"tool_liveness":        st.ToolLiveness,
+				"execution_provenance": st.ExecutionProvenance,
+				"conversation_id":      st.ActiveConversationID,
+			})
 		}
 	}
 
