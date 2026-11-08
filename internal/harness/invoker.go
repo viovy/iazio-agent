@@ -439,6 +439,24 @@ func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []
 	}
 
 	cmd.Env = os.Environ()
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		extraBins := []string{
+			filepath.Join(home, ".local", "bin"),
+			filepath.Join(home, "bin"),
+			filepath.Join(home, ".iazio", "bin"),
+		}
+		curPath := os.Getenv("PATH")
+		for _, eb := range extraBins {
+			if !strings.Contains(curPath, eb) {
+				if curPath == "" {
+					curPath = eb
+				} else {
+					curPath = eb + string(os.PathListSeparator) + curPath
+				}
+			}
+		}
+		cmd.Env = append(cmd.Env, "PATH="+curPath)
+	}
 	if c.WorkDir != "" {
 		fleetRoot := c.WorkDir
 		for {
