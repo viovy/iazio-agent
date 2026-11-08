@@ -1785,6 +1785,19 @@ func TestDispatcher_PreClaimBarrier_EagerReadinessAndIdleWorktrees(t *testing.T)
 		t.Fatalf("expected 0 ClaimJob calls when eagerReadinessGate is false, got %d", claimCalls)
 	}
 
+	// 1b. When toolUpdater is configured and eagerReadinessGate is false (e.g. DRIFT_DETECTED),
+	// checkPreClaimBarrier still claims JobTypeToolsUpdate to prevent deadlock.
+	d.SetToolUpdater(func(context.Context, []string, bool, ...string) error { return nil })
+	processed, err = d.PollAndProcess(ctx)
+	if err != nil || processed {
+		t.Fatalf("expected PollAndProcess to claim only JobTypeToolsUpdate when eagerReadinessGate is false and toolUpdater is set, got processed=%v err=%v", processed, err)
+	}
+	if claimCalls != 1 || len(lastClaimReq.JobTypes) != 1 || lastClaimReq.JobTypes[0] != JobTypeToolsUpdate {
+		t.Fatalf("expected 1 ClaimJob call with [agent.tools.update], got calls=%d req=%+v", claimCalls, lastClaimReq)
+	}
+	d.SetToolUpdater(nil)
+	claimCalls = 0
+
 	// 2. HostGate in GateStateUpdatingTools blocks ClaimJob
 	ready = true
 	realGate := supervisor.NewHostExecutionAndUpdateGate()

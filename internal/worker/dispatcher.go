@@ -876,6 +876,16 @@ func (d *Dispatcher) checkPreClaimBarrier(ctx context.Context) (ClaimRequest, bo
 	}
 	if d.eagerReadinessGate != nil {
 		if ready, _ := d.eagerReadinessGate(ctx); !ready {
+			if d.toolUpdater != nil {
+				for _, jt := range d.jobTypes {
+					if jt == JobTypeToolsUpdate {
+						return ClaimRequest{
+							HostID:   d.hostID,
+							JobTypes: []string{JobTypeToolsUpdate},
+						}, true
+					}
+				}
+			}
 			return ClaimRequest{}, false
 		}
 	}
@@ -1541,6 +1551,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		return true, compErr
 
 	case JobTypeToolsUpdate:
+		start := time.Now()
 		var p struct {
 			Tools         []string `json:"tools"`
 			Force         bool     `json:"force"`
@@ -1552,7 +1563,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				if errors.Is(err, ErrJobDeferred) {
 					compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{
 						FencingToken: job.FencingToken,
-						Result:       json.RawMessage(`{"status":"queued","deferred":true,"message":"tool update queued for execution when harness is idle"}`),
+						Result:       json.RawMessage(`{"status":"queued","deferred":true,"message":"tool update queued for execution when harness is idle","summary":"Tool update queued for execution when harness is idle"}`),
 					})
 					return true, compErr
 				}
@@ -1560,9 +1571,31 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				return true, err
 			}
 		}
+		elapsedSec := int64(time.Since(start).Seconds())
+		if elapsedSec <= 0 {
+			elapsedSec = 1
+		}
+		toolsLabel := "all"
+		if len(p.Tools) > 0 {
+			toolsLabel = strings.Join(p.Tools, ", ")
+		}
+		summary := fmt.Sprintf("Completed agent.tools.update on host %s (tools=%s, force=%v)", d.hostID, toolsLabel, p.Force)
+		resPayload, _ := json.Marshal(map[string]any{
+			"status":          "completed",
+			"updated":         true,
+			"tools":           p.Tools,
+			"force":           p.Force,
+			"target_version":  p.TargetVersion,
+			"host_id":         d.hostID,
+			"agent_pid":       os.Getpid(),
+			"harness_pid":     os.Getpid(),
+			"elapsed_seconds": elapsedSec,
+			"summary":         summary,
+			"output":          summary,
+		})
 		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{
 			FencingToken: job.FencingToken,
-			Result:       json.RawMessage(`{"updated":true}`),
+			Result:       resPayload,
 		})
 		return true, compErr
 

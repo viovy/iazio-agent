@@ -78,6 +78,13 @@ func setActiveElasticSink(s *elasticlog.Sink) {
 	shutdownHooksMu.Unlock()
 }
 
+func getActiveElasticSink() *elasticlog.Sink {
+	shutdownHooksMu.Lock()
+	s := activeElasticSink
+	shutdownHooksMu.Unlock()
+	return s
+}
+
 func flushTelemetryAndCloseSink() {
 	shutdownHooksMu.Lock()
 	flusher := globalTracerFlusher
@@ -1345,7 +1352,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			if api != "" {
 				cpClient := worker.NewHTTPControlPlaneClient(api, authToken, nil, spooler)
 				cpClient.TokenProvider = tokenProvider
-				cliInvoker := harness.NewCLIInvoker("", "")
+				cliInvoker := harness.NewCLIInvoker(resolveHarnessBinaryPath(), "")
 				disp = worker.NewDispatcher(cpClient, cliInvoker, host)
 				disp.SetHostGate(hostGate)
 				wireDispatcherReadinessAndIdleWorktrees(disp, &client, eagerUpdater, getRepos)
@@ -1355,6 +1362,17 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				var pendingSelfRestart atomic.Bool
 				disp.SetPreDispatchHook(buildPreDispatchHook(eagerUpdater, &updatingTools, &pendingSelfRestart))
 				disp.SetPostJobHook(func(ctx context.Context, job *worker.Job) {
+					if job != nil {
+						if sink := getActiveElasticSink(); sink != nil {
+							sink.Info("dispatcher job completed", map[string]any{
+								"host":     host,
+								"job_id":   job.ID,
+								"job_type": job.Type,
+								"repo":     job.Repo,
+								"story_id": job.StoryID,
+							})
+						}
+					}
 					if eagerUpdater != nil {
 						eagerUpdater.TriggerEvaluation("post_job_completion")
 					}
@@ -1380,6 +1398,14 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 					if stdout != nil {
 						fmt.Fprintf(stdout, "[dispatcher] tool update job executing: tools=%v force=%v target_version=%s\n", tools, force, tv)
+					}
+					if sink := getActiveElasticSink(); sink != nil {
+						sink.Info("dispatcher tool update starting", map[string]any{
+							"host":           host,
+							"tools":          tools,
+							"force":          force,
+							"target_version": tv,
+						})
 					}
 					// Dispatched agent.tools.update jobs:
 					// 1. Pass the actual caller force flag (unforced updates do not force-reinstall, N2).
@@ -1513,7 +1539,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return 0, runCtx.Err()
 				}
 				argv := []string{
-					"iazio-harness", "run",
+					resolveHarnessBinaryPath(), "run",
 					"--job-id", job.JobID,
 					"--api-url", job.APIURL,
 					"--worktree-path", job.WorktreePath,

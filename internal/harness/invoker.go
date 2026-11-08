@@ -109,35 +109,48 @@ type CLIInvoker struct {
 	OnConversationAllocated func(convID string)
 }
 
+func resolveDefaultHarnessBinary() string {
+	if env := strings.TrimSpace(os.Getenv("IAZIO_HARNESS_BIN")); env != "" {
+		return env
+	}
+	binName := "iazio-harness"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	home := strings.TrimSpace(os.Getenv("HOME"))
+	if home == "" {
+		if uh, err := os.UserHomeDir(); err == nil {
+			home = strings.TrimSpace(uh)
+		}
+	}
+	if home != "" {
+		var cands []string
+		if runtime.GOOS == "windows" {
+			cands = []string{
+				filepath.Join(home, "bin", binName),
+				filepath.Join(home, ".local", "bin", binName),
+				filepath.Join(home, ".iazio", "bin", binName),
+			}
+		} else {
+			cands = []string{
+				filepath.Join(home, ".local", "bin", binName),
+				filepath.Join(home, "bin", binName),
+				filepath.Join(home, ".iazio", "bin", binName),
+			}
+		}
+		for _, cand := range cands {
+			if _, err := os.Stat(cand); err == nil {
+				return cand
+			}
+		}
+	}
+	return "iazio-harness"
+}
+
 // NewCLIInvoker creates a CLIInvoker with default binary resolution.
 func NewCLIInvoker(binaryPath, workDir string) *CLIInvoker {
 	if binaryPath == "" {
-		if env := os.Getenv("IAZIO_HARNESS_BIN"); env != "" {
-			binaryPath = env
-		} else {
-			binName := "iazio-harness"
-			if runtime.GOOS == "windows" {
-				binName += ".exe"
-			}
-			if home, err := os.UserHomeDir(); err == nil && home != "" {
-				cands := []string{filepath.Join(home, ".local", "bin", binName)}
-				if runtime.GOOS == "windows" {
-					cands = []string{
-						filepath.Join(home, "bin", binName),
-						filepath.Join(home, ".local", "bin", binName),
-					}
-				}
-				for _, cand := range cands {
-					if _, err := os.Stat(cand); err == nil {
-						binaryPath = cand
-						break
-					}
-				}
-			}
-			if binaryPath == "" {
-				binaryPath = "iazio-harness"
-			}
-		}
+		binaryPath = resolveDefaultHarnessBinary()
 	}
 	return &CLIInvoker{
 		HarnessBinary: binaryPath,
@@ -412,7 +425,11 @@ func (w *storyTrackingWriter) scanLine(line string) {
 }
 
 func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []byte) (string, string, error) {
-	cmd := procutil.CommandContext(ctx, c.HarnessBinary, args...)
+	bin := c.HarnessBinary
+	if bin == "" || bin == "iazio-harness" || bin == "iazio-harness.exe" {
+		bin = resolveDefaultHarnessBinary()
+	}
+	cmd := procutil.CommandContext(ctx, bin, args...)
 	setProcGroup(cmd)
 	cmd.Cancel = func() error {
 		return killProcGroup(cmd)
