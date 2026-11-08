@@ -1785,6 +1785,19 @@ func TestDispatcher_PreClaimBarrier_EagerReadinessAndIdleWorktrees(t *testing.T)
 		t.Fatalf("expected 0 ClaimJob calls when eagerReadinessGate is false, got %d", claimCalls)
 	}
 
+	// 1b. When toolUpdater is configured and eagerReadinessGate is false (e.g. DRIFT_DETECTED),
+	// checkPreClaimBarrier still claims JobTypeToolsUpdate to prevent deadlock.
+	d.SetToolUpdater(func(context.Context, []string, bool, ...string) error { return nil })
+	processed, err = d.PollAndProcess(ctx)
+	if err != nil || processed {
+		t.Fatalf("expected PollAndProcess to claim only JobTypeToolsUpdate when eagerReadinessGate is false and toolUpdater is set, got processed=%v err=%v", processed, err)
+	}
+	if claimCalls != 1 || len(lastClaimReq.JobTypes) != 1 || lastClaimReq.JobTypes[0] != JobTypeToolsUpdate {
+		t.Fatalf("expected 1 ClaimJob call with [agent.tools.update], got calls=%d req=%+v", claimCalls, lastClaimReq)
+	}
+	d.SetToolUpdater(nil)
+	claimCalls = 0
+
 	// 2. HostGate in GateStateUpdatingTools blocks ClaimJob
 	ready = true
 	realGate := supervisor.NewHostExecutionAndUpdateGate()
@@ -2284,6 +2297,93 @@ func jsonNumber(n int) string {
 	return string(b)
 }
 
+func TestStoryGOV5196_Integration_DriftToolsUpdateClaim_AckBeforePreDispatchHook_And_RichToolUpdateResult(t *testing.T) {
+	ctx := context.Background()
+	cp := newMockControlPlane()
+	inv := &mockInvoker{}
+	d := NewDispatcher(cp, inv, "debian")
+
+	// Part 1: When eagerReadinessGate returns (false, "DRIFT_DETECTED"), PollAndProcess still claims
+	// JobTypeToolsUpdate, executes toolUpdater, and completes with rich telemetry (summary, output, agent_pid, elapsed_seconds).
+	d.SetEagerReadinessGate(func(context.Context) (bool, string) {
+		return false, "DRIFT_DETECTED"
+	})
+	var updatedTools []string
+	d.SetToolUpdater(func(_ context.Context, tools []string, force bool, targetVersion ...string) error {
+		updatedTools = append(updatedTools, tools...)
+		return nil
+	})
+	cp.claimFunc = func(_ context.Context, req ClaimRequest) (*Job, error) {
+		if len(req.JobTypes) != 1 || req.JobTypes[0] != JobTypeToolsUpdate {
+			t.Fatalf("expected ClaimRequest.JobTypes=[%s] during DRIFT_DETECTED, got %v", JobTypeToolsUpdate, req.JobTypes)
+		}
+		return &Job{
+			ID:           "job_9224339206904244",
+			Type:         JobTypeToolsUpdate,
+			Repo:         "fleet",
+			LeaseToken:   "lease-9224",
+			FencingToken: 7,
+			Payload:      json.RawMessage(`{"tools":["iazio-agent","iazio-harness"],"force":true}`),
+		}, nil
+	}
+
+	processed, err := d.PollAndProcess(ctx)
+	if err != nil || !processed {
+		t.Fatalf("expected PollAndProcess to succeed for job_9224339206904244 during DRIFT_DETECTED, got processed=%v err=%v", processed, err)
+	}
+	if len(updatedTools) != 2 || updatedTools[0] != "iazio-agent" || updatedTools[1] != "iazio-harness" {
+		t.Fatalf("expected updatedTools=[iazio-agent iazio-harness], got %v", updatedTools)
+	}
+	compReq, ok := cp.completedJobs["job_9224339206904244"]
+	if !ok {
+		t.Fatal("expected job_9224339206904244 in completedJobs")
+	}
+	var resMap map[string]any
+	if err := json.Unmarshal(compReq.Result, &resMap); err != nil {
+		t.Fatalf("failed to unmarshal tool update result: %v", err)
+	}
+	if resMap["status"] != "completed" || resMap["updated"] != true || resMap["host_id"] != "debian" {
+		t.Fatalf("expected status=completed updated=true host_id=debian, got %+v", resMap)
+	}
+	if summary, _ := resMap["summary"].(string); !strings.Contains(summary, "Completed agent.tools.update on host debian") {
+		t.Fatalf("expected non-empty summary in tool update result, got %q", summary)
+	}
+	if pid, _ := resMap["agent_pid"].(float64); int(pid) <= 0 {
+		t.Fatalf("expected positive agent_pid in tool update result, got %v", resMap["agent_pid"])
+	}
+
+	// Part 2: Verify AckLease is invoked BEFORE preDispatchHook runs so slow pre-dispatch checks or workspace prep
+	// never cause 20s LEASE_ACK_TIMEOUT_REQUEUED on the control plane.
+	d.SetEagerReadinessGate(func(context.Context) (bool, string) {
+		return true, "UP_TO_DATE"
+	})
+	var eventOrder []string
+	cp.ackLeaseFunc = func(_ context.Context, jobID, leaseToken string, agentPID int, activeConvID string) error {
+		eventOrder = append(eventOrder, "ack_lease:"+jobID)
+		return nil
+	}
+	d.SetPreDispatchHook(func(_ context.Context, job *Job) error {
+		eventOrder = append(eventOrder, "pre_dispatch_hook:"+job.ID)
+		return nil
+	})
+	cp.claimFunc = func(_ context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:           "job_ack_before_prep",
+			Type:         JobTypePromptExecute,
+			Repo:         ".",
+			LeaseToken:   "lease-ack-order",
+			FencingToken: 8,
+			Payload:      json.RawMessage(`{"prompt":"verify order"}`),
+		}, nil
+	}
+	processed2, err2 := d.PollAndProcess(ctx)
+	if err2 != nil || !processed2 {
+		t.Fatalf("expected PollAndProcess for job_ack_before_prep to succeed, got processed=%v err=%v", processed2, err2)
+	}
+	if len(eventOrder) < 2 || eventOrder[0] != "ack_lease:job_ack_before_prep" || eventOrder[1] != "pre_dispatch_hook:job_ack_before_prep" {
+		t.Fatalf("expected AckLease to fire before preDispatchHook, got order=%v", eventOrder)
+	}
+}
 
 
 

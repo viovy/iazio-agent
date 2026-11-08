@@ -876,6 +876,16 @@ func (d *Dispatcher) checkPreClaimBarrier(ctx context.Context) (ClaimRequest, bo
 	}
 	if d.eagerReadinessGate != nil {
 		if ready, _ := d.eagerReadinessGate(ctx); !ready {
+			if d.toolUpdater != nil {
+				for _, jt := range d.jobTypes {
+					if jt == JobTypeToolsUpdate {
+						return ClaimRequest{
+							HostID:   d.hostID,
+							JobTypes: []string{JobTypeToolsUpdate},
+						}, true
+					}
+				}
+			}
 			return ClaimRequest{}, false
 		}
 	}
@@ -1126,6 +1136,53 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 	d.setActiveJob(job.ID, worktreeDir, os.Getpid())
 	defer d.clearActiveJob(job.ID)
 
+	// Phase 2 of Two-Phase Lease Handshake: Acknowledge lease immediately after local worktree reservation
+	// (before potentially long-running 52-submodule workspace sanitization or preDispatchHook) so the 20s
+	// LeaseAckDeadlineAt never expires during workspace preparation.
+	if job.LeaseToken != "" {
+		var ackErr error
+		if wtAcker, ok := d.client.(interface {
+			AckLeaseWithWorktree(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID, worktreePath string) error
+		}); ok {
+			ackErr = wtAcker.AckLeaseWithWorktree(ctx, job.ID, job.LeaseToken, os.Getpid(), resolvedConvID, worktreeDir)
+		} else {
+			ackErr = d.client.AckLease(ctx, job.ID, job.LeaseToken, os.Getpid(), resolvedConvID)
+		}
+		if ackErr != nil {
+			fmt.Fprintf(os.Stderr, "[dispatcher] ack lease warning for job %s: %v\n", job.ID, ackErr)
+		}
+	}
+
+	var allocatedStoryMu sync.Mutex
+	currentStoryID := initialStoryID
+	currentConvID := resolvedConvID
+
+	hbCtx, hbCancel := context.WithCancel(ctx)
+	defer hbCancel()
+	if job.FencingToken > 0 || job.LeaseToken != "" {
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-hbCtx.Done():
+					return
+				case <-ticker.C:
+					allocatedStoryMu.Lock()
+					sid := currentStoryID
+					cid := currentConvID
+					allocatedStoryMu.Unlock()
+					if err := d.client.HeartbeatJob(hbCtx, job.ID, job.LeaseToken, job.FencingToken, sid, worktreeDir, cid); err != nil {
+						// Upstream control-plane errors (including 409 LEASE_FENCED after a control-plane redeploy/restart,
+						// 5xx, or transient network blips) must NEVER kill an active local agy/iazio-harness execution
+						// (job_38eeeb536a5a7130 root cause). Re-ack the lease to re-synchronize with the control plane.
+						_ = d.client.AckLease(hbCtx, job.ID, job.LeaseToken, os.Getpid(), cid)
+					}
+				}
+			}
+		}()
+	}
+
 	isResumeJob := job.ParentJobID != "" || resolvedConvID != "" || job.Attempts > 1 || job.InfraRequeueCount > 0 || job.Type == "resume" || strings.Contains(string(job.Payload), `"kind":"resume"`) || strings.Contains(string(job.Payload), `"Kind":"resume"`) || strings.Contains(string(job.Payload), `"parent_job_id"`) || strings.Contains(string(job.Payload), `"resume_conversation_id"`)
 
 	// Pre-job workspace sanitization: non-destructive lock clearing, interrupted git ops recovery, dirty patch archiving, and line ending hygiene
@@ -1165,21 +1222,6 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		}
 	}
 
-	// Phase 2 of Two-Phase Lease Handshake: Acknowledge lease to transition from LEASED to RUNNING
-	if job.LeaseToken != "" {
-		var ackErr error
-		if wtAcker, ok := d.client.(interface {
-			AckLeaseWithWorktree(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID, worktreePath string) error
-		}); ok {
-			ackErr = wtAcker.AckLeaseWithWorktree(ctx, job.ID, job.LeaseToken, os.Getpid(), resolvedConvID, worktreeDir)
-		} else {
-			ackErr = d.client.AckLease(ctx, job.ID, job.LeaseToken, os.Getpid(), resolvedConvID)
-		}
-		if ackErr != nil {
-			fmt.Fprintf(os.Stderr, "[dispatcher] ack lease warning for job %s: %v\n", job.ID, ackErr)
-		}
-	}
-
 	var execCtx context.Context
 	var execCancel context.CancelFunc
 	if d.jobTimeout > 0 {
@@ -1188,10 +1230,6 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		execCtx, execCancel = context.WithCancel(ctx)
 	}
 	defer execCancel()
-
-	var allocatedStoryMu sync.Mutex
-	currentStoryID := initialStoryID
-	currentConvID := resolvedConvID
 
 	onStoryDiscovered := func(storyID string) {
 		clean := strings.TrimSpace(storyID)
@@ -1245,32 +1283,6 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		WithConversationCallback(func(string)) harness.Invoker
 	}); ok {
 		invoker = convAware.WithConversationCallback(onConversationDiscovered)
-	}
-
-	hbCtx, hbCancel := context.WithCancel(ctx)
-	defer hbCancel()
-	if job.FencingToken > 0 || job.LeaseToken != "" {
-		go func() {
-			ticker := time.NewTicker(10 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-hbCtx.Done():
-					return
-				case <-ticker.C:
-					allocatedStoryMu.Lock()
-					sid := currentStoryID
-					cid := currentConvID
-					allocatedStoryMu.Unlock()
-					if err := d.client.HeartbeatJob(hbCtx, job.ID, job.LeaseToken, job.FencingToken, sid, worktreeDir, cid); err != nil {
-						// Upstream control-plane errors (including 409 LEASE_FENCED after a control-plane redeploy/restart,
-						// 5xx, or transient network blips) must NEVER kill an active local agy/iazio-harness execution
-						// (job_38eeeb536a5a7130 root cause). Re-ack the lease to re-synchronize with the control plane.
-						_ = d.client.AckLease(hbCtx, job.ID, job.LeaseToken, os.Getpid(), cid)
-					}
-				}
-			}
-		}()
 	}
 
 	defer func() {
@@ -1541,6 +1553,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		return true, compErr
 
 	case JobTypeToolsUpdate:
+		start := time.Now()
 		var p struct {
 			Tools         []string `json:"tools"`
 			Force         bool     `json:"force"`
@@ -1552,7 +1565,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				if errors.Is(err, ErrJobDeferred) {
 					compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{
 						FencingToken: job.FencingToken,
-						Result:       json.RawMessage(`{"status":"queued","deferred":true,"message":"tool update queued for execution when harness is idle"}`),
+						Result:       json.RawMessage(`{"status":"queued","deferred":true,"message":"tool update queued for execution when harness is idle","summary":"Tool update queued for execution when harness is idle"}`),
 					})
 					return true, compErr
 				}
@@ -1560,9 +1573,31 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				return true, err
 			}
 		}
+		elapsedSec := int64(time.Since(start).Seconds())
+		if elapsedSec <= 0 {
+			elapsedSec = 1
+		}
+		toolsLabel := "all"
+		if len(p.Tools) > 0 {
+			toolsLabel = strings.Join(p.Tools, ", ")
+		}
+		summary := fmt.Sprintf("Completed agent.tools.update on host %s (tools=%s, force=%v)", d.hostID, toolsLabel, p.Force)
+		resPayload, _ := json.Marshal(map[string]any{
+			"status":          "completed",
+			"updated":         true,
+			"tools":           p.Tools,
+			"force":           p.Force,
+			"target_version":  p.TargetVersion,
+			"host_id":         d.hostID,
+			"agent_pid":       os.Getpid(),
+			"harness_pid":     os.Getpid(),
+			"elapsed_seconds": elapsedSec,
+			"summary":         summary,
+			"output":          summary,
+		})
 		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{
 			FencingToken: job.FencingToken,
-			Result:       json.RawMessage(`{"updated":true}`),
+			Result:       resPayload,
 		})
 		return true, compErr
 
