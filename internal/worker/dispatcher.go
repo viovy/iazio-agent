@@ -891,6 +891,12 @@ func (d *Dispatcher) checkPreClaimBarrier(ctx context.Context) (ClaimRequest, bo
 			}
 		}
 		if len(idle) == 0 {
+			if d.toolUpdater != nil {
+				return ClaimRequest{
+					HostID:   d.hostID,
+					JobTypes: []string{JobTypeToolsUpdate},
+				}, true
+			}
 			return ClaimRequest{}, false
 		}
 		claimReq.IdleWorktrees = idle
@@ -912,6 +918,9 @@ func extractPayloadStringField(payload json.RawMessage, key string) string {
 
 func (d *Dispatcher) resolveJobWorktree(job *Job) (string, harness.Invoker) {
 	invoker := d.invoker
+	if job != nil && job.Type == JobTypeToolsUpdate {
+		return ".", invoker
+	}
 	var resolvedFromCallback string
 	if d.worktreeResolver != nil {
 		resolvedFromCallback = strings.TrimSpace(d.worktreeResolver(job.Repo))
