@@ -357,3 +357,45 @@ func TestManagedTools_IncludesAutopilotBaselinePlugins(t *testing.T) {
 	}
 }
 
+func TestCleanupDevBinaries_RootPrivilegeHandling(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission test")
+	}
+	tmpDir := t.TempDir()
+	readOnlyDir := filepath.Join(tmpDir, "readonly-bin")
+	if err := os.MkdirAll(readOnlyDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binFile := filepath.Join(readOnlyDir, "autopilot-dev")
+	if err := os.WriteFile(binFile, []byte("echo hi"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Make directory read-only (0555) so unlinking file inside it returns permission denied
+	if err := os.Chmod(readOnlyDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.Chmod(readOnlyDir, 0o755)
+	}()
+
+	candidates := []DevBinaryCandidate{
+		{Path: binFile, ToolName: "autopilot", VariantType: "dev_suffix"},
+	}
+
+	report, err := CleanupDevBinaries(context.Background(), candidates, filepath.Join(tmpDir, "canonical"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// On non-root execution, unlinking in 0555 directory should fail with permission denied and be classified into RootRequiredPaths
+	if os.Geteuid() != 0 {
+		if len(report.RootRequiredPaths) != 1 || report.RootRequiredPaths[0] != binFile {
+			t.Fatalf("expected %s in RootRequiredPaths, got: %+v", binFile, report.RootRequiredPaths)
+		}
+		if len(report.FailedPaths) != 1 || !strings.Contains(report.FailedPaths[0], "root privileges required") {
+			t.Fatalf("expected failed path with root privileges required, got: %+v", report.FailedPaths)
+		}
+	}
+}
+
+

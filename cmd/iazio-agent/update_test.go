@@ -2620,3 +2620,17 @@ func TestPerformUpdateWithResult_DynamicControlPlaneBearerHeader(t *testing.T) {
 	}
 }
 
+func TestParseUpdateFlags_PositionalToolNames(t *testing.T) {
+	opts, err := parseUpdateFlags([]string{"--force", "autopilot-ai-conformance", "iazio-harvester"})
+	if err != nil {
+		t.Fatalf("unexpected error parsing flags: %v", err)
+	}
+	if !opts.Force {
+		t.Errorf("expected Force to be true")
+	}
+	if len(opts.TargetTools) != 2 || opts.TargetTools[0] != "autopilot-ai-conformance" || opts.TargetTools[1] != "iazio-harvester" {
+		t.Errorf("expected TargetTools [autopilot-ai-conformance, iazio-harvester], got: %+v", opts.TargetTools)
+	}
+}
+
+

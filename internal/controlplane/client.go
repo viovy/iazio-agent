@@ -187,9 +187,11 @@ func (c Client) HeartbeatDetailed(ctx context.Context, hostID string, tools []To
 		}
 	}
 	if c.DiscoveredDevBinaries != nil {
-		if devBins := c.DiscoveredDevBinaries(); len(devBins) > 0 {
-			body["discovered_dev_binaries"] = devBins
+		devBins := c.DiscoveredDevBinaries()
+		if devBins == nil {
+			devBins = []string{}
 		}
+		body["discovered_dev_binaries"] = devBins
 	}
 	var res HeartbeatResponse
 	if err := c.postJSON(ctx, "/v1/hosts/"+hostID+"/heartbeat", body, &res); err != nil {

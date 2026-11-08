@@ -545,13 +545,17 @@ func parseUpdateFlags(args []string) (UpdateOptions, error) {
 		case strings.HasPrefix(args[i], "--bin-dir="):
 			opts.BinDir = strings.TrimPrefix(args[i], "--bin-dir=")
 		default:
+			if !strings.HasPrefix(args[i], "-") {
+				opts.TargetTools = append(opts.TargetTools, args[i])
+				continue
+			}
 			return opts, fmt.Errorf("unknown update flag %s", args[i])
 		}
 	}
 	return opts, nil
 }
 
-func runCleanupBinaries(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
+func runCleanupBinariesWithReport(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) (*inventory.CleanupReport, error) {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
@@ -583,42 +587,62 @@ func runCleanupBinaries(ctx context.Context, args []string, stdout, stderr io.Wr
 	if dryRun {
 		if jsonOutput {
 			data, _ := json.MarshalIndent(candidates, "", "  ")
-			fmt.Fprintln(stdout, string(data))
-			return nil
+			if stdout != nil {
+				fmt.Fprintln(stdout, string(data))
+			}
+			return nil, nil
 		}
-		fmt.Fprintf(stdout, "Dev binary dry-run scan on %s: %d candidates found\n", runtime.GOOS, len(candidates))
-		for _, c := range candidates {
-			fmt.Fprintf(stdout, "  - %s (%s)\n", c.Path, c.VariantType)
+		if stdout != nil {
+			fmt.Fprintf(stdout, "Dev binary dry-run scan on %s: %d candidates found\n", runtime.GOOS, len(candidates))
+			for _, c := range candidates {
+				fmt.Fprintf(stdout, "  - %s (%s)\n", c.Path, c.VariantType)
+			}
 		}
-		return nil
+		return nil, nil
 	}
 
-	report, err := inventory.CleanupDevBinaries(ctx, candidates, canonicalBinDir)
+	rep, err := inventory.CleanupDevBinaries(ctx, candidates, canonicalBinDir)
+	report := &rep
 	if err != nil {
-		return err
+		return report, err
 	}
 
 	if jsonOutput {
 		data, _ := json.MarshalIndent(report, "", "  ")
-		fmt.Fprintln(stdout, string(data))
-		return nil
+		if stdout != nil {
+			fmt.Fprintln(stdout, string(data))
+		}
+		return report, nil
 	}
 
-	fmt.Fprintf(stdout, "Dev binary cleanup complete on %s:\n", runtime.GOOS)
-	fmt.Fprintf(stdout, "  Deleted: %d\n", len(report.DeletedPaths))
-	for _, p := range report.DeletedPaths {
-		fmt.Fprintf(stdout, "    - %s\n", p)
-	}
-	if len(report.KilledPIDs) > 0 {
-		fmt.Fprintf(stdout, "  Killed PIDs: %v\n", report.KilledPIDs)
-	}
-	if len(report.FailedPaths) > 0 {
-		fmt.Fprintf(stdout, "  Failed: %d\n", len(report.FailedPaths))
-		for _, f := range report.FailedPaths {
-			fmt.Fprintf(stdout, "    - %s\n", f)
+	if stdout != nil {
+		fmt.Fprintf(stdout, "Dev binary cleanup complete on %s:\n", runtime.GOOS)
+		fmt.Fprintf(stdout, "  Deleted: %d\n", len(report.DeletedPaths))
+		for _, p := range report.DeletedPaths {
+			fmt.Fprintf(stdout, "    - %s\n", p)
+		}
+		if len(report.KilledPIDs) > 0 {
+			fmt.Fprintf(stdout, "  Killed PIDs: %v\n", report.KilledPIDs)
+		}
+		if len(report.FailedPaths) > 0 {
+			fmt.Fprintf(stdout, "  Failed: %d\n", len(report.FailedPaths))
+			for _, f := range report.FailedPaths {
+				fmt.Fprintf(stdout, "    - %s\n", f)
+			}
+		}
+		if len(report.RootRequiredPaths) > 0 {
+			fmt.Fprintf(stdout, "  Root required (run with sudo): %d\n", len(report.RootRequiredPaths))
+			for _, r := range report.RootRequiredPaths {
+				fmt.Fprintf(stdout, "    - %s\n", r)
+			}
 		}
 	}
-	return nil
+	return report, nil
+}
+
+func runCleanupBinaries(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {
+	_, err := runCleanupBinariesWithReport(ctx, args, stdout, stderr, getenv)
+	return err
 }
 
 func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer, getenv func(string) string) error {

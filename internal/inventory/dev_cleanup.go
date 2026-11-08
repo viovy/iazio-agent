@@ -31,6 +31,7 @@ type CleanupReport struct {
 	DeletedPaths           []string `json:"deleted_paths"`
 	KilledPIDs             []int    `json:"killed_pids"`
 	FailedPaths            []string `json:"failed_paths"`
+	RootRequiredPaths      []string `json:"root_required_paths,omitempty"`
 	CanonicalPathsVerified []string `json:"canonical_paths_verified"`
 }
 
@@ -424,6 +425,7 @@ func CleanupDevBinaries(ctx context.Context, candidates []DevBinaryCandidate, ca
 		DeletedPaths:           make([]string, 0),
 		KilledPIDs:             make([]int, 0),
 		FailedPaths:            make([]string, 0),
+		RootRequiredPaths:      make([]string, 0),
 		CanonicalPathsVerified: make([]string, 0),
 	}
 
@@ -527,6 +529,13 @@ func CleanupDevBinaries(ctx context.Context, candidates []DevBinaryCandidate, ca
 					scheduleRebootDelete(tempTrash)
 					err = nil
 				}
+			} else {
+				// POSIX: attempt non-interactive sudo if configured without password
+				sudoCmd := procutil.CommandContext(ctx, "sudo", "-n", "rm", "-f", targetPath)
+				if sudoErr := sudoCmd.Run(); sudoErr == nil {
+					_ = procutil.CommandContext(ctx, "sudo", "-n", "rm", "-f", targetPath+".version").Run()
+					err = nil
+				}
 			}
 		}
 
@@ -535,7 +544,14 @@ func CleanupDevBinaries(ctx context.Context, candidates []DevBinaryCandidate, ca
 			InvalidateVersionCache(targetPath)
 			_ = os.Remove(targetPath + ".version")
 		} else {
-			report.FailedPaths = append(report.FailedPaths, fmt.Sprintf("%s: %v", targetPath, err))
+			isPerm := os.IsPermission(err) || strings.Contains(strings.ToLower(err.Error()), "permission denied")
+			isRootPath := strings.HasPrefix(cleanTarget, "/usr/") || strings.HasPrefix(cleanTarget, "/etc/") || strings.HasPrefix(cleanTarget, "/opt/")
+			if isPerm || isRootPath {
+				report.RootRequiredPaths = append(report.RootRequiredPaths, targetPath)
+				report.FailedPaths = append(report.FailedPaths, fmt.Sprintf("%s: permission denied (root privileges required): %v", targetPath, err))
+			} else {
+				report.FailedPaths = append(report.FailedPaths, fmt.Sprintf("%s: %v", targetPath, err))
+			}
 		}
 	}
 
