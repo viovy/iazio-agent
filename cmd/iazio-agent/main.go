@@ -1122,7 +1122,43 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						}()
 					case "CLEANUP_BINARIES", "CLEANUP_DEV_BINARIES":
 						go func() {
-							_ = runCleanupBinaries(runCtx, nil, stdout, stderr, nil)
+							report, err := runCleanupBinariesWithReport(runCtx, nil, stdout, stderr, nil)
+							if err != nil && stderr != nil {
+								fmt.Fprintf(stderr, "[cleanup] dev binary cleanup error: %v\n", err)
+							}
+							if report != nil && api != "" {
+								var cat, title, msg string
+								if len(report.RootRequiredPaths) > 0 {
+									cat = "warning"
+									title = "Dev Binary Cleanup Requires Root Privileges"
+									msg = fmt.Sprintf("Cleanup encountered %d binaries in root-owned paths. Run on host: sudo rm -f %s",
+										len(report.RootRequiredPaths), strings.Join(report.RootRequiredPaths, " "))
+								} else if len(report.FailedPaths) > 0 {
+									cat = "error"
+									title = "Dev Binary Cleanup Failed"
+									msg = fmt.Sprintf("Failed to remove %d binaries on host %s: %s",
+										len(report.FailedPaths), host, strings.Join(report.FailedPaths, "; "))
+								} else {
+									cat = "success"
+									title = "Dev Binary Cleanup Completed"
+									msg = fmt.Sprintf("Successfully removed %d dev & shadow binaries on host %s.",
+										len(report.DeletedPaths), host)
+								}
+								_ = client.PostNotification(runCtx, controlplane.NotificationRecord{
+									Title:    title,
+									Message:  msg,
+									Category: cat,
+									HostID:   host,
+									Source:   "iazio-agent",
+									Metadata: map[string]any{
+										"deleted_paths":       report.DeletedPaths,
+										"failed_paths":        report.FailedPaths,
+										"root_required_paths": report.RootRequiredPaths,
+										"killed_pids":         report.KilledPIDs,
+									},
+								})
+								_ = client.Heartbeat(runCtx, host, getTools(), false)
+							}
 						}()
 					case "PING":
 						if stdout != nil {
