@@ -4905,6 +4905,56 @@ func TestIsTestBinary_IgnoresTestModeEnvOverride(t *testing.T) {
 	flushTelemetryAndCloseSink()
 }
 
+func TestStoryGOV5196_WireIdleWorktreesAndPruneStaleHarnessActiveJobs(t *testing.T) {
+	wtIdle := t.TempDir()
+	wtSessionBusy := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wtSessionBusy, ".session_story_id"), []byte("STORY-GOV-5196\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summaryIdle := controlplane.RepoSummary{
+		WorktreePath: wtIdle,
+		Lock:         "IDLE",
+	}
+	summaryBusy := controlplane.RepoSummary{
+		WorktreePath: wtSessionBusy,
+		Lock:         "IDLE",
+	}
+	if !isRepoSummaryIdle(summaryIdle) {
+		t.Fatal("expected wtIdle without .session_story_id to be idle")
+	}
+	if isRepoSummaryIdle(summaryBusy) {
+		t.Fatal("expected wtSessionBusy with active .session_story_id to be treated as NOT idle")
+	}
+
+	// Test pruneStaleHarnessActiveJobs removes >2h old entries that do not own repolock
+	activeFile := filepath.Join(t.TempDir(), "harness-active-jobs.json")
+	staleTime := time.Now().Add(-4 * time.Hour)
+	freshTime := time.Now().Add(-5 * time.Minute)
+	inputJobs := []watchdog.TrackedJob{
+		{
+			JobID:        "job-stale-old",
+			WorktreePath: "/work/meta-repo",
+			Status:       watchdog.StatusRunning,
+			UpdatedAt:    staleTime,
+		},
+		{
+			JobID:        "job-fresh-live",
+			WorktreePath: "/work/meta-repo",
+			Status:       watchdog.StatusRunning,
+			UpdatedAt:    freshTime,
+		},
+	}
+	pruned := pruneStaleHarnessActiveJobs(activeFile, inputJobs)
+	if len(pruned) != 1 || pruned[0].JobID != "job-fresh-live" {
+		t.Fatalf("expected stale job to be pruned leaving only job-fresh-live, got %+v", pruned)
+	}
+	if _, err := os.Stat(activeFile); err != nil {
+		t.Fatalf("expected pruned harness-active-jobs.json to be persisted, got %v", err)
+	}
+}
+
+
 
 
 

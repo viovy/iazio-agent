@@ -1261,6 +1261,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						if rawH, errH := os.ReadFile(harnessActivePath); errH == nil {
 							var hJobs []watchdog.TrackedJob
 							if json.Unmarshal(rawH, &hJobs) == nil {
+								hJobs = pruneStaleHarnessActiveJobs(harnessActivePath, hJobs)
 								for _, hj := range hJobs {
 									if hj.JobID == "" || seen[hj.JobID] || hj.Status != watchdog.StatusRunning {
 										continue
@@ -2677,7 +2678,11 @@ func checkRepoLockBusy(worktreePath, jobID string, isAlive func(int) bool) (repo
 		isAlive = watchdog.IsProcessAlive
 	}
 	lockInfo, lockErr := repolock.Read(worktreePath)
-	if lockErr == nil && lockInfo.JobID != "" && lockInfo.JobID != jobID {
+	if lockErr == nil && lockInfo.JobID != "" && lockInfo.JobID != jobID && !repolock.IsExpiredMaintenanceLock(lockInfo) {
+		lockStatus := strings.ToUpper(strings.TrimSpace(lockInfo.Status))
+		if lockStatus == "COMPLETED" || lockStatus == "FAILED" || lockStatus == "IDLE" {
+			return lockInfo, 0, false
+		}
 		checkPID := lockInfo.PID
 		if lockInfo.HarnessPID > 0 {
 			checkPID = lockInfo.HarnessPID
@@ -2956,6 +2961,27 @@ func isStaleOrSyntheticHarnessActiveJob(hj watchdog.TrackedJob) bool {
 	return false
 }
 
+func pruneStaleHarnessActiveJobs(harnessActivePath string, hJobs []watchdog.TrackedJob) []watchdog.TrackedJob {
+	if len(hJobs) == 0 {
+		return hJobs
+	}
+	kept := make([]watchdog.TrackedJob, 0, len(hJobs))
+	changed := false
+	for _, hj := range hJobs {
+		if hj.Status == watchdog.StatusRunning && isStaleOrSyntheticHarnessActiveJob(hj) {
+			changed = true
+			continue
+		}
+		kept = append(kept, hj)
+	}
+	if changed && strings.TrimSpace(harnessActivePath) != "" {
+		if data, err := json.MarshalIndent(kept, "", "  "); err == nil {
+			_ = os.WriteFile(harnessActivePath, data, 0o644)
+		}
+	}
+	return kept
+}
+
 type harnessFleetStatusPayload struct {
 	Branch               string   `json:"branch"`
 	HeadSHA              string   `json:"head_sha"`
@@ -3066,7 +3092,7 @@ func isASEFlowCompletedAndLastJobSucceeded(repoPath string, st controlplane.Repo
 	if _, err := os.Stat(filepath.Join(repoPath, ".ase", "active.lock")); err == nil {
 		return false
 	}
-	if lockInfo, err := repolock.Read(repoPath); err == nil && lockInfo.PID > 0 && watchdog.IsProcessAlive(lockInfo.PID) {
+	if lockInfo, err := repolock.Read(repoPath); err == nil && !repolock.IsExpiredMaintenanceLock(lockInfo) && lockInfo.PID > 0 && watchdog.IsProcessAlive(lockInfo.PID) {
 		return false
 	}
 
@@ -3120,6 +3146,9 @@ func isASEFlowCompletedAndLastJobSucceeded(repoPath string, st controlplane.Repo
 					for i := range jobs {
 						j := jobs[i]
 						if filepath.Clean(j.WorktreePath) != cleanRepo {
+							continue
+						}
+						if isStaleOrSyntheticHarnessActiveJob(j) {
 							continue
 						}
 						if latestJob == nil || j.UpdatedAt.After(latestJob.UpdatedAt) {
@@ -3570,7 +3599,26 @@ func isRepoSummaryIdle(r controlplane.RepoSummary) bool {
 		return false
 	}
 	lock := strings.ToUpper(strings.TrimSpace(r.Lock))
-	return lock == "" || lock == "IDLE"
+	if lock != "" && lock != "IDLE" {
+		return false
+	}
+	wt := strings.TrimSpace(r.WorktreePath)
+	if wt == "" {
+		wt = strings.TrimSpace(r.Path)
+	}
+	if wt != "" {
+		cleanWT := filepath.Clean(wt)
+		if _, _, busy := checkRepoLockBusy(cleanWT, "", watchdog.IsProcessAlive); busy {
+			return false
+		}
+		if b, err := os.ReadFile(filepath.Join(cleanWT, ".session_story_id")); err == nil {
+			storyID := strings.TrimSpace(string(b))
+			if strings.HasPrefix(storyID, "STORY-") && !isStoryCompletedOnDiskFallback(cleanWT, storyID) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // gitmodulesHasSubmodule checks whether .gitmodules content declares a submodule
@@ -4148,4 +4196,5 @@ func wireDispatcherReadinessAndIdleWorktrees(disp *worker.Dispatcher, client *co
 		}
 		return disp.CollectIdleWorktrees(candidates)
 	}
+	disp.SetIdleWorktreesProvider(client.IdleWorktrees)
 }

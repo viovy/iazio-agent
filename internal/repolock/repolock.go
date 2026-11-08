@@ -200,6 +200,30 @@ func ensureGitInfoExclude(worktree string) {
 	_ = os.WriteFile(excludePath, []byte(text), 0o644)
 }
 
+// IsExpiredMaintenanceLock returns true when LockInfo belongs to a bounded internal maintenance task
+// (such as "autopilot-git-update" or "autopilot-git-update-agy") that has exceeded its maximum TTL,
+// preventing self-PID (iazio-agent daemon) locks from wedging worktrees if an update times out or aborts.
+func IsExpiredMaintenanceLock(info LockInfo) bool {
+	jobID := strings.TrimSpace(info.JobID)
+	var maxAge time.Duration
+	switch jobID {
+	case "autopilot-git-update":
+		maxAge = 5 * time.Minute
+	case "autopilot-git-update-agy":
+		maxAge = 12 * time.Minute
+	default:
+		return false
+	}
+	ref := info.UpdatedAt
+	if ref.IsZero() {
+		ref = info.LockedAt
+	}
+	if ref.IsZero() {
+		return true
+	}
+	return time.Since(ref) > maxAge
+}
+
 // Acquire attempts to acquire an exclusive lock on the repository worktree.
 // If another process is actively running (determined by OS flock or alive PID), it returns ErrRepoBusy.
 // If a previous execution crashed (PID dead), it allows the caller to adopt/resume the lock.
@@ -230,7 +254,8 @@ func Acquire(worktree string, info LockInfo, isAlive func(int) bool) (*LockHandl
 	existing, readErr := Read(worktree)
 	existingStatus := strings.ToUpper(strings.TrimSpace(existing.Status))
 	if readErr == nil && existing.JobID != "" && existing.JobID != info.JobID &&
-		existingStatus != "COMPLETED" && existingStatus != "FAILED" && existingStatus != "IDLE" {
+		existingStatus != "COMPLETED" && existingStatus != "FAILED" && existingStatus != "IDLE" &&
+		!IsExpiredMaintenanceLock(existing) {
 		checkPID := existing.PID
 		if existing.HarnessPID > 0 {
 			checkPID = existing.HarnessPID

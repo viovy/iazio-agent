@@ -2160,5 +2160,77 @@ func TestHTTPControlPlaneClient_DeclineJob_And_DispatcherHelpers(t *testing.T) {
 	_ = os.Remove(sentinelPath)
 }
 
+func TestStoryGOV5196_ToolsUpdateWhenIdleWorktreesEmpty_AndExpiredMaintenanceLocks(t *testing.T) {
+	ctx := context.Background()
+	cp := newMockControlPlane()
+	inv := &mockInvoker{}
+	d := NewDispatcher(cp, inv, "pc1")
+
+	var lastClaimReq ClaimRequest
+	toolUpdated := false
+	d.SetToolUpdater(func(_ context.Context, tools []string, force bool, targetVersion ...string) error {
+		toolUpdated = true
+		return nil
+	})
+	d.SetIdleWorktreesProvider(func() []string {
+		return nil // simulate all worktrees busy or dirty
+	})
+	d.SetWorktreeResolver(func(repo string) string {
+		t.Fatalf("expected worktreeResolver NOT to be called for agent.tools.update, got repo=%q", repo)
+		return ""
+	})
+
+	cp.claimFunc = func(_ context.Context, req ClaimRequest) (*Job, error) {
+		lastClaimReq = req
+		return &Job{
+			ID:         "job_f633dd5b34c16f08",
+			Type:       JobTypeToolsUpdate,
+			Repo:       "fleet",
+			LeaseToken: "lease-tools-1",
+			Payload:    json.RawMessage(`{"tools":["iazio-agent"],"force":false}`),
+		}, nil
+	}
+
+	processed, err := d.PollAndProcess(ctx)
+	if err != nil || !processed {
+		t.Fatalf("expected PollAndProcess to claim and execute agent.tools.update even when idle worktrees is empty, got processed=%v err=%v", processed, err)
+	}
+	if len(lastClaimReq.JobTypes) != 1 || lastClaimReq.JobTypes[0] != JobTypeToolsUpdate {
+		t.Fatalf("expected ClaimRequest.JobTypes=[%s], got %v", JobTypeToolsUpdate, lastClaimReq.JobTypes)
+	}
+	if !toolUpdated {
+		t.Fatal("expected toolUpdater callback to execute")
+	}
+
+	// Verify expired autopilot-git-update maintenance lock does not block CollectIdleWorktrees or repolock.Acquire
+	wt := initTestFleetWorkspace(t)
+	lockDir := filepath.Join(wt, ".iazio")
+	_ = os.MkdirAll(lockDir, 0o755)
+	expiredAt := time.Now().UTC().Add(-15 * time.Minute).Format(time.RFC3339)
+	expiredLockJSON := `{"job_id":"autopilot-git-update","pid":` + jsonNumber(os.Getpid()) + `,"started_at":"` + expiredAt + `","status":"RUNNING"}`
+	if err := os.WriteFile(filepath.Join(lockDir, "repo.lock"), []byte(expiredLockJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idle := d.CollectIdleWorktrees([]string{wt})
+	if len(idle) != 1 || idle[0] != filepath.Clean(wt) {
+		t.Fatalf("expected worktree with expired autopilot-git-update lock to be collected as idle, got %v", idle)
+	}
+	h, err := repolock.Acquire(wt, repolock.LockInfo{
+		JobID:  "job-new-1",
+		PID:    os.Getpid(),
+		Status: "RUNNING",
+	}, func(int) bool { return true })
+	if err != nil {
+		t.Fatalf("expected repolock.Acquire to overwrite expired autopilot-git-update lock, got %v", err)
+	}
+	_ = h.Release()
+}
+
+func jsonNumber(n int) string {
+	b, _ := json.Marshal(n)
+	return string(b)
+}
+
+
 
 
