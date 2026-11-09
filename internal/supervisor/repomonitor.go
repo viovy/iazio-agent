@@ -327,6 +327,9 @@ func isStoryMarkedDoneOnDisk(repoPath, storyID string) bool {
 				if b, rErr := os.ReadFile(filepath.Join(storiesDir, e.Name())); rErr == nil {
 					content := string(b)
 					if strings.Contains(strings.ToUpper(content), sid) {
+						if isStoryMarkdownIncompleteInRepo(repoPath, sid, content) {
+							return false
+						}
 						if strings.Contains(content, "status: DONE") || strings.Contains(content, "status: \"DONE\"") || strings.Contains(content, "status: 'DONE'") {
 							return true
 						}
@@ -353,6 +356,9 @@ func isStoryMarkedDoneOnDisk(repoPath, storyID string) bool {
 						if strings.HasPrefix(strings.ToLower(trimmed), "status:") {
 							val := strings.Trim(strings.TrimSpace(trimmed[len("status:"):]), "\"'")
 							if strings.EqualFold(val, "DONE") {
+								if hasUnresolvedStorySIRInRepo(repoPath, sid) {
+									return false
+								}
 								return true
 							}
 							break
@@ -363,6 +369,72 @@ func isStoryMarkedDoneOnDisk(repoPath, storyID string) bool {
 		}
 	}
 	return false
+}
+
+func extractStoryMarkdownSection(content, headingSubstr string) string {
+	lines := strings.Split(content, "\n")
+	inSection := false
+	var out []string
+	target := strings.ToLower(strings.TrimSpace(headingSubstr))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "## ") {
+			if inSection {
+				break
+			}
+			if strings.Contains(strings.ToLower(trimmed), target) {
+				inSection = true
+			}
+			continue
+		}
+		if inSection {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+func hasUnresolvedStorySIRInRepo(repoPath, storyID string) bool {
+	sid := strings.ToLower(strings.TrimSpace(storyID))
+	if repoPath == "" || sid == "" {
+		return false
+	}
+	shortID := strings.TrimPrefix(sid, "story-")
+	patterns := []string{
+		filepath.Join(repoPath, "tmp", "reports", fmt.Sprintf("intervention-%s-sir-*.json", sid)),
+		filepath.Join(repoPath, "tmp", "reports", fmt.Sprintf("intervention-story-%s-sir-*.json", shortID)),
+	}
+	for _, pat := range patterns {
+		matches, err := filepath.Glob(pat)
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			b, rErr := os.ReadFile(m)
+			if rErr != nil {
+				continue
+			}
+			s := strings.ToUpper(string(b))
+			if strings.Contains(s, `"STATUS": "OPEN"`) || strings.Contains(s, `"STATUS":"OPEN"`) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isStoryMarkdownIncompleteInRepo(repoPath, storyID, content string) bool {
+	if dodSection := extractStoryMarkdownSection(content, "Definition of Done"); dodSection != "" {
+		if strings.Contains(dodSection, "- [ ]") {
+			return true
+		}
+	}
+	if revSection := extractStoryMarkdownSection(content, "Reviews"); revSection != "" {
+		if strings.Contains(strings.ToLower(revSection), "_pending_") {
+			return true
+		}
+	}
+	return hasUnresolvedStorySIRInRepo(repoPath, storyID)
 }
 
 func isStoryExplicitlyInProgressOnDisk(repoPath, storyID string) bool {
@@ -390,7 +462,8 @@ func isStoryExplicitlyInProgressOnDisk(repoPath, storyID string) bool {
 				if strings.Contains(strings.ToUpper(content), sid) {
 					if strings.Contains(content, "status: IN_PROGRESS") || strings.Contains(content, "status: \"IN_PROGRESS\"") ||
 						strings.Contains(content, "status: 'IN_PROGRESS'") ||
-						strings.Contains(content, "status: READY") || strings.Contains(content, "status: \"READY\"") {
+						strings.Contains(content, "status: READY") || strings.Contains(content, "status: \"READY\"") ||
+						isStoryMarkdownIncompleteInRepo(repoPath, sid, content) {
 						return true
 					}
 				}
@@ -454,18 +527,18 @@ func IsWorktreeIdleForGitUpdate(repoPath string, sup *Sup, isPIDAlive func(int) 
 		return false
 	}
 
-	// 1. Check in-flight story branch directly from git HEAD or submodules
+	// 1. Check in-flight branch directly from git HEAD or submodules:
+	// Any non-main, non-maintenance feature/fix/chore branch is considered in-flight unless its inferred story is completely DONE.
 	if brOut, brErr := procutil.Command("git", "-C", cleanPath, "symbolic-ref", "--short", "-q", "HEAD").Output(); brErr == nil {
 		br := strings.TrimSpace(string(brOut))
-		if br != "" && br != "main" && br != "master" && br != "HEAD" {
-			if inferred := InferStoryIDFromBranch(br); inferred != "" {
-				if !isStoryMarkedDoneOnDisk(cleanPath, inferred) {
-					return false
-				}
+		if br != "" && br != "main" && br != "master" && br != "HEAD" && !isAutomatedMaintenanceBranchInRepo(br) {
+			inferred := InferStoryIDFromBranch(br)
+			if inferred == "" || !isStoryMarkedDoneOnDisk(cleanPath, inferred) {
+				return false
 			}
 		}
 	}
-	if hasActiveNonMainSubmoduleStoryInRepo(cleanPath) {
+	if hasAnyNonMainSubmoduleInRepo(cleanPath) || hasActiveNonMainSubmoduleStoryInRepo(cleanPath) {
 		return false
 	}
 
@@ -509,7 +582,7 @@ func IsWorktreeIdleForGitUpdate(repoPath string, sup *Sup, isPIDAlive func(int) 
 	if b, err := os.ReadFile(sessionPath); err == nil {
 		storyID := strings.TrimSpace(string(b))
 		if storyID != "" && !isStoryMarkedDoneOnDisk(cleanPath, storyID) {
-			if isStoryExplicitlyInProgressOnDisk(cleanPath, storyID) {
+			if isStoryExplicitlyInProgressOnDisk(cleanPath, storyID) || hasUnresolvedStorySIRInRepo(cleanPath, storyID) {
 				return false
 			}
 			if _, rErr := os.Stat(filepath.Join(cleanPath, "tmp", "ase-resume-"+storyID+".json")); rErr == nil {
