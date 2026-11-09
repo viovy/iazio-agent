@@ -3163,6 +3163,9 @@ func isASEFlowCompletedAndLastJobSucceeded(repoPath string, st controlplane.Repo
 	if st.ASEState == "RUNNING" || st.ASEState == "IN_PROGRESS" || strings.EqualFold(st.ASEState, "active") || st.HasActiveGitLock {
 		return false
 	}
+	if strings.TrimSpace(st.ActiveStoryID) != "" && !isStoryCompletedOnDiskFallback(repoPath, st.ActiveStoryID) {
+		return false
+	}
 	if st.Branch != "main" && st.Branch != "master" {
 		return false
 	}
@@ -3444,11 +3447,13 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 		}
 		// Detect ad-hoc ASE session bound via .session_story_id or active story branch / scoped resume
 		detectedStoryID := ""
+		hasRootSessionFile := false
 		sessionFile := filepath.Join(repoPath, ".session_story_id")
 		if sessionBytes, err := os.ReadFile(sessionFile); err == nil {
 			sid := strings.TrimSpace(string(sessionBytes))
 			if strings.HasPrefix(sid, "STORY-") {
 				detectedStoryID = sid
+				hasRootSessionFile = true
 			}
 		}
 		if detectedStoryID == "" {
@@ -3478,17 +3483,24 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 					hasResumeFile = true
 				}
 				if nonMainBranch || len(st.NonMainSubmodules) > 0 || hasResumeFile {
-					if st.ASEState == "" || st.ASEState == "IDLE" {
-						st.ASEState = "RUNNING"
-					}
-					if st.ExecutionProvenance == "" || st.ExecutionProvenance == "IDLE" {
-						st.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
-					}
-					if st.ToolLiveness == "" || st.ToolLiveness == "NONE" {
-						st.ToolLiveness = "LIVE"
-					}
-					if st.ActiveTool == "" {
-						st.ActiveTool = "autopilot-ase"
+					if st.ASEState == "IDLE" || (!hasRootSessionFile && !hasResumeFile) {
+						st.ASEState = "FAILED_DIRTY"
+						st.ExecutionProvenance = "NONE"
+						st.ToolLiveness = "TERMINATED"
+						st.ActiveTool = ""
+					} else {
+						if st.ASEState == "" {
+							st.ASEState = "RUNNING"
+						}
+						if st.ExecutionProvenance == "" || st.ExecutionProvenance == "IDLE" {
+							st.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
+						}
+						if st.ToolLiveness == "" || st.ToolLiveness == "NONE" {
+							st.ToolLiveness = "LIVE"
+						}
+						if st.ActiveTool == "" {
+							st.ActiveTool = "autopilot-ase"
+						}
 					}
 				}
 			}

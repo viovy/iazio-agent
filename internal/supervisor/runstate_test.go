@@ -101,7 +101,7 @@ func TestSup_ScanAndReattachRuns(t *testing.T) {
 	liveWorktree := "/test/repo/live"
 
 	// Start a real process tagged with liveJobID that will stay alive during reattach test
-	cmd := exec.Command("sh", "-c", "trap 'exit 0' TERM; while true; do sleep 1; done", liveJobID)
+	cmd := exec.Command("sh", "-c", "trap 'exit 0' TERM; while true; do sleep 1; done # "+liveJobID, liveJobID)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("failed starting sleep process: %v", err)
 	}
@@ -111,6 +111,12 @@ func TestSup_ScanAndReattachRuns(t *testing.T) {
 	}()
 
 	livePID := cmd.Process.Pid
+	for i := 0; i < 20; i++ {
+		if verifyProcessIdentity(livePID, liveJobID, time.Now()) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	// Write running state for live process
 	_ = SaveRunState(RunState{
