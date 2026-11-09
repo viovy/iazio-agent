@@ -4954,6 +4954,37 @@ func TestStoryGOV5196_WireIdleWorktreesAndPruneStaleHarnessActiveJobs(t *testing
 	}
 }
 
+func TestStoryGov5223_IsASEFlowCompletedAndLastJobSucceededSkipsInFlightSubmoduleStory(t *testing.T) {
+	repoDir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(repoDir, ".autopilot"), 0o755)
+	_ = os.WriteFile(filepath.Join(repoDir, ".autopilot", "state.json"), []byte(`{"state":"COMPLETED","story_id":"STORY-GOV-5222","verification_status":"PASSED"}`), 0o644)
+	_ = os.MkdirAll(filepath.Join(repoDir, "docs", "stories"), 0o755)
+	_ = os.WriteFile(filepath.Join(repoDir, "docs", "stories", "2026-11-09-gov-5222-done.story.md"), []byte("---\nid: STORY-GOV-5222\nstatus: DONE\n---\n"), 0o644)
+
+	failedDirtySt := controlplane.RepoRuntimeStatus{
+		RepoPath:          repoDir,
+		Branch:            "main",
+		ASEState:          "FAILED_DIRTY",
+		ActiveStoryID:     "STORY-VIGO-0289",
+		NonMainSubmodules: []string{"vigo (feat/vigo-0289-security-transport-hygiene-remediation)"},
+	}
+	if isASEFlowCompletedAndLastJobSucceeded(repoDir, failedDirtySt) {
+		t.Fatal("expected isASEFlowCompletedAndLastJobSucceeded=false when ASEState=FAILED_DIRTY")
+	}
+
+	idleWithInFlightSubmoduleSt := controlplane.RepoRuntimeStatus{
+		RepoPath:          repoDir,
+		Branch:            "main",
+		ASEState:          "IDLE",
+		ActiveStoryID:     "STORY-VIGO-0289",
+		NonMainSubmodules: []string{"vigo (feat/vigo-0289-security-transport-hygiene-remediation)"},
+	}
+	if isASEFlowCompletedAndLastJobSucceeded(repoDir, idleWithInFlightSubmoduleSt) {
+		t.Fatal("expected isASEFlowCompletedAndLastJobSucceeded=false when NonMainSubmodules has an uncompleted ActiveStoryID")
+	}
+}
+
+
 
 
 
