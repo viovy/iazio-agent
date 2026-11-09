@@ -2180,11 +2180,22 @@ func runService(args []string, stdout io.Writer, getenv func(string) string) err
 		return service.ReviveCheck(home, execCommand)
 	case "reconcile":
 		home, _ := os.UserHomeDir()
+		if !isTestBinary() {
+			if err := service.CheckExplicitServiceControlAllowed(home, bin); err != nil {
+				return err
+			}
+		}
 		if err := service.ReconcileServiceConfiguration(home, bin, execCommand); err != nil {
 			return err
 		}
 		fmt.Fprintln(stdout, "iazio-agent user service configuration reconciled")
 		return nil
+	}
+	if !isTestBinary() && (action == "install" || action == "restart") {
+		home, _ := os.UserHomeDir()
+		if err := service.CheckExplicitServiceControlAllowed(home, bin); err != nil {
+			return err
+		}
 	}
 	switch goos {
 	case "darwin":

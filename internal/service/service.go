@@ -488,7 +488,7 @@ func InstallDarwinResilience(home, bin string, run func(name string, args ...str
 		}
 	} else if watcherChanged || !watcherLoaded || watcherDrifted {
 		if watcherChanged || watcherDrifted {
-			_ = bootoutAndWaitDarwin(watcherTarget, run)
+			_ = bootoutAndWaitDarwin(watcherTarget, run, statusFn)
 		}
 		if err := run("launchctl", "bootstrap", domain, watcherPlistPath); err != nil {
 			_ = os.Remove(watcherPlistPath)
@@ -526,7 +526,7 @@ func InstallDarwinResilience(home, bin string, run func(name string, args ...str
 		}
 	} else if watchdogChanged || !watchdogLoaded || watchdogDrifted {
 		if watchdogChanged || watchdogDrifted {
-			_ = bootoutAndWaitDarwin(watchdogTarget, run)
+			_ = bootoutAndWaitDarwin(watchdogTarget, run, statusFn)
 		}
 		if err := run("launchctl", "bootstrap", domain, watchdogPlistPath); err != nil {
 			_ = os.Remove(watchdogPlistPath)
@@ -1060,12 +1060,16 @@ func reconcileLinuxServiceConfiguration(home, bin string, run func(name string, 
 	return nil
 }
 
-func bootoutAndWaitDarwin(target string, run func(name string, args ...string) error) error {
+func bootoutAndWaitDarwin(target string, run func(name string, args ...string) error, statusFns ...func(name string, args ...string) ([]byte, error)) error {
 	err := run("launchctl", "bootout", target)
+	checkFn := statusCheckCommand
+	if len(statusFns) > 0 && statusFns[0] != nil {
+		checkFn = statusFns[0]
+	}
 	if !isTestProcess() && !IsServiceControlDisabled() {
 		deadline := time.Now().Add(3 * time.Second)
 		for time.Now().Before(deadline) {
-			if _, pErr := statusCheckCommand("launchctl", "print", target); pErr != nil {
+			if _, pErr := checkFn("launchctl", "print", target); pErr != nil {
 				break
 			}
 			time.Sleep(100 * time.Millisecond)
@@ -1074,9 +1078,13 @@ func bootoutAndWaitDarwin(target string, run func(name string, args ...string) e
 	return err
 }
 
-func isRunningInsideDarwinAgentService(target, expectedPlistPath, expectedBinPath string) bool {
+func isRunningInsideDarwinAgentService(target, expectedPlistPath, expectedBinPath string, statusFns ...func(name string, args ...string) ([]byte, error)) bool {
 	envMatch := os.Getenv("XPC_SERVICE_NAME") == DarwinLabel || os.Getenv("IAZIO_AGENT_SERVICE") == "1"
-	if out, err := statusCheckCommand("launchctl", "print", target); err == nil {
+	checkFn := statusCheckCommand
+	if len(statusFns) > 0 && statusFns[0] != nil {
+		checkFn = statusFns[0]
+	}
+	if out, err := checkFn("launchctl", "print", target); err == nil {
 		outStr := string(out)
 		// Self-identity check FIRST: if this process's own PID is the live running PID
 		// of the launchd job, return true immediately so reconcile never boots out its own job
@@ -1107,7 +1115,7 @@ func reconcileDarwinServiceConfiguration(home, bin string, run func(name string,
 	domain := "gui/" + strconv.Itoa(os.Getuid())
 	target := domain + "/" + agentLabel
 	agentPlist := filepath.Join(launchAgentsDir, agentLabel+".plist")
-	insideService := isRunningInsideDarwinAgentService(target, agentPlist, bin)
+	insideService := isRunningInsideDarwinAgentService(target, agentPlist, bin, statusFn)
 
 	// Reconcile primary iazio-agent LaunchAgent
 	expectedPlist := darwinPlist(bin, logPath)
@@ -1124,7 +1132,7 @@ func reconcileDarwinServiceConfiguration(home, bin string, run func(name string,
 	if (plistChanged || agentDrifted) && !insideService {
 		needsReload := agentDrifted || !agentHealthyRunning || !strings.Contains(existingStr, bin)
 		if needsReload {
-			_ = bootoutAndWaitDarwin(target, run)
+			_ = bootoutAndWaitDarwin(target, run, statusFn)
 			_ = run("launchctl", "bootstrap", domain, agentPlist)
 			_ = run("launchctl", "enable", target)
 		}
@@ -1165,7 +1173,7 @@ func reconcileDarwinServiceConfiguration(home, bin string, run func(name string,
 		drifted := err == nil && isDarwinLaunchdServiceDrifted(outStr, agentPlist, bin)
 		if err != nil || drifted || strings.Contains(outStr, "job state = exited") || !strings.Contains(outStr, "pid =") {
 			if drifted {
-				_ = bootoutAndWaitDarwin(target, run)
+				_ = bootoutAndWaitDarwin(target, run, statusFn)
 			}
 			if err != nil || drifted {
 				_ = run("launchctl", "bootstrap", domain, agentPlist)
@@ -1918,6 +1926,21 @@ func isServiceControlCommand(name string) bool {
 	}
 }
 
+// ErrServiceControlSuppressed is returned when an explicit service management action
+// (install, reconcile, restart) is rejected because the target home/binary or process
+// environment is in a temporary/test path or has service control disabled.
+var ErrServiceControlSuppressed = errors.New("[SIR: SERVICE_CONTROL_SUPPRESSED] OS service control is suppressed for temporary/test paths or test mode")
+
+// CheckExplicitServiceControlAllowed returns ErrServiceControlSuppressed when home, bin,
+// or the process environment forbids mutating host OS service managers.
+func CheckExplicitServiceControlAllowed(home, bin string) error {
+	if IsTempOrTestPath(home) || IsTempOrTestPath(bin) || isServiceControlDisabledByEnvOrHome() {
+		fmt.Fprintf(os.Stderr, "[SIR: SERVICE_CONTROL_SUPPRESSED] home=%s bin=%s reason=temp-or-test-path\n", home, bin)
+		return ErrServiceControlSuppressed
+	}
+	return nil
+}
+
 func resolveServiceControlRunners(home, bin string, run func(name string, args ...string) error) (func(name string, args ...string) error, func(name string, args ...string) ([]byte, error)) {
 	if run == nil {
 		run = execCommand
@@ -1926,14 +1949,14 @@ func resolveServiceControlRunners(home, bin string, run func(name string, args .
 	if IsTempOrTestPath(home) || IsTempOrTestPath(bin) || isServiceControlDisabledByEnvOrHome() {
 		wrappedRun := func(name string, args ...string) error {
 			if isServiceControlCommand(name) {
-				fmt.Fprintf(os.Stderr, "[service] service control suppressed (%s): reason=temp-or-test-path\n", name)
+				fmt.Fprintf(os.Stderr, "[SIR: SERVICE_CONTROL_SUPPRESSED] command=%s reason=temp-or-test-path\n", name)
 				return nil
 			}
 			return run(name, args...)
 		}
 		wrappedStatus := func(name string, args ...string) ([]byte, error) {
 			if isServiceControlCommand(name) {
-				return nil, errors.New("service control command suppressed for temp/test path")
+				return nil, errors.New("[SIR: SERVICE_CONTROL_SUPPRESSED] service control command suppressed for temp/test path")
 			}
 			return statusFn(name, args...)
 		}
@@ -1944,7 +1967,7 @@ func resolveServiceControlRunners(home, bin string, run func(name string, args .
 
 var execCommand = func(name string, args ...string) error {
 	if IsServiceControlDisabled() && isServiceControlCommand(name) {
-		fmt.Fprintf(os.Stderr, "[service] service control suppressed (%s): reason=disabled-or-test-env\n", name)
+		fmt.Fprintf(os.Stderr, "[SIR: SERVICE_CONTROL_SUPPRESSED] command=%s reason=disabled-or-test-env\n", name)
 		return nil
 	}
 	cmd := procutil.Command(name, args...)

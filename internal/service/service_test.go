@@ -1574,7 +1574,10 @@ func TestReconcileDarwinServiceConfiguration_SelfBootoutGuard(t *testing.T) {
 	origStatusCheck := statusCheckCommand
 	defer func() { statusCheckCommand = origStatusCheck }()
 	statusCheckCommand = func(name string, args ...string) ([]byte, error) {
-		return []byte(fmt.Sprintf("state = running\npid = %d\n", os.Getpid())), nil
+		return []byte(fmt.Sprintf(
+			"state = running\npid = %d\npath = /private/var/folders/l8/7kps/T/TestE2E_Gov3799/001/Library/LaunchAgents/io.iazio.iazio-agent.plist\nprogram = /var/folders/l8/7kps/T/TestE2E_Gov3799/001/.local/bin/iazio-agent\nlast exit code = 78: EX_CONFIG\n",
+			os.Getpid(),
+		)), nil
 	}
 
 	t.Setenv("XPC_SERVICE_NAME", DarwinLabel)
@@ -2034,6 +2037,14 @@ func TestInstallDarwinAt_TempHomeSuppressesExplicitRunner(t *testing.T) {
 	t.Setenv("IAZIO_DISABLE_SERVICE_CONTROL", "")
 	t.Setenv("GO_TEST", "")
 
+	origStatusCheck := statusCheckCommand
+	defer func() { statusCheckCommand = origStatusCheck }()
+	var statusProbes []string
+	statusCheckCommand = func(name string, args ...string) ([]byte, error) {
+		statusProbes = append(statusProbes, name+" "+strings.Join(args, " "))
+		return []byte("state = running\n"), nil
+	}
+
 	tempHome := t.TempDir()
 	var recorded []string
 	recordingRunner := func(name string, args ...string) error {
@@ -2041,10 +2052,20 @@ func TestInstallDarwinAt_TempHomeSuppressesExplicitRunner(t *testing.T) {
 		return nil
 	}
 
-	if err := InstallDarwinAt(tempHome, filepath.Join(nonTempHome, ".local", "bin", "iazio-agent"), recordingRunner); err != nil {
+	binPath := filepath.Join(nonTempHome, ".local", "bin", "iazio-agent")
+	if err := InstallDarwinAt(tempHome, binPath, recordingRunner); err != nil {
 		t.Fatalf("InstallDarwinAt with tempHome failed: %v", err)
+	}
+	if err := reconcileDarwinServiceConfiguration(tempHome, binPath, recordingRunner); err != nil {
+		t.Fatalf("reconcileDarwinServiceConfiguration with tempHome failed: %v", err)
 	}
 	if len(recorded) != 0 {
 		t.Fatalf("expected zero launchctl mutations to reach explicit runner when home is a temp path, got: %v", recorded)
+	}
+	if len(statusProbes) != 0 {
+		t.Fatalf("expected zero launchctl print status probes to reach statusCheckCommand when home is a temp path, got: %v", statusProbes)
+	}
+	if err := CheckExplicitServiceControlAllowed(tempHome, binPath); !errors.Is(err, ErrServiceControlSuppressed) {
+		t.Fatalf("expected ErrServiceControlSuppressed for tempHome, got: %v", err)
 	}
 }

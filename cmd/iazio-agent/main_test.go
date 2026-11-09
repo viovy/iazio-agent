@@ -5061,6 +5061,20 @@ func TestStoryGov5225_E2E_CompiledAgentTempHomeNeverInvokesHostServiceControl(t 
 	if data, err := os.ReadFile(markerFile); err == nil && len(data) > 0 {
 		t.Fatalf("expected zero host service-control invocations for temp HOME, got:\n%s", string(data))
 	}
+
+	// 3. Explicit CLI `service reconcile` in temp HOME must exit non-zero and emit [SIR: SERVICE_CONTROL_SUPPRESSED]
+	reconcileCmd := exec.Command(agentBin, "service", "reconcile")
+	reconcileCmd.Env = append(cleanEnv,
+		"HOME="+tempHome,
+		"PATH="+fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+	)
+	recOut, recErr := reconcileCmd.CombinedOutput()
+	if recErr == nil {
+		t.Fatalf("expected explicit 'service reconcile' in temp HOME to exit non-zero, got nil (%s)", string(recOut))
+	}
+	if !strings.Contains(string(recOut), "[SIR: SERVICE_CONTROL_SUPPRESSED]") {
+		t.Fatalf("expected [SIR: SERVICE_CONTROL_SUPPRESSED] in output, got:\n%s", string(recOut))
+	}
 }
 
 
