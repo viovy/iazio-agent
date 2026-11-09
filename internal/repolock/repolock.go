@@ -406,10 +406,13 @@ func IsOnFeatureBranch(worktree string) (bool, string) {
 	if worktree == "" {
 		return false, ""
 	}
+	if _, err := os.Stat(filepath.Join(worktree, ".git")); err != nil {
+		return false, ""
+	}
 	cmd := procutil.Command("git", "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD")
 	out, err := cmd.Output()
 	if err != nil {
-		return false, ""
+		return true, "git_error"
 	}
 	branch := strings.TrimSpace(string(out))
 	if branch == "" || branch == "main" || branch == "master" || branch == "HEAD" {
@@ -487,6 +490,7 @@ func isStoryDone(worktree, storyID string) bool {
 
 // IsWorktreeCleanForNewJob verifies that a worktree is fully clean and safe for a new autonomous job to claim:
 // - no active unfinished .session_story_id from a different story
+// - no post-ase-sync-failed quarantine marker (.iazio/post-ase-sync-failed)
 // - no uncommitted/untracked files (IsWorktreeDirty)
 // - no unpushed commits (HasUnpushedCommits)
 // - not checked out to an unmerged feature branch
@@ -511,19 +515,25 @@ func IsWorktreeCleanForNewJob(worktree string, allowedStoryID ...string) (bool, 
 			}
 		}
 	}
+	// Check for post-ase-sync-failed quarantine marker (Rule B90 §2)
+	if _, err := os.Stat(filepath.Join(worktree, ".iazio", "post-ase-sync-failed")); err == nil {
+		return false, "quarantined: post-ASE tool update or codebase synchronization failed"
+	}
+	// Check if this is a git worktree
+	if _, err := os.Stat(filepath.Join(worktree, ".git")); err != nil {
+		return true, ""
+	}
 	// Check dirty files
 	if IsWorktreeDirty(worktree) {
 		return false, "uncommitted or untracked changes in worktree"
 	}
-	// Check unpushed commits if repository has remote
-	if out, err := procutil.Command("git", "-C", worktree, "remote").Output(); err == nil && strings.TrimSpace(string(out)) != "" {
-		ahead, unpushedErr := HasUnpushedCommits(worktree)
-		if unpushedErr != nil {
-			return false, fmt.Sprintf("unpushed commit check failed: %v", unpushedErr)
-		}
-		if ahead {
-			return false, "unpushed commits present ahead of remote origin"
-		}
+	// Check unpushed commits unconditionally (fails closed)
+	ahead, unpushedErr := HasUnpushedCommits(worktree)
+	if unpushedErr != nil {
+		return false, fmt.Sprintf("unpushed commit check failed: %v", unpushedErr)
+	}
+	if ahead {
+		return false, "unpushed commits present ahead of remote origin"
 	}
 	// Check feature branch
 	if onFeat, branch := IsOnFeatureBranch(worktree); onFeat {

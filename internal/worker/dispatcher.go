@@ -1608,6 +1608,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 			targetRepo = res.Repo
 		}
 		if isASEJob(job) {
+			var postAseSyncErr error
 			if d.toolUpdater != nil {
 				_, tuSpan := telemetry.StartSpan(ctx, "agent.ase_tool_update",
 					telemetry.WithTag("job.id", job.ID),
@@ -1617,6 +1618,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				tuErr := d.toolUpdater(updateCtx, nil, false)
 				cancelUpdate()
 				if tuErr != nil {
+					postAseSyncErr = fmt.Errorf("tool update failed: %w", tuErr)
 					if tuSpan != nil {
 						tuSpan.SetTag("error", "true")
 						tuSpan.SetTag("error.message", tuErr.Error())
@@ -1637,6 +1639,9 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 					SyncRepoSync(context.Context, string) error
 				}); ok {
 					if syncErr := syncSyncer.SyncRepoSync(syncCtx, targetRepo); syncErr != nil {
+						if postAseSyncErr == nil {
+							postAseSyncErr = fmt.Errorf("repo sync failed: %w", syncErr)
+						}
 						if syncSpan != nil {
 							syncSpan.SetTag("error", "true")
 							syncSpan.SetTag("error.message", syncErr.Error())
@@ -1650,6 +1655,15 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				if syncSpan != nil {
 					syncSpan.End()
 				}
+			}
+
+			// If tool update or repo sync failed, quarantine the worktree per Rule B90 §2
+			if postAseSyncErr != nil {
+				markerDir := filepath.Join(worktreeDir, ".iazio")
+				_ = os.MkdirAll(markerDir, 0o755)
+				_ = os.WriteFile(filepath.Join(markerDir, "post-ase-sync-failed"), []byte(postAseSyncErr.Error()+"\n"), 0o644)
+			} else {
+				_ = os.Remove(filepath.Join(worktreeDir, ".iazio", "post-ase-sync-failed"))
 			}
 		}
 

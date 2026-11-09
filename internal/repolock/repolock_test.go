@@ -556,7 +556,18 @@ func TestIsWorktreeCleanForNewJob_And_UnpushedCommits(t *testing.T) {
 	_ = exec.Command("git", "-C", repoDir, "add", "file.txt").Run()
 	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "initial commit").Run()
 
-	// Clean repository with no remote tracking is clean
+	// 3a. Fails closed when no remote is configured (finding F3)
+	if clean, reason := IsWorktreeCleanForNewJob(repoDir); clean || !strings.Contains(reason, "no git remotes configured") {
+		t.Fatalf("expected repo with no remotes to fail closed, got clean=%v reason=%s", clean, reason)
+	}
+
+	// Configure remote
+	remoteDir := t.TempDir()
+	_ = exec.Command("git", "init", "--bare", remoteDir).Run()
+	_ = exec.Command("git", "-C", repoDir, "remote", "add", "origin", remoteDir).Run()
+	_ = exec.Command("git", "-C", repoDir, "push", "-u", "origin", "main").Run()
+
+	// Clean repository with remote tracking is clean
 	if clean, reason := IsWorktreeCleanForNewJob(repoDir); !clean {
 		t.Fatalf("expected committed main repo to be clean, got reason=%s", reason)
 	}
@@ -585,11 +596,6 @@ func TestIsWorktreeCleanForNewJob_And_UnpushedCommits(t *testing.T) {
 	}
 
 	// 6. Upstream ahead blocks
-	remoteDir := t.TempDir()
-	_ = exec.Command("git", "init", "--bare", remoteDir).Run()
-	_ = exec.Command("git", "-C", repoDir, "remote", "add", "origin", remoteDir).Run()
-	_ = exec.Command("git", "-C", repoDir, "push", "-u", "origin", "main").Run()
-
 	ahead, err := HasUnpushedCommits(repoDir)
 	if err != nil || ahead {
 		t.Fatalf("expected 0 unpushed commits after initial push, got ahead=%v err=%v", ahead, err)
@@ -621,6 +627,27 @@ func TestIsWorktreeCleanForNewJob_And_UnpushedCommits(t *testing.T) {
 	}
 	if !isStoryDone(repoDir, "STORY-TEST-2") {
 		t.Fatal("expected isStoryDone to return true for STORY-TEST-2")
+	}
+
+	// 8. Post-ASE sync failure quarantine marker (Rule B90 §2 / finding F1)
+	quarantineDir := filepath.Join(repoDir, ".iazio")
+	_ = os.MkdirAll(quarantineDir, 0o755)
+	quarantineFile := filepath.Join(quarantineDir, "post-ase-sync-failed")
+	_ = os.WriteFile(quarantineFile, []byte("sync failed\n"), 0o644)
+	if clean, reason := IsWorktreeCleanForNewJob(repoDir); clean || !strings.Contains(reason, "quarantined") {
+		t.Fatalf("expected quarantined worktree to be rejected, got clean=%v reason=%s", clean, reason)
+	}
+	_ = os.Remove(quarantineFile)
+
+	// 9. Fail-closed on corrupted git repo / git failure (finding F3)
+	badGitDir := t.TempDir()
+	_ = exec.Command("git", "-C", badGitDir, "init", "-b", "main").Run()
+	_ = os.WriteFile(filepath.Join(badGitDir, ".git", "HEAD"), []byte("corrupted head ref\n"), 0o644)
+	if onFeat, _ := IsOnFeatureBranch(badGitDir); !onFeat {
+		t.Fatal("expected IsOnFeatureBranch to fail closed (return true) on git error")
+	}
+	if clean, _ := IsWorktreeCleanForNewJob(badGitDir); clean {
+		t.Fatal("expected IsWorktreeCleanForNewJob to fail closed on git error")
 	}
 }
 

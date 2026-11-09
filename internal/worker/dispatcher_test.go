@@ -2397,6 +2397,10 @@ func TestASECompletionGate_Invariants_StoryGov5232(t *testing.T) {
 	_ = os.WriteFile(f, []byte("init\n"), 0o644)
 	_ = exec.Command("git", "-C", wt, "add", "file.txt").Run()
 	_ = exec.Command("git", "-C", wt, "commit", "-m", "init").Run()
+	bareRemote := t.TempDir()
+	_ = exec.Command("git", "init", "--bare", bareRemote).Run()
+	_ = exec.Command("git", "-C", wt, "remote", "add", "origin", bareRemote).Run()
+	_ = exec.Command("git", "-C", wt, "push", "-u", "origin", "main").Run()
 
 	var lastCompleteReq CompleteRequest
 	cp := newMockControlPlane()
@@ -2489,11 +2493,6 @@ func TestASECompletionGate_Invariants_StoryGov5232(t *testing.T) {
 	_ = exec.Command("git", "-C", wt, "checkout", "main").Run()
 
 	// 4. Clean worktree passes and triggers syncer
-	bareRemote := t.TempDir()
-	_ = exec.Command("git", "init", "--bare", bareRemote).Run()
-	_ = exec.Command("git", "-C", wt, "remote", "add", "origin", bareRemote).Run()
-	_ = exec.Command("git", "-C", wt, "push", "-u", "origin", "main").Run()
-
 	mockSync := &mockRepoSyncer{}
 	dClean := NewDispatcher(cp, inv, "host-1", mockSync)
 
@@ -2617,6 +2616,34 @@ func TestASECompletionGate_Invariants_StoryGov5232(t *testing.T) {
 	if !isASEJob(aseSlashJob) {
 		t.Fatal("expected isASEJob to be true for leading /autonomous-story-execution")
 	}
+
+	// 9. Post-ASE tool update / sync failure creates quarantine marker (Rule B90 §2 / finding F1)
+	dFail := NewDispatcher(cp, inv, "host-1", &mockSequenceSyncer{
+		syncCallback: func(repo string) {},
+	})
+	dFail.SetToolUpdater(func(ctx context.Context, tools []string, force bool, targetVersion ...string) error {
+		return errors.New("simulated tool update failure")
+	})
+	jobFail := &Job{
+		ID:           "job_ase_fail_update",
+		Type:         JobTypePromptExecute,
+		Repo:         "meta-repo",
+		StoryID:      "STORY-GOV-5232",
+		FencingToken: 10,
+		Payload:      json.RawMessage(`{"prompt":"/autonomous-story-execution fail update","worktree_path":"` + filepath.ToSlash(wt) + `"}`),
+	}
+	cp.claimFunc = func(_ context.Context, _ ClaimRequest) (*Job, error) { return jobFail, nil }
+	processed, err = dFail.PollAndProcess(context.Background())
+	if !processed || err != nil {
+		t.Fatalf("expected job to process, got processed=%v err=%v", processed, err)
+	}
+	if _, statErr := os.Stat(filepath.Join(wt, ".iazio", "post-ase-sync-failed")); statErr != nil {
+		t.Fatalf("expected .iazio/post-ase-sync-failed marker to be written on tool update failure: %v", statErr)
+	}
+	if clean, reason := repolock.IsWorktreeCleanForNewJob(wt); clean || !strings.Contains(reason, "quarantined") {
+		t.Fatalf("expected worktree to be quarantined after post-ASE sync failure, got clean=%v reason=%s", clean, reason)
+	}
+	_ = os.Remove(filepath.Join(wt, ".iazio", "post-ase-sync-failed"))
 }
 
 type mockSequenceSyncer struct {
