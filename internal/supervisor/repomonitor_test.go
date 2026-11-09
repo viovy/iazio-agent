@@ -1932,4 +1932,39 @@ func TestIsWorktreeIdleForGitUpdate_StoryScopingAndBranchDetection(t *testing.T)
 	if IsWorktreeIdleForGitUpdate(tempDir, nil, nil) {
 		t.Fatalf("expected worktree with active .session_story_id to NOT be idle, but got idle=true")
 	}
+
+	// Switch back to main while .session_story_id has an IN_PROGRESS story in iazio-infra/docs/stories -> still NOT idle!
+	if out, err := exec.Command("git", "-C", tempDir, "checkout", "main").CombinedOutput(); err != nil {
+		t.Fatalf("git checkout main: %v (%s)", err, string(out))
+	}
+	iazioStoriesDir := filepath.Join(tempDir, "iazio-infra", "docs", "stories")
+	_ = os.MkdirAll(iazioStoriesDir, 0755)
+	_ = os.WriteFile(filepath.Join(iazioStoriesDir, "2026-11-09-iazio-0200-test.story.md"), []byte("---\nid: STORY-IAZIO-0200\nstatus: IN_PROGRESS\n---\n"), 0644)
+	_ = os.WriteFile(filepath.Join(tempDir, ".session_story_id"), []byte("STORY-IAZIO-0200\n"), 0644)
+	if IsWorktreeIdleForGitUpdate(tempDir, nil, nil) {
+		t.Fatalf("expected worktree on main with IN_PROGRESS story in iazio-infra/docs/stories and .session_story_id to NOT be idle")
+	}
+	if _, okSan := SanitizeIdleEphemeralArtifacts(context.Background(), tempDir, nil, nil); okSan {
+		t.Fatalf("expected SanitizeIdleEphemeralArtifacts to skip when .session_story_id points to IN_PROGRESS story in iazio-infra/docs/stories")
+	}
+
+	// Test healStrandedMaintenanceBranchBeforeGitUpdate on chore/governance-pointers-*
+	maintDir := t.TempDir()
+	initTestGitRepo(t, maintDir)
+	if out, err := exec.Command("git", "-C", maintDir, "checkout", "-b", "chore/governance-pointers-20261109-072028").CombinedOutput(); err != nil {
+		t.Fatalf("checkout maintenance branch: %v (%s)", err, string(out))
+	}
+	sirDir := filepath.Join(maintDir, "tmp", "reports")
+	_ = os.MkdirAll(sirDir, 0755)
+	sirPath := filepath.Join(sirDir, "intervention-git-update-sir-5002c92fd239.json")
+	_ = os.WriteFile(sirPath, []byte(`{"status":"OPEN"}`), 0644)
+	healStrandedMaintenanceBranchBeforeGitUpdate(context.Background(), maintDir)
+	br, okBr := readWorktreeHeadBranchFast(maintDir)
+	if !okBr || br != "main" {
+		t.Fatalf("expected healStrandedMaintenanceBranchBeforeGitUpdate to switch to main, got %q (%v)", br, okBr)
+	}
+	if _, err := os.Stat(sirPath); !os.IsNotExist(err) {
+		t.Fatalf("expected stale intervention-git-update-sir JSON to be removed on maintenance branch heal")
+	}
 }
+

@@ -259,23 +259,104 @@ func isEphemeralCachePath(relPath string) bool {
 	return IsEphemeralArtifactPath(relPath)
 }
 
+func storyCandidateDirsForRepo(repoPath, sid string) []string {
+	candidateDirs := []string{
+		filepath.Join(repoPath, "docs", "stories"),
+		filepath.Join(filepath.Dir(repoPath), "docs", "stories"),
+	}
+	parts := strings.Split(sid, "-")
+	if len(parts) >= 3 {
+		cat := strings.ToLower(parts[1])
+		switch cat {
+		case "vigo":
+			candidateDirs = append(candidateDirs,
+				filepath.Join(repoPath, "vigo", "docs", "stories"),
+				filepath.Join(repoPath, "vigo-api", "docs", "stories"),
+			)
+		case "iazio":
+			candidateDirs = append(candidateDirs,
+				filepath.Join(repoPath, "iazio-infra", "docs", "stories"),
+				filepath.Join(repoPath, "iazio", "docs", "stories"),
+			)
+		case "gov", "auto", "ap":
+			candidateDirs = append(candidateDirs,
+				filepath.Join(repoPath, "autopilot-umbrella", "docs", "stories"),
+				filepath.Join(repoPath, "iazio-infra", "docs", "stories"),
+			)
+		case "eye":
+			candidateDirs = append(candidateDirs,
+				filepath.Join(repoPath, "eye-habit", "docs", "stories"),
+			)
+		}
+	}
+	return candidateDirs
+}
+
 func isStoryMarkedDoneOnDisk(repoPath, storyID string) bool {
-	storyID = strings.TrimSpace(storyID)
-	if storyID == "" {
+	sid := strings.ToUpper(strings.TrimSpace(storyID))
+	if repoPath == "" || !strings.HasPrefix(sid, "STORY-") {
 		return false
 	}
-	lowerID := strings.ToLower(strings.TrimPrefix(storyID, "STORY-"))
-	storiesDir := filepath.Join(repoPath, "docs", "stories")
-	if matches, err := filepath.Glob(filepath.Join(storiesDir, "*"+lowerID+"*.story.md")); err == nil {
-		for _, m := range matches {
-			if b, rErr := os.ReadFile(m); rErr == nil {
-				content := string(b)
-				if strings.Contains(content, "id: "+storyID) || strings.Contains(content, "id: \""+storyID+"\"") {
-					if strings.Contains(content, "status: DONE") || strings.Contains(content, "status: \"DONE\"") {
-						return true
+
+	if b, err := os.ReadFile(filepath.Join(repoPath, ".autopilot", "ase-state.json")); err == nil {
+		var aseSt struct {
+			StoryID string `json:"story_id"`
+			Status  string `json:"status"`
+			Phase   string `json:"phase"`
+		}
+		if json.Unmarshal(b, &aseSt) == nil && strings.EqualFold(strings.TrimSpace(aseSt.StoryID), sid) {
+			if strings.EqualFold(aseSt.Status, "DONE") || strings.EqualFold(aseSt.Phase, "completed") {
+				return true
+			}
+		}
+	}
+
+	lowerID := strings.ToLower(strings.TrimPrefix(sid, "STORY-"))
+	fullLower := strings.ToLower(sid)
+	for _, storiesDir := range storyCandidateDirsForRepo(repoPath, sid) {
+		entries, err := os.ReadDir(storiesDir)
+		if err == nil {
+			for _, e := range entries {
+				if e.IsDir() || !strings.HasSuffix(e.Name(), ".story.md") {
+					continue
+				}
+				nameLower := strings.ToLower(e.Name())
+				if !strings.Contains(nameLower, lowerID) && !strings.Contains(nameLower, fullLower) {
+					continue
+				}
+				if b, rErr := os.ReadFile(filepath.Join(storiesDir, e.Name())); rErr == nil {
+					content := string(b)
+					if strings.Contains(strings.ToUpper(content), sid) {
+						if strings.Contains(content, "status: DONE") || strings.Contains(content, "status: \"DONE\"") || strings.Contains(content, "status: 'DONE'") {
+							return true
+						}
+						if strings.Contains(content, "status: IN_PROGRESS") || strings.Contains(content, "status: \"IN_PROGRESS\"") {
+							return false
+						}
 					}
-					if strings.Contains(content, "status: IN_PROGRESS") || strings.Contains(content, "status: \"IN_PROGRESS\"") {
-						return false
+				}
+			}
+		}
+		if indexBytes, idxErr := os.ReadFile(filepath.Join(storiesDir, "index.yml")); idxErr == nil {
+			lines := strings.Split(string(indexBytes), "\n")
+			for i, l := range lines {
+				if strings.Contains(strings.ToUpper(l), sid) {
+					end := i + 8
+					if end > len(lines) {
+						end = len(lines)
+					}
+					for j := i; j < end; j++ {
+						trimmed := strings.TrimSpace(lines[j])
+						if j > i && strings.HasPrefix(trimmed, "- id:") {
+							break
+						}
+						if strings.HasPrefix(strings.ToLower(trimmed), "status:") {
+							val := strings.Trim(strings.TrimSpace(trimmed[len("status:"):]), "\"'")
+							if strings.EqualFold(val, "DONE") {
+								return true
+							}
+							break
+						}
 					}
 				}
 			}
@@ -285,18 +366,31 @@ func isStoryMarkedDoneOnDisk(repoPath, storyID string) bool {
 }
 
 func isStoryExplicitlyInProgressOnDisk(repoPath, storyID string) bool {
-	storyID = strings.TrimSpace(storyID)
-	if storyID == "" {
+	sid := strings.ToUpper(strings.TrimSpace(storyID))
+	if repoPath == "" || !strings.HasPrefix(sid, "STORY-") {
 		return false
 	}
-	lowerID := strings.ToLower(strings.TrimPrefix(storyID, "STORY-"))
-	storiesDir := filepath.Join(repoPath, "docs", "stories")
-	if matches, err := filepath.Glob(filepath.Join(storiesDir, "*"+lowerID+"*.story.md")); err == nil {
-		for _, m := range matches {
-			if b, rErr := os.ReadFile(m); rErr == nil {
+	lowerID := strings.ToLower(strings.TrimPrefix(sid, "STORY-"))
+	fullLower := strings.ToLower(sid)
+	for _, storiesDir := range storyCandidateDirsForRepo(repoPath, sid) {
+		entries, err := os.ReadDir(storiesDir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".story.md") {
+				continue
+			}
+			nameLower := strings.ToLower(e.Name())
+			if !strings.Contains(nameLower, lowerID) && !strings.Contains(nameLower, fullLower) {
+				continue
+			}
+			if b, rErr := os.ReadFile(filepath.Join(storiesDir, e.Name())); rErr == nil {
 				content := string(b)
-				if strings.Contains(content, "id: "+storyID) || strings.Contains(content, "id: \""+storyID+"\"") {
-					if strings.Contains(content, "status: IN_PROGRESS") || strings.Contains(content, "status: \"IN_PROGRESS\"") {
+				if strings.Contains(strings.ToUpper(content), sid) {
+					if strings.Contains(content, "status: IN_PROGRESS") || strings.Contains(content, "status: \"IN_PROGRESS\"") ||
+						strings.Contains(content, "status: 'IN_PROGRESS'") ||
+						strings.Contains(content, "status: READY") || strings.Contains(content, "status: \"READY\"") {
 						return true
 					}
 				}
@@ -360,7 +454,7 @@ func IsWorktreeIdleForGitUpdate(repoPath string, sup *Sup, isPIDAlive func(int) 
 		return false
 	}
 
-	// 1. Check in-flight story branch directly from git HEAD
+	// 1. Check in-flight story branch directly from git HEAD or submodules
 	if brOut, brErr := procutil.Command("git", "-C", cleanPath, "symbolic-ref", "--short", "-q", "HEAD").Output(); brErr == nil {
 		br := strings.TrimSpace(string(brOut))
 		if br != "" && br != "main" && br != "master" && br != "HEAD" {
@@ -370,6 +464,9 @@ func IsWorktreeIdleForGitUpdate(repoPath string, sup *Sup, isPIDAlive func(int) 
 				}
 			}
 		}
+	}
+	if hasActiveNonMainSubmoduleStoryInRepo(cleanPath) {
+		return false
 	}
 
 	// 2. Check active ASE state from .autopilot/ase-state.json
@@ -424,10 +521,97 @@ func IsWorktreeIdleForGitUpdate(repoPath string, sup *Sup, isPIDAlive func(int) 
 					return false
 				}
 			}
+			if hasAnyNonMainSubmoduleInRepo(cleanPath) {
+				return false
+			}
 		}
 	}
 
 	return true
+}
+
+func readWorktreeHeadBranchFast(dir string) (string, bool) {
+	gitPath := filepath.Join(dir, ".git")
+	fi, err := os.Stat(gitPath)
+	if err != nil {
+		return "", false
+	}
+	gitDir := gitPath
+	if !fi.IsDir() {
+		b, rErr := os.ReadFile(gitPath)
+		if rErr != nil {
+			return "", false
+		}
+		content := strings.TrimSpace(string(b))
+		if strings.HasPrefix(content, "gitdir:") {
+			target := strings.TrimSpace(strings.TrimPrefix(content, "gitdir:"))
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(dir, target)
+			}
+			gitDir = target
+		}
+	}
+	headBytes, hErr := os.ReadFile(filepath.Join(gitDir, "HEAD"))
+	if hErr != nil {
+		return "", false
+	}
+	headStr := strings.TrimSpace(string(headBytes))
+	if strings.HasPrefix(headStr, "ref: refs/heads/") {
+		return strings.TrimPrefix(headStr, "ref: refs/heads/"), true
+	}
+	return "detached", true
+}
+
+func hasAnyNonMainSubmoduleInRepo(repoPath string) bool {
+	for _, sub := range DiscoverSubRepositories(repoPath) {
+		subDir := filepath.Join(repoPath, sub)
+		if br, ok := readWorktreeHeadBranchFast(subDir); ok && br != "main" && br != "master" && br != "detached" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasActiveNonMainSubmoduleStoryInRepo(repoPath string) bool {
+	for _, sub := range DiscoverSubRepositories(repoPath) {
+		subDir := filepath.Join(repoPath, sub)
+		if br, ok := readWorktreeHeadBranchFast(subDir); ok && br != "main" && br != "master" && br != "detached" {
+			if inferred := InferStoryIDFromBranch(br); inferred != "" && !isStoryMarkedDoneOnDisk(repoPath, inferred) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isAutomatedMaintenanceBranchInRepo(branch string) bool {
+	b := strings.ToLower(strings.TrimSpace(branch))
+	return strings.HasPrefix(b, "chore/governance-pointers-") ||
+		strings.HasPrefix(b, "chore/submodule-pointers-") ||
+		strings.HasPrefix(b, "chore/auto-sync-")
+}
+
+func healStrandedMaintenanceBranchBeforeGitUpdate(ctx context.Context, cleanPath string) {
+	brOut, brErr := procutil.CommandContext(ctx, "git", "-C", cleanPath, "symbolic-ref", "--short", "-q", "HEAD").Output()
+	if brErr != nil {
+		return
+	}
+	br := strings.TrimSpace(string(brOut))
+	if !isAutomatedMaintenanceBranchInRepo(br) {
+		return
+	}
+	_ = procutil.CommandContext(ctx, "git", "-C", cleanPath, "checkout", "main").Run()
+	fetchCmd := procutil.CommandContext(ctx, "git", "-C", cleanPath, "fetch", "origin", "main")
+	fetchCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if fetchCmd.Run() == nil {
+		_ = procutil.CommandContext(ctx, "git", "-C", cleanPath, "reset", "--hard", "origin/main").Run()
+	}
+	_ = procutil.CommandContext(ctx, "git", "-C", cleanPath, "branch", "-D", br).Run()
+	if sirs, gErr := filepath.Glob(filepath.Join(cleanPath, "tmp", "reports", "intervention-git-update-sir-*.json")); gErr == nil {
+		for _, sir := range sirs {
+			_ = os.Remove(sir)
+		}
+	}
 }
 
 func cleanOrRestoreSingleArtifact(ctx context.Context, dir, relPath string) bool {
@@ -1090,6 +1274,8 @@ func (m *RepoStateMonitor) UpdateAndRemediateWorktree(ctx context.Context, item 
 		}
 	}
 	defer releaseLock()
+
+	healStrandedMaintenanceBranchBeforeGitUpdate(ctx, cleanPath)
 
 	// Step 1: Execute "autopilot git-update" directly via shell in the worktree root
 	res.Stage1Executed = true
