@@ -582,13 +582,10 @@ func IsWorktreeIdleForGitUpdate(repoPath string, sup *Sup, isPIDAlive func(int) 
 	if b, err := os.ReadFile(sessionPath); err == nil {
 		storyID := strings.TrimSpace(string(b))
 		if storyID != "" && !isStoryMarkedDoneOnDisk(cleanPath, storyID) {
-			if isStoryExplicitlyInProgressOnDisk(cleanPath, storyID) {
+			if isStoryExplicitlyInProgressOnDisk(cleanPath, storyID) || hasUnresolvedStorySIRInRepo(cleanPath, storyID) {
 				return false
 			}
 			if _, rErr := os.Stat(filepath.Join(cleanPath, "tmp", "ase-resume-"+storyID+".json")); rErr == nil {
-				return false
-			}
-			if fi, stErr := os.Stat(sessionPath); stErr == nil && time.Since(fi.ModTime()) <= 2*time.Hour {
 				return false
 			}
 			if brOut, brErr := procutil.Command("git", "-C", cleanPath, "symbolic-ref", "--short", "-q", "HEAD").Output(); brErr == nil {
