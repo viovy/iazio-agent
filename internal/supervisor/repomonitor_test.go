@@ -1860,3 +1860,76 @@ func TestStep2_AgyEscalationOnStep1Failure_With60MinFingerprintCooldownAndAutoRe
 		t.Fatalf("expected FinalState.IsClean=true after Stage 2 remediation")
 	}
 }
+
+func TestInferStoryIDFromBranch(t *testing.T) {
+	cases := []struct {
+		branch   string
+		expected string
+	}{
+		{"chore/gov-5186-increase-jenkins-zfs-volume-25gb", "STORY-GOV-5186"},
+		{"feat/gov-5209-pointer-pr-rebase-rollback-and-fleet-healing", "STORY-GOV-5209"},
+		{"feat/iazio-0199-adhoc-ase-detection-and-retention", "STORY-IAZIO-0199"},
+		{"autopilot-plugins-internal (on feat/STORY-IAZIO-0194-sync)", "STORY-IAZIO-0194"},
+		{"fix/story-vigo-0235-something", "STORY-VIGO-0235"},
+		{"main", ""},
+		{"master", ""},
+		{"HEAD", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		got := InferStoryIDFromBranch(tc.branch)
+		if got != tc.expected {
+			t.Errorf("InferStoryIDFromBranch(%q) = %q, want %q", tc.branch, got, tc.expected)
+		}
+	}
+}
+
+func TestIsWorktreeIdleForGitUpdate_StoryScopingAndBranchDetection(t *testing.T) {
+	tempDir := t.TempDir()
+	initTestGitRepo(t, tempDir)
+
+	// Case 1: On main, no stories -> idle
+	if !IsWorktreeIdleForGitUpdate(tempDir, nil, nil) {
+		t.Fatalf("expected clean main to be idle")
+	}
+
+	// Case 2: .autopilot/ase-state.json has an old completed story STORY-GOV-5169,
+	// but active branch is feat/gov-5209-... with IN_PROGRESS story.
+	// Previously, aseStateDone leaked and treated the worktree as idle!
+	dotAutopilot := filepath.Join(tempDir, ".autopilot")
+	if err := os.MkdirAll(dotAutopilot, 0755); err != nil {
+		t.Fatalf("mkdir .autopilot: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dotAutopilot, "ase-state.json"), []byte(`{"phase":"completed","status":"DONE","story_id":"STORY-GOV-5169"}`), 0644); err != nil {
+		t.Fatalf("write ase-state: %v", err)
+	}
+
+	// Create docs/stories directory with IN_PROGRESS story STORY-GOV-5209
+	storiesDir := filepath.Join(tempDir, "docs", "stories")
+	if err := os.MkdirAll(storiesDir, 0755); err != nil {
+		t.Fatalf("mkdir docs/stories: %v", err)
+	}
+	storyContent := "---\nid: STORY-GOV-5209\nstatus: IN_PROGRESS\n---\n"
+	if err := os.WriteFile(filepath.Join(storiesDir, "2026-11-09-gov-5209.story.md"), []byte(storyContent), 0644); err != nil {
+		t.Fatalf("write story file: %v", err)
+	}
+
+	// Switch git HEAD to feat/gov-5209-pointer-pr-rebase-rollback-and-fleet-healing
+	cmd := exec.Command("git", "-C", tempDir, "checkout", "-b", "feat/gov-5209-pointer-pr-rebase-rollback-and-fleet-healing")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git checkout -b failed: %v (%s)", err, string(out))
+	}
+
+	// Even WITHOUT .session_story_id, the active story branch must prevent worktree from being idle!
+	if IsWorktreeIdleForGitUpdate(tempDir, nil, nil) {
+		t.Fatalf("expected active story branch with IN_PROGRESS story to NOT be idle, but got idle=true")
+	}
+
+	// With .session_story_id present, it must also NOT be idle (and must not be wiped by old STORY-GOV-5169!)
+	if err := os.WriteFile(filepath.Join(tempDir, ".session_story_id"), []byte("STORY-GOV-5209\n"), 0644); err != nil {
+		t.Fatalf("write .session_story_id: %v", err)
+	}
+	if IsWorktreeIdleForGitUpdate(tempDir, nil, nil) {
+		t.Fatalf("expected worktree with active .session_story_id to NOT be idle, but got idle=true")
+	}
+}

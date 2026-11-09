@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -305,8 +306,32 @@ func isStoryExplicitlyInProgressOnDisk(repoPath, storyID string) bool {
 	return false
 }
 
+var (
+	branchExplicitStoryRe = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+-[0-9]+)\b`)
+	branchSlugStoryRe     = regexp.MustCompile(`(?i)^(?:chore|feat|fix|refactor|docs|test|ci|perf|build)/(?:story-)?([a-z]{2,10})-([0-9]{2,6})(?:[-/]|$)`)
+)
+
+// InferStoryIDFromBranch extracts a canonical STORY-<CAT>-<NUM> identifier from a story branch name
+// (e.g. "feat/gov-5209-pointer-pr-rebase-rollback-and-fleet-healing" -> "STORY-GOV-5209") or submodule status entry.
+func InferStoryIDFromBranch(branch string) string {
+	b := strings.TrimSpace(branch)
+	if b == "" || b == "main" || b == "master" || b == "HEAD" || b == "detached" {
+		return ""
+	}
+	if idx := strings.Index(b, "(on "); idx >= 0 {
+		b = strings.TrimSuffix(strings.TrimSpace(b[idx+4:]), ")")
+	}
+	if m := branchExplicitStoryRe.FindStringSubmatch(b); len(m) == 2 {
+		return strings.ToUpper(m[1])
+	}
+	if m := branchSlugStoryRe.FindStringSubmatch(b); len(m) == 3 {
+		return fmt.Sprintf("STORY-%s-%s", strings.ToUpper(m[1]), m[2])
+	}
+	return ""
+}
+
 // IsWorktreeIdleForGitUpdate returns true when repolock is idle (no active iazio-harness / agy process running)
-// and there is no active IN_PROGRESS ASE story in .autopilot/ase-state.json (or the referenced story is already DONE).
+// and there is no active IN_PROGRESS ASE story in .autopilot/ase-state.json, git HEAD story branch, or .session_story_id.
 func IsWorktreeIdleForGitUpdate(repoPath string, sup *Sup, isPIDAlive func(int) bool) bool {
 	cleanPath := filepath.Clean(strings.TrimSpace(repoPath))
 	if cleanPath == "" {
@@ -335,7 +360,19 @@ func IsWorktreeIdleForGitUpdate(repoPath string, sup *Sup, isPIDAlive func(int) 
 		return false
 	}
 
-	aseStateDone := false
+	// 1. Check in-flight story branch directly from git HEAD
+	if brOut, brErr := procutil.Command("git", "-C", cleanPath, "symbolic-ref", "--short", "-q", "HEAD").Output(); brErr == nil {
+		br := strings.TrimSpace(string(brOut))
+		if br != "" && br != "main" && br != "master" && br != "HEAD" {
+			if inferred := InferStoryIDFromBranch(br); inferred != "" {
+				if !isStoryMarkedDoneOnDisk(cleanPath, inferred) {
+					return false
+				}
+			}
+		}
+	}
+
+	// 2. Check active ASE state from .autopilot/ase-state.json
 	aseStatePath := filepath.Join(cleanPath, ".autopilot", "ase-state.json")
 	if b, err := os.ReadFile(aseStatePath); err == nil {
 		var as struct {
@@ -345,19 +382,15 @@ func IsWorktreeIdleForGitUpdate(repoPath string, sup *Sup, isPIDAlive func(int) 
 		}
 		if json.Unmarshal(b, &as) == nil {
 			status := strings.ToUpper(strings.TrimSpace(as.Status))
-			phase := strings.ToLower(strings.TrimSpace(as.Phase))
-			if status == "DONE" || status == "COMPLETED" || phase == "completed" {
-				aseStateDone = true
-			} else if status == "IN_PROGRESS" || status == "RUNNING" {
-				if as.StoryID != "" && isStoryMarkedDoneOnDisk(cleanPath, as.StoryID) {
-					aseStateDone = true
-				} else {
+			if status == "IN_PROGRESS" || status == "RUNNING" {
+				if as.StoryID == "" || !isStoryMarkedDoneOnDisk(cleanPath, as.StoryID) {
 					return false
 				}
 			}
 		}
 	}
 
+	// 3. Check active state from .autopilot/state.json
 	statePath := filepath.Join(cleanPath, ".autopilot", "state.json")
 	if b, err := os.ReadFile(statePath); err == nil {
 		var s struct {
@@ -366,7 +399,7 @@ func IsWorktreeIdleForGitUpdate(repoPath string, sup *Sup, isPIDAlive func(int) 
 		}
 		if json.Unmarshal(b, &s) == nil {
 			st := strings.ToUpper(strings.TrimSpace(s.State))
-			if (st == "IN_PROGRESS" || st == "RUNNING") && !aseStateDone {
+			if st == "IN_PROGRESS" || st == "RUNNING" {
 				if s.StoryID == "" || !isStoryMarkedDoneOnDisk(cleanPath, s.StoryID) {
 					return false
 				}
@@ -374,10 +407,11 @@ func IsWorktreeIdleForGitUpdate(repoPath string, sup *Sup, isPIDAlive func(int) 
 		}
 	}
 
+	// 4. Check active session story from .session_story_id
 	sessionPath := filepath.Join(cleanPath, ".session_story_id")
 	if b, err := os.ReadFile(sessionPath); err == nil {
 		storyID := strings.TrimSpace(string(b))
-		if storyID != "" && !aseStateDone && !isStoryMarkedDoneOnDisk(cleanPath, storyID) {
+		if storyID != "" && !isStoryMarkedDoneOnDisk(cleanPath, storyID) {
 			if isStoryExplicitlyInProgressOnDisk(cleanPath, storyID) {
 				return false
 			}

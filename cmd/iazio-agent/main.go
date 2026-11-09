@@ -3308,7 +3308,13 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 	// Delegate repo evaluation and Tier 1/Tier 2 self-remediation to iazio-harness (SSOT Intelligence Engine).
 	harnessSucceeded := false
 	harnessBin := resolveHarnessBinaryPath()
-	harnessCtx, cancelHarness := context.WithTimeout(ctx, 45*time.Second)
+	harnessTimeout := 180 * time.Second
+	if rawTO := strings.TrimSpace(os.Getenv("IAZIO_HARNESS_TIMEOUT")); rawTO != "" {
+		if d, err := time.ParseDuration(rawTO); err == nil && d > 0 {
+			harnessTimeout = d
+		}
+	}
+	harnessCtx, cancelHarness := context.WithTimeout(ctx, harnessTimeout)
 	harnessCmd := procutil.CommandContext(harnessCtx, harnessBin, "fleet-status", "--repo", repoPath, "--auto-remediate", "--json")
 	harnessOut, harnessErr := harnessCmd.Output()
 	cancelHarness()
@@ -3322,7 +3328,7 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 			// trigger iazio-harness to execute "autopilot git-update" with autoremediation.
 			hasDirtyTree := !st.IsClean || !st.SubmodulesClean || st.DirtyFilesCount > 0 || st.UntrackedFilesCount > 0 || len(st.DirtySubmodules) > 0
 			if hasDirtyTree && isASEFlowCompletedAndLastJobSucceeded(repoPath, st) {
-				remCtx, cancelRem := context.WithTimeout(ctx, 45*time.Second)
+				remCtx, cancelRem := context.WithTimeout(ctx, harnessTimeout)
 				remCmd := procutil.CommandContext(remCtx, harnessBin, "repo", "remediate", "--repo", repoPath, "--strategy", "git-update", "--json")
 				remOut, remErr := remCmd.Output()
 				cancelRem()
@@ -3436,36 +3442,53 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 				st.ASEState = "RUNNING"
 			}
 		}
-		// Detect ad-hoc ASE session bound via .session_story_id or scoped tmp/ase-resume-<storyID>.json
+		// Detect ad-hoc ASE session bound via .session_story_id or active story branch / scoped resume
+		detectedStoryID := ""
 		sessionFile := filepath.Join(repoPath, ".session_story_id")
 		if sessionBytes, err := os.ReadFile(sessionFile); err == nil {
-			storyID := strings.TrimSpace(string(sessionBytes))
-			if strings.HasPrefix(storyID, "STORY-") {
-				if isStoryCompletedOnDiskFallback(repoPath, storyID) {
-					cleanOrRestoreFallbackSessionStoryFile(repoPath, sessionFile)
-					_ = os.Remove(filepath.Join(repoPath, "tmp", "ase-resume-"+storyID+".json"))
-				} else {
-					if st.ActiveStoryID == "" {
-						st.ActiveStoryID = storyID
+			sid := strings.TrimSpace(string(sessionBytes))
+			if strings.HasPrefix(sid, "STORY-") {
+				detectedStoryID = sid
+			}
+		}
+		if detectedStoryID == "" {
+			if inferred := supervisor.InferStoryIDFromBranch(st.Branch); inferred != "" {
+				detectedStoryID = inferred
+			} else {
+				for _, sub := range st.NonMainSubmodules {
+					if cand := supervisor.InferStoryIDFromBranch(sub); cand != "" {
+						detectedStoryID = cand
+						break
 					}
-					nonMainBranch := st.Branch != "" && st.Branch != "main" && st.Branch != "master" && st.Branch != "HEAD"
-					hasResumeFile := false
-					if _, err := os.Stat(filepath.Join(repoPath, "tmp", "ase-resume-"+storyID+".json")); err == nil {
-						hasResumeFile = true
+				}
+			}
+		}
+
+		if detectedStoryID != "" {
+			if isStoryCompletedOnDiskFallback(repoPath, detectedStoryID) {
+				cleanOrRestoreFallbackSessionStoryFile(repoPath, sessionFile)
+				_ = os.Remove(filepath.Join(repoPath, "tmp", "ase-resume-"+detectedStoryID+".json"))
+			} else {
+				if st.ActiveStoryID == "" {
+					st.ActiveStoryID = detectedStoryID
+				}
+				nonMainBranch := st.Branch != "" && st.Branch != "main" && st.Branch != "master" && st.Branch != "HEAD"
+				hasResumeFile := false
+				if _, err := os.Stat(filepath.Join(repoPath, "tmp", "ase-resume-"+detectedStoryID+".json")); err == nil {
+					hasResumeFile = true
+				}
+				if nonMainBranch || len(st.NonMainSubmodules) > 0 || hasResumeFile {
+					if st.ASEState == "" || st.ASEState == "IDLE" {
+						st.ASEState = "RUNNING"
 					}
-					if nonMainBranch || len(st.NonMainSubmodules) > 0 || hasResumeFile {
-						if st.ASEState == "" || st.ASEState == "IDLE" {
-							st.ASEState = "RUNNING"
-						}
-						if st.ExecutionProvenance == "" || st.ExecutionProvenance == "IDLE" {
-							st.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
-						}
-						if st.ToolLiveness == "" || st.ToolLiveness == "NONE" {
-							st.ToolLiveness = "LIVE"
-						}
-						if st.ActiveTool == "" {
-							st.ActiveTool = "autopilot-ase"
-						}
+					if st.ExecutionProvenance == "" || st.ExecutionProvenance == "IDLE" {
+						st.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
+					}
+					if st.ToolLiveness == "" || st.ToolLiveness == "NONE" {
+						st.ToolLiveness = "LIVE"
+					}
+					if st.ActiveTool == "" {
+						st.ActiveTool = "autopilot-ase"
 					}
 				}
 			}
