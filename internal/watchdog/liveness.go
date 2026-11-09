@@ -180,18 +180,21 @@ func (m *ConversationLivenessMonitor) resolveWorkspaceTimestamp(worktreePath str
 		return time.Time{}
 	}
 
-	// Check git index mtime
-	gitIndex := filepath.Join(worktreePath, ".git", "index")
-	if fi, err := os.Stat(gitIndex); err == nil {
-		return fi.ModTime().UTC()
+	var latest time.Time
+	candidates := []string{
+		filepath.Join(worktreePath, ".git", "index"),
+		filepath.Join(worktreePath, ".git", "logs", "HEAD"),
+		filepath.Join(worktreePath, ".iazio", "repo.lock"),
+		filepath.Join(worktreePath, ".iazio", "execution-checkpoint.json"),
 	}
-
-	gitLogsHead := filepath.Join(worktreePath, ".git", "logs", "HEAD")
-	if fi, err := os.Stat(gitLogsHead); err == nil {
-		return fi.ModTime().UTC()
+	for _, p := range candidates {
+		if fi, err := os.Stat(p); err == nil {
+			if mt := fi.ModTime().UTC(); mt.After(latest) {
+				latest = mt
+			}
+		}
 	}
-
-	return time.Time{}
+	return latest
 }
 
 func (m *ConversationLivenessMonitor) captureProcessTree(pid int) string {

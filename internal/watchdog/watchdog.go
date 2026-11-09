@@ -354,6 +354,32 @@ func (w *Watchdog) reapProcess(jobID string, pid int) {
 	w.OnProcessExit(jobID, pid, exitCode, err)
 }
 
+func syncJobMetadataFromWorktreeLocked(job *TrackedJob) {
+	if job == nil || job.WorktreePath == "" {
+		return
+	}
+	if lockInfo, err := repolock.Read(job.WorktreePath); err == nil && (lockInfo.JobID == "" || lockInfo.JobID == job.JobID) {
+		if lockInfo.ConversationID != "" {
+			job.ConversationID = lockInfo.ConversationID
+		}
+		if lockInfo.ToolPID > 0 {
+			job.ToolPID = lockInfo.ToolPID
+		}
+	}
+	if job.ConversationID == "" {
+		cpFile := filepath.Join(job.WorktreePath, ".iazio", "execution-checkpoint.json")
+		if data, err := os.ReadFile(cpFile); err == nil {
+			var cp struct {
+				JobID          string `json:"job_id"`
+				ConversationID string `json:"conversation_id"`
+			}
+			if err := json.Unmarshal(data, &cp); err == nil && cp.ConversationID != "" && (cp.JobID == "" || cp.JobID == job.JobID) {
+				job.ConversationID = cp.ConversationID
+			}
+		}
+	}
+}
+
 // OnProcessExit handles termination of a supervised child process.
 func (w *Watchdog) OnProcessExit(jobID string, pid, exitCode int, waitErr error) {
 	w.mu.Lock()
@@ -372,8 +398,8 @@ func (w *Watchdog) OnProcessExit(jobID string, pid, exitCode int, waitErr error)
 		w.mu.Unlock()
 		return
 	}
-	if job.Status == StatusAutoResuming {
-		// Process exit was already anticipated and handled by stall detector / auto-resumer
+	if job.Status == StatusAutoResuming || job.Status == StatusCompleted || job.Status == StatusFailed || job.Status == StatusCircuitBreakerTripped || job.CircuitBreakerTripped {
+		// Process exit was already anticipated and handled by stall detector / auto-resumer or job already reached terminal state
 		w.mu.Unlock()
 		return
 	}
@@ -387,7 +413,7 @@ func (w *Watchdog) OnProcessExit(jobID string, pid, exitCode int, waitErr error)
 
 	// First inspect if AI tool process (ToolPID) is still running while harness terminated
 	if job.ToolPID <= 0 && job.WorktreePath != "" {
-		if lockInfo, err := repolock.Read(job.WorktreePath); err == nil && lockInfo.ToolPID > 0 {
+		if lockInfo, err := repolock.Read(job.WorktreePath); err == nil && (lockInfo.JobID == "" || lockInfo.JobID == job.JobID) && lockInfo.ToolPID > 0 {
 			job.ToolPID = lockInfo.ToolPID
 		}
 	}
@@ -490,10 +516,14 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 				w.mu.Unlock()
 				return
 			}
+			nowSpawn := w.now().UTC()
 			job.PID = newPID
 			job.HarnessPID = newPID
+			job.StartedAt = nowSpawn
+			job.LastActivityAt = nowSpawn
+			job.IdleSeconds = 0
 			job.Status = StatusRunning
-			job.UpdatedAt = w.now().UTC()
+			job.UpdatedAt = nowSpawn
 			w.persistStateLocked()
 			w.mu.Unlock()
 
@@ -559,22 +589,7 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 	}
 
 	// Early and eager conversation ID capture before resuming
-	if job.ConversationID == "" && job.WorktreePath != "" {
-		if lockInfo, err := repolock.Read(job.WorktreePath); err == nil && lockInfo.ConversationID != "" {
-			job.ConversationID = lockInfo.ConversationID
-		}
-	}
-	if job.ConversationID == "" && job.WorktreePath != "" {
-		cpFile := filepath.Join(job.WorktreePath, ".iazio", "execution-checkpoint.json")
-		if data, err := os.ReadFile(cpFile); err == nil {
-			var cp struct {
-				ConversationID string `json:"conversation_id"`
-			}
-			if err := json.Unmarshal(data, &cp); err == nil && cp.ConversationID != "" {
-				job.ConversationID = cp.ConversationID
-			}
-		}
-	}
+	syncJobMetadataFromWorktreeLocked(job)
 	if job.ConversationID == "" && job.WorktreePath != "" && job.StoryID != "" {
 		resolver := sessionstore.DefaultResolver()
 		if sess, err := resolver.ResolveForStory(job.WorktreePath, job.StoryID); err == nil && sess != nil && sess.ConversationID != "" {
@@ -651,9 +666,14 @@ func (w *Watchdog) attemptResumeWithReason(jobID, reason string, unmetGates []st
 			w.mu.Unlock()
 			return
 		}
+		nowSpawn := w.now().UTC()
 		job.PID = newPID
+		job.HarnessPID = newPID
+		job.StartedAt = nowSpawn
+		job.LastActivityAt = nowSpawn
+		job.IdleSeconds = 0
 		job.Status = StatusRunning
-		job.UpdatedAt = w.now().UTC()
+		job.UpdatedAt = nowSpawn
 		w.persistStateLocked()
 		w.mu.Unlock()
 
@@ -733,22 +753,8 @@ func (w *Watchdog) CheckInterrupted(ctx context.Context) []TrackedJob {
 		if job.Status == StatusCompleted || job.Status == StatusFailed || job.Status == StatusCircuitBreakerTripped {
 			continue
 		}
-		// Eagerly refresh conversation ID while process is still alive
-		if job.ConversationID == "" && job.WorktreePath != "" {
-			if lockInfo, err := repolock.Read(job.WorktreePath); err == nil && lockInfo.ConversationID != "" {
-				job.ConversationID = lockInfo.ConversationID
-			} else {
-				cpFile := filepath.Join(job.WorktreePath, ".iazio", "execution-checkpoint.json")
-				if data, err := os.ReadFile(cpFile); err == nil {
-					var cp struct {
-						ConversationID string `json:"conversation_id"`
-					}
-					if err := json.Unmarshal(data, &cp); err == nil && cp.ConversationID != "" {
-						job.ConversationID = cp.ConversationID
-					}
-				}
-			}
-		}
+		// Eagerly refresh conversation ID and tool PID while process is still alive (scoped to current job)
+		syncJobMetadataFromWorktreeLocked(job)
 
 		// Liveness and stall detection for active processes
 		if job.PID > 0 && w.isAlive(job.PID) && w.monitor != nil {
@@ -781,7 +787,7 @@ func (w *Watchdog) CheckInterrupted(ctx context.Context) []TrackedJob {
 
 			// Check if AI tool (ToolPID) is still running while harness died
 			if job.ToolPID <= 0 && job.WorktreePath != "" {
-				if lockInfo, err := repolock.Read(job.WorktreePath); err == nil && lockInfo.ToolPID > 0 {
+				if lockInfo, err := repolock.Read(job.WorktreePath); err == nil && (lockInfo.JobID == "" || lockInfo.JobID == job.JobID) && lockInfo.ToolPID > 0 {
 					job.ToolPID = lockInfo.ToolPID
 				}
 			}

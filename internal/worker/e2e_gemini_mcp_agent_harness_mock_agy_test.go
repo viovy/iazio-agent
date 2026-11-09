@@ -1060,3 +1060,141 @@ func TestE2E_GeminiWeb_IazioMCP_HarnessAPI_Agent_Harness_MockAgy(t *testing.T) {
 		}
 	})
 }
+
+func TestE2E_StoryGov5206_Sch1569_Job1570_WatchdogAndHarnessMockAgyRecovery(t *testing.T) {
+	harnessBin, _, _ := buildHarnessAndMockAgyBinaries(t)
+	fleetDir := initTestFleetWorkspace(t)
+	t.Setenv("IAZIO_FLEET_ROOT", fleetDir)
+	t.Setenv("MOCK_AGY_SCENARIO", "sch_1569_fallback_new_conversation_resume")
+	t.Setenv("MOCK_AGY_STATE_MARKER", filepath.Join(t.TempDir(), "sch1569_agent_e2e.state"))
+
+	_ = exec.Command("git", "-C", fleetDir, "checkout", "-B", "main").Run()
+	storyDoc := "---\nid: STORY-ROOT-45276\nstatus: DONE\n---\n# STORY-ROOT-45276: Canonical AI Review\n\n## Acceptance Criteria\n- [x] AC1\n"
+	if err := os.WriteFile(filepath.Join(fleetDir, "docs", "stories", "2026-11-09-root-45276.story.md"), []byte(storyDoc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	indexDoc := "stories:\n  - id: STORY-ROOT-45276\n    status: DONE\n    path: docs/stories/2026-11-09-root-45276.story.md\n"
+	if err := os.WriteFile(filepath.Join(fleetDir, "docs", "stories", "index.yml"), []byte(indexDoc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = exec.Command("git", "-C", fleetDir, "add", ".").Run()
+	_ = exec.Command("git", "-C", fleetDir, "commit", "-m", "feat: complete STORY-ROOT-45276").Run()
+
+	// Seed stale .iazio/execution-checkpoint.json from job-1408 (Oct 25) to verify neither iazio-agent nor iazio-harness adopts it
+	iazioDir := filepath.Join(fleetDir, ".iazio")
+	if err := os.MkdirAll(iazioDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staleCP := `{"job_id":"job-1408","conversation_id":"287e8a2b-1e95-4aa1-b2f9-9b151134c574","engine":"agy"}`
+	if err := os.WriteFile(filepath.Join(iazioDir, "execution-checkpoint.json"), []byte(staleCP), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	activeConvID := ""
+	var registeredConvs []string
+	var exitStatuses []int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/jobs/job-1570"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":                     "job-1570",
+				"schedule_id":            "sch-1569",
+				"parent_job_id":          "job-1098",
+				"root_job_id":            "job-1098",
+				"kind":                   "resume",
+				"engine":                 "mock-agy",
+				"agent":                  "mock-agy",
+				"worktree_path":          fleetDir,
+				"docs_hub_path":          fleetDir,
+				"story_id":               "STORY-ROOT-45276",
+				"prompt":                 "deep review and fix in canonical AI",
+				"status":                 "RUNNING",
+				"resume_mode":            "fallback_new_conversation",
+				"resume_fallback_reason": "cross-engine resume not supported: parent used autopilot, final engine is agy",
+				"resume_conversation_id": "5e170251-5362-4bf3-8f98-f47eb900be28",
+				"active_conversation_id": activeConvID,
+			})
+		case r.Method == http.MethodPost && (strings.HasSuffix(r.URL.Path, "/conversations") || strings.HasSuffix(r.URL.Path, "/conversation-lineage")):
+			var body struct {
+				ConversationID string `json:"conversation_id"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.ConversationID != "" {
+				activeConvID = body.ConversationID
+				registeredConvs = append(registeredConvs, body.ConversationID)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exit"):
+			var body struct {
+				ExitCode int `json:"exit_code"`
+				Code     int `json:"code"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			exitStatuses = append(exitStatuses, body.ExitCode)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		}
+	}))
+	defer srv.Close()
+
+	// Run Attempt #1 via iazio-harness (simulating initial spawn by iazio-agent for job-1570)
+	cmd1 := exec.Command(
+		harnessBin, "run",
+		"--job-id", "job-1570",
+		"--api-url", srv.URL,
+		"--worktree-path", fleetDir,
+		"--docs-hub-path", fleetDir,
+		"--kind", "resume",
+	)
+	out1, err1 := cmd1.CombinedOutput()
+	if err1 != nil {
+		t.Fatalf("expected Attempt #1 of sch_1569_fallback_new_conversation_resume to succeed, err=%v output:\n%s", err1, string(out1))
+	}
+
+	// Verify Attempt #1 registered 8d5d3c3d-1eb6-4517-a64b-df5b27cff909 and overwrote .iazio/execution-checkpoint.json for job-1570
+	mu.Lock()
+	gotActiveAfter1 := activeConvID
+	mu.Unlock()
+	if gotActiveAfter1 != "8d5d3c3d-1eb6-4517-a64b-df5b27cff909" {
+		t.Fatalf("expected Attempt #1 to register fallback conversation 8d5d3c3d-1eb6-4517-a64b-df5b27cff909, got %q (out:\n%s)", gotActiveAfter1, string(out1))
+	}
+
+	// Run Attempt #2 via iazio-harness (simulating in-place watchdog auto-resume even if a stale caller passes --resume-conversation 287e8a2b-...)
+	cmd2 := exec.Command(
+		harnessBin, "run",
+		"--job-id", "job-1570",
+		"--api-url", srv.URL,
+		"--worktree-path", fleetDir,
+		"--docs-hub-path", fleetDir,
+		"--kind", "resume",
+		"--resume-conversation", "287e8a2b-1e95-4aa1-b2f9-9b151134c574",
+	)
+	out2, err2 := cmd2.CombinedOutput()
+	if err2 != nil {
+		t.Fatalf("expected Attempt #2 auto-resume of job-1570 to succeed cleanly, err=%v output:\n%s", err2, string(out2))
+	}
+
+	mu.Lock()
+	finalConvs := append([]string(nil), registeredConvs...)
+	finalExits := append([]int(nil), exitStatuses...)
+	mu.Unlock()
+
+	for _, c := range finalConvs {
+		if c == "287e8a2b-1e95-4aa1-b2f9-9b151134c574" || c == "5e170251-5362-4bf3-8f98-f47eb900be28" {
+			t.Fatalf("expected job-1570 never to register stale/abandoned conversation %q, got %v", c, finalConvs)
+		}
+	}
+	if len(finalExits) == 0 || finalExits[len(finalExits)-1] != 0 {
+		t.Fatalf("expected final exit code 0 for job-1570, got %v", finalExits)
+	}
+}
+

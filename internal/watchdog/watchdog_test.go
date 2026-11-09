@@ -1142,3 +1142,189 @@ func TestWatchdog_LifecycleAndLivenessHelpers(t *testing.T) {
 	}
 }
 
+func TestWatchdog_StoryGov5206_Sch1569_Job1570_CheckpointIsolation_RepoLockRefresh_StartedAtReset_And_SingleCircuitBreaker(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "wd-gov-5206.json")
+
+	// 1. Seed a stale checkpoint from job-1408 (Oct 25) with conversation 287e8a2b-1e95-4aa1-b2f9-9b151134c574
+	iazioDir := filepath.Join(tmpDir, ".iazio")
+	if err := os.MkdirAll(iazioDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staleCP := `{"job_id":"job-1408","conversation_id":"287e8a2b-1e95-4aa1-b2f9-9b151134c574","engine":"agy"}`
+	if err := os.WriteFile(filepath.Join(iazioDir, "execution-checkpoint.json"), []byte(staleCP), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	alivePID := 37748
+	var spawnedJobs []TrackedJob
+	var terminalFailureCalls int
+	var lockHandle *repolock.LockHandle
+
+	mon := &ConversationLivenessMonitor{
+		StallTimeout: 180 * time.Second,
+		LivenessDir:  filepath.Join(tmpDir, "liveness"),
+		BrainDir:     filepath.Join(tmpDir, "brain"),
+		Now:          func() time.Time { return now },
+	}
+
+	w := New(Options{
+		StateFile:  stateFile,
+		MaxResumes: 2,
+		Now:        func() time.Time { return now },
+		IsAlive:    func(pid int) bool { return pid == alivePID },
+		Monitor:    mon,
+		KillProcess: func(pid int) error {
+			if lockHandle != nil {
+				_ = lockHandle.Release()
+				_ = os.Remove(filepath.Join(iazioDir, "repo.lock"))
+				lockHandle = nil
+			}
+			if pid == alivePID {
+				alivePID = 0
+			}
+			return nil
+		},
+		Spawner: func(ctx context.Context, job TrackedJob) (int, error) {
+			spawnedJobs = append(spawnedJobs, job)
+			alivePID = 41668 + len(spawnedJobs)
+			return alivePID, nil
+		},
+		OnJobTerminalFailure: func(job TrackedJob, reason string) {
+			terminalFailureCalls++
+		},
+	})
+
+	// Track job-1570 (spawned for sch-1569 with fallback_new_conversation -> initial ConversationID is "")
+	w.Track(TrackedJob{
+		JobID:           "job-1570",
+		ScheduleID:      "sch-1569",
+		WorktreePath:    tmpDir,
+		PID:             37748,
+		HarnessPID:      37748,
+		Engine:          "agy",
+		Kind:            "resume",
+		Prompt:          "/autonomous-story-execution STORY-GOV-5206",
+		StoryID:         "STORY-GOV-5206",
+		ConversationID:  "",
+		StartedAt:       now,
+		StallTimeoutSec: 180,
+		AutoResumePolicy: AutoResumePolicy{
+			Enabled:                true,
+			MaxAutoResumes:         2,
+			BackoffInitialSec:      0,
+			RequireForwardProgress: false,
+		},
+	})
+
+	// Tick at +10s: job-1570 must NOT adopt job-1408's stale checkpoint conversation 287e8a2b-...
+	now = now.Add(10 * time.Second)
+	w.CheckInterrupted(context.Background())
+	got, err := w.GetJob("job-1570")
+	if err != nil {
+		t.Fatalf("GetJob failed: %v", err)
+	}
+	if got.ConversationID != "" {
+		t.Fatalf("expected job-1570 to ignore stale job-1408 checkpoint conversation, got %q", got.ConversationID)
+	}
+
+	// Now simulate iazio-harness acquiring repo.lock for job-1570 and discovering new conversation 8d5d3c3d-1eb6-4517-a64b-df5b27cff909
+	var lockErr error
+	lockHandle, lockErr = repolock.Acquire(tmpDir, repolock.LockInfo{
+		JobID:          "job-1570",
+		ScheduleID:     "sch-1569",
+		PID:            37748,
+		HarnessPID:     37748,
+		ConversationID: "8d5d3c3d-1eb6-4517-a64b-df5b27cff909",
+		Status:         "RUNNING",
+	}, func(int) bool { return true })
+	if lockErr != nil {
+		t.Fatalf("repolock.Acquire failed: %v", lockErr)
+	}
+	defer func() {
+		if lockHandle != nil {
+			_ = lockHandle.Release()
+		}
+	}()
+	_ = os.Chtimes(filepath.Join(iazioDir, "repo.lock"), now, now)
+	_ = os.Chtimes(filepath.Join(iazioDir, "execution-checkpoint.json"), now.Add(-24*time.Hour), now.Add(-24*time.Hour))
+
+	// Even if job.ConversationID had been polluted earlier, syncJobMetadataFromWorktreeLocked must refresh it from job-1570's repo.lock
+	w.mu.Lock()
+	w.jobs["job-1570"].ConversationID = "287e8a2b-1e95-4aa1-b2f9-9b151134c574"
+	w.mu.Unlock()
+
+	now = now.Add(10 * time.Second)
+	w.CheckInterrupted(context.Background())
+	got, _ = w.GetJob("job-1570")
+	if got.ConversationID != "8d5d3c3d-1eb6-4517-a64b-df5b27cff909" {
+		t.Fatalf("expected repo.lock conversation 8d5d3c3d-1eb6-4517-a64b-df5b27cff909 to override stale conversation ID, got %q", got.ConversationID)
+	}
+
+	// Advance time past 180s stall timeout (to +200s from repo.lock mtime) -> triggers Attempt #1 auto-resume
+	now = now.Add(200 * time.Second)
+	w.CheckInterrupted(context.Background())
+
+	if len(spawnedJobs) != 1 {
+		t.Fatalf("expected 1 auto-resume spawn after stall, got %d", len(spawnedJobs))
+	}
+	if spawnedJobs[0].ConversationID != "8d5d3c3d-1eb6-4517-a64b-df5b27cff909" {
+		t.Fatalf("expected Attempt #1 to resume conversation 8d5d3c3d-1eb6-4517-a64b-df5b27cff909, got %q", spawnedJobs[0].ConversationID)
+	}
+
+	gotAfterSpawn, _ := w.GetJob("job-1570")
+	if !gotAfterSpawn.StartedAt.Equal(now) {
+		t.Fatalf("expected StartedAt to be reset to %v on auto-resume spawn, got %v", now, gotAfterSpawn.StartedAt)
+	}
+
+	// Crucial regression check: 5 seconds later (+5s), CheckInterrupted must NOT kill Attempt #1!
+	// Previously, StartedAt remained at t=0 (225s ago), causing CheckInterrupted to kill Attempt #1 on the very next 5s tick!
+	now = now.Add(5 * time.Second)
+	w.CheckInterrupted(context.Background())
+	if len(spawnedJobs) != 1 {
+		t.Fatalf("expected Attempt #1 NOT to be killed 5s after spawn, got %d spawns", len(spawnedJobs))
+	}
+	gotStillRunning, _ := w.GetJob("job-1570")
+	if gotStillRunning.Status != StatusRunning || gotStillRunning.PID != 41669 {
+		t.Fatalf("expected Attempt #1 (PID 41669) to still be RUNNING after 5s tick, got status=%s pid=%d", gotStillRunning.Status, gotStillRunning.PID)
+	}
+
+	// Verify resolveWorkspaceTimestamp picks latest mtime across .git/index and .iazio/repo.lock
+	gitDir := filepath.Join(tmpDir, ".git")
+	_ = os.MkdirAll(gitDir, 0o755)
+	oldTime := now.Add(-1 * time.Hour)
+	recentTime := now.Add(-10 * time.Second)
+	gitIndex := filepath.Join(gitDir, "index")
+	_ = os.WriteFile(gitIndex, []byte("idx"), 0o644)
+	_ = os.Chtimes(gitIndex, oldTime, oldTime)
+	cpFile := filepath.Join(iazioDir, "execution-checkpoint.json")
+	_ = os.WriteFile(cpFile, []byte(`{"job_id":"job-1570","conversation_id":"8d5d3c3d-1eb6-4517-a64b-df5b27cff909"}`), 0o644)
+	_ = os.Chtimes(cpFile, recentTime, recentTime)
+	wsTS := mon.resolveWorkspaceTimestamp(tmpDir)
+	if !wsTS.Equal(recentTime) {
+		t.Fatalf("expected resolveWorkspaceTimestamp to return newer checkpoint mtime %v over older .git/index %v, got %v", recentTime, oldTime, wsTS)
+	}
+
+	// Now simulate exhausting MaxResumes (2) and verify racing OnProcessExit does NOT fire duplicate OnJobTerminalFailure
+	_ = os.Chtimes(cpFile, oldTime, oldTime)
+	now = now.Add(200 * time.Second) // Attempt #1 stalls -> spawns Attempt #2 (PID 41670)
+	w.CheckInterrupted(context.Background())
+	if len(spawnedJobs) != 2 {
+		t.Fatalf("expected Attempt #2 spawn, got %d", len(spawnedJobs))
+	}
+
+	now = now.Add(200 * time.Second) // Attempt #2 stalls -> trips CIRCUIT_BREAKER_TRIPPED
+	w.CheckInterrupted(context.Background())
+	if terminalFailureCalls != 1 {
+		t.Fatalf("expected exactly 1 OnJobTerminalFailure call when circuit breaker trips, got %d", terminalFailureCalls)
+	}
+
+	// Simulate reapProcess goroutine waking up for killed PID 41670 and calling OnProcessExit after circuit breaker already tripped
+	w.OnProcessExit("job-1570", 41670, 1, errors.New("exit status 1"))
+	if terminalFailureCalls != 1 {
+		t.Fatalf("expected racing OnProcessExit after CIRCUIT_BREAKER_TRIPPED NOT to fire duplicate OnJobTerminalFailure, got %d", terminalFailureCalls)
+	}
+}
+
+
