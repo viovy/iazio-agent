@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -2382,6 +2383,135 @@ func TestStoryGOV5196_Integration_DriftToolsUpdateClaim_AckBeforePreDispatchHook
 	}
 	if len(eventOrder) < 2 || eventOrder[0] != "ack_lease:job_ack_before_prep" || eventOrder[1] != "pre_dispatch_hook:job_ack_before_prep" {
 		t.Fatalf("expected AckLease to fire before preDispatchHook, got order=%v", eventOrder)
+	}
+}
+
+func TestASECompletionGate_Invariants_StoryGov5232(t *testing.T) {
+	// 1. Missing story binding fails closed
+	wt := t.TempDir()
+	_ = exec.Command("git", "init", wt).Run()
+	_ = exec.Command("git", "-C", wt, "config", "user.email", "test@test.local").Run()
+	_ = exec.Command("git", "-C", wt, "config", "user.name", "Test").Run()
+	_ = exec.Command("git", "-C", wt, "checkout", "-b", "main").Run()
+	f := filepath.Join(wt, "file.txt")
+	_ = os.WriteFile(f, []byte("init\n"), 0o644)
+	_ = exec.Command("git", "-C", wt, "add", "file.txt").Run()
+	_ = exec.Command("git", "-C", wt, "commit", "-m", "init").Run()
+
+	var lastCompleteReq CompleteRequest
+	cp := newMockControlPlane()
+	cp.claimFunc = func(_ context.Context, _ ClaimRequest) (*Job, error) {
+			return &Job{
+				ID:           "job_ase_missing_story",
+				Type:         JobTypePromptExecute,
+				Repo:         wt,
+				FencingToken: 1,
+				Payload:      json.RawMessage(`{"prompt":"/autonomous-story-execution fix bug","worktree_path":"` + filepath.ToSlash(wt) + `"}`),
+			}, nil
+		}
+	cp.completeFunc = func(_ context.Context, _ string, req CompleteRequest) error {
+		lastCompleteReq = req
+		return nil
+	}
+	inv := &mockInvoker{
+		executePromptFunc: func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+			return &harness.PromptExecutionResult{
+				Status:   "completed",
+				ExitCode: 0,
+				// No StoryID set
+			}, nil
+		},
+	}
+	d := NewDispatcher(cp, inv, "host-1")
+	processed, err := d.PollAndProcess(context.Background())
+	if !processed || err == nil || !strings.Contains(err.Error(), "ASE_COMPLETION_GATE_VIOLATION") || !strings.Contains(err.Error(), "no story ID was bound") {
+		t.Fatalf("expected missing story binding to fail completion gate, processed=%v err=%v", processed, err)
+	}
+	if !strings.Contains(lastCompleteReq.Error, "ASE_COMPLETION_GATE_VIOLATION") {
+		t.Fatalf("expected CompleteRequest.Error to contain gate violation, got %q", lastCompleteReq.Error)
+	}
+
+	// 2. Dirty worktree fails closed
+	dirtyFile := filepath.Join(wt, "dirty.txt")
+	_ = os.WriteFile(dirtyFile, []byte("uncommitted\n"), 0o644)
+	cp.claimFunc = func(_ context.Context, _ ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:           "job_ase_dirty_wt",
+			Type:         JobTypePromptExecute,
+			Repo:         wt,
+			StoryID:      "STORY-GOV-5232",
+			FencingToken: 2,
+			Payload:      json.RawMessage(`{"prompt":"/autonomous-story-execution fix bug","worktree_path":"` + filepath.ToSlash(wt) + `"}`),
+		}, nil
+	}
+	inv.executePromptFunc = func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+		return &harness.PromptExecutionResult{
+			Status:   "completed",
+			ExitCode: 0,
+			StoryID:  "STORY-GOV-5232",
+		}, nil
+	}
+	// Resume mode so acquireWorktreeRepoLock doesn't decline
+	jobDirty := &Job{
+		ID:                   "job_ase_dirty_wt",
+		Type:                 JobTypePromptExecute,
+		Repo:                 wt,
+		StoryID:              "STORY-GOV-5232",
+		ActiveConversationID: "conv-dirty-1",
+		FencingToken:         2,
+		Payload:              json.RawMessage(`{"prompt":"/autonomous-story-execution fix bug","worktree_path":"` + filepath.ToSlash(wt) + `"}`),
+	}
+	cp.claimFunc = func(_ context.Context, _ ClaimRequest) (*Job, error) { return jobDirty, nil }
+
+	processed, err = d.PollAndProcess(context.Background())
+	if !processed || err == nil || !strings.Contains(err.Error(), "dirty with uncommitted changes") {
+		t.Fatalf("expected dirty worktree to fail completion gate, processed=%v err=%v", processed, err)
+	}
+	_ = os.Remove(dirtyFile)
+
+	// 3. Feature branch fails closed
+	_ = exec.Command("git", "-C", wt, "checkout", "-b", "feat/STORY-GOV-5232").Run()
+	jobFeat := &Job{
+		ID:                   "job_ase_feat_wt",
+		Type:                 JobTypePromptExecute,
+		Repo:                 wt,
+		StoryID:              "STORY-GOV-5232",
+		ActiveConversationID: "conv-feat-1",
+		FencingToken:         3,
+		Payload:              json.RawMessage(`{"prompt":"/autonomous-story-execution fix bug","worktree_path":"` + filepath.ToSlash(wt) + `"}`),
+	}
+	cp.claimFunc = func(_ context.Context, _ ClaimRequest) (*Job, error) { return jobFeat, nil }
+
+	processed, err = d.PollAndProcess(context.Background())
+	if !processed || err == nil || !strings.Contains(err.Error(), "unmerged feature branch") {
+		t.Fatalf("expected feature branch to fail completion gate, processed=%v err=%v", processed, err)
+	}
+	_ = exec.Command("git", "-C", wt, "checkout", "main").Run()
+
+	// 4. Clean worktree passes and triggers syncer
+	mockSync := &mockRepoSyncer{}
+	dClean := NewDispatcher(cp, inv, "host-1", mockSync)
+
+	jobClean := &Job{
+		ID:           "job_ase_clean",
+		Type:         JobTypePromptExecute,
+		Repo:         "meta-repo",
+		StoryID:      "STORY-GOV-5232",
+		FencingToken: 4,
+		Payload:      json.RawMessage(`{"prompt":"/autonomous-story-execution fix bug","worktree_path":"` + filepath.ToSlash(wt) + `"}`),
+	}
+	cp.claimFunc = func(_ context.Context, _ ClaimRequest) (*Job, error) { return jobClean, nil }
+	lastCompleteReq = CompleteRequest{}
+
+	processed, err = dClean.PollAndProcess(context.Background())
+	if !processed || err != nil {
+		t.Fatalf("expected clean ASE job to succeed, processed=%v err=%v", processed, err)
+	}
+	if lastCompleteReq.Error != "" {
+		t.Fatalf("expected no CompleteRequest error, got %q", lastCompleteReq.Error)
+	}
+	if len(mockSync.triggeredRepos) == 0 || mockSync.triggeredRepos[0] != "meta-repo" {
+		t.Fatalf("expected syncer to be triggered for meta-repo, got %v", mockSync.triggeredRepos)
 	}
 }
 

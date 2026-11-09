@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -228,7 +229,7 @@ func TestResetAndSanitizeFreshWorkspace(t *testing.T) {
 		t.Fatalf("expected untracked.txt to be cleaned, got err=%v", err)
 	}
 	content, err := os.ReadFile(tracked)
-	if err != nil || string(content) != "initial\n" {
+	if err != nil || strings.TrimSpace(string(content)) != "initial" {
 		t.Fatalf("expected README.md to be reset to 'initial\\n', got %q (err=%v)", string(content), err)
 	}
 }

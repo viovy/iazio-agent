@@ -524,3 +524,88 @@ func TestIsWorktreeDirty_And_EdgeCases(t *testing.T) {
 	}
 }
 
+func TestIsWorktreeCleanForNewJob_And_UnpushedCommits(t *testing.T) {
+	// 1. Non-git or empty directory is considered clean
+	if clean, _ := IsWorktreeCleanForNewJob(""); !clean {
+		t.Fatal("expected empty path to be clean")
+	}
+	tmpEmpty := t.TempDir()
+	if clean, _ := IsWorktreeCleanForNewJob(tmpEmpty); !clean {
+		t.Fatal("expected empty non-git dir to be clean")
+	}
+
+	// 2. Active .session_story_id makes it not clean
+	_ = os.WriteFile(filepath.Join(tmpEmpty, ".session_story_id"), []byte("STORY-GOV-5232\n"), 0o644)
+	if clean, reason := IsWorktreeCleanForNewJob(tmpEmpty); clean || !strings.Contains(reason, "STORY-GOV-5232") {
+		t.Fatalf("expected active .session_story_id to block new job, got clean=%v reason=%s", clean, reason)
+	}
+	_ = os.Remove(filepath.Join(tmpEmpty, ".session_story_id"))
+
+	// 3. Real git repository tests
+	repoDir := t.TempDir()
+	if err := exec.Command("git", "init", repoDir).Run(); err != nil {
+		t.Skip("git not available")
+	}
+	_ = exec.Command("git", "-C", repoDir, "config", "user.email", "test@test.local").Run()
+	_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Test").Run()
+
+	// Initial commit on main
+	_ = exec.Command("git", "-C", repoDir, "checkout", "-b", "main").Run()
+	f := filepath.Join(repoDir, "file.txt")
+	_ = os.WriteFile(f, []byte("initial\n"), 0o644)
+	_ = exec.Command("git", "-C", repoDir, "add", "file.txt").Run()
+	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "initial commit").Run()
+
+	// Clean repository with no remote tracking is clean
+	if clean, reason := IsWorktreeCleanForNewJob(repoDir); !clean {
+		t.Fatalf("expected committed main repo to be clean, got reason=%s", reason)
+	}
+
+	// 4. Dirty file blocks
+	dirtyFile := filepath.Join(repoDir, "dirty.txt")
+	_ = os.WriteFile(dirtyFile, []byte("uncommitted\n"), 0o644)
+	if clean, reason := IsWorktreeCleanForNewJob(repoDir); clean || !strings.Contains(reason, "uncommitted") {
+		t.Fatalf("expected dirty repo to block, got clean=%v reason=%s", clean, reason)
+	}
+	_ = os.Remove(dirtyFile)
+
+	// 5. Feature branch blocks
+	_ = exec.Command("git", "-C", repoDir, "checkout", "-b", "feat/my-feature").Run()
+	if onFeat, branch := IsOnFeatureBranch(repoDir); !onFeat || branch != "feat/my-feature" {
+		t.Fatalf("expected IsOnFeatureBranch=true on feat/my-feature, got %v (%s)", onFeat, branch)
+	}
+	if clean, reason := IsWorktreeCleanForNewJob(repoDir); clean || !strings.Contains(reason, "feat/my-feature") {
+		t.Fatalf("expected feature branch to block new job, got clean=%v reason=%s", clean, reason)
+	}
+
+	// Switch back to main
+	_ = exec.Command("git", "-C", repoDir, "checkout", "main").Run()
+	if onFeat, _ := IsOnFeatureBranch(repoDir); onFeat {
+		t.Fatal("expected IsOnFeatureBranch=false on main")
+	}
+
+	// 6. Upstream ahead blocks
+	remoteDir := t.TempDir()
+	_ = exec.Command("git", "init", "--bare", remoteDir).Run()
+	_ = exec.Command("git", "-C", repoDir, "remote", "add", "origin", remoteDir).Run()
+	_ = exec.Command("git", "-C", repoDir, "push", "-u", "origin", "main").Run()
+
+	if HasUnpushedCommits(repoDir) {
+		t.Fatal("expected 0 unpushed commits after initial push")
+	}
+	if clean, reason := IsWorktreeCleanForNewJob(repoDir); !clean {
+		t.Fatalf("expected clean worktree after push, got reason=%s", reason)
+	}
+
+	// Add local unpushed commit
+	_ = os.WriteFile(f, []byte("updated\n"), 0o644)
+	_ = exec.Command("git", "-C", repoDir, "commit", "-am", "local commit ahead").Run()
+
+	if !HasUnpushedCommits(repoDir) {
+		t.Fatal("expected HasUnpushedCommits=true when ahead of origin/main")
+	}
+	if clean, reason := IsWorktreeCleanForNewJob(repoDir); clean || !strings.Contains(reason, "unpushed") {
+		t.Fatalf("expected unpushed commit to block new job, got clean=%v reason=%s", clean, reason)
+	}
+}
+

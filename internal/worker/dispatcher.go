@@ -738,6 +738,9 @@ func (d *Dispatcher) isCandidateWorktreeIdle(clean string) bool {
 	if d.worktreeBusyDetector != nil && d.worktreeBusyDetector(clean) {
 		return false
 	}
+	if ok, _ := repolock.IsWorktreeCleanForNewJob(clean); !ok {
+		return false
+	}
 	return supervisor.InspectWorktreeGitState(clean).IsClean
 }
 
@@ -1003,6 +1006,13 @@ func (d *Dispatcher) acquireWorktreeRepoLock(ctx context.Context, job *Job, work
 		fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: worktree %s locked by other\n", job.ID, worktreeDir)
 		_ = d.declineJob(ctx, job.ID, reasonRepoBusy)
 		return nil, false
+	}
+	if resolvedConvID == "" {
+		if clean, reason := repolock.IsWorktreeCleanForNewJob(worktreeDir, initialStoryID); !clean {
+			fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: worktree %s is not clean for new job: %s\n", job.ID, worktreeDir, reason)
+			_ = d.declineJob(ctx, job.ID, reasonRepoBusy)
+			return nil, false
+		}
 	}
 	h, lockErr := repolock.Acquire(worktreeDir, repolock.LockInfo{
 		JobID:          job.ID,
@@ -1531,6 +1541,55 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 			}
 		}
 		finalTurns, finalSHA := d.flushConversationHarvest(ctx, job, extractConversationIDFromResult(res)...)
+
+		// STORY-GOV-5232: Enforce strict ASE completion gate invariants.
+		// A job executing an autonomous story execution flow MUST:
+		// 1. Have bound a valid story ID
+		// 2. Have zero dirty files in worktree
+		// 3. Have zero unpushed commits in worktree
+		// 4. Not remain on an unmerged feature branch
+		var aseGateErr error
+		if isASEJob(job) && worktreeDir != "" && worktreeDir != "." {
+			targetStoryID := ""
+			if res != nil {
+				targetStoryID = res.StoryID
+				if targetStoryID == "" {
+					targetStoryID = extractStoryID(res.Summary, res.Output)
+				}
+			}
+			if targetStoryID == "" {
+				allocatedStoryMu.Lock()
+				targetStoryID = currentStoryID
+				allocatedStoryMu.Unlock()
+			}
+			if targetStoryID == "" {
+				aseGateErr = fmt.Errorf("ASE_COMPLETION_GATE_VIOLATION: job %s executed an autonomous story execution flow but no story ID was bound or allocated", job.ID)
+			} else {
+				if repolock.IsWorktreeDirty(worktreeDir) {
+					aseGateErr = fmt.Errorf("ASE_COMPLETION_GATE_VIOLATION: worktree %s is dirty with uncommitted changes after ASE run", worktreeDir)
+				} else if repolock.HasUnpushedCommits(worktreeDir) {
+					aseGateErr = fmt.Errorf("ASE_COMPLETION_GATE_VIOLATION: worktree %s has unpushed commits after ASE run; story was not landed or pushed", worktreeDir)
+				} else if onFeat, featBranch := repolock.IsOnFeatureBranch(worktreeDir); onFeat {
+					aseGateErr = fmt.Errorf("ASE_COMPLETION_GATE_VIOLATION: worktree %s remains on unmerged feature branch %q after ASE run", worktreeDir, featBranch)
+				}
+			}
+		}
+
+		if aseGateErr != nil {
+			if gateSpan != nil {
+				gateSpan.SetTag("error", "true")
+				gateSpan.SetTag("error.message", aseGateErr.Error())
+				gateSpan.End()
+			}
+			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{
+				FencingToken:          job.FencingToken,
+				Error:                 aseGateErr.Error(),
+				FinalTurnCount:        finalTurns,
+				FinalTranscriptSHA256: finalSHA,
+			})
+			return true, aseGateErr
+		}
+
 		resBytes, _ := json.Marshal(res)
 		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{
 			FencingToken:          job.FencingToken,
@@ -1696,4 +1755,17 @@ func (d *Dispatcher) flushConversationHarvest(ctx context.Context, job *Job, ext
 	}
 	turns, sha, _ := d.flusher(ctx, convID)
 	return turns, sha
+}
+
+func isASEJob(job *Job) bool {
+	if job == nil {
+		return false
+	}
+	if job.Type == JobTypeStoryExecute {
+		return true
+	}
+	payloadLower := strings.ToLower(string(job.Payload))
+	return strings.Contains(payloadLower, "/autonomous-story-execution") ||
+		strings.Contains(payloadLower, "autonomous-story-execution") ||
+		strings.Contains(payloadLower, "autopilot ase")
 }

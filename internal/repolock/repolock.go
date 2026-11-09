@@ -323,11 +323,13 @@ func ForceRelease(worktree string) error {
 	return nil
 }
 
-// IsWorktreeDirty checks if a repository worktree has uncommitted modifications or untracked files.
+// IsWorktreeDirty checks if a repository worktree has uncommitted modifications or untracked files,
+// ignoring internal iazio runtime files (.iazio/, .iazio-repolock, .session_story_id, .autopilot/).
 func IsWorktreeDirty(worktree string) bool {
 	if worktree == "" {
 		return false
 	}
+	ensureGitInfoExclude(worktree)
 	cmd := procutil.Command("git", "-C", worktree, "status", "--porcelain")
 	out, err := cmd.Output()
 	if err != nil {
@@ -335,9 +337,133 @@ func IsWorktreeDirty(worktree string) bool {
 	}
 	for _, l := range strings.Split(string(out), "\n") {
 		trimmed := strings.TrimSpace(l)
-		if len(trimmed) > 3 {
+		if len(trimmed) < 3 {
+			continue
+		}
+		pathPart := strings.TrimSpace(trimmed[2:])
+		pathPart = strings.TrimPrefix(filepath.ToSlash(pathPart), "./")
+		if pathPart == ".iazio" || strings.HasPrefix(pathPart, ".iazio/") ||
+			pathPart == ".iazio-repolock" || pathPart == ".session_story_id" ||
+			pathPart == ".autopilot" || strings.HasPrefix(pathPart, ".autopilot/") {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// HasUnpushedCommits checks if a repository worktree has commits ahead of its upstream or origin tracking branch.
+func HasUnpushedCommits(worktree string) bool {
+	if worktree == "" {
+		return false
+	}
+	// 1. Try checking against upstream @{u}
+	cmdUpstream := procutil.Command("git", "-C", worktree, "rev-list", "--count", "@{u}..HEAD")
+	if out, err := cmdUpstream.Output(); err == nil {
+		cnt := 0
+		if _, scanErr := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &cnt); scanErr == nil && cnt > 0 {
+			return true
+		}
+	}
+	// 2. Try checking against origin/main..HEAD
+	cmdOriginMain := procutil.Command("git", "-C", worktree, "rev-list", "--count", "origin/main..HEAD")
+	if out, err := cmdOriginMain.Output(); err == nil {
+		cnt := 0
+		if _, scanErr := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &cnt); scanErr == nil && cnt > 0 {
+			return true
+		}
+	}
+	// 3. Try checking against origin/master..HEAD
+	cmdOriginMaster := procutil.Command("git", "-C", worktree, "rev-list", "--count", "origin/master..HEAD")
+	if out, err := cmdOriginMaster.Output(); err == nil {
+		cnt := 0
+		if _, scanErr := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &cnt); scanErr == nil && cnt > 0 {
 			return true
 		}
 	}
 	return false
+}
+
+// IsOnFeatureBranch checks if the repository worktree is currently checked out to a feature branch (not main/master/HEAD).
+func IsOnFeatureBranch(worktree string) (bool, string) {
+	if worktree == "" {
+		return false, ""
+	}
+	cmd := procutil.Command("git", "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return false, ""
+	}
+	branch := strings.TrimSpace(string(out))
+	if branch == "" || branch == "main" || branch == "master" || branch == "HEAD" {
+		return false, branch
+	}
+	return true, branch
+}
+
+func isStoryDone(worktree, storyID string) bool {
+	if storyID == "" {
+		return false
+	}
+	globs := []string{
+		filepath.Join(worktree, "docs", "stories", "*.story.md"),
+		filepath.Join(worktree, "docs", "stories", "*.md"),
+		filepath.Join(worktree, "..", "docs", "stories", "*.story.md"),
+	}
+	for _, g := range globs {
+		matches, err := filepath.Glob(g)
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			if b, err := os.ReadFile(m); err == nil {
+				text := string(b)
+				if strings.Contains(text, storyID) && (strings.Contains(text, "status: DONE") || strings.Contains(text, "status: \"DONE\"") || strings.Contains(text, "status: 'DONE'")) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// IsWorktreeCleanForNewJob verifies that a worktree is fully clean and safe for a new autonomous job to claim:
+// - no active unfinished .session_story_id from a different story
+// - no uncommitted/untracked files (IsWorktreeDirty)
+// - no unpushed commits (HasUnpushedCommits)
+// - not checked out to an unmerged feature branch
+func IsWorktreeCleanForNewJob(worktree string, allowedStoryID ...string) (bool, string) {
+	if worktree == "" {
+		return true, ""
+	}
+	fi, err := os.Stat(worktree)
+	if err != nil || !fi.IsDir() {
+		return true, ""
+	}
+	var allowed string
+	if len(allowedStoryID) > 0 {
+		allowed = strings.TrimSpace(allowedStoryID[0])
+	}
+	// Check .session_story_id
+	if b, err := os.ReadFile(filepath.Join(worktree, ".session_story_id")); err == nil {
+		storyID := strings.TrimSpace(string(b))
+		if storyID != "" && (allowed == "" || !strings.EqualFold(storyID, allowed)) {
+			if !isStoryDone(worktree, storyID) {
+				return false, fmt.Sprintf("active .session_story_id found (%s)", storyID)
+			}
+		}
+	}
+	// Check dirty files
+	if IsWorktreeDirty(worktree) {
+		return false, "uncommitted or untracked changes in worktree"
+	}
+	// Check unpushed commits
+	if HasUnpushedCommits(worktree) {
+		return false, "unpushed commits present ahead of remote origin"
+	}
+	// Check feature branch
+	if onFeat, branch := IsOnFeatureBranch(worktree); onFeat {
+		return false, fmt.Sprintf("worktree on feature branch %q (must be on clean main/master)", branch)
+	}
+	return true, ""
 }

@@ -90,6 +90,9 @@ func initTestFleetWorkspace(t *testing.T) string {
 	if err := os.MkdirAll(filepath.Join(fleetDir, "docs", "stories"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(fleetDir, "docs", "stories", "index.yml"), []byte("version: \"1.0\"\nstories: []\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(fleetDir, "README.md"), []byte("# Fleet Root\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -401,6 +404,12 @@ func TestE2E_GeminiWeb_IazioMCP_HarnessAPI_Agent_Harness_MockAgy(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(fleetDir, ".session_story_id"), []byte("STORY-GOV-3839\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
+		storyContent := "---\nid: STORY-GOV-3839\ntitle: Sort prompts alphabetically in iazio-web /prompts view\nstatus: DONE\npriority: P1\n---\n# Story\n"
+		if err := os.WriteFile(filepath.Join(fleetDir, "docs", "stories", "2026-11-09-gov-3839-sort-prompts.story.md"), []byte(storyContent), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_ = exec.Command("git", "-C", fleetDir, "add", "docs/stories/2026-11-09-gov-3839-sort-prompts.story.md").Run()
+		_ = exec.Command("git", "-C", fleetDir, "commit", "-m", "chore: add completed story").Run()
 
 		payloadBytes, _ := json.Marshal(map[string]any{
 			"prompt_id":        "prompt_ase_697e5159287042b2",
