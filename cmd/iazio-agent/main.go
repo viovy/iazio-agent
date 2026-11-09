@@ -462,16 +462,16 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			defer cancel()
 
 			watchdog.StartSystemdWatchdog(runCtx)
-			if !isTestBinary() {
-				if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if !isTestBinary() && !service.IsServiceControlDisabled() {
+				if home, err := os.UserHomeDir(); err == nil && home != "" && !service.IsTempOrTestPath(home) {
 					binPath := filepath.Join(home, ".local", "bin", "iazio-agent")
 					if runtime.GOOS == "windows" {
 						binPath = filepath.Join(home, "bin", "iazio-agent.exe")
 					}
 					go func() {
 						_ = service.ReconcileServiceConfiguration(home, binPath, nil)
-						_ = iaziouser.EnforceEdgeNonServicePolicy(home, runtime.GOOS, nil)
-						_ = iaziouser.HealCompanionServices(home, runtime.GOOS, nil, watchdog.IsProcessAlive)
+						_ = iaziouser.EnforceEdgeNonServicePolicy(home, runtime.GOOS, execCommandOutput)
+						_ = iaziouser.HealCompanionServices(home, runtime.GOOS, execCommandOutput, watchdog.IsProcessAlive)
 					}()
 				}
 				if runtime.GOOS == "windows" {
@@ -2180,11 +2180,22 @@ func runService(args []string, stdout io.Writer, getenv func(string) string) err
 		return service.ReviveCheck(home, execCommand)
 	case "reconcile":
 		home, _ := os.UserHomeDir()
+		if !isTestBinary() {
+			if err := service.CheckExplicitServiceControlAllowed(home, bin); err != nil {
+				return err
+			}
+		}
 		if err := service.ReconcileServiceConfiguration(home, bin, execCommand); err != nil {
 			return err
 		}
 		fmt.Fprintln(stdout, "iazio-agent user service configuration reconciled")
 		return nil
+	}
+	if !isTestBinary() && (action == "install" || action == "restart") {
+		home, _ := os.UserHomeDir()
+		if err := service.CheckExplicitServiceControlAllowed(home, bin); err != nil {
+			return err
+		}
 	}
 	switch goos {
 	case "darwin":
@@ -2491,7 +2502,7 @@ func installCanonicalBinary() (string, error) {
 	if err := copyBinary(src, dest); err != nil {
 		return "", err
 	}
-	if !isTestBinary() {
+	if !isTestBinary() && !service.IsServiceControlDisabled() && !service.IsTempOrTestPath(home) {
 		_ = service.ReconcileServiceConfiguration(home, dest, nil)
 	}
 	// Purge secondary installation binary from ~/.iazio/bin/
@@ -2528,7 +2539,7 @@ func isServiceControlCommand(name string) bool {
 }
 
 var execCommand = func(name string, args ...string) error {
-	if isTestBinary() && isServiceControlCommand(name) {
+	if (isTestBinary() || service.IsServiceControlDisabled()) && isServiceControlCommand(name) {
 		return nil
 	}
 	cmd := procutil.Command(name, args...)
@@ -2540,7 +2551,7 @@ var execCommand = func(name string, args ...string) error {
 }
 
 var execCommandOutput = func(name string, args ...string) ([]byte, error) {
-	if isTestBinary() && isServiceControlCommand(name) {
+	if (isTestBinary() || service.IsServiceControlDisabled()) && isServiceControlCommand(name) {
 		return nil, errors.New("service control command disabled in test binary")
 	}
 	cmd := procutil.Command(name, args...)

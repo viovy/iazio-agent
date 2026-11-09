@@ -216,14 +216,36 @@ func controlArgv(goos, action string, force bool) []string {
 	}
 }
 
+func resolveDarwinPlistHome(bin, logPath string) string {
+	cleanLog := filepath.Clean(logPath)
+	if filepath.Base(cleanLog) == "agent.log" &&
+		filepath.Base(filepath.Dir(cleanLog)) == "logs" &&
+		filepath.Base(filepath.Dir(filepath.Dir(cleanLog))) == ".iazio" {
+		if h := filepath.Dir(filepath.Dir(filepath.Dir(cleanLog))); h != "" && h != "." {
+			return h
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return home
+	}
+	cleanBin := filepath.Clean(bin)
+	if filepath.Base(filepath.Dir(cleanBin)) == "bin" && filepath.Base(filepath.Dir(filepath.Dir(cleanBin))) == ".local" {
+		if h := filepath.Dir(filepath.Dir(filepath.Dir(cleanBin))); h != "" && h != "." {
+			return h
+		}
+	}
+	return ""
+}
+
 func darwinPlist(bin, logPath string) string {
 	apiXml := ""
 	if apiEnv := resolveHarnessAPIURL(); apiEnv != "" {
 		apiXml = fmt.Sprintf("\n\t\t<key>IAZIO_HARNESS_API_URL</key>\n\t\t<string>%s</string>", apiEnv)
 	}
+	resolvedHome := resolveDarwinPlistHome(bin, logPath)
 	homeXml := ""
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		homeXml = fmt.Sprintf("\n\t\t<key>HOME</key>\n\t\t<string>%s</string>", home)
+	if resolvedHome != "" {
+		homeXml = fmt.Sprintf("\n\t\t<key>HOME</key>\n\t\t<string>%s</string>", resolvedHome)
 	}
 	userXml := ""
 	if u := os.Getenv("USER"); u != "" {
@@ -231,17 +253,20 @@ func darwinPlist(bin, logPath string) string {
 	} else if curr, err := user.Current(); err == nil && curr.Username != "" {
 		userXml = fmt.Sprintf("\n\t\t<key>USER</key>\n\t\t<string>%s</string>", curr.Username)
 	}
-	pathXml := ""
-	if p := os.Getenv("PATH"); p != "" {
-		pathXml = fmt.Sprintf("\n\t\t<key>PATH</key>\n\t\t<string>%s</string>", p)
+	// Use a deterministic PATH so CLI or watchdog invocations with differing caller
+	// PATHs do not rewrite the LaunchAgent plist and bootout the running daemon.
+	deterministicPath := "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+	if resolvedHome != "" {
+		deterministicPath = filepath.Join(resolvedHome, ".local", "bin") + ":" + deterministicPath
 	}
+	pathXml := fmt.Sprintf("\n\t\t<key>PATH</key>\n\t\t<string>%s</string>", deterministicPath)
 	esXml := ""
 	if esEnv := resolveElasticsearchURL(); esEnv != "" {
 		esXml = fmt.Sprintf("\n\t\t<key>IAZIO_ELASTICSEARCH_URL</key>\n\t\t<string>%s</string>", esEnv)
 	}
 	maintenancePath := ""
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		maintenancePath = filepath.Join(home, ".iazio", "maintenance.lock")
+	if resolvedHome != "" {
+		maintenancePath = filepath.Join(resolvedHome, ".iazio", "maintenance.lock")
 	} else {
 		maintenancePath = filepath.Join(".iazio", "maintenance.lock")
 	}
@@ -347,11 +372,82 @@ func DarwinWatchdogPlist(bin, logPath string) string {
 `, watchdogLabel, bin, logPath, logPath)
 }
 
+func normalizeDarwinPath(p string) string {
+	trimmed := strings.TrimSpace(p)
+	if trimmed == "" {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(trimmed); err == nil && strings.TrimSpace(resolved) != "" {
+		trimmed = resolved
+	}
+	c := filepath.Clean(trimmed)
+	if strings.HasPrefix(c, "/private/var/") || strings.HasPrefix(c, "/private/tmp/") {
+		c = strings.TrimPrefix(c, "/private")
+	}
+	return c
+}
+
+func extractDarwinLaunchdPID(printOutput string) (int, bool) {
+	for _, rawLine := range strings.Split(printOutput, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if strings.HasPrefix(line, "pid = ") {
+			fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "pid = ")))
+			if len(fields) > 0 {
+				if pid, err := strconv.Atoi(fields[0]); err == nil && pid > 0 {
+					return pid, true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+func hasExactDarwinPID(printOutput string, wantPID int) bool {
+	if wantPID <= 0 {
+		return false
+	}
+	pid, ok := extractDarwinLaunchdPID(printOutput)
+	return ok && pid == wantPID
+}
+
+// isDarwinLaunchdServiceDrifted inspects `launchctl print` output and returns true when:
+//   - `path = <plist>` is present and does not match expectedPlistPath (after symlink & case normalization), OR
+//   - `program = <bin>` is present and does not match expectedBinPath (after symlink & case normalization), OR
+//   - the loaded job is NOT currently running with a live PID (`state = running` + exact `pid = <N>`)
+//     and reports `78: EX_CONFIG`, `last exit code = 78`, or `job state = spawn failed`.
+func isDarwinLaunchdServiceDrifted(printOutput, expectedPlistPath, expectedBinPath string) bool {
+	normPlist := normalizeDarwinPath(expectedPlistPath)
+	normBin := normalizeDarwinPath(expectedBinPath)
+	for _, rawLine := range strings.Split(printOutput, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if strings.HasPrefix(line, "path = ") {
+			loadedPlist := normalizeDarwinPath(strings.TrimPrefix(line, "path = "))
+			if loadedPlist != "" && normPlist != "" && !strings.EqualFold(loadedPlist, normPlist) {
+				return true
+			}
+		}
+		if strings.HasPrefix(line, "program = ") {
+			loadedBin := normalizeDarwinPath(strings.TrimPrefix(line, "program = "))
+			if loadedBin != "" && normBin != "" && !strings.EqualFold(loadedBin, normBin) {
+				return true
+			}
+		}
+	}
+	_, hasLivePID := extractDarwinLaunchdPID(printOutput)
+	currentlyRunning := strings.Contains(printOutput, "state = running") && hasLivePID
+	if !currentlyRunning {
+		if strings.Contains(printOutput, "78: EX_CONFIG") ||
+			strings.Contains(printOutput, "last exit code = 78") ||
+			strings.Contains(printOutput, "job state = spawn failed") {
+			return true
+		}
+	}
+	return false
+}
+
 // InstallDarwinResilience installs and enables the watcher and watchdog LaunchAgents.
 func InstallDarwinResilience(home, bin string, run func(name string, args ...string) error) error {
-	if run == nil {
-		run = execCommand
-	}
+	run, statusFn := resolveServiceControlRunners(home, bin, run)
 	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
 	logDir := filepath.Join(home, ".iazio", "logs")
 	logPath := filepath.Join(logDir, "agent.log")
@@ -375,11 +471,24 @@ func InstallDarwinResilience(home, bin string, run func(name string, args ...str
 			return fmt.Errorf("write watcher plist: %w", err)
 		}
 	}
-	_, watcherLoadedErr := statusCheckCommand("launchctl", "print", watcherTarget)
+	insideWatcher := os.Getenv("XPC_SERVICE_NAME") == DarwinWatcherLabel
+	watcherOut, watcherLoadedErr := statusFn("launchctl", "print", watcherTarget)
 	watcherLoaded := watcherLoadedErr == nil
-	if watcherChanged || !watcherLoaded {
-		if watcherChanged {
-			_ = run("launchctl", "bootout", watcherTarget)
+	watcherDrifted := watcherLoaded && isDarwinLaunchdServiceDrifted(string(watcherOut), watcherPlistPath, bin)
+	if insideWatcher {
+		if !watcherLoaded {
+			if err := run("launchctl", "bootstrap", domain, watcherPlistPath); err != nil {
+				_ = os.Remove(watcherPlistPath)
+				return fmt.Errorf("launchctl bootstrap watcher: %w", err)
+			}
+			if err := run("launchctl", "enable", watcherTarget); err != nil {
+				_ = os.Remove(watcherPlistPath)
+				return fmt.Errorf("launchctl enable watcher: %w", err)
+			}
+		}
+	} else if watcherChanged || !watcherLoaded || watcherDrifted {
+		if watcherChanged || watcherDrifted {
+			_ = bootoutAndWaitDarwin(watcherTarget, run, statusFn)
 		}
 		if err := run("launchctl", "bootstrap", domain, watcherPlistPath); err != nil {
 			_ = os.Remove(watcherPlistPath)
@@ -401,8 +510,9 @@ func InstallDarwinResilience(home, bin string, run func(name string, args ...str
 		}
 	}
 	insideWatchdog := os.Getenv("XPC_SERVICE_NAME") == DarwinWatchdogLabel
-	_, watchdogLoadedErr := statusCheckCommand("launchctl", "print", watchdogTarget)
+	watchdogOut, watchdogLoadedErr := statusFn("launchctl", "print", watchdogTarget)
 	watchdogLoaded := watchdogLoadedErr == nil
+	watchdogDrifted := watchdogLoaded && isDarwinLaunchdServiceDrifted(string(watchdogOut), watchdogPlistPath, bin)
 	if insideWatchdog {
 		if !watchdogLoaded {
 			if err := run("launchctl", "bootstrap", domain, watchdogPlistPath); err != nil {
@@ -414,9 +524,9 @@ func InstallDarwinResilience(home, bin string, run func(name string, args ...str
 				return fmt.Errorf("launchctl enable watchdog: %w", err)
 			}
 		}
-	} else if watchdogChanged || !watchdogLoaded {
-		if watchdogChanged {
-			_ = run("launchctl", "bootout", watchdogTarget)
+	} else if watchdogChanged || !watchdogLoaded || watchdogDrifted {
+		if watchdogChanged || watchdogDrifted {
+			_ = bootoutAndWaitDarwin(watchdogTarget, run, statusFn)
 		}
 		if err := run("launchctl", "bootstrap", domain, watchdogPlistPath); err != nil {
 			_ = os.Remove(watchdogPlistPath)
@@ -473,6 +583,7 @@ func InstallDarwinAt(home, bin string, run func(name string, args ...string) err
 	if bin == "" {
 		return errors.New("binary path is required")
 	}
+	run, _ = resolveServiceControlRunners(home, bin, run)
 	plistPath := filepath.Join(home, "Library", "LaunchAgents", agentLabel+".plist")
 	logPath := filepath.Join(home, ".iazio", "logs", "agent.log")
 	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
@@ -595,9 +706,7 @@ ExecStart=%s service revive-check
 
 // InstallLinuxResilience installs and enables the .path watcher and .timer watchdog units.
 func InstallLinuxResilience(home, bin string, run func(name string, args ...string) error) error {
-	if run == nil {
-		run = execCommand
-	}
+	run, _ = resolveServiceControlRunners(home, bin, run)
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
 	if err := os.MkdirAll(unitDir, 0o755); err != nil {
 		return err
@@ -746,12 +855,10 @@ func ReconcileServiceConfiguration(home, bin string, run func(name string, args 
 }
 
 func reconcileWindowsServiceConfiguration(home, bin string, run func(name string, args ...string) error) error {
-	if run == nil {
-		run = execCommand
-	}
 	if bin == "" || bin == "iazio-agent" || !filepath.IsAbs(bin) || strings.Contains(bin, filepath.Join(".iazio", "bin")) {
 		bin = filepath.Join(home, "bin", "iazio-agent.exe")
 	}
+	run, _ = resolveServiceControlRunners(home, bin, run)
 	tasksDir := filepath.Join(home, ".iazio", "tasks")
 	cleanStaleBackups(tasksDir)
 	cleanStaleBackups(filepath.Join(home, ".local", "bin"))
@@ -822,19 +929,17 @@ func reconcileWindowsServiceConfiguration(home, bin string, run func(name string
 
 	// Reconcile companion iazio-harvester Windows user service if installed in canonical ~/bin
 	harvesterBin := filepath.Join(home, "bin", "iazio-harvester.exe")
-	if _, err := os.Stat(harvesterBin); err == nil && !isTestProcess() {
+	if _, err := os.Stat(harvesterBin); err == nil && !isTestProcess() && !IsServiceControlDisabled() && !IsTempOrTestPath(home) {
 		_ = procutil.Command(harvesterBin, "service", "reconcile").Run()
 	}
 	return nil
 }
 
 func reconcileLinuxServiceConfiguration(home, bin string, run func(name string, args ...string) error) error {
-	if run == nil {
-		run = execCommand
-	}
 	if bin == "" || bin == "iazio-agent" || !filepath.IsAbs(bin) || strings.Contains(bin, filepath.Join(".iazio", "bin")) {
 		bin = filepath.Join(home, ".local", "bin", "iazio-agent")
 	}
+	run, statusFn := resolveServiceControlRunners(home, bin, run)
 	cleanStaleBackups(filepath.Join(home, ".iazio", "bin"))
 	cleanStaleBackups(filepath.Join(home, ".local", "bin"))
 	// Purge secondary binary from ~/.iazio/bin/
@@ -936,7 +1041,7 @@ func reconcileLinuxServiceConfiguration(home, bin string, run func(name string, 
 
 	// Reconcile companion iazio-harvester user service if harvester binary exists in canonical ~/.local/bin
 	harvesterBin := filepath.Join(home, ".local", "bin", "iazio-harvester")
-	if _, err := os.Stat(harvesterBin); err == nil && !isTestProcess() {
+	if _, err := os.Stat(harvesterBin); err == nil && !isTestProcess() && !IsServiceControlDisabled() && !IsTempOrTestPath(home) {
 		_ = procutil.Command(harvesterBin, "service", "reconcile").Run()
 	}
 
@@ -946,7 +1051,7 @@ func reconcileLinuxServiceConfiguration(home, bin string, run func(name string, 
 		inMaintenance = true
 	}
 	if !inMaintenance {
-		_, isActErr := statusCheckCommand("systemctl", "--user", "is-active", "--quiet", "iazio-agent.service")
+		_, isActErr := statusFn("systemctl", "--user", "is-active", "--quiet", "iazio-agent.service")
 		if isActErr != nil {
 			_ = run("systemctl", "--user", "reset-failed", "iazio-agent.service", "iazio-agent-watcher.service", "iazio-agent-watchdog.service")
 			_ = run("systemctl", "--user", "restart", "iazio-agent.service")
@@ -955,27 +1060,52 @@ func reconcileLinuxServiceConfiguration(home, bin string, run func(name string, 
 	return nil
 }
 
-func isRunningInsideDarwinAgentService(target string) bool {
-	if os.Getenv("XPC_SERVICE_NAME") == DarwinLabel || os.Getenv("IAZIO_AGENT_SERVICE") == "1" {
-		return true
+func bootoutAndWaitDarwin(target string, run func(name string, args ...string) error, statusFns ...func(name string, args ...string) ([]byte, error)) error {
+	err := run("launchctl", "bootout", target)
+	checkFn := statusCheckCommand
+	if len(statusFns) > 0 && statusFns[0] != nil {
+		checkFn = statusFns[0]
 	}
-	if out, err := statusCheckCommand("launchctl", "print", target); err == nil {
-		outStr := string(out)
-		pidStr := fmt.Sprintf("pid = %d", os.Getpid())
-		if strings.Contains(outStr, "state = running") && strings.Contains(outStr, pidStr) {
-			return true
+	if !isTestProcess() && !IsServiceControlDisabled() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, pErr := checkFn("launchctl", "print", target); pErr != nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
-	return false
+	return err
+}
+
+func isRunningInsideDarwinAgentService(target, expectedPlistPath, expectedBinPath string, statusFns ...func(name string, args ...string) ([]byte, error)) bool {
+	envMatch := os.Getenv("XPC_SERVICE_NAME") == DarwinLabel || os.Getenv("IAZIO_AGENT_SERVICE") == "1"
+	checkFn := statusCheckCommand
+	if len(statusFns) > 0 && statusFns[0] != nil {
+		checkFn = statusFns[0]
+	}
+	if out, err := checkFn("launchctl", "print", target); err == nil {
+		outStr := string(out)
+		// Self-identity check FIRST: if this process's own PID is the live running PID
+		// of the launchd job, return true immediately so reconcile never boots out its own job
+		// even if the on-disk/in-memory plist path is drifted.
+		if strings.Contains(outStr, "state = running") && hasExactDarwinPID(outStr, os.Getpid()) {
+			return true
+		}
+		if isDarwinLaunchdServiceDrifted(outStr, expectedPlistPath, expectedBinPath) {
+			return false
+		}
+		_, hasLivePID := extractDarwinLaunchdPID(outStr)
+		return envMatch && strings.Contains(outStr, "state = running") && hasLivePID
+	}
+	return envMatch
 }
 
 func reconcileDarwinServiceConfiguration(home, bin string, run func(name string, args ...string) error) error {
-	if run == nil {
-		run = execCommand
-	}
 	if bin == "" || bin == "iazio-agent" || !filepath.IsAbs(bin) || strings.Contains(bin, filepath.Join(".iazio", "bin")) {
 		bin = filepath.Join(home, ".local", "bin", "iazio-agent")
 	}
+	run, statusFn := resolveServiceControlRunners(home, bin, run)
 	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
 	_ = os.MkdirAll(launchAgentsDir, 0o755)
 	logDir := filepath.Join(home, ".iazio", "logs")
@@ -984,17 +1114,25 @@ func reconcileDarwinServiceConfiguration(home, bin string, run func(name string,
 
 	domain := "gui/" + strconv.Itoa(os.Getuid())
 	target := domain + "/" + agentLabel
-	insideService := isRunningInsideDarwinAgentService(target)
+	agentPlist := filepath.Join(launchAgentsDir, agentLabel+".plist")
+	insideService := isRunningInsideDarwinAgentService(target, agentPlist, bin, statusFn)
 
 	// Reconcile primary iazio-agent LaunchAgent
-	agentPlist := filepath.Join(launchAgentsDir, agentLabel+".plist")
 	expectedPlist := darwinPlist(bin, logPath)
 	data, err := os.ReadFile(agentPlist)
 	existingStr := string(data)
-	if err != nil || existingStr != expectedPlist {
+	plistChanged := err != nil || existingStr != expectedPlist
+	if plistChanged {
 		_ = os.WriteFile(agentPlist, []byte(expectedPlist), 0o644)
-		if !insideService {
-			_ = run("launchctl", "bootout", target)
+	}
+	agentOut, agentLoadedErr := statusFn("launchctl", "print", target)
+	agentOutStr := string(agentOut)
+	agentDrifted := agentLoadedErr == nil && isDarwinLaunchdServiceDrifted(agentOutStr, agentPlist, bin)
+	agentHealthyRunning := agentLoadedErr == nil && !agentDrifted && strings.Contains(agentOutStr, "pid =") && !strings.Contains(agentOutStr, "job state = exited")
+	if (plistChanged || agentDrifted) && !insideService {
+		needsReload := agentDrifted || !agentHealthyRunning || !strings.Contains(existingStr, bin)
+		if needsReload {
+			_ = bootoutAndWaitDarwin(target, run, statusFn)
 			_ = run("launchctl", "bootstrap", domain, agentPlist)
 			_ = run("launchctl", "enable", target)
 		}
@@ -1004,12 +1142,15 @@ func reconcileDarwinServiceConfiguration(home, bin string, run func(name string,
 	}
 
 	// Per ADR-002, iazio-harness must NEVER be installed as a user or system service.
-	// Purge any legacy iazio-harness LaunchAgent plists if present.
+	// Purge any legacy iazio-harness LaunchAgent plists if present OR still loaded in launchd memory.
 	_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-harness"))
 	_ = os.Remove(filepath.Join(home, ".iazio", "bin", "iazio-harvester"))
 	for _, legacyLabel := range []string{"io.iazio.iazio-harness", "io.iazio.iazio-harness.watcher", "io.iazio.iazio-harness.watchdog", "io.iazio.iazio-harness-watcher", "io.iazio.iazio-harness-watchdog"} {
 		legacyPlist := filepath.Join(launchAgentsDir, legacyLabel+".plist")
-		if _, err := os.Stat(legacyPlist); err == nil {
+		_, statErr := os.Stat(legacyPlist)
+		legacyOut, printErr := statusFn("launchctl", "print", domain+"/"+legacyLabel)
+		legacyLoadedInMemory := printErr == nil && strings.Contains(string(legacyOut), legacyLabel)
+		if statErr == nil || legacyLoadedInMemory {
 			_ = run("launchctl", "bootout", domain+"/"+legacyLabel)
 			_ = os.Remove(legacyPlist)
 		}
@@ -1017,7 +1158,7 @@ func reconcileDarwinServiceConfiguration(home, bin string, run func(name string,
 
 	// Reconcile companion iazio-harvester LaunchAgent if harvester binary exists in canonical ~/.local/bin
 	harvesterBin := filepath.Join(home, ".local", "bin", "iazio-harvester")
-	if _, err := os.Stat(harvesterBin); err == nil && !isTestProcess() {
+	if _, err := os.Stat(harvesterBin); err == nil && !isTestProcess() && !IsServiceControlDisabled() && !IsTempOrTestPath(home) {
 		_ = procutil.Command(harvesterBin, "service", "reconcile").Run()
 	}
 
@@ -1027,11 +1168,16 @@ func reconcileDarwinServiceConfiguration(home, bin string, run func(name string,
 		inMaintenance = true
 	}
 	if !inMaintenance && !insideService {
-		out, err := statusCheckCommand("launchctl", "print", target)
+		out, err := statusFn("launchctl", "print", target)
 		outStr := string(out)
-		if err != nil || strings.Contains(outStr, "job state = exited") || !strings.Contains(outStr, "pid =") {
-			if err != nil {
+		drifted := err == nil && isDarwinLaunchdServiceDrifted(outStr, agentPlist, bin)
+		if err != nil || drifted || strings.Contains(outStr, "job state = exited") || !strings.Contains(outStr, "pid =") {
+			if drifted {
+				_ = bootoutAndWaitDarwin(target, run, statusFn)
+			}
+			if err != nil || drifted {
 				_ = run("launchctl", "bootstrap", domain, agentPlist)
+				_ = run("launchctl", "enable", target)
 			}
 			_ = run("launchctl", "kickstart", "-k", target)
 		}
@@ -1537,6 +1683,7 @@ func InstallLinuxAt(home, bin string, run func(name string, args ...string) erro
 	if run == nil {
 		return errors.New("systemctl runner is required")
 	}
+	run, _ = resolveServiceControlRunners(home, bin, run)
 	unitPath := filepath.Join(home, ".config", "systemd", "user", "iazio-agent.service")
 	if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
 		return err
@@ -1578,6 +1725,7 @@ func InstallWindowsAt(home, bin, user string, run func(name string, args ...stri
 	if run == nil {
 		return errors.New("schtasks runner is required")
 	}
+	run, _ = resolveServiceControlRunners(home, bin, run)
 	dir := filepath.Join(home, ".iazio", "tasks")
 	logDir := filepath.Join(home, ".iazio", "logs")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -1692,6 +1840,69 @@ func windowsLogonUser() string {
 	return strings.TrimSpace(current.Username)
 }
 
+// IsTempOrTestPath returns true when p resides inside an OS temporary directory
+// (/var/folders/, /private/var/folders/, /tmp/, /private/tmp/, os.TempDir())
+// or a Go test / build directory (TestE2E_, /Test, go-build).
+func IsTempOrTestPath(p string) bool {
+	trimmed := strings.TrimSpace(p)
+	if trimmed == "" {
+		return false
+	}
+	clean := filepath.ToSlash(filepath.Clean(trimmed))
+	lower := strings.ToLower(clean)
+	for _, prefix := range []string{
+		"/var/folders/",
+		"/private/var/folders/",
+		"/tmp/",
+		"/private/tmp/",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	if tmp := strings.TrimSpace(os.TempDir()); tmp != "" {
+		cleanTmp := strings.ToLower(filepath.ToSlash(filepath.Clean(tmp)))
+		if cleanTmp != "/" && cleanTmp != "." && (lower == cleanTmp || strings.HasPrefix(lower, cleanTmp+"/")) {
+			return true
+		}
+	}
+	if strings.Contains(clean, "/TestE2E_") || strings.Contains(clean, "/go-build") {
+		return true
+	}
+	return false
+}
+
+func isGoTestBinaryPath(exe string) bool {
+	base := strings.ToLower(filepath.Base(exe))
+	return strings.HasSuffix(base, ".test") || strings.HasSuffix(base, ".test.exe") || strings.HasPrefix(base, "___test")
+}
+
+func isServiceControlDisabledByEnvOrHome() bool {
+	for _, k := range []string{"IAZIO_TEST_MODE", "IAZIO_DISABLE_SERVICE_CONTROL", "GO_TEST"} {
+		v := strings.ToLower(strings.TrimSpace(os.Getenv(k)))
+		if v == "1" || v == "true" || v == "yes" {
+			return true
+		}
+	}
+	if IsTempOrTestPath(os.Getenv("HOME")) {
+		return true
+	}
+	if exe, err := os.Executable(); err == nil && IsTempOrTestPath(exe) && !isGoTestBinaryPath(exe) {
+		return true
+	}
+	return false
+}
+
+// IsServiceControlDisabled returns true when OS service-control commands
+// (launchctl, systemctl, schtasks, loginctl, crontab, taskkill) must be suppressed
+// because the process is running in test mode or with a temporary HOME/executable path.
+func IsServiceControlDisabled() bool {
+	if isTestProcess() {
+		return true
+	}
+	return isServiceControlDisabledByEnvOrHome()
+}
+
 func isTestProcess() bool {
 	for _, arg := range os.Args {
 		if strings.HasPrefix(arg, "-test.") {
@@ -1699,11 +1910,8 @@ func isTestProcess() bool {
 		}
 	}
 	exe, err := os.Executable()
-	if err == nil {
-		base := strings.ToLower(filepath.Base(exe))
-		if strings.HasSuffix(base, ".test") || strings.HasSuffix(base, ".test.exe") {
-			return true
-		}
+	if err == nil && isGoTestBinaryPath(exe) {
+		return true
 	}
 	return false
 }
@@ -1718,8 +1926,48 @@ func isServiceControlCommand(name string) bool {
 	}
 }
 
+// ErrServiceControlSuppressed is returned when an explicit service management action
+// (install, reconcile, restart) is rejected because the target home/binary or process
+// environment is in a temporary/test path or has service control disabled.
+var ErrServiceControlSuppressed = errors.New("[SIR: SERVICE_CONTROL_SUPPRESSED] OS service control is suppressed for temporary/test paths or test mode")
+
+// CheckExplicitServiceControlAllowed returns ErrServiceControlSuppressed when home, bin,
+// or the process environment forbids mutating host OS service managers.
+func CheckExplicitServiceControlAllowed(home, bin string) error {
+	if IsTempOrTestPath(home) || IsTempOrTestPath(bin) || isServiceControlDisabledByEnvOrHome() {
+		fmt.Fprintf(os.Stderr, "[SIR: SERVICE_CONTROL_SUPPRESSED] home=%s bin=%s reason=temp-or-test-path\n", home, bin)
+		return ErrServiceControlSuppressed
+	}
+	return nil
+}
+
+func resolveServiceControlRunners(home, bin string, run func(name string, args ...string) error) (func(name string, args ...string) error, func(name string, args ...string) ([]byte, error)) {
+	if run == nil {
+		run = execCommand
+	}
+	statusFn := statusCheckCommand
+	if IsTempOrTestPath(home) || IsTempOrTestPath(bin) || isServiceControlDisabledByEnvOrHome() {
+		wrappedRun := func(name string, args ...string) error {
+			if isServiceControlCommand(name) {
+				fmt.Fprintf(os.Stderr, "[SIR: SERVICE_CONTROL_SUPPRESSED] command=%s reason=temp-or-test-path\n", name)
+				return nil
+			}
+			return run(name, args...)
+		}
+		wrappedStatus := func(name string, args ...string) ([]byte, error) {
+			if isServiceControlCommand(name) {
+				return nil, errors.New("[SIR: SERVICE_CONTROL_SUPPRESSED] service control command suppressed for temp/test path")
+			}
+			return statusFn(name, args...)
+		}
+		return wrappedRun, wrappedStatus
+	}
+	return run, statusFn
+}
+
 var execCommand = func(name string, args ...string) error {
-	if isTestProcess() && isServiceControlCommand(name) {
+	if IsServiceControlDisabled() && isServiceControlCommand(name) {
+		fmt.Fprintf(os.Stderr, "[SIR: SERVICE_CONTROL_SUPPRESSED] command=%s reason=disabled-or-test-env\n", name)
 		return nil
 	}
 	cmd := procutil.Command(name, args...)
@@ -1731,7 +1979,7 @@ var execCommand = func(name string, args ...string) error {
 }
 
 var statusCheckCommand = func(name string, args ...string) ([]byte, error) {
-	if isTestProcess() && isServiceControlCommand(name) {
+	if IsServiceControlDisabled() && isServiceControlCommand(name) {
 		return nil, errors.New("service control command disabled in test process")
 	}
 	cmd := procutil.Command(name, args...)
