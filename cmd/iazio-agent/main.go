@@ -1699,11 +1699,26 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				if a.ID == "" {
 					return nil
 				}
-				_, span := telemetry.StartSpan(runCtx, "agent.execute_lease",
+				parentTraceID := strings.TrimSpace(a.ZipkinTraceID)
+				var parentSpanID string
+				if tp := strings.TrimSpace(a.Traceparent); tp != "" {
+					hdr := http.Header{}
+					hdr.Set("traceparent", tp)
+					if tid, pid := telemetry.ExtractHTTP(hdr); tid != "" {
+						parentTraceID = tid
+						parentSpanID = pid
+					}
+				}
+				spanOpts := []telemetry.SpanOption{
+					telemetry.WithParentTrace(parentTraceID, parentSpanID),
 					telemetry.WithTag("job.id", a.ID),
 					telemetry.WithTag("worktree.path", a.WorktreePath),
 					telemetry.WithTag("story.id", a.StoryID),
-				)
+				}
+				if a.ScheduleID != "" {
+					spanOpts = append(spanOpts, telemetry.WithTag("schedule.id", a.ScheduleID))
+				}
+				_, span := telemetry.StartSpan(runCtx, "agent.execute_lease", spanOpts...)
 				defer span.End()
 
 				// Repo lock verification: refuse duplicate/concurrent jobs in the same worktree (cross-platform liveness via watchdog.IsProcessAlive)
