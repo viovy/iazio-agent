@@ -3160,10 +3160,10 @@ func applyHarnessFleetStatusPayload(res harnessFleetStatusPayload, repoPath stri
 }
 
 func isASEFlowCompletedAndLastJobSucceeded(repoPath string, st controlplane.RepoRuntimeStatus) bool {
-	if st.ASEState == "RUNNING" || st.ASEState == "IN_PROGRESS" || strings.EqualFold(st.ASEState, "FAILED_DIRTY") || strings.EqualFold(st.ASEState, "active") || st.HasActiveGitLock {
+	if st.ASEState == "RUNNING" || st.ASEState == "IN_PROGRESS" || strings.EqualFold(st.ASEState, "active") || st.HasActiveGitLock {
 		return false
 	}
-	if len(st.NonMainSubmodules) > 0 && strings.TrimSpace(st.ActiveStoryID) != "" && !isStoryCompletedOnDiskFallback(repoPath, st.ActiveStoryID) {
+	if strings.TrimSpace(st.ActiveStoryID) != "" && !isStoryCompletedOnDiskFallback(repoPath, st.ActiveStoryID) {
 		return false
 	}
 	if st.Branch != "main" && st.Branch != "master" {
