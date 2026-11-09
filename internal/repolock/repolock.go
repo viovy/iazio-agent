@@ -368,7 +368,10 @@ func HasUnpushedCommits(worktree string) (bool, error) {
 		return false, fmt.Errorf("git remote check failed in %s: %w", worktree, remoteErr)
 	}
 	if strings.TrimSpace(string(remoteOut)) == "" {
-		return false, nil
+		if os.Getenv("IAZIO_TEST_SKIP_REMOTE") == "1" {
+			return false, nil
+		}
+		return false, fmt.Errorf("no git remotes configured in %s", worktree)
 	}
 
 	// 1. Try checking against upstream @{u}
@@ -422,22 +425,27 @@ func parseStoryFrontmatter(filePath string) (id, status string) {
 	}
 	lines := strings.Split(string(b), "\n")
 	inFrontmatter := false
+	sawOpening := false
 	for idx, rawLine := range lines {
 		trimmed := strings.TrimSpace(rawLine)
 		if idx == 0 && trimmed == "---" {
 			inFrontmatter = true
+			sawOpening = true
 			continue
 		}
 		if inFrontmatter && trimmed == "---" {
 			break
 		}
-		if inFrontmatter || idx < 30 {
+		if inFrontmatter {
 			if strings.HasPrefix(trimmed, "id:") && id == "" {
 				id = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "id:")), `"'`)
 			} else if strings.HasPrefix(trimmed, "status:") && status == "" {
 				status = strings.ToUpper(strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "status:")), `"'`))
 			}
 		}
+	}
+	if !sawOpening {
+		return "", ""
 	}
 	return id, status
 }
@@ -451,6 +459,14 @@ func isStoryDone(worktree, storyID string) bool {
 		filepath.Join(worktree, "docs", "stories", "*.md"),
 		filepath.Join(worktree, "..", "docs", "stories", "*.story.md"),
 		filepath.Join(worktree, "..", "docs", "stories", "*.md"),
+	}
+	if out, err := procutil.Command("git", "-C", worktree, "rev-parse", "--show-superproject-working-tree").Output(); err == nil {
+		if sp := strings.TrimSpace(string(out)); sp != "" {
+			globs = append(globs,
+				filepath.Join(sp, "docs", "stories", "*.story.md"),
+				filepath.Join(sp, "docs", "stories", "*.md"),
+			)
+		}
 	}
 	for _, g := range globs {
 		matches, err := filepath.Glob(g)

@@ -2489,6 +2489,11 @@ func TestASECompletionGate_Invariants_StoryGov5232(t *testing.T) {
 	_ = exec.Command("git", "-C", wt, "checkout", "main").Run()
 
 	// 4. Clean worktree passes and triggers syncer
+	bareRemote := t.TempDir()
+	_ = exec.Command("git", "init", "--bare", bareRemote).Run()
+	_ = exec.Command("git", "-C", wt, "remote", "add", "origin", bareRemote).Run()
+	_ = exec.Command("git", "-C", wt, "push", "-u", "origin", "main").Run()
+
 	mockSync := &mockRepoSyncer{}
 	dClean := NewDispatcher(cp, inv, "host-1", mockSync)
 
@@ -2515,11 +2520,6 @@ func TestASECompletionGate_Invariants_StoryGov5232(t *testing.T) {
 	}
 
 	// 5. Unpushed commits fail closed in ASE completion gate (AC1 / finding F9)
-	bareRemote := t.TempDir()
-	_ = exec.Command("git", "init", "--bare", bareRemote).Run()
-	_ = exec.Command("git", "-C", wt, "remote", "add", "origin", bareRemote).Run()
-	_ = exec.Command("git", "-C", wt, "push", "-u", "origin", "main").Run()
-
 	// Commit ahead without pushing
 	_ = os.WriteFile(filepath.Join(wt, "file.txt"), []byte("ahead\n"), 0o644)
 	_ = exec.Command("git", "-C", wt, "commit", "-am", "commit ahead of origin").Run()
@@ -2627,6 +2627,13 @@ func (m *mockSequenceSyncer) TriggerRepoSync(repoName string) {
 	if m.syncCallback != nil {
 		m.syncCallback(repoName)
 	}
+}
+
+func (m *mockSequenceSyncer) SyncRepoSync(ctx context.Context, repoName string) error {
+	if m.syncCallback != nil {
+		m.syncCallback(repoName)
+	}
+	return nil
 }
 
 

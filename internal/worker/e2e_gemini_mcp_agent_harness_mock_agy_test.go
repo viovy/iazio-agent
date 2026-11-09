@@ -80,7 +80,7 @@ func initTestFleetWorkspace(t *testing.T) string {
 			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
 		}
 	}
-	runGit("init")
+	runGit("init", "-b", "main")
 	runGit("config", "user.name", "Test Operator")
 	runGit("config", "user.email", "operator@iazio.test")
 
@@ -101,6 +101,10 @@ func initTestFleetWorkspace(t *testing.T) string {
 	}
 	runGit("add", ".")
 	runGit("commit", "-m", "chore: initial fleet commit")
+	bareRemote := filepath.Join(t.TempDir(), "origin.git")
+	_ = exec.Command("git", "init", "--bare", bareRemote).Run()
+	runGit("remote", "add", "origin", bareRemote)
+	runGit("push", "-u", "origin", "main")
 	return fleetDir
 }
 
@@ -410,6 +414,7 @@ func TestE2E_GeminiWeb_IazioMCP_HarnessAPI_Agent_Harness_MockAgy(t *testing.T) {
 		}
 		_ = exec.Command("git", "-C", fleetDir, "add", "docs/stories/2026-11-09-gov-3839-sort-prompts.story.md").Run()
 		_ = exec.Command("git", "-C", fleetDir, "commit", "-m", "chore: add completed story").Run()
+		_ = exec.Command("git", "-C", fleetDir, "push").Run()
 
 		payloadBytes, _ := json.Marshal(map[string]any{
 			"prompt_id":        "prompt_ase_697e5159287042b2",
@@ -1088,6 +1093,7 @@ func TestE2E_StoryGov5206_Sch1569_Job1570_WatchdogAndHarnessMockAgyRecovery(t *t
 	}
 	_ = exec.Command("git", "-C", fleetDir, "add", ".").Run()
 	_ = exec.Command("git", "-C", fleetDir, "commit", "-m", "feat: complete STORY-ROOT-45276").Run()
+	_ = exec.Command("git", "-C", fleetDir, "push").Run()
 
 	// Seed stale .iazio/execution-checkpoint.json from job-1408 (Oct 25) to verify neither iazio-agent nor iazio-harness adopts it
 	iazioDir := filepath.Join(fleetDir, ".iazio")

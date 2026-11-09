@@ -1613,7 +1613,10 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 					telemetry.WithTag("job.id", job.ID),
 					telemetry.WithTag("worktree", worktreeDir),
 				)
-				if tuErr := d.toolUpdater(execCtx, nil, false); tuErr != nil {
+				updateCtx, cancelUpdate := context.WithTimeout(context.Background(), 30*time.Second)
+				tuErr := d.toolUpdater(updateCtx, nil, false)
+				cancelUpdate()
+				if tuErr != nil {
 					if tuSpan != nil {
 						tuSpan.SetTag("error", "true")
 						tuSpan.SetTag("error.message", tuErr.Error())
@@ -1629,13 +1632,21 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 					telemetry.WithTag("job.id", job.ID),
 					telemetry.WithTag("repo", targetRepo),
 				)
+				syncCtx, cancelSync := context.WithTimeout(context.Background(), 15*time.Second)
 				if syncSyncer, ok := d.syncer.(interface {
 					SyncRepoSync(context.Context, string) error
 				}); ok {
-					_ = syncSyncer.SyncRepoSync(ctx, targetRepo)
+					if syncErr := syncSyncer.SyncRepoSync(syncCtx, targetRepo); syncErr != nil {
+						if syncSpan != nil {
+							syncSpan.SetTag("error", "true")
+							syncSpan.SetTag("error.message", syncErr.Error())
+						}
+						fmt.Fprintf(os.Stderr, "[dispatcher] warning: synchronous post-ASE repo sync failed for %s: %v\n", targetRepo, syncErr)
+					}
 				} else {
 					d.syncer.TriggerRepoSync(targetRepo)
 				}
+				cancelSync()
 				if syncSpan != nil {
 					syncSpan.End()
 				}
