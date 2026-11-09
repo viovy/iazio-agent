@@ -1996,3 +1996,65 @@ func TestIsWorktreeIdleForGitUpdate_StoryScopingAndBranchDetection(t *testing.T)
 	}
 }
 
+func TestStoryIazio0201_SupervisorAlternatesRebaseHealAndBrainASETurn(t *testing.T) {
+	baseWork := t.TempDir()
+	refRepo := filepath.Join(baseWork, "meta-repo")
+	slotRepo := filepath.Join(baseWork, "meta-repo-04")
+	_ = os.MkdirAll(filepath.Join(refRepo, ".git", "objects"), 0o755)
+	_ = os.MkdirAll(slotRepo, 0o755)
+	initTestGitRepo(t, slotRepo)
+
+	altPath := filepath.Join(slotRepo, ".git", "objects", "info", "alternates")
+	_ = os.MkdirAll(filepath.Dir(altPath), 0o755)
+	_ = os.WriteFile(altPath, []byte("/mnt/c/work/meta-repo/.git/objects\n"), 0o644)
+
+	if n := NormalizeGitAlternatesPaths(slotRepo); n != 1 {
+		t.Fatalf("expected NormalizeGitAlternatesPaths=1, got %d", n)
+	}
+	altRaw, err := os.ReadFile(altPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(altRaw)) != "../../../meta-repo/.git/objects" {
+		t.Fatalf("expected relative alternates ../../../meta-repo/.git/objects, got %q", strings.TrimSpace(string(altRaw)))
+	}
+
+	// Stranded rebase on chore/governance-pointers-* is healed by healStrandedMaintenanceBranchBeforeGitUpdate
+	_ = exec.Command("git", "-C", slotRepo, "checkout", "-b", "chore/governance-pointers-20261109-171414").Run()
+	_ = os.WriteFile(filepath.Join(slotRepo, "README.md"), []byte("pointers-conflict\n"), 0o644)
+	_ = exec.Command("git", "-C", slotRepo, "add", ".").Run()
+	_ = exec.Command("git", "-C", slotRepo, "commit", "-m", "chore: pointers").Run()
+	_ = exec.Command("git", "-C", slotRepo, "checkout", "main").Run()
+	_ = os.WriteFile(filepath.Join(slotRepo, "README.md"), []byte("main-advance\n"), 0o644)
+	_ = exec.Command("git", "-C", slotRepo, "add", ".").Run()
+	_ = exec.Command("git", "-C", slotRepo, "commit", "-m", "main advance").Run()
+	_ = exec.Command("git", "-C", slotRepo, "checkout", "chore/governance-pointers-20261109-171414").Run()
+	_ = exec.Command("git", "-C", slotRepo, "rebase", "main").Run()
+
+	brainRoot := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainRoot)
+
+	healStrandedMaintenanceBranchBeforeGitUpdate(context.Background(), slotRepo)
+	br, okBr := readWorktreeHeadBranchFast(slotRepo)
+	if !okBr || br != "main" {
+		t.Fatalf("expected stranded rebase on chore/governance-pointers-* to heal to main, got %q (%v)", br, okBr)
+	}
+
+	// Active brain transcript for slotRepo blocks IsWorktreeIdleForGitUpdate and reports active turn
+	convID := "1f2e5efc-e041-4c89-b25a-fe32389d66cd"
+	convLogs := filepath.Join(brainRoot, convID, ".system_generated", "logs")
+	_ = os.MkdirAll(convLogs, 0o755)
+	transcriptBody := `{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"/autonomous-story-execution deep review"}` + "\n" +
+		`{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":"` +
+		strings.ReplaceAll(filepath.Join(slotRepo, "AGENTS.md"), `\`, `\\`) + `"}}]}` + "\n"
+	_ = os.WriteFile(filepath.Join(convLogs, "transcript.jsonl"), []byte(transcriptBody), 0o644)
+
+	activeTurn, gotConv, _ := InspectActiveBrainASETurnForRepo(slotRepo, time.Now())
+	if !activeTurn || gotConv != convID {
+		t.Fatalf("expected InspectActiveBrainASETurnForRepo=true with convID=%s, got active=%v conv=%q", convID, activeTurn, gotConv)
+	}
+	if IsWorktreeIdleForGitUpdate(slotRepo, nil, nil) {
+		t.Fatalf("expected IsWorktreeIdleForGitUpdate=false while active brain ASE turn is running")
+	}
+}
+

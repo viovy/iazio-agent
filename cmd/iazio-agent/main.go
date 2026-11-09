@@ -3366,7 +3366,8 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 	}
 
 	if !harnessSucceeded {
-		// Fallback when iazio-harness binary is unavailable: sanitize idle ephemeral artifacts then run git status
+		// Fallback when iazio-harness binary is unavailable: normalize cross-OS git alternates, sanitize idle ephemeral artifacts, then run git status
+		supervisor.NormalizeGitAlternatesPaths(repoPath)
 		_, _ = supervisor.SanitizeIdleEphemeralArtifacts(ctx, repoPath, nil, watchdog.IsProcessAlive)
 		cmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain=v2", "--branch")
 		out, err := cmd.CombinedOutput()
@@ -3522,6 +3523,24 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 		}
 		if st.ToolLiveness == "" {
 			st.ToolLiveness = "NONE"
+		}
+	}
+
+	// Reconcile active Antigravity brain transcript ASE turns across Windows/WSL/Linux/macOS
+	if st.ExecutionProvenance != "COORDINATED_HARNESS" {
+		if activeBrainASE, brainConvID, brainStoryID := supervisor.InspectActiveBrainASETurnForRepo(repoPath, time.Now()); activeBrainASE {
+			st.ASEState = "RUNNING"
+			st.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
+			st.ToolLiveness = "LIVE"
+			if st.ActiveTool == "" || st.ActiveTool == "NONE" {
+				st.ActiveTool = "agy"
+			}
+			if st.ActiveConversationID == "" && brainConvID != "" {
+				st.ActiveConversationID = brainConvID
+			}
+			if st.ActiveStoryID == "" && brainStoryID != "" {
+				st.ActiveStoryID = brainStoryID
+			}
 		}
 	}
 
