@@ -229,6 +229,8 @@ func defaultBaselineManifest(profile string) ManifestResponse {
 			{Name: "iazio-harvester", Repository: "viovy/iazio-harvester", BinaryName: "iazio-harvester", Description: "Conversation harvester", Tier: "baseline"},
 			{Name: "autopilot", Repository: "viovy/autopilot", BinaryName: "autopilot", Description: "Autopilot CLI", Tier: "baseline"},
 			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", BinaryName: "autopilot-fleet", Description: "Fleet orchestration plugin", Tier: "baseline"},
+			{Name: "autopilot-git-flow", Repository: "viovy/autopilot-plugins-internal", BinaryName: "autopilot-git-flow", Description: "Git-Flow lifecycle plugin", Tier: "baseline"},
+			{Name: "autopilot-git-update", Repository: "viovy/autopilot-plugins-internal", BinaryName: "autopilot-git-update", Description: "Fleet git-update and pointer sync plugin", Tier: "baseline"},
 			{Name: "autopilot-story", Repository: "viovy/autopilot-plugins-internal", BinaryName: "autopilot-story", Description: "Story lifecycle plugin", Tier: "baseline"},
 			{Name: "autopilot-backlog", Repository: "viovy/autopilot-plugins-internal", BinaryName: "autopilot-backlog", Description: "Backlog management plugin", Tier: "baseline"},
 			{Name: "iazio-mcp", Repository: "viovy/iazio-mcp", BinaryName: "iazio-mcp", Description: "MCP protocol tool bridge", Tier: "baseline"},
