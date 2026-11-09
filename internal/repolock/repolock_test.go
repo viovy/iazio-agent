@@ -590,8 +590,9 @@ func TestIsWorktreeCleanForNewJob_And_UnpushedCommits(t *testing.T) {
 	_ = exec.Command("git", "-C", repoDir, "remote", "add", "origin", remoteDir).Run()
 	_ = exec.Command("git", "-C", repoDir, "push", "-u", "origin", "main").Run()
 
-	if HasUnpushedCommits(repoDir) {
-		t.Fatal("expected 0 unpushed commits after initial push")
+	ahead, err := HasUnpushedCommits(repoDir)
+	if err != nil || ahead {
+		t.Fatalf("expected 0 unpushed commits after initial push, got ahead=%v err=%v", ahead, err)
 	}
 	if clean, reason := IsWorktreeCleanForNewJob(repoDir); !clean {
 		t.Fatalf("expected clean worktree after push, got reason=%s", reason)
@@ -601,11 +602,25 @@ func TestIsWorktreeCleanForNewJob_And_UnpushedCommits(t *testing.T) {
 	_ = os.WriteFile(f, []byte("updated\n"), 0o644)
 	_ = exec.Command("git", "-C", repoDir, "commit", "-am", "local commit ahead").Run()
 
-	if !HasUnpushedCommits(repoDir) {
-		t.Fatal("expected HasUnpushedCommits=true when ahead of origin/main")
+	ahead, err = HasUnpushedCommits(repoDir)
+	if err != nil || !ahead {
+		t.Fatalf("expected HasUnpushedCommits=true when ahead of origin/main, got ahead=%v err=%v", ahead, err)
 	}
 	if clean, reason := IsWorktreeCleanForNewJob(repoDir); clean || !strings.Contains(reason, "unpushed") {
 		t.Fatalf("expected unpushed commit to block new job, got clean=%v reason=%s", clean, reason)
+	}
+
+	// 7. Verify isStoryDone YAML frontmatter parsing precision (finding F7)
+	storyDir := filepath.Join(repoDir, "docs", "stories")
+	_ = os.MkdirAll(storyDir, 0o755)
+	// Story 2 is DONE, and its markdown body mentions STORY-TEST-1
+	story2File := filepath.Join(storyDir, "2026-11-09-test-2.story.md")
+	_ = os.WriteFile(story2File, []byte("---\nid: STORY-TEST-2\nstatus: DONE\n---\n# Story 2\nMentions STORY-TEST-1 in body\n"), 0o644)
+	if isStoryDone(repoDir, "STORY-TEST-1") {
+		t.Fatal("expected isStoryDone to return false for STORY-TEST-1 when only mentioned in body of STORY-TEST-2")
+	}
+	if !isStoryDone(repoDir, "STORY-TEST-2") {
+		t.Fatal("expected isStoryDone to return true for STORY-TEST-2")
 	}
 }
 

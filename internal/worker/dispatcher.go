@@ -556,7 +556,10 @@ func (d *Dispatcher) clearActiveJob(jobID string) {
 	delete(d.activeJobs, jobID)
 }
 
-const reasonRepoBusy = "REPO_BUSY"
+const (
+	reasonRepoBusy                = "REPO_BUSY"
+	reasonRepoDirtyUncompletedASE = "repo_dirty_uncompleted_ase"
+)
 
 func normalizeWorktreeKey(wt string) string {
 	trimmed := strings.TrimSpace(wt)
@@ -1009,8 +1012,12 @@ func (d *Dispatcher) acquireWorktreeRepoLock(ctx context.Context, job *Job, work
 	}
 	if resolvedConvID == "" {
 		if clean, reason := repolock.IsWorktreeCleanForNewJob(worktreeDir, initialStoryID); !clean {
-			fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: worktree %s is not clean for new job: %s\n", job.ID, worktreeDir, reason)
-			_ = d.declineJob(ctx, job.ID, reasonRepoBusy)
+			fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: worktree %s is quarantined (not clean for new job: %s)\n", job.ID, worktreeDir, reason)
+			if span := telemetry.SpanFromContext(ctx); span != nil {
+				span.SetTag("decline_reason", reasonRepoDirtyUncompletedASE)
+				span.SetTag("worktree.quarantine_reason", reason)
+			}
+			_ = d.declineJob(ctx, job.ID, reasonRepoDirtyUncompletedASE)
 			return nil, false
 		}
 	}
@@ -1567,10 +1574,12 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 			} else {
 				if repolock.IsWorktreeDirty(worktreeDir) {
 					aseGateErr = fmt.Errorf("ASE_COMPLETION_GATE_VIOLATION: worktree %s is dirty with uncommitted changes after ASE run", worktreeDir)
-				} else if repolock.HasUnpushedCommits(worktreeDir) {
-					aseGateErr = fmt.Errorf("ASE_COMPLETION_GATE_VIOLATION: worktree %s has unpushed commits after ASE run; story was not landed or pushed", worktreeDir)
 				} else if onFeat, featBranch := repolock.IsOnFeatureBranch(worktreeDir); onFeat {
 					aseGateErr = fmt.Errorf("ASE_COMPLETION_GATE_VIOLATION: worktree %s remains on unmerged feature branch %q after ASE run", worktreeDir, featBranch)
+				} else if unpushed, unpushedErr := repolock.HasUnpushedCommits(worktreeDir); unpushedErr != nil {
+					aseGateErr = fmt.Errorf("ASE_COMPLETION_GATE_VIOLATION: unpushed commit probe failed for worktree %s: %w", worktreeDir, unpushedErr)
+				} else if unpushed {
+					aseGateErr = fmt.Errorf("ASE_COMPLETION_GATE_VIOLATION: worktree %s has unpushed commits after ASE run; story was not landed or pushed", worktreeDir)
 				}
 			}
 		}
@@ -1590,6 +1599,49 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 			return true, aseGateErr
 		}
 
+		// STORY-GOV-5232 / AC3: Enforce strict serial lifecycle sequence:
+		// 1. ASE Flow Completion Gate passed (checked above).
+		// 2. Synchronous Tool & Canonical AI Update and Repository Synchronization.
+		// 3. Mark job complete via CompleteJob, releasing worktree for next-story dequeue.
+		targetRepo := job.Repo
+		if targetRepo == "" && res != nil {
+			targetRepo = res.Repo
+		}
+		if isASEJob(job) {
+			if d.toolUpdater != nil {
+				_, tuSpan := telemetry.StartSpan(ctx, "agent.ase_tool_update",
+					telemetry.WithTag("job.id", job.ID),
+					telemetry.WithTag("worktree", worktreeDir),
+				)
+				if tuErr := d.toolUpdater(execCtx, nil, false); tuErr != nil {
+					if tuSpan != nil {
+						tuSpan.SetTag("error", "true")
+						tuSpan.SetTag("error.message", tuErr.Error())
+					}
+					fmt.Fprintf(os.Stderr, "[dispatcher] warning: post-ASE tool update failed for job %s: %v\n", job.ID, tuErr)
+				}
+				if tuSpan != nil {
+					tuSpan.End()
+				}
+			}
+			if d.syncer != nil && targetRepo != "" {
+				_, syncSpan := telemetry.StartSpan(ctx, "agent.ase_repo_sync",
+					telemetry.WithTag("job.id", job.ID),
+					telemetry.WithTag("repo", targetRepo),
+				)
+				if syncSyncer, ok := d.syncer.(interface {
+					SyncRepoSync(context.Context, string) error
+				}); ok {
+					_ = syncSyncer.SyncRepoSync(ctx, targetRepo)
+				} else {
+					d.syncer.TriggerRepoSync(targetRepo)
+				}
+				if syncSpan != nil {
+					syncSpan.End()
+				}
+			}
+		}
+
 		resBytes, _ := json.Marshal(res)
 		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{
 			FencingToken:          job.FencingToken,
@@ -1600,14 +1652,8 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		if gateSpan != nil {
 			gateSpan.End()
 		}
-		if compErr == nil && d.syncer != nil {
-			targetRepo := job.Repo
-			if targetRepo == "" && res != nil {
-				targetRepo = res.Repo
-			}
-			if targetRepo != "" {
-				d.syncer.TriggerRepoSync(targetRepo)
-			}
+		if compErr == nil && !isASEJob(job) && d.syncer != nil && targetRepo != "" {
+			d.syncer.TriggerRepoSync(targetRepo)
 		}
 		return true, compErr
 
@@ -1764,8 +1810,25 @@ func isASEJob(job *Job) bool {
 	if job.Type == JobTypeStoryExecute {
 		return true
 	}
-	payloadLower := strings.ToLower(string(job.Payload))
-	return strings.Contains(payloadLower, "/autonomous-story-execution") ||
-		strings.Contains(payloadLower, "autonomous-story-execution") ||
-		strings.Contains(payloadLower, "autopilot ase")
+	var p struct {
+		Prompt          string `json:"prompt"`
+		EffectiveAction string `json:"effective_action"`
+		Command         string `json:"command"`
+	}
+	if err := json.Unmarshal(job.Payload, &p); err == nil {
+		if strings.TrimSpace(p.EffectiveAction) == "/autonomous-story-execution" {
+			return true
+		}
+		trimmedPrompt := strings.TrimSpace(p.Prompt)
+		if strings.HasPrefix(trimmedPrompt, "/autonomous-story-execution") || strings.HasPrefix(trimmedPrompt, "autopilot ase") {
+			return true
+		}
+		trimmedCmd := strings.TrimSpace(p.Command)
+		if strings.HasPrefix(trimmedCmd, "/autonomous-story-execution") || strings.HasPrefix(trimmedCmd, "autopilot ase") {
+			return true
+		}
+		return false
+	}
+	raw := strings.TrimSpace(string(job.Payload))
+	return strings.HasPrefix(raw, "/autonomous-story-execution") || strings.HasPrefix(raw, "autopilot ase")
 }

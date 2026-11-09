@@ -2513,6 +2513,120 @@ func TestASECompletionGate_Invariants_StoryGov5232(t *testing.T) {
 	if len(mockSync.triggeredRepos) == 0 || mockSync.triggeredRepos[0] != "meta-repo" {
 		t.Fatalf("expected syncer to be triggered for meta-repo, got %v", mockSync.triggeredRepos)
 	}
+
+	// 5. Unpushed commits fail closed in ASE completion gate (AC1 / finding F9)
+	bareRemote := t.TempDir()
+	_ = exec.Command("git", "init", "--bare", bareRemote).Run()
+	_ = exec.Command("git", "-C", wt, "remote", "add", "origin", bareRemote).Run()
+	_ = exec.Command("git", "-C", wt, "push", "-u", "origin", "main").Run()
+
+	// Commit ahead without pushing
+	_ = os.WriteFile(filepath.Join(wt, "file.txt"), []byte("ahead\n"), 0o644)
+	_ = exec.Command("git", "-C", wt, "commit", "-am", "commit ahead of origin").Run()
+
+	jobUnpushed := &Job{
+		ID:                   "job_ase_unpushed",
+		Type:                 JobTypePromptExecute,
+		Repo:                 wt,
+		StoryID:              "STORY-GOV-5232",
+		ActiveConversationID: "conv-unpushed-1",
+		FencingToken:         5,
+		Payload:              json.RawMessage(`{"prompt":"/autonomous-story-execution fix bug","worktree_path":"` + filepath.ToSlash(wt) + `"}`),
+	}
+	cp.claimFunc = func(_ context.Context, _ ClaimRequest) (*Job, error) { return jobUnpushed, nil }
+	processed, err = dClean.PollAndProcess(context.Background())
+	if !processed || err == nil || !strings.Contains(err.Error(), "unpushed commits after ASE run") {
+		t.Fatalf("expected unpushed commits to fail completion gate, processed=%v err=%v", processed, err)
+	}
+	// Push commits to restore clean state on origin/main
+	_ = exec.Command("git", "-C", wt, "push", "origin", "main").Run()
+
+	// 6. Worktree reservation decline with repo_dirty_uncompleted_ase (AC4 / finding F3 & F6)
+	dirtyForDecline := filepath.Join(wt, "dirty-decline.txt")
+	_ = os.WriteFile(dirtyForDecline, []byte("dirty content\n"), 0o644)
+	jobDecline := &Job{
+		ID:           "job_decline_dirty_wt",
+		Type:         JobTypePromptExecute,
+		Repo:         wt,
+		StoryID:      "STORY-GOV-9999",
+		FencingToken: 6,
+		Payload:      json.RawMessage(`{"prompt":"/autonomous-story-execution new story","worktree_path":"` + filepath.ToSlash(wt) + `"}`),
+	}
+	cp.claimFunc = func(_ context.Context, _ ClaimRequest) (*Job, error) { return jobDecline, nil }
+	processed, err = dClean.PollAndProcess(context.Background())
+	if processed || err != nil {
+		t.Fatalf("expected dirty worktree claim to be declined without error, processed=%v err=%v", processed, err)
+	}
+	if reason := cp.declinedJobs["job_decline_dirty_wt"]; reason != reasonRepoDirtyUncompletedASE {
+		t.Fatalf("expected decline reason %q, got %q", reasonRepoDirtyUncompletedASE, reason)
+	}
+	_ = os.Remove(dirtyForDecline)
+
+	// 7. AC3 Sequence Invariant: Tool Update -> Repo Syncer -> CompleteJob (finding F1)
+	var callSequence []string
+	dSeq := NewDispatcher(cp, inv, "host-1", &mockSequenceSyncer{
+		syncCallback: func(repo string) {
+			callSequence = append(callSequence, "repo_syncer:"+repo)
+		},
+	})
+	dSeq.SetToolUpdater(func(ctx context.Context, tools []string, force bool, targetVersion ...string) error {
+		callSequence = append(callSequence, "tool_updater")
+		return nil
+	})
+	cp.completeFunc = func(_ context.Context, jobID string, req CompleteRequest) error {
+		callSequence = append(callSequence, "complete_job:"+jobID)
+		lastCompleteReq = req
+		return nil
+	}
+	jobSeq := &Job{
+		ID:           "job_ase_sequence",
+		Type:         JobTypePromptExecute,
+		Repo:         "meta-repo",
+		StoryID:      "STORY-GOV-5232",
+		FencingToken: 7,
+		Payload:      json.RawMessage(`{"prompt":"/autonomous-story-execution sequence test","worktree_path":"` + filepath.ToSlash(wt) + `"}`),
+	}
+	cp.claimFunc = func(_ context.Context, _ ClaimRequest) (*Job, error) { return jobSeq, nil }
+	processed, err = dSeq.PollAndProcess(context.Background())
+	if !processed || err != nil {
+		t.Fatalf("expected sequence test job to succeed, processed=%v err=%v", processed, err)
+	}
+	expectedSeq := []string{"tool_updater", "repo_syncer:meta-repo", "complete_job:job_ase_sequence"}
+	if len(callSequence) < 3 || callSequence[0] != expectedSeq[0] || callSequence[1] != expectedSeq[1] || callSequence[2] != expectedSeq[2] {
+		t.Fatalf("expected call sequence %v, got %v", expectedSeq, callSequence)
+	}
+
+	// 8. isASEJob precision: mention in general prompt does not trigger ASE gate (finding F8)
+	generalJob := &Job{
+		ID:           "job_general_chat",
+		Type:         JobTypePromptExecute,
+		Repo:         "meta-repo",
+		FencingToken: 8,
+		Payload:      json.RawMessage(`{"prompt":"can you explain how /autonomous-story-execution works?","worktree_path":"` + filepath.ToSlash(wt) + `"}`),
+	}
+	if isASEJob(generalJob) {
+		t.Fatal("expected isASEJob to be false for question mentioning /autonomous-story-execution in body")
+	}
+	aseSlashJob := &Job{
+		ID:           "job_ase_slash",
+		Type:         JobTypePromptExecute,
+		Repo:         "meta-repo",
+		FencingToken: 9,
+		Payload:      json.RawMessage(`{"prompt":"/autonomous-story-execution fix bug","worktree_path":"` + filepath.ToSlash(wt) + `"}`),
+	}
+	if !isASEJob(aseSlashJob) {
+		t.Fatal("expected isASEJob to be true for leading /autonomous-story-execution")
+	}
+}
+
+type mockSequenceSyncer struct {
+	syncCallback func(repo string)
+}
+
+func (m *mockSequenceSyncer) TriggerRepoSync(repoName string) {
+	if m.syncCallback != nil {
+		m.syncCallback(repoName)
+	}
 }
 
 

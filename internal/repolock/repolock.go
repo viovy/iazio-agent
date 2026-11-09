@@ -325,15 +325,19 @@ func ForceRelease(worktree string) error {
 
 // IsWorktreeDirty checks if a repository worktree has uncommitted modifications or untracked files,
 // ignoring internal iazio runtime files (.iazio/, .iazio-repolock, .session_story_id, .autopilot/).
+// Fails closed by returning true if git status fails.
 func IsWorktreeDirty(worktree string) bool {
 	if worktree == "" {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(worktree, ".git")); err != nil {
 		return false
 	}
 	ensureGitInfoExclude(worktree)
 	cmd := procutil.Command("git", "-C", worktree, "status", "--porcelain")
 	out, err := cmd.Output()
 	if err != nil {
-		return false
+		return true
 	}
 	for _, l := range strings.Split(string(out), "\n") {
 		trimmed := strings.TrimSpace(l)
@@ -353,35 +357,45 @@ func IsWorktreeDirty(worktree string) bool {
 }
 
 // HasUnpushedCommits checks if a repository worktree has commits ahead of its upstream or origin tracking branch.
-func HasUnpushedCommits(worktree string) bool {
+// Returns (true, nil) if ahead, (false, nil) if clean and up to date, or (false, err) if probe fails.
+func HasUnpushedCommits(worktree string) (bool, error) {
 	if worktree == "" {
-		return false
+		return false, nil
 	}
+	cmdRemote := procutil.Command("git", "-C", worktree, "remote")
+	remoteOut, remoteErr := cmdRemote.Output()
+	if remoteErr != nil {
+		return false, fmt.Errorf("git remote check failed in %s: %w", worktree, remoteErr)
+	}
+	if strings.TrimSpace(string(remoteOut)) == "" {
+		return false, nil
+	}
+
 	// 1. Try checking against upstream @{u}
 	cmdUpstream := procutil.Command("git", "-C", worktree, "rev-list", "--count", "@{u}..HEAD")
 	if out, err := cmdUpstream.Output(); err == nil {
 		cnt := 0
-		if _, scanErr := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &cnt); scanErr == nil && cnt > 0 {
-			return true
+		if _, scanErr := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &cnt); scanErr == nil {
+			return cnt > 0, nil
 		}
 	}
 	// 2. Try checking against origin/main..HEAD
 	cmdOriginMain := procutil.Command("git", "-C", worktree, "rev-list", "--count", "origin/main..HEAD")
 	if out, err := cmdOriginMain.Output(); err == nil {
 		cnt := 0
-		if _, scanErr := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &cnt); scanErr == nil && cnt > 0 {
-			return true
+		if _, scanErr := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &cnt); scanErr == nil {
+			return cnt > 0, nil
 		}
 	}
 	// 3. Try checking against origin/master..HEAD
 	cmdOriginMaster := procutil.Command("git", "-C", worktree, "rev-list", "--count", "origin/master..HEAD")
 	if out, err := cmdOriginMaster.Output(); err == nil {
 		cnt := 0
-		if _, scanErr := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &cnt); scanErr == nil && cnt > 0 {
-			return true
+		if _, scanErr := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &cnt); scanErr == nil {
+			return cnt > 0, nil
 		}
 	}
-	return false
+	return false, fmt.Errorf("no upstream tracking ref or remote origin branch found in %s", worktree)
 }
 
 // IsOnFeatureBranch checks if the repository worktree is currently checked out to a feature branch (not main/master/HEAD).
@@ -401,6 +415,33 @@ func IsOnFeatureBranch(worktree string) (bool, string) {
 	return true, branch
 }
 
+func parseStoryFrontmatter(filePath string) (id, status string) {
+	b, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", ""
+	}
+	lines := strings.Split(string(b), "\n")
+	inFrontmatter := false
+	for idx, rawLine := range lines {
+		trimmed := strings.TrimSpace(rawLine)
+		if idx == 0 && trimmed == "---" {
+			inFrontmatter = true
+			continue
+		}
+		if inFrontmatter && trimmed == "---" {
+			break
+		}
+		if inFrontmatter || idx < 30 {
+			if strings.HasPrefix(trimmed, "id:") && id == "" {
+				id = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "id:")), `"'`)
+			} else if strings.HasPrefix(trimmed, "status:") && status == "" {
+				status = strings.ToUpper(strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "status:")), `"'`))
+			}
+		}
+	}
+	return id, status
+}
+
 func isStoryDone(worktree, storyID string) bool {
 	if storyID == "" {
 		return false
@@ -409,6 +450,7 @@ func isStoryDone(worktree, storyID string) bool {
 		filepath.Join(worktree, "docs", "stories", "*.story.md"),
 		filepath.Join(worktree, "docs", "stories", "*.md"),
 		filepath.Join(worktree, "..", "docs", "stories", "*.story.md"),
+		filepath.Join(worktree, "..", "docs", "stories", "*.md"),
 	}
 	for _, g := range globs {
 		matches, err := filepath.Glob(g)
@@ -416,9 +458,9 @@ func isStoryDone(worktree, storyID string) bool {
 			continue
 		}
 		for _, m := range matches {
-			if b, err := os.ReadFile(m); err == nil {
-				text := string(b)
-				if strings.Contains(text, storyID) && (strings.Contains(text, "status: DONE") || strings.Contains(text, "status: \"DONE\"") || strings.Contains(text, "status: 'DONE'")) {
+			fmID, fmStatus := parseStoryFrontmatter(m)
+			if strings.EqualFold(fmID, storyID) || (fmID == "" && strings.Contains(strings.ToUpper(filepath.Base(m)), strings.ToUpper(storyID))) {
+				if fmStatus == "DONE" || fmStatus == "COMPLETED" {
 					return true
 				}
 			}
@@ -457,9 +499,15 @@ func IsWorktreeCleanForNewJob(worktree string, allowedStoryID ...string) (bool, 
 	if IsWorktreeDirty(worktree) {
 		return false, "uncommitted or untracked changes in worktree"
 	}
-	// Check unpushed commits
-	if HasUnpushedCommits(worktree) {
-		return false, "unpushed commits present ahead of remote origin"
+	// Check unpushed commits if repository has remote
+	if out, err := procutil.Command("git", "-C", worktree, "remote").Output(); err == nil && strings.TrimSpace(string(out)) != "" {
+		ahead, unpushedErr := HasUnpushedCommits(worktree)
+		if unpushedErr != nil {
+			return false, fmt.Sprintf("unpushed commit check failed: %v", unpushedErr)
+		}
+		if ahead {
+			return false, "unpushed commits present ahead of remote origin"
+		}
 	}
 	// Check feature branch
 	if onFeat, branch := IsOnFeatureBranch(worktree); onFeat {
