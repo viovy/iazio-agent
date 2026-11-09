@@ -13,6 +13,28 @@ import (
 	"unicode/utf16"
 )
 
+func newNonTempTestHome(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(wd, "testdata", "homes")
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(base, "home-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(dir)
+		_ = os.Remove(base)
+		_ = os.Remove(filepath.Join(wd, "testdata"))
+	})
+	return dir
+}
+
 func TestUnitContainsNoninteractive(t *testing.T) {
 	text := UnitText("linux", "/usr/bin/iazio-agent")
 	if !contains(text, "IAZIO_AGENT_NONINTERACTIVE=1") {
@@ -26,7 +48,7 @@ func TestUnitContainsNoninteractive(t *testing.T) {
 
 func TestInstallDarwinBootstrapsUserAgent(t *testing.T) {
 	t.Setenv("IAZIO_HARNESS_API_URL", "http://127.0.0.1:8090")
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	var got []string
 	err := InstallDarwinAt(home, "/Users/romeo/.local/bin/iazio-agent", func(name string, args ...string) error {
 		got = append(got, name+" "+strings.Join(args, " "))
@@ -93,7 +115,7 @@ func TestDryRunText(t *testing.T) {
 }
 
 func TestInstallLinuxAndWindowsUnits(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	var cmds []string
 	run := func(name string, args ...string) error {
 		cmds = append(cmds, name+" "+strings.Join(args, " "))
@@ -286,7 +308,7 @@ func TestSuiteAllowed(t *testing.T) {
 }
 
 func TestUserDaemonLinuxFallback(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := filepath.Join(home, "bin", "iazio-agent")
 	_ = os.MkdirAll(filepath.Dir(bin), 0o755)
 	_ = os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755)
@@ -326,7 +348,7 @@ func TestResolveElasticsearchURL(t *testing.T) {
 		t.Fatalf("expected custom ES URL, got %q", got)
 	}
 	t.Setenv("IAZIO_ELASTICSEARCH_URL", "")
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("HOME", home)
 	cfgDir := filepath.Join(home, ".iazio")
@@ -339,7 +361,7 @@ func TestResolveElasticsearchURL(t *testing.T) {
 
 func TestResolveHarnessAPIURLDefaults(t *testing.T) {
 	t.Setenv("IAZIO_HARNESS_API_URL", "")
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("HOME", home)
 
@@ -416,7 +438,7 @@ func TestControlArgv_AllPlatforms(t *testing.T) {
 }
 
 func TestDaemonPIDLifecycle(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	pidPath := filepath.Join(home, ".iazio", "agent.pid")
 	_ = os.MkdirAll(filepath.Dir(pidPath), 0755)
 
@@ -463,7 +485,7 @@ func TestAgentLogPath(t *testing.T) {
 }
 
 func TestInstallErrors(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 
 	// InstallDarwinAt errors
 	if err := InstallDarwinAt(home, "", func(string, ...string) error { return nil }); err == nil {
@@ -507,7 +529,7 @@ func TestInstallErrors(t *testing.T) {
 	_ = IsSystemdAvailable()
 
 	// StartUserDaemonAt branches with mock runner
-	testHome := t.TempDir()
+	testHome := newNonTempTestHome(t)
 	pidFile := filepath.Join(testHome, ".iazio", "agent.pid")
 	_ = os.MkdirAll(filepath.Dir(pidFile), 0755)
 	_ = os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644)
@@ -532,7 +554,7 @@ func TestInstallErrors(t *testing.T) {
 }
 
 func TestInstallDarwinAt(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := filepath.Join(home, "bin", "iazio-agent")
 
 	if err := InstallDarwinAt(home, "", func(string, ...string) error { return nil }); err == nil {
@@ -584,7 +606,7 @@ func TestInstallDarwinAt(t *testing.T) {
 }
 
 func TestInstallLinuxAt(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := filepath.Join(home, "bin", "iazio-agent")
 
 	if err := InstallLinuxAt(home, bin, nil); err == nil {
@@ -619,7 +641,7 @@ func TestInstallLinuxAt(t *testing.T) {
 }
 
 func TestInstallWindowsAt(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := filepath.Join(home, "bin", "iazio-agent.exe")
 
 	if err := InstallWindowsAt(home, bin, "DOMAIN\\user", nil); err == nil {
@@ -719,7 +741,7 @@ func TestInstallWindowsAt(t *testing.T) {
 }
 
 func TestDaemonPIDLifecycleExtended(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	pidDir := filepath.Join(home, ".iazio")
 	_ = os.MkdirAll(pidDir, 0o755)
 	pidFile := filepath.Join(pidDir, "agent.pid")
@@ -788,7 +810,7 @@ func TestSetupUserCrontab(t *testing.T) {
 }
 
 func TestInstallWrapperFunctions(t *testing.T) {
-	fakeHome := t.TempDir()
+	fakeHome := newNonTempTestHome(t)
 	t.Setenv("HOME", fakeHome)
 	t.Setenv("USERPROFILE", fakeHome)
 
@@ -824,7 +846,7 @@ func TestInstallWrapperFunctions(t *testing.T) {
 }
 
 func TestResilienceUnitsAndWatcher(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := filepath.Join(home, ".iazio", "bin", "iazio-agent")
 
 	var commands []string
@@ -862,7 +884,7 @@ func TestResilienceUnitsAndWatcher(t *testing.T) {
 }
 
 func TestPauseResumeAndReviveCheck(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	var commands []string
 	runner := func(name string, args ...string) error {
 		commands = append(commands, name+" "+strings.Join(args, " "))
@@ -897,8 +919,8 @@ func TestPauseResumeAndReviveCheck(t *testing.T) {
 }
 
 func TestDevInstallHotSwap(t *testing.T) {
-	home := t.TempDir()
-	srcDir := t.TempDir()
+	home := newNonTempTestHome(t)
+	srcDir := newNonTempTestHome(t)
 	srcBin := filepath.Join(srcDir, "iazio-agent-dev")
 	if err := os.WriteFile(srcBin, []byte("#!/bin/sh\necho dev\n"), 0755); err != nil {
 		t.Fatal(err)
@@ -961,7 +983,7 @@ func decodeUTF16LE(b []byte) string {
 }
 
 func TestDarwinResilienceUnits(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := filepath.Join(home, ".iazio", "bin", "iazio-agent")
 	logPath := filepath.Join(home, ".iazio", "logs", "agent.log")
 
@@ -1024,7 +1046,7 @@ func TestDarwinResilienceUnits(t *testing.T) {
 }
 
 func TestReviveCheckDarwin(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := filepath.Join(home, ".iazio", "bin", "iazio-agent")
 	_ = os.MkdirAll(filepath.Dir(bin), 0755)
 	_ = os.WriteFile(bin, []byte("#!/bin/sh\n"), 0755)
@@ -1109,7 +1131,7 @@ func TestParseSchtasksStatus(t *testing.T) {
 }
 
 func TestPauseAndResumeService(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	runner := func(name string, args ...string) error {
 		return nil
 	}
@@ -1129,7 +1151,7 @@ func TestPauseAndResumeService(t *testing.T) {
 }
 
 func TestUserDaemonAt_Helpers(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := filepath.Join(home, ".local", "bin", "iazio-agent")
 	_ = os.MkdirAll(filepath.Dir(bin), 0755)
 	_ = os.WriteFile(bin, []byte("#!/bin/sh\n"), 0755)
@@ -1165,7 +1187,7 @@ func TestUserDaemonAt_Helpers(t *testing.T) {
 }
 
 func TestCopyBinaryAtomic(t *testing.T) {
-	tmp := t.TempDir()
+	tmp := newNonTempTestHome(t)
 	src := filepath.Join(tmp, "src.bin")
 	_ = os.WriteFile(src, []byte("atomic-bytes"), 0755)
 
@@ -1196,7 +1218,7 @@ func TestWindowsLogonUser(t *testing.T) {
 }
 
 func TestInstallLinuxResilience(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := filepath.Join(home, "iazio-agent")
 	var calls []string
 	runner := func(name string, args ...string) error {
@@ -1216,7 +1238,7 @@ func TestIsSystemdAvailable(t *testing.T) {
 }
 
 func TestInstallDarwinResilience(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := filepath.Join(home, "iazio-agent")
 	var calls []string
 	runner := func(name string, args ...string) error {
@@ -1232,7 +1254,7 @@ func TestInstallDarwinResilience(t *testing.T) {
 }
 
 func TestDevInstall_DefaultExecutable(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	runner := func(name string, args ...string) error {
 		return nil
 	}
@@ -1242,7 +1264,7 @@ func TestDevInstall_DefaultExecutable(t *testing.T) {
 }
 
 func TestReviveCheck_LinuxInactive(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	var runCalls []string
 	runner := func(name string, args ...string) error {
 		runCalls = append(runCalls, name+" "+strings.Join(args, " "))
@@ -1299,7 +1321,7 @@ func TestStartUserDaemonAt_DirectExec(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("user daemon shell runner uses /bin/sh on unix")
 	}
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	daemonDir := filepath.Join(home, ".iazio", "daemon")
 	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -1315,7 +1337,7 @@ func TestStartUserDaemonAt_DirectExec(t *testing.T) {
 }
 
 func TestUninstallUserDaemonAt_DefaultCrontab(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	pidFile := filepath.Join(home, ".iazio", "agent.pid")
 	_ = os.MkdirAll(filepath.Dir(pidFile), 0o755)
 	_ = os.WriteFile(pidFile, []byte("99999999"), 0o644)
@@ -1365,7 +1387,7 @@ func TestUninstallUserDaemonAt_DefaultCrontab(t *testing.T) {
 }
 
 func TestInstallDarwinResilience_ErrorCases(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := "/usr/local/bin/iazio-agent"
 
 	err1 := InstallDarwinResilience(home, bin, func(name string, args ...string) error {
@@ -1410,7 +1432,7 @@ func TestInstallDarwinResilience_ErrorCases(t *testing.T) {
 }
 
 func TestInstallLinuxResilience_ErrorCase(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := "/usr/local/bin/iazio-agent"
 
 	err := InstallLinuxResilience(home, bin, func(name string, args ...string) error {
@@ -1425,7 +1447,7 @@ func TestInstallLinuxResilience_ErrorCase(t *testing.T) {
 }
 
 func TestReviveCheck_ExpiredLock(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	lockDir := filepath.Join(home, ".iazio")
 	if err := os.MkdirAll(lockDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -1450,7 +1472,7 @@ func TestReviveCheck_ExpiredLock(t *testing.T) {
 }
 
 func TestPauseAndResume_DefaultRunner(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	var runCalls []string
 	restore := SetExecCommandForTest(func(name string, args ...string) error {
 		runCalls = append(runCalls, name+" "+strings.Join(args, " "))
@@ -1497,7 +1519,7 @@ func TestWindowsLogonUser_EnvVariants(t *testing.T) {
 }
 
 func TestReconcileServiceConfiguration(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := filepath.Join(home, ".iazio", "bin", "iazio-agent")
 	var cmds []string
 	run := func(name string, args ...string) error {
@@ -1532,7 +1554,7 @@ func TestReconcileServiceConfiguration(t *testing.T) {
 }
 
 func TestReconcileDarwinServiceConfiguration_SelfBootoutGuard(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	canonicalBin := filepath.Join(home, ".local", "bin", "iazio-agent")
 	harnessBin := filepath.Join(home, ".local", "bin", "iazio-harness")
 	if err := os.MkdirAll(filepath.Dir(canonicalBin), 0o755); err != nil {
@@ -1590,7 +1612,7 @@ func TestReconcileDarwinServiceConfiguration_SelfBootoutGuard(t *testing.T) {
 }
 
 func TestInstallDarwinResilience_WatchdogSelfBootoutGuard(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := filepath.Join(home, ".local", "bin", "iazio-agent")
 
 	origStatusCheck := statusCheckCommand
@@ -1652,7 +1674,7 @@ func TestLinuxUnitHardening(t *testing.T) {
 }
 
 func TestReviveCheck_MaintenanceLockActive(t *testing.T) {
-	tmpDir := t.TempDir()
+	tmpDir := newNonTempTestHome(t)
 	lockDir := filepath.Join(tmpDir, ".iazio")
 	_ = os.MkdirAll(lockDir, 0755)
 	lockFile := filepath.Join(lockDir, "maintenance.lock")
@@ -1665,7 +1687,7 @@ func TestReviveCheck_MaintenanceLockActive(t *testing.T) {
 }
 
 func TestLegacyHarnessUnitsPurgedOnLinuxReconcile(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
 	if err := os.MkdirAll(unitDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -1715,7 +1737,7 @@ func TestRestartToolService(t *testing.T) {
 }
 
 func TestReconcileServiceConfiguration_AllBranches(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	binDir := filepath.Join(home, ".iazio", "bin")
 	_ = os.MkdirAll(binDir, 0755)
 	agentBin := filepath.Join(binDir, "iazio-agent")
@@ -1769,7 +1791,7 @@ func TestIsTempOrTestPath_And_ServiceControlDisabled(t *testing.T) {
 }
 
 func TestInstallDarwinResilience_HealsPoisonedTempPathAndExConfig78(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := filepath.Join(home, ".local", "bin", "iazio-agent")
 	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
 	logPath := filepath.Join(home, ".iazio", "logs", "agent.log")
@@ -1832,7 +1854,7 @@ func TestInstallDarwinResilience_HealsPoisonedTempPathAndExConfig78(t *testing.T
 }
 
 func TestReconcileDarwinServiceConfiguration_PurgesInMemoryOrphanHarnessAndDeterministicPath(t *testing.T) {
-	home := t.TempDir()
+	home := newNonTempTestHome(t)
 	bin := filepath.Join(home, ".local", "bin", "iazio-agent")
 	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
 	logPath := filepath.Join(home, ".iazio", "logs", "agent.log")
@@ -1908,23 +1930,56 @@ func TestReconcileDarwinServiceConfiguration_PurgesInMemoryOrphanHarnessAndDeter
 		t.Fatalf("must not bootout healthy running %s, got:\n%s", DarwinLabel, joined)
 	}
 
-	// Verify F1 & F2 & F6:
+	// Verify A1, A3, A4, F1, F2, F6:
 	// 1. Running service with historical last exit code = 78 or penalty box is NOT flagged as drifted.
 	runningWithHistory := fmt.Sprintf("state = running\npid = 99999\npath = %s\nprogram = %s\nlast exit code = 78: EX_CONFIG\nproperties = { penalty box }\n", agentPlistPath, bin)
 	if isDarwinLaunchdServiceDrifted(runningWithHistory, agentPlistPath, bin) {
 		t.Fatal("expected running service with matching path/program and historical exit 78 not to be flagged as drifted")
 	}
 
-	// 2. isRunningInsideDarwinAgentService returns false when plist path is drifted, even if XPC_SERVICE_NAME matches.
+	// 1b. Non-running idle StartInterval job with "penalty box" alone (no exit 78 / spawn failed) is NOT flagged as drifted (Finding A4).
+	idlePenaltyBox := fmt.Sprintf("state = waiting\npath = %s\nprogram = %s\nproperties = { penalty box }\n", agentPlistPath, bin)
+	if isDarwinLaunchdServiceDrifted(idlePenaltyBox, agentPlistPath, bin) {
+		t.Fatal("expected idle StartInterval job with penalty box alone not to be flagged as drifted")
+	}
+
+	// 1c. Exact PID parsing does not prefix-match pid = 12 against pid = 123 (Finding A4).
+	if hasExactDarwinPID("state = running\npid = 123\n", 12) {
+		t.Fatal("expected hasExactDarwinPID not to prefix-match pid=12 against pid=123")
+	}
+	if !hasExactDarwinPID("state = running\npid = 123\n", 123) {
+		t.Fatal("expected hasExactDarwinPID to match exact pid=123")
+	}
+
+	// 2a. Self-identity first (Finding A1): when pid == os.Getpid() and state = running,
+	// isRunningInsideDarwinAgentService returns true even if path is drifted, preventing self-bootout.
 	t.Setenv("XPC_SERVICE_NAME", DarwinLabel)
 	statusCheckCommand = func(name string, args ...string) ([]byte, error) {
 		return []byte(fmt.Sprintf("state = running\npid = %d\npath = /private/var/folders/poisoned/io.iazio.iazio-agent.plist\nprogram = %s\n", os.Getpid(), bin)), nil
 	}
+	if !isRunningInsideDarwinAgentService("gui/501/"+DarwinLabel, agentPlistPath, bin) {
+		t.Fatal("expected isRunningInsideDarwinAgentService=true when loaded pid equals os.Getpid() even if path is drifted (Finding A1 self-bootout guard)")
+	}
+	// Verify reconcileDarwinServiceConfiguration never boots out io.iazio.iazio-agent when loaded pid == os.Getpid() even with drifted path.
+	cmds = nil
+	if err := reconcileDarwinServiceConfiguration(home, bin, run); err != nil {
+		t.Fatalf("reconcileDarwinServiceConfiguration inside running self-pid agent failed: %v", err)
+	}
+	if strings.Contains(strings.Join(cmds, "\n"), "bootout gui/"+strconv.Itoa(os.Getuid())+"/"+DarwinLabel+"\n") ||
+		strings.HasSuffix(strings.Join(cmds, "\n"), "bootout gui/"+strconv.Itoa(os.Getuid())+"/"+DarwinLabel) {
+		t.Fatalf("must NEVER bootout own running launchd job when pid == os.Getpid(), got:\n%s", strings.Join(cmds, "\n"))
+	}
+
+	// 2b. When pid != os.Getpid() (e.g. child/CLI process with XPC_SERVICE_NAME inherited) and plist path is drifted,
+	// isRunningInsideDarwinAgentService returns false (AC2.3).
+	statusCheckCommand = func(name string, args ...string) ([]byte, error) {
+		return []byte(fmt.Sprintf("state = running\npid = 99999\npath = /private/var/folders/poisoned/io.iazio.iazio-agent.plist\nprogram = %s\n", bin)), nil
+	}
 	if isRunningInsideDarwinAgentService("gui/501/"+DarwinLabel, agentPlistPath, bin) {
-		t.Fatal("expected isRunningInsideDarwinAgentService=false when loaded plist path is drifted")
+		t.Fatal("expected isRunningInsideDarwinAgentService=false when pid != os.Getpid() and loaded plist path is drifted")
 	}
 	statusCheckCommand = func(name string, args ...string) ([]byte, error) {
-		return []byte(fmt.Sprintf("state = running\npid = %d\npath = %s\nprogram = %s\n", os.Getpid(), agentPlistPath, bin)), nil
+		return []byte(fmt.Sprintf("state = running\npid = 99999\npath = %s\nprogram = %s\n", agentPlistPath, bin)), nil
 	}
 	if !isRunningInsideDarwinAgentService("gui/501/"+DarwinLabel, agentPlistPath, bin) {
 		t.Fatal("expected isRunningInsideDarwinAgentService=true when loaded plist path matches canonical and state=running")
@@ -1969,5 +2024,27 @@ func TestReconcileDarwinServiceConfiguration_PurgesInMemoryOrphanHarnessAndDeter
 	// 5. resolveDarwinPlistHome fallback when logPath is not under .iazio/logs
 	if gotHome := resolveDarwinPlistHome(filepath.Join("/Users/testuser", ".local", "bin", "iazio-agent"), "/var/log/custom.log"); gotHome == "" {
 		t.Fatal("expected non-empty resolved home from resolveDarwinPlistHome fallback")
+	}
+}
+
+func TestInstallDarwinAt_TempHomeSuppressesExplicitRunner(t *testing.T) {
+	nonTempHome := newNonTempTestHome(t)
+	t.Setenv("HOME", nonTempHome)
+	t.Setenv("IAZIO_TEST_MODE", "")
+	t.Setenv("IAZIO_DISABLE_SERVICE_CONTROL", "")
+	t.Setenv("GO_TEST", "")
+
+	tempHome := t.TempDir()
+	var recorded []string
+	recordingRunner := func(name string, args ...string) error {
+		recorded = append(recorded, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	if err := InstallDarwinAt(tempHome, filepath.Join(nonTempHome, ".local", "bin", "iazio-agent"), recordingRunner); err != nil {
+		t.Fatalf("InstallDarwinAt with tempHome failed: %v", err)
+	}
+	if len(recorded) != 0 {
+		t.Fatalf("expected zero launchctl mutations to reach explicit runner when home is a temp path, got: %v", recorded)
 	}
 }

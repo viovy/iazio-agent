@@ -373,20 +373,48 @@ func DarwinWatchdogPlist(bin, logPath string) string {
 }
 
 func normalizeDarwinPath(p string) string {
-	c := filepath.Clean(strings.TrimSpace(p))
-	if strings.HasPrefix(c, "/private/var/") {
-		c = strings.TrimPrefix(c, "/private")
-	} else if strings.HasPrefix(c, "/private/tmp/") {
+	trimmed := strings.TrimSpace(p)
+	if trimmed == "" {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(trimmed); err == nil && strings.TrimSpace(resolved) != "" {
+		trimmed = resolved
+	}
+	c := filepath.Clean(trimmed)
+	if strings.HasPrefix(c, "/private/var/") || strings.HasPrefix(c, "/private/tmp/") {
 		c = strings.TrimPrefix(c, "/private")
 	}
 	return c
 }
 
+func extractDarwinLaunchdPID(printOutput string) (int, bool) {
+	for _, rawLine := range strings.Split(printOutput, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if strings.HasPrefix(line, "pid = ") {
+			fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "pid = ")))
+			if len(fields) > 0 {
+				if pid, err := strconv.Atoi(fields[0]); err == nil && pid > 0 {
+					return pid, true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+func hasExactDarwinPID(printOutput string, wantPID int) bool {
+	if wantPID <= 0 {
+		return false
+	}
+	pid, ok := extractDarwinLaunchdPID(printOutput)
+	return ok && pid == wantPID
+}
+
 // isDarwinLaunchdServiceDrifted inspects `launchctl print` output and returns true when:
-//   - `path = <plist>` is present and does not match expectedPlistPath, OR
-//   - `program = <bin>` is present and does not match expectedBinPath, OR
-//   - the loaded job is NOT currently running with a live PID (`state = running` + `pid =`)
-//     and reports `78: EX_CONFIG`, `last exit code = 78`, `job state = spawn failed`, or `penalty box`.
+//   - `path = <plist>` is present and does not match expectedPlistPath (after symlink & case normalization), OR
+//   - `program = <bin>` is present and does not match expectedBinPath (after symlink & case normalization), OR
+//   - the loaded job is NOT currently running with a live PID (`state = running` + exact `pid = <N>`)
+//     and reports `78: EX_CONFIG`, `last exit code = 78`, or `job state = spawn failed`.
 func isDarwinLaunchdServiceDrifted(printOutput, expectedPlistPath, expectedBinPath string) bool {
 	normPlist := normalizeDarwinPath(expectedPlistPath)
 	normBin := normalizeDarwinPath(expectedBinPath)
@@ -394,23 +422,23 @@ func isDarwinLaunchdServiceDrifted(printOutput, expectedPlistPath, expectedBinPa
 		line := strings.TrimSpace(rawLine)
 		if strings.HasPrefix(line, "path = ") {
 			loadedPlist := normalizeDarwinPath(strings.TrimPrefix(line, "path = "))
-			if loadedPlist != "" && normPlist != "" && loadedPlist != normPlist {
+			if loadedPlist != "" && normPlist != "" && !strings.EqualFold(loadedPlist, normPlist) {
 				return true
 			}
 		}
 		if strings.HasPrefix(line, "program = ") {
 			loadedBin := normalizeDarwinPath(strings.TrimPrefix(line, "program = "))
-			if loadedBin != "" && normBin != "" && loadedBin != normBin {
+			if loadedBin != "" && normBin != "" && !strings.EqualFold(loadedBin, normBin) {
 				return true
 			}
 		}
 	}
-	currentlyRunning := strings.Contains(printOutput, "state = running") && strings.Contains(printOutput, "pid =")
+	_, hasLivePID := extractDarwinLaunchdPID(printOutput)
+	currentlyRunning := strings.Contains(printOutput, "state = running") && hasLivePID
 	if !currentlyRunning {
 		if strings.Contains(printOutput, "78: EX_CONFIG") ||
 			strings.Contains(printOutput, "last exit code = 78") ||
-			strings.Contains(printOutput, "job state = spawn failed") ||
-			strings.Contains(printOutput, "penalty box") {
+			strings.Contains(printOutput, "job state = spawn failed") {
 			return true
 		}
 	}
@@ -1050,14 +1078,17 @@ func isRunningInsideDarwinAgentService(target, expectedPlistPath, expectedBinPat
 	envMatch := os.Getenv("XPC_SERVICE_NAME") == DarwinLabel || os.Getenv("IAZIO_AGENT_SERVICE") == "1"
 	if out, err := statusCheckCommand("launchctl", "print", target); err == nil {
 		outStr := string(out)
+		// Self-identity check FIRST: if this process's own PID is the live running PID
+		// of the launchd job, return true immediately so reconcile never boots out its own job
+		// even if the on-disk/in-memory plist path is drifted.
+		if strings.Contains(outStr, "state = running") && hasExactDarwinPID(outStr, os.Getpid()) {
+			return true
+		}
 		if isDarwinLaunchdServiceDrifted(outStr, expectedPlistPath, expectedBinPath) {
 			return false
 		}
-		pidStr := fmt.Sprintf("pid = %d", os.Getpid())
-		if strings.Contains(outStr, "state = running") && strings.Contains(outStr, pidStr) {
-			return true
-		}
-		return envMatch && strings.Contains(outStr, "state = running")
+		_, hasLivePID := extractDarwinLaunchdPID(outStr)
+		return envMatch && strings.Contains(outStr, "state = running") && hasLivePID
 	}
 	return envMatch
 }
@@ -1833,13 +1864,12 @@ func IsTempOrTestPath(p string) bool {
 	return false
 }
 
-// IsServiceControlDisabled returns true when OS service-control commands
-// (launchctl, systemctl, schtasks, loginctl, crontab, taskkill) must be suppressed
-// because the process is running in test mode or with a temporary HOME/executable path.
-func IsServiceControlDisabled() bool {
-	if isTestProcess() {
-		return true
-	}
+func isGoTestBinaryPath(exe string) bool {
+	base := strings.ToLower(filepath.Base(exe))
+	return strings.HasSuffix(base, ".test") || strings.HasSuffix(base, ".test.exe") || strings.HasPrefix(base, "___test")
+}
+
+func isServiceControlDisabledByEnvOrHome() bool {
 	for _, k := range []string{"IAZIO_TEST_MODE", "IAZIO_DISABLE_SERVICE_CONTROL", "GO_TEST"} {
 		v := strings.ToLower(strings.TrimSpace(os.Getenv(k)))
 		if v == "1" || v == "true" || v == "yes" {
@@ -1849,10 +1879,20 @@ func IsServiceControlDisabled() bool {
 	if IsTempOrTestPath(os.Getenv("HOME")) {
 		return true
 	}
-	if exe, err := os.Executable(); err == nil && IsTempOrTestPath(exe) {
+	if exe, err := os.Executable(); err == nil && IsTempOrTestPath(exe) && !isGoTestBinaryPath(exe) {
 		return true
 	}
 	return false
+}
+
+// IsServiceControlDisabled returns true when OS service-control commands
+// (launchctl, systemctl, schtasks, loginctl, crontab, taskkill) must be suppressed
+// because the process is running in test mode or with a temporary HOME/executable path.
+func IsServiceControlDisabled() bool {
+	if isTestProcess() {
+		return true
+	}
+	return isServiceControlDisabledByEnvOrHome()
 }
 
 func isTestProcess() bool {
@@ -1862,11 +1902,8 @@ func isTestProcess() bool {
 		}
 	}
 	exe, err := os.Executable()
-	if err == nil {
-		base := strings.ToLower(filepath.Base(exe))
-		if strings.HasSuffix(base, ".test") || strings.HasSuffix(base, ".test.exe") || strings.HasPrefix(base, "___test") {
-			return true
-		}
+	if err == nil && isGoTestBinaryPath(exe) {
+		return true
 	}
 	return false
 }
@@ -1881,15 +1918,12 @@ func isServiceControlCommand(name string) bool {
 	}
 }
 
-var testExecOverrideActive bool
-
 func resolveServiceControlRunners(home, bin string, run func(name string, args ...string) error) (func(name string, args ...string) error, func(name string, args ...string) ([]byte, error)) {
-	callerSuppliedRun := run != nil
 	if run == nil {
 		run = execCommand
 	}
 	statusFn := statusCheckCommand
-	if !testExecOverrideActive && !callerSuppliedRun && (IsTempOrTestPath(home) || IsTempOrTestPath(bin) || IsServiceControlDisabled()) {
+	if IsTempOrTestPath(home) || IsTempOrTestPath(bin) || isServiceControlDisabledByEnvOrHome() {
 		wrappedRun := func(name string, args ...string) error {
 			if isServiceControlCommand(name) {
 				fmt.Fprintf(os.Stderr, "[service] service control suppressed (%s): reason=temp-or-test-path\n", name)
@@ -1934,8 +1968,6 @@ var statusCheckCommand = func(name string, args ...string) ([]byte, error) {
 func SetExecCommandForTest(runner func(name string, args ...string) error, statusChecker ...func(name string, args ...string) ([]byte, error)) func() {
 	origExec := execCommand
 	origStatus := statusCheckCommand
-	origOverride := testExecOverrideActive
-	testExecOverrideActive = true
 	if runner != nil {
 		execCommand = runner
 	}
@@ -1950,7 +1982,6 @@ func SetExecCommandForTest(runner func(name string, args ...string) error, statu
 	return func() {
 		execCommand = origExec
 		statusCheckCommand = origStatus
-		testExecOverrideActive = origOverride
 	}
 }
 
