@@ -321,6 +321,11 @@ func (ze *ZipkinExporter) sendSpans(ctx context.Context, spans []*Span) error {
 		} else if jid := tags["iazio.job_id"]; jid != "" && tags["job.id"] == "" {
 			tags["job.id"] = jid
 		}
+		if tags["host.name"] == "" {
+			if hn, err := os.Hostname(); err == nil && strings.TrimSpace(hn) != "" {
+				tags["host.name"] = strings.TrimSpace(hn)
+			}
+		}
 
 		var annos []ZipkinAnnotation
 		for _, a := range s.Annotations {

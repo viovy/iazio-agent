@@ -1743,3 +1743,231 @@ func TestReconcileServiceConfiguration_AllBranches(t *testing.T) {
 	// ReviveCheck without maintenance lock
 	_ = ReviveCheck(home, runner)
 }
+
+func TestIsTempOrTestPath_And_ServiceControlDisabled(t *testing.T) {
+	if !IsTempOrTestPath("/private/var/folders/l8/7kpsgc7s/T/TestE2E_Gov3799/001") {
+		t.Fatal("expected /private/var/folders/.../TestE2E_... to be detected as temp/test path")
+	}
+	if !IsTempOrTestPath("/var/folders/l8/7kpsgc7s/T/TestE2E_Gov3799/001") {
+		t.Fatal("expected /var/folders/... to be detected as temp/test path")
+	}
+	if !IsTempOrTestPath("/tmp/test-home-123") {
+		t.Fatal("expected /tmp/... to be detected as temp/test path")
+	}
+	if !IsTempOrTestPath(t.TempDir()) {
+		t.Fatal("expected t.TempDir() to be detected as temp/test path")
+	}
+	if IsTempOrTestPath("/Users/romeo") || IsTempOrTestPath("/home/romeo") {
+		t.Fatal("expected real user home not to be flagged as temp/test path")
+	}
+	if IsTempOrTestPath("") {
+		t.Fatal("expected empty path not to be flagged as temp/test path")
+	}
+	if !IsServiceControlDisabled() {
+		t.Fatal("expected IsServiceControlDisabled() to be true inside go test process")
+	}
+}
+
+func TestInstallDarwinResilience_HealsPoisonedTempPathAndExConfig78(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, ".local", "bin", "iazio-agent")
+	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
+	logPath := filepath.Join(home, ".iazio", "logs", "agent.log")
+	if err := os.MkdirAll(launchAgentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-populate canonical watcher and watchdog plists on disk so watcherChanged/watchdogChanged are false.
+	watcherPlistPath := filepath.Join(launchAgentsDir, watcherLabel+".plist")
+	watchdogPlistPath := filepath.Join(launchAgentsDir, watchdogLabel+".plist")
+	if err := os.WriteFile(watcherPlistPath, []byte(DarwinWatcherPlist(bin, logPath)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(watchdogPlistPath, []byte(DarwinWatchdogPlist(bin, logPath)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate launchd in-memory state poisoned by a deleted TestE2E temp dir with 78: EX_CONFIG (spawn failed).
+	origStatusCheck := statusCheckCommand
+	defer func() { statusCheckCommand = origStatusCheck }()
+	statusCheckCommand = func(name string, args ...string) ([]byte, error) {
+		return []byte(
+			"gui/501/io.iazio.iazio-agent-watcher = {\n" +
+				"\tpath = /private/var/folders/l8/7kps/T/TestE2E_Gov3799/001/Library/LaunchAgents/io.iazio.iazio-agent-watcher.plist\n" +
+				"\tprogram = /var/folders/l8/7kps/T/TestE2E_Gov3799/001/.local/bin/iazio-agent\n" +
+				"\tjob state = spawn failed\n" +
+				"\tlast exit code = 78: EX_CONFIG\n" +
+				"\tproperties = { penalty box }\n" +
+				"}\n",
+		), nil
+	}
+
+	t.Setenv("XPC_SERVICE_NAME", "")
+	var cmds []string
+	run := func(name string, args ...string) error {
+		cmds = append(cmds, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	if err := InstallDarwinResilience(home, bin, run); err != nil {
+		t.Fatalf("InstallDarwinResilience failed: %v", err)
+	}
+
+	joined := strings.Join(cmds, "\n")
+	for _, required := range []string{
+		"bootout gui/" + strconv.Itoa(os.Getuid()) + "/" + watcherLabel,
+		"bootstrap gui/" + strconv.Itoa(os.Getuid()) + " " + watcherPlistPath,
+		"enable gui/" + strconv.Itoa(os.Getuid()) + "/" + watcherLabel,
+		"bootout gui/" + strconv.Itoa(os.Getuid()) + "/" + watchdogLabel,
+		"bootstrap gui/" + strconv.Itoa(os.Getuid()) + " " + watchdogPlistPath,
+		"enable gui/" + strconv.Itoa(os.Getuid()) + "/" + watchdogLabel,
+	} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("expected %q when healing poisoned in-memory launchd plist path / EX_CONFIG, got:\n%s", required, joined)
+		}
+	}
+}
+
+func TestReconcileDarwinServiceConfiguration_PurgesInMemoryOrphanHarnessAndDeterministicPath(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, ".local", "bin", "iazio-agent")
+	launchAgentsDir := filepath.Join(home, "Library", "LaunchAgents")
+	logPath := filepath.Join(home, ".iazio", "logs", "agent.log")
+	if err := os.MkdirAll(launchAgentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify darwinPlist generates identical content regardless of caller PATH.
+	t.Setenv("PATH", "/custom/conda/bin:/usr/bin")
+	plist1 := darwinPlist(bin, logPath)
+	t.Setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+	plist2 := darwinPlist(bin, logPath)
+	if plist1 != plist2 {
+		t.Fatalf("expected deterministic darwinPlist regardless of caller PATH, got:\n%s\nvs\n%s", plist1, plist2)
+	}
+
+	// Pre-write canonical plists on disk; do NOT create io.iazio.iazio-harness.plist on disk (already deleted).
+	agentPlistPath := filepath.Join(launchAgentsDir, DarwinLabel+".plist")
+	if err := os.WriteFile(agentPlistPath, []byte(plist1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(launchAgentsDir, watcherLabel+".plist"), []byte(DarwinWatcherPlist(bin, logPath)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(launchAgentsDir, watchdogLabel+".plist"), []byte(DarwinWatchdogPlist(bin, logPath)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate io.iazio.iazio-agent healthy in launchd AND orphan io.iazio.iazio-harness still loaded in launchd memory.
+	origStatusCheck := statusCheckCommand
+	defer func() { statusCheckCommand = origStatusCheck }()
+	statusCheckCommand = func(name string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "print" {
+			target := args[1]
+			if strings.HasSuffix(target, "/io.iazio.iazio-harness") ||
+				strings.HasSuffix(target, "/io.iazio.iazio-harness-watcher") ||
+				strings.HasSuffix(target, "/io.iazio.iazio-harness-watchdog") {
+				return []byte(target + " = {\n\tstate = waiting\n\truns = 12747\n\tlast exit code = 1\n}\n"), nil
+			}
+			if strings.HasSuffix(target, "/"+DarwinLabel) {
+				return []byte(fmt.Sprintf("%s = {\n\tstate = running\n\tpid = 99999\n\tpath = %s\n\tprogram = %s\n}\n", target, agentPlistPath, bin)), nil
+			}
+			return []byte("state = waiting\n"), nil
+		}
+		return nil, errors.New("unexpected command")
+	}
+
+	t.Setenv("XPC_SERVICE_NAME", "")
+	var cmds []string
+	run := func(name string, args ...string) error {
+		cmds = append(cmds, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	if err := reconcileDarwinServiceConfiguration(home, bin, run); err != nil {
+		t.Fatalf("reconcileDarwinServiceConfiguration failed: %v", err)
+	}
+
+	joined := strings.Join(cmds, "\n")
+	// Must bootout in-memory orphan io.iazio.iazio-harness jobs even though .plist files are absent on disk
+	for _, label := range []string{"io.iazio.iazio-harness", "io.iazio.iazio-harness-watcher", "io.iazio.iazio-harness-watchdog"} {
+		expectedBootout := "bootout gui/" + strconv.Itoa(os.Getuid()) + "/" + label
+		if !strings.Contains(joined, expectedBootout) {
+			t.Fatalf("expected %q for orphan in-memory harness LaunchAgent, got:\n%s", expectedBootout, joined)
+		}
+	}
+	// Must NOT bootout healthy running io.iazio.iazio-agent
+	if strings.Contains(joined, "bootout gui/"+strconv.Itoa(os.Getuid())+"/"+DarwinLabel+"\n") ||
+		strings.HasSuffix(joined, "bootout gui/"+strconv.Itoa(os.Getuid())+"/"+DarwinLabel) {
+		t.Fatalf("must not bootout healthy running %s, got:\n%s", DarwinLabel, joined)
+	}
+
+	// Verify F1 & F2 & F6:
+	// 1. Running service with historical last exit code = 78 or penalty box is NOT flagged as drifted.
+	runningWithHistory := fmt.Sprintf("state = running\npid = 99999\npath = %s\nprogram = %s\nlast exit code = 78: EX_CONFIG\nproperties = { penalty box }\n", agentPlistPath, bin)
+	if isDarwinLaunchdServiceDrifted(runningWithHistory, agentPlistPath, bin) {
+		t.Fatal("expected running service with matching path/program and historical exit 78 not to be flagged as drifted")
+	}
+
+	// 2. isRunningInsideDarwinAgentService returns false when plist path is drifted, even if XPC_SERVICE_NAME matches.
+	t.Setenv("XPC_SERVICE_NAME", DarwinLabel)
+	statusCheckCommand = func(name string, args ...string) ([]byte, error) {
+		return []byte(fmt.Sprintf("state = running\npid = %d\npath = /private/var/folders/poisoned/io.iazio.iazio-agent.plist\nprogram = %s\n", os.Getpid(), bin)), nil
+	}
+	if isRunningInsideDarwinAgentService("gui/501/"+DarwinLabel, agentPlistPath, bin) {
+		t.Fatal("expected isRunningInsideDarwinAgentService=false when loaded plist path is drifted")
+	}
+	statusCheckCommand = func(name string, args ...string) ([]byte, error) {
+		return []byte(fmt.Sprintf("state = running\npid = %d\npath = %s\nprogram = %s\n", os.Getpid(), agentPlistPath, bin)), nil
+	}
+	if !isRunningInsideDarwinAgentService("gui/501/"+DarwinLabel, agentPlistPath, bin) {
+		t.Fatal("expected isRunningInsideDarwinAgentService=true when loaded plist path matches canonical and state=running")
+	}
+
+	// 3. Reconciling when io.iazio.iazio-agent itself is drifted (temp path / EX_CONFIG) boots out, bootstraps, and enables it.
+	t.Setenv("XPC_SERVICE_NAME", "")
+	cmds = nil
+	statusCheckCommand = func(name string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "print" && strings.HasSuffix(args[1], "/"+DarwinLabel) {
+			return []byte("state = spawn failed\npath = /private/var/folders/TestE2E_123/io.iazio.iazio-agent.plist\nlast exit code = 78: EX_CONFIG\n"), nil
+		}
+		return []byte("state = waiting\n"), nil
+	}
+	if err := reconcileDarwinServiceConfiguration(home, bin, run); err != nil {
+		t.Fatalf("reconcileDarwinServiceConfiguration on drifted agent failed: %v", err)
+	}
+	joinedDriftedAgent := strings.Join(cmds, "\n")
+	for _, req := range []string{
+		"bootout gui/" + strconv.Itoa(os.Getuid()) + "/" + DarwinLabel,
+		"bootstrap gui/" + strconv.Itoa(os.Getuid()) + " " + agentPlistPath,
+		"enable gui/" + strconv.Itoa(os.Getuid()) + "/" + DarwinLabel,
+	} {
+		if !strings.Contains(joinedDriftedAgent, req) {
+			t.Fatalf("expected %q when healing drifted primary agent, got:\n%s", req, joinedDriftedAgent)
+		}
+	}
+
+	// 4. insideWatcher guard: when XPC_SERVICE_NAME == DarwinWatcherLabel, InstallDarwinResilience never boots out watcher.
+	t.Setenv("XPC_SERVICE_NAME", DarwinWatcherLabel)
+	cmds = nil
+	statusCheckCommand = func(name string, args ...string) ([]byte, error) {
+		return []byte("state = running\npath = /private/var/folders/drifted/watcher.plist\n"), nil
+	}
+	if err := InstallDarwinResilience(home, bin, run); err != nil {
+		t.Fatalf("InstallDarwinResilience insideWatcher failed: %v", err)
+	}
+	if strings.Contains(strings.Join(cmds, "\n"), "bootout gui/"+strconv.Itoa(os.Getuid())+"/"+watcherLabel) {
+		t.Fatalf("must never bootout watcher from insideWatcher context, got:\n%s", strings.Join(cmds, "\n"))
+	}
+
+	// 5. resolveDarwinPlistHome fallback when logPath is not under .iazio/logs
+	if gotHome := resolveDarwinPlistHome(filepath.Join("/Users/testuser", ".local", "bin", "iazio-agent"), "/var/log/custom.log"); gotHome == "" {
+		t.Fatal("expected non-empty resolved home from resolveDarwinPlistHome fallback")
+	}
+}

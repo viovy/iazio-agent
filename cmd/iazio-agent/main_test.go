@@ -4984,6 +4984,86 @@ func TestStoryGov5223_IsASEFlowCompletedAndLastJobSucceededSkipsInFlightSubmodul
 	}
 }
 
+func TestStoryGov5225_E2E_CompiledAgentTempHomeNeverInvokesHostServiceControl(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell interceptor test")
+	}
+	tempHome := t.TempDir()
+	fakeBinDir := t.TempDir()
+	markerFile := filepath.Join(fakeBinDir, "service-control-invoked.log")
+
+	for _, svcCmd := range []string{"launchctl", "systemctl", "schtasks"} {
+		scriptPath := filepath.Join(fakeBinDir, svcCmd)
+		script := fmt.Sprintf("#!/bin/sh\necho \"%s $*\" >> %q\nexit 0\n", svcCmd, markerFile)
+		if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	agentBin := filepath.Join(tempHome, ".local", "bin", "iazio-agent")
+	if err := os.MkdirAll(filepath.Dir(agentBin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	buildCmd := exec.Command("go", "build", "-buildvcs=false", "-o", agentBin, ".")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build iazio-agent: %v\n%s", err, string(out))
+	}
+
+	// Seed legacy .iazio/bin/iazio-agent and drifted LaunchAgent plist under tempHome
+	legacyDir := filepath.Join(tempHome, ".iazio", "bin")
+	launchAgentsDir := filepath.Join(tempHome, "Library", "LaunchAgents")
+	_ = os.MkdirAll(legacyDir, 0o755)
+	_ = os.MkdirAll(launchAgentsDir, 0o755)
+	legacyBin := filepath.Join(legacyDir, "iazio-agent")
+	_ = os.WriteFile(legacyBin, []byte("#!/bin/sh\n"), 0o755)
+	plistPath := filepath.Join(launchAgentsDir, "io.iazio.iazio-agent.plist")
+	_ = os.WriteFile(plistPath, []byte("<plist><string>"+legacyBin+"</string></plist>"), 0o644)
+
+	// Scrub IAZIO_TEST_MODE, IAZIO_DISABLE_SERVICE_CONTROL, and GO_TEST so path-based
+	// temp-HOME / temp-executable suppression is proven independently of env flags.
+	var cleanEnv []string
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "IAZIO_TEST_MODE=") ||
+			strings.HasPrefix(kv, "IAZIO_DISABLE_SERVICE_CONTROL=") ||
+			strings.HasPrefix(kv, "GO_TEST=") ||
+			strings.HasPrefix(kv, "HOME=") ||
+			strings.HasPrefix(kv, "PATH=") ||
+			strings.HasPrefix(kv, "XPC_SERVICE_NAME=") {
+			continue
+		}
+		cleanEnv = append(cleanEnv, kv)
+	}
+	runCmd := exec.Command(agentBin, "version")
+	runCmd.Env = append(cleanEnv,
+		"HOME="+tempHome,
+		"PATH="+fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"XPC_SERVICE_NAME=io.iazio.iazio-agent",
+	)
+	if out, err := runCmd.CombinedOutput(); err != nil {
+		t.Fatalf("iazio-agent version failed: %v (%s)", err, string(out))
+	}
+
+	// 1. Legacy binary must be purged and plist rewritten in tempHome
+	if _, err := os.Stat(legacyBin); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy binary %s to be removed", legacyBin)
+	}
+	if runtime.GOOS == "darwin" {
+		plistBytes, err := os.ReadFile(plistPath)
+		if err != nil {
+			t.Fatalf("expected plist %s to exist: %v", plistPath, err)
+		}
+		if !strings.Contains(string(plistBytes), agentBin) {
+			t.Fatalf("expected plist to reference %s, got:\n%s", agentBin, string(plistBytes))
+		}
+	}
+
+	// 2. Host service control commands (launchctl/systemctl/schtasks) must NEVER be invoked when HOME is a temp dir
+	if data, err := os.ReadFile(markerFile); err == nil && len(data) > 0 {
+		t.Fatalf("expected zero host service-control invocations for temp HOME, got:\n%s", string(data))
+	}
+}
+
+
 
 
 
