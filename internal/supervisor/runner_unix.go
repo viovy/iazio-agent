@@ -60,9 +60,24 @@ func verifyProcessIdentity(pid int, expectedJobID string, startedAt time.Time) b
 	if pid <= 0 || !isProcessAlive(pid) {
 		return false
 	}
-	// Try /proc/<pid>/cmdline first (Linux)
-	if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil {
-		return matchesHarnessIdentity(string(data), expectedJobID)
+	// Try /proc/<pid>/cmdline first (Linux). If the process was just spawned (<2s ago),
+	// retry briefly in case fork() returned before execve() populated /proc/<pid>/cmdline.
+	if _, statErr := os.Stat(fmt.Sprintf("/proc/%d/cmdline", pid)); statErr == nil {
+		attempts := 1
+		if !startedAt.IsZero() && time.Since(startedAt) < 2*time.Second {
+			attempts = 10
+		}
+		for i := 0; i < attempts; i++ {
+			if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil {
+				if matchesHarnessIdentity(string(data), expectedJobID) {
+					return true
+				}
+			}
+			if i+1 < attempts {
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		return false
 	}
 	// Fallback for macOS / Darwin / BSD without /proc
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
