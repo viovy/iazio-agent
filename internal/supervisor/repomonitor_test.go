@@ -1966,5 +1966,33 @@ func TestIsWorktreeIdleForGitUpdate_StoryScopingAndBranchDetection(t *testing.T)
 	if _, err := os.Stat(sirPath); !os.IsNotExist(err) {
 		t.Fatalf("expected stale intervention-git-update-sir JSON to be removed on maintenance branch heal")
 	}
+
+	// Non-main feature branch without <cat>-<num> slug must NOT be idle for git-update
+	noSlugDir := t.TempDir()
+	initTestGitRepo(t, noSlugDir)
+	if out, err := exec.Command("git", "-C", noSlugDir, "checkout", "-b", "fix/adhoc-ase-linux-brain-and-git-update-healing").CombinedOutput(); err != nil {
+		t.Fatalf("checkout non-slug feature branch: %v (%s)", err, string(out))
+	}
+	if IsWorktreeIdleForGitUpdate(noSlugDir, nil, nil) {
+		t.Fatalf("expected non-main feature branch without story slug to NOT be idle for git-update")
+	}
+
+	// Story with status: DONE in frontmatter but unchecked DoD / _pending_ Reviews / open SIR must NOT be marked done
+	incompleteDir := t.TempDir()
+	initTestGitRepo(t, incompleteDir)
+	incStoriesDir := filepath.Join(incompleteDir, "docs", "stories")
+	_ = os.MkdirAll(incStoriesDir, 0755)
+	incStoryPath := filepath.Join(incStoriesDir, "2026-11-09-iazio-0200-test.story.md")
+	_ = os.WriteFile(incStoryPath, []byte("---\nid: STORY-IAZIO-0200\nstatus: DONE\n---\n## 5. Definition of Done\n- [ ] Check\n## 7. Reviews\n_pending_\n"), 0644)
+	_ = os.WriteFile(filepath.Join(incompleteDir, ".session_story_id"), []byte("STORY-IAZIO-0200\n"), 0644)
+	if isStoryMarkedDoneOnDisk(incompleteDir, "STORY-IAZIO-0200") {
+		t.Fatalf("expected isStoryMarkedDoneOnDisk=false when DoD has unchecked items and Reviews is _pending_")
+	}
+	if !isStoryExplicitlyInProgressOnDisk(incompleteDir, "STORY-IAZIO-0200") {
+		t.Fatalf("expected isStoryExplicitlyInProgressOnDisk=true when story markdown is incomplete")
+	}
+	if IsWorktreeIdleForGitUpdate(incompleteDir, nil, nil) {
+		t.Fatalf("expected IsWorktreeIdleForGitUpdate=false when .session_story_id points to incomplete DONE story")
+	}
 }
 

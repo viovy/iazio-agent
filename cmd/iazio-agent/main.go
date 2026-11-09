@@ -3305,9 +3305,6 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 		LastCheckedAt: time.Now(),
 	}
 
-	// Step 0: Before preflight/runtime status probing halts a worktree, sanitize idle ephemeral artifacts.
-	_, _ = supervisor.SanitizeIdleEphemeralArtifacts(ctx, repoPath, nil, watchdog.IsProcessAlive)
-
 	// Delegate repo evaluation and Tier 1/Tier 2 self-remediation to iazio-harness (SSOT Intelligence Engine).
 	harnessSucceeded := false
 	harnessBin := resolveHarnessBinaryPath()
@@ -3358,7 +3355,8 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 	}
 
 	if !harnessSucceeded {
-		// Fallback git status & branch when iazio-harness binary is unavailable
+		// Fallback when iazio-harness binary is unavailable: sanitize idle ephemeral artifacts then run git status
+		_, _ = supervisor.SanitizeIdleEphemeralArtifacts(ctx, repoPath, nil, watchdog.IsProcessAlive)
 		cmd := procutil.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain=v2", "--branch")
 		out, err := cmd.CombinedOutput()
 		if err == nil {
