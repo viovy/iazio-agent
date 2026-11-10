@@ -524,3 +524,130 @@ func TestIsWorktreeDirty_And_EdgeCases(t *testing.T) {
 	}
 }
 
+func TestIsWorktreeCleanForNewJob_And_UnpushedCommits(t *testing.T) {
+	// 1. Non-git or empty directory is considered clean
+	if clean, _ := IsWorktreeCleanForNewJob(""); !clean {
+		t.Fatal("expected empty path to be clean")
+	}
+	tmpEmpty := t.TempDir()
+	if clean, _ := IsWorktreeCleanForNewJob(tmpEmpty); !clean {
+		t.Fatal("expected empty non-git dir to be clean")
+	}
+
+	// 2. Active .session_story_id makes it not clean
+	_ = os.WriteFile(filepath.Join(tmpEmpty, ".session_story_id"), []byte("STORY-GOV-5232\n"), 0o644)
+	if clean, reason := IsWorktreeCleanForNewJob(tmpEmpty); clean || !strings.Contains(reason, "STORY-GOV-5232") {
+		t.Fatalf("expected active .session_story_id to block new job, got clean=%v reason=%s", clean, reason)
+	}
+	_ = os.Remove(filepath.Join(tmpEmpty, ".session_story_id"))
+
+	// 3. Real git repository tests
+	repoDir := t.TempDir()
+	if err := exec.Command("git", "init", repoDir).Run(); err != nil {
+		t.Skip("git not available")
+	}
+	_ = exec.Command("git", "-C", repoDir, "config", "user.email", "test@test.local").Run()
+	_ = exec.Command("git", "-C", repoDir, "config", "user.name", "Test").Run()
+
+	// Initial commit on main
+	_ = exec.Command("git", "-C", repoDir, "checkout", "-b", "main").Run()
+	f := filepath.Join(repoDir, "file.txt")
+	_ = os.WriteFile(f, []byte("initial\n"), 0o644)
+	_ = exec.Command("git", "-C", repoDir, "add", "file.txt").Run()
+	_ = exec.Command("git", "-C", repoDir, "commit", "-m", "initial commit").Run()
+
+	// 3a. Fails closed when no remote is configured (finding F3)
+	if clean, reason := IsWorktreeCleanForNewJob(repoDir); clean || !strings.Contains(reason, "no git remotes configured") {
+		t.Fatalf("expected repo with no remotes to fail closed, got clean=%v reason=%s", clean, reason)
+	}
+
+	// Configure remote
+	remoteDir := t.TempDir()
+	_ = exec.Command("git", "init", "--bare", remoteDir).Run()
+	_ = exec.Command("git", "-C", repoDir, "remote", "add", "origin", remoteDir).Run()
+	_ = exec.Command("git", "-C", repoDir, "push", "-u", "origin", "main").Run()
+
+	// Clean repository with remote tracking is clean
+	if clean, reason := IsWorktreeCleanForNewJob(repoDir); !clean {
+		t.Fatalf("expected committed main repo to be clean, got reason=%s", reason)
+	}
+
+	// 4. Dirty file blocks
+	dirtyFile := filepath.Join(repoDir, "dirty.txt")
+	_ = os.WriteFile(dirtyFile, []byte("uncommitted\n"), 0o644)
+	if clean, reason := IsWorktreeCleanForNewJob(repoDir); clean || !strings.Contains(reason, "uncommitted") {
+		t.Fatalf("expected dirty repo to block, got clean=%v reason=%s", clean, reason)
+	}
+	_ = os.Remove(dirtyFile)
+
+	// 5. Feature branch blocks
+	_ = exec.Command("git", "-C", repoDir, "checkout", "-b", "feat/my-feature").Run()
+	if onFeat, branch := IsOnFeatureBranch(repoDir); !onFeat || branch != "feat/my-feature" {
+		t.Fatalf("expected IsOnFeatureBranch=true on feat/my-feature, got %v (%s)", onFeat, branch)
+	}
+	if clean, reason := IsWorktreeCleanForNewJob(repoDir); clean || !strings.Contains(reason, "feat/my-feature") {
+		t.Fatalf("expected feature branch to block new job, got clean=%v reason=%s", clean, reason)
+	}
+
+	// Switch back to main
+	_ = exec.Command("git", "-C", repoDir, "checkout", "main").Run()
+	if onFeat, _ := IsOnFeatureBranch(repoDir); onFeat {
+		t.Fatal("expected IsOnFeatureBranch=false on main")
+	}
+
+	// 6. Upstream ahead blocks
+	ahead, err := HasUnpushedCommits(repoDir)
+	if err != nil || ahead {
+		t.Fatalf("expected 0 unpushed commits after initial push, got ahead=%v err=%v", ahead, err)
+	}
+	if clean, reason := IsWorktreeCleanForNewJob(repoDir); !clean {
+		t.Fatalf("expected clean worktree after push, got reason=%s", reason)
+	}
+
+	// Add local unpushed commit
+	_ = os.WriteFile(f, []byte("updated\n"), 0o644)
+	_ = exec.Command("git", "-C", repoDir, "commit", "-am", "local commit ahead").Run()
+
+	ahead, err = HasUnpushedCommits(repoDir)
+	if err != nil || !ahead {
+		t.Fatalf("expected HasUnpushedCommits=true when ahead of origin/main, got ahead=%v err=%v", ahead, err)
+	}
+	if clean, reason := IsWorktreeCleanForNewJob(repoDir); clean || !strings.Contains(reason, "unpushed") {
+		t.Fatalf("expected unpushed commit to block new job, got clean=%v reason=%s", clean, reason)
+	}
+
+	// 7. Verify isStoryDone YAML frontmatter parsing precision (finding F7)
+	storyDir := filepath.Join(repoDir, "docs", "stories")
+	_ = os.MkdirAll(storyDir, 0o755)
+	// Story 2 is DONE, and its markdown body mentions STORY-TEST-1
+	story2File := filepath.Join(storyDir, "2026-11-09-test-2.story.md")
+	_ = os.WriteFile(story2File, []byte("---\nid: STORY-TEST-2\nstatus: DONE\n---\n# Story 2\nMentions STORY-TEST-1 in body\n"), 0o644)
+	if isStoryDone(repoDir, "STORY-TEST-1") {
+		t.Fatal("expected isStoryDone to return false for STORY-TEST-1 when only mentioned in body of STORY-TEST-2")
+	}
+	if !isStoryDone(repoDir, "STORY-TEST-2") {
+		t.Fatal("expected isStoryDone to return true for STORY-TEST-2")
+	}
+
+	// 8. Post-ASE sync failure quarantine marker (Rule B90 §2 / finding F1)
+	quarantineDir := filepath.Join(repoDir, ".iazio")
+	_ = os.MkdirAll(quarantineDir, 0o755)
+	quarantineFile := filepath.Join(quarantineDir, "post-ase-sync-failed")
+	_ = os.WriteFile(quarantineFile, []byte("sync failed\n"), 0o644)
+	if clean, reason := IsWorktreeCleanForNewJob(repoDir); clean || !strings.Contains(reason, "quarantined") {
+		t.Fatalf("expected quarantined worktree to be rejected, got clean=%v reason=%s", clean, reason)
+	}
+	_ = os.Remove(quarantineFile)
+
+	// 9. Fail-closed on corrupted git repo / git failure (finding F3)
+	badGitDir := t.TempDir()
+	_ = exec.Command("git", "-C", badGitDir, "init", "-b", "main").Run()
+	_ = os.WriteFile(filepath.Join(badGitDir, ".git", "HEAD"), []byte("corrupted head ref\n"), 0o644)
+	if onFeat, _ := IsOnFeatureBranch(badGitDir); !onFeat {
+		t.Fatal("expected IsOnFeatureBranch to fail closed (return true) on git error")
+	}
+	if clean, _ := IsWorktreeCleanForNewJob(badGitDir); clean {
+		t.Fatal("expected IsWorktreeCleanForNewJob to fail closed on git error")
+	}
+}
+

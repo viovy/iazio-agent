@@ -127,6 +127,11 @@ func (s *CodebaseSyncer) TriggerRepoSync(repoName string) {
 	}
 }
 
+// SyncRepoSync executes synchronous blocking repo synchronization for repoName.
+func (s *CodebaseSyncer) SyncRepoSync(ctx context.Context, repoName string) error {
+	return s.SyncRepo(ctx, repoName)
+}
+
 // Start begins the background periodic and on-demand synchronization worker loop.
 func (s *CodebaseSyncer) Start(ctx context.Context) error {
 	s.mu.Lock()
