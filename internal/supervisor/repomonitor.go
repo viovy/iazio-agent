@@ -529,14 +529,11 @@ func IsWorktreeIdleForGitUpdate(repoPath string, sup *Sup, isPIDAlive func(int) 
 	}
 
 	// 1. Check in-flight branch directly from git HEAD or submodules:
-	// Any non-main, non-maintenance feature/fix/chore branch is considered in-flight unless its inferred story is completely DONE.
+	// Any non-main, non-maintenance feature/fix/chore branch has not yet landed to main and is NEVER idle.
 	if brOut, brErr := procutil.Command("git", "-C", cleanPath, "symbolic-ref", "--short", "-q", "HEAD").Output(); brErr == nil {
 		br := strings.TrimSpace(string(brOut))
 		if br != "" && br != "main" && br != "master" && br != "HEAD" && !isAutomatedMaintenanceBranchInRepo(br) {
-			inferred := InferStoryIDFromBranch(br)
-			if inferred == "" || !isStoryMarkedDoneOnDisk(cleanPath, inferred) {
-				return false
-			}
+			return false
 		}
 	}
 	if hasAnyNonMainSubmoduleInRepo(cleanPath) || hasActiveNonMainSubmoduleStoryInRepo(cleanPath) {

@@ -2745,6 +2745,109 @@ func TestDispatcher_IgnoresAgyStepTranscriptInPermissionDenialAndPropagatesFaile
 	}
 }
 
+func TestStoryGov5256_SupervisorAutoResumesUnmergedFeatureBranchAndBlocksOtherStories(t *testing.T) {
+	wt := t.TempDir()
+	_ = exec.Command("git", "init", wt).Run()
+	_ = exec.Command("git", "-C", wt, "config", "user.email", "test@test.local").Run()
+	_ = exec.Command("git", "-C", wt, "config", "user.name", "Test").Run()
+	_ = exec.Command("git", "-C", wt, "checkout", "-b", "main").Run()
+	_ = os.WriteFile(filepath.Join(wt, "file.txt"), []byte("init\n"), 0o644)
+	_ = exec.Command("git", "-C", wt, "add", "file.txt").Run()
+	_ = exec.Command("git", "-C", wt, "commit", "-m", "init").Run()
+	bareRemote := t.TempDir()
+	_ = exec.Command("git", "init", "--bare", bareRemote).Run()
+	_ = exec.Command("git", "-C", wt, "remote", "add", "origin", bareRemote).Run()
+	_ = exec.Command("git", "-C", wt, "push", "-u", "origin", "main").Run()
+	_ = os.WriteFile(filepath.Join(wt, ".session_story_id"), []byte("STORY-GOV-5251\n"), 0o644)
+	_ = exec.Command("git", "-C", wt, "checkout", "-b", "feat/gov-5251-k8s-clusters-jenkins-unification").Run()
+	_ = os.WriteFile(filepath.Join(wt, "file.txt"), []byte("k8s jenkins unification\n"), 0o644)
+	_ = exec.Command("git", "-C", wt, "commit", "-am", "feat(STORY-GOV-5251): unify k8s clusters").Run()
 
+	cp := newMockControlPlane()
+	var lastComplete CompleteRequest
+	cp.completeFunc = func(_ context.Context, _ string, req CompleteRequest) error {
+		lastComplete = req
+		return nil
+	}
 
+	// 1. Another story (STORY-GOV-9999) attempting to claim wt while STORY-GOV-5251 is bound must be declined even if ActiveConversationID is set
+	otherJob := &Job{
+		ID:                   "job_other_story",
+		Type:                 JobTypePromptExecute,
+		Repo:                 wt,
+		StoryID:              "STORY-GOV-9999",
+		ActiveConversationID: "conv-other-9999",
+		FencingToken:         1,
+		Payload:              json.RawMessage(`{"prompt":"/autonomous-story-execution other story","worktree_path":"` + filepath.ToSlash(wt) + `"}`),
+	}
+	cp.claimFunc = func(_ context.Context, _ ClaimRequest) (*Job, error) { return otherJob, nil }
+	inv := &mockInvoker{}
+	d := NewDispatcher(cp, inv, "pc1")
+
+	processed, err := d.PollAndProcess(context.Background())
+	if processed || err != nil {
+		t.Fatalf("expected job for STORY-GOV-9999 to be declined while STORY-GOV-5251 is uncompleted on wt, processed=%v err=%v", processed, err)
+	}
+	if gotReason := cp.declinedJobs["job_other_story"]; gotReason != reasonRepoDirtyUncompletedASE {
+		t.Fatalf("expected decline reason %q for other story, got %q", reasonRepoDirtyUncompletedASE, gotReason)
+	}
+
+	// 2. Resuming STORY-GOV-5251 on wt: Turn 1 returns ASE_GATE_INCOMPLETE (with '429' in transcript summary),
+	// Turn 2 receives resume_conversation_id and lands the feature branch onto main + origin/main.
+	attempt := 0
+	var secondPayload map[string]any
+	inv.executePromptFunc = func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+		attempt++
+		if attempt == 1 {
+			return &harness.PromptExecutionResult{
+				Status:          "failed",
+				ExitCode:        1,
+				StoryID:         "STORY-GOV-5251",
+				ConversationID:  "ebd2122a-fe9f-4472-b880-b33e99199901",
+				FailureCategory: "ASE_GATE_INCOMPLETE",
+				FailureStage:    "COMPLETION_GATE",
+				Summary:         "ASE_GATE_INCOMPLETE: unmerged_feature_branch (transcript earlier mentioned 429 quota)",
+			}, nil
+		}
+		_ = json.Unmarshal(payload, &secondPayload)
+		_ = exec.Command("git", "-C", wt, "checkout", "main").Run()
+		_ = exec.Command("git", "-C", wt, "merge", "--no-ff", "feat/gov-5251-k8s-clusters-jenkins-unification", "-m", "Merge STORY-GOV-5251").Run()
+		_ = exec.Command("git", "-C", wt, "push", "origin", "main").Run()
+		return &harness.PromptExecutionResult{
+			Status:         "completed",
+			ExitCode:       0,
+			StoryID:        "STORY-GOV-5251",
+			ConversationID: "ebd2122a-fe9f-4472-b880-b33e99199901",
+			Summary:        "Landed STORY-GOV-5251 to main",
+		}, nil
+	}
+
+	resumeJob := &Job{
+		ID:                   "job_7d5cad6fd223f5a0",
+		Type:                 JobTypePromptExecute,
+		Repo:                 wt,
+		StoryID:              "STORY-GOV-5251",
+		ActiveConversationID: "ebd2122a-fe9f-4472-b880-b33e99199901",
+		FencingToken:         2,
+		Payload:              json.RawMessage(`{"prompt":"/autonomous-story-execution STORY-GOV-5251","worktree_path":"` + filepath.ToSlash(wt) + `"}`),
+	}
+	cp.claimFunc = func(_ context.Context, _ ClaimRequest) (*Job, error) { return resumeJob, nil }
+
+	processed, err = d.PollAndProcess(context.Background())
+	if !processed || err != nil {
+		t.Fatalf("expected supervisor retry to land branch and complete job_7d5cad6fd223f5a0, got processed=%v err=%v", processed, err)
+	}
+	if attempt != 2 {
+		t.Fatalf("expected 2 ExecutePrompt attempts (Turn 1 incomplete, Turn 2 landed), got %d", attempt)
+	}
+	if gotConv, _ := secondPayload["resume_conversation_id"].(string); gotConv != "ebd2122a-fe9f-4472-b880-b33e99199901" {
+		t.Fatalf("expected Turn 2 payload to carry resume_conversation_id=ebd2122a-fe9f-4472-b880-b33e99199901, got %q", gotConv)
+	}
+	if lastComplete.Error != "" {
+		t.Fatalf("expected empty CompleteRequest.Error after supervisor landing retry, got %q", lastComplete.Error)
+	}
+	if _, statErr := os.Stat(filepath.Join(wt, ".session_story_id")); !os.IsNotExist(statErr) {
+		t.Fatalf("expected .session_story_id to be cleaned up after ASE completion gate passed, got err=%v", statErr)
+	}
+}
 
