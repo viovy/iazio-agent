@@ -1011,6 +1011,19 @@ func (d *Dispatcher) acquireWorktreeRepoLock(ctx context.Context, job *Job, work
 		_ = d.declineJob(ctx, job.ID, reasonRepoBusy)
 		return nil, false
 	}
+	if b, sErr := os.ReadFile(filepath.Join(worktreeDir, ".session_story_id")); sErr == nil {
+		if boundStory := strings.TrimSpace(string(b)); boundStory != "" {
+			if initialStoryID == "" || !strings.EqualFold(initialStoryID, boundStory) {
+				fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s (story=%s): worktree %s is bound to uncompleted ASE story %s\n", job.ID, initialStoryID, worktreeDir, boundStory)
+				if span := telemetry.SpanFromContext(ctx); span != nil {
+					span.SetTag("decline_reason", reasonRepoDirtyUncompletedASE)
+					span.SetTag("worktree.quarantine_reason", "bound_to_uncompleted_ase_story:"+boundStory)
+				}
+				_ = d.declineJob(ctx, job.ID, reasonRepoDirtyUncompletedASE)
+				return nil, false
+			}
+		}
+	}
 	if resolvedConvID == "" {
 		if clean, reason := repolock.IsWorktreeCleanForNewJob(worktreeDir, initialStoryID); !clean {
 			fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: worktree %s is quarantined (not clean for new job: %s)\n", job.ID, worktreeDir, reason)
@@ -1423,25 +1436,50 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 		var err error
 		for supAttempt := 1; supAttempt <= maxSupervisorAttempts; supAttempt++ {
 			res, err = invoker.ExecutePrompt(execCtx, payload)
+			var loopASEGateErr error
 			if err == nil && res != nil {
 				if hasHeadlessPermissionDenialInAgentOutput(res.Summary + "\n" + res.Output) {
 					err = fmt.Errorf("PERMISSION_DENIED: headless agent tool permission was auto-denied: %s", strings.TrimSpace(res.Summary))
 				} else if strings.EqualFold(res.Status, "failed") || res.ExitCode != 0 {
 					err = fmt.Errorf("prompt execution failed (status=%s exit=%d): %s", res.Status, res.ExitCode, strings.TrimSpace(res.Summary))
+				} else if isASEJob(job) && worktreeDir != "" && worktreeDir != "." {
+					conIDs := extractConversationIDFromResult(res)
+					hasResumableConv := len(conIDs) > 0 || resolvedConvID != ""
+					if hasResumableConv {
+						if repolock.IsWorktreeDirty(worktreeDir) {
+							loopASEGateErr = fmt.Errorf("ASE_COMPLETION_GATE_VIOLATION: worktree %s is dirty with uncommitted changes after ASE run", worktreeDir)
+						} else if onFeat, featBranch := repolock.IsOnFeatureBranch(worktreeDir); onFeat {
+							loopASEGateErr = fmt.Errorf("ASE_COMPLETION_GATE_VIOLATION: worktree %s remains on unmerged feature branch %q after ASE run", worktreeDir, featBranch)
+						} else if unpushed, unpushedErr := repolock.HasUnpushedCommits(worktreeDir); unpushedErr == nil && unpushed {
+							loopASEGateErr = fmt.Errorf("ASE_COMPLETION_GATE_VIOLATION: worktree %s has unpushed commits after ASE run; story was not landed or pushed", worktreeDir)
+						}
+					}
 				}
 			}
-			if err == nil || supAttempt == maxSupervisorAttempts || execCtx.Err() != nil {
+			retryTriggerErr := err
+			if retryTriggerErr == nil && loopASEGateErr != nil && supAttempt < maxSupervisorAttempts {
+				retryTriggerErr = loopASEGateErr
+			}
+			if retryTriggerErr == nil || supAttempt == maxSupervisorAttempts || execCtx.Err() != nil {
 				break
 			}
-			errLower := strings.ToLower(err.Error())
-			if strings.Contains(err.Error(), "PERMISSION_DENIED") ||
-				errors.Is(err, context.DeadlineExceeded) ||
-				errors.Is(err, context.Canceled) ||
-				strings.Contains(errLower, "429") ||
-				strings.Contains(errLower, "quota") {
+			errLower := strings.ToLower(retryTriggerErr.Error())
+			isASEGateFailure := loopASEGateErr != nil ||
+				strings.Contains(errLower, "ase_gate_incomplete") ||
+				strings.Contains(errLower, "ase_completion_gate_violation") ||
+				strings.Contains(errLower, "unmerged feature branch") ||
+				strings.Contains(errLower, "unmerged_feature_branch") ||
+				strings.Contains(errLower, "dirty_worktree_post_exit") ||
+				strings.Contains(errLower, "incomplete_ase_flow") ||
+				strings.Contains(errLower, "unpushed_commits") ||
+				(res != nil && strings.EqualFold(strings.TrimSpace(res.FailureCategory), "ASE_GATE_INCOMPLETE"))
+			if strings.Contains(retryTriggerErr.Error(), "PERMISSION_DENIED") ||
+				errors.Is(retryTriggerErr, context.DeadlineExceeded) ||
+				errors.Is(retryTriggerErr, context.Canceled) ||
+				(!isASEGateFailure && (strings.Contains(errLower, "429 you have exhausted") || strings.Contains(errLower, "resourceexhausted") || strings.Contains(errLower, "insufficient_quota"))) {
 				break
 			}
-			// Mutual supervision: iazio-harness or agy crashed/exited non-zero locally.
+			// Mutual supervision: iazio-harness or agy crashed/exited non-zero locally or exited before landing ASE branch.
 			// Re-ack/heartbeat the job lease and retry in-place (attaching to discovered conversation on attempt 2,
 			// or falling back to a new conversation on attempt 3 if conversation attach also failed).
 			var discoveredStory, discoveredConv string
@@ -1458,6 +1496,12 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 					discoveredStory = s
 				}
 			}
+			if discoveredConv == "" && resolvedConvID != "" {
+				discoveredConv = resolvedConvID
+			}
+			if discoveredStory == "" && initialStoryID != "" {
+				discoveredStory = initialStoryID
+			}
 			if discoveredStory != "" {
 				onStoryDiscovered(discoveredStory)
 			}
@@ -1470,6 +1514,12 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 					resolvedConvID = discoveredConv
 					retryMap["resume_conversation_id"] = discoveredConv
 					retryMap["conversation_id"] = discoveredConv
+					if isASEGateFailure && discoveredStory != "" {
+						retryMap["prompt"] = fmt.Sprintf(
+							"Resume and complete /autonomous-story-execution for %s on conversation %s (%s): commit all worktree changes cleanly, mark story status: DONE, run autopilot-git-flow land --story %s --status-done --record-reviews, and settle the worktree on main.",
+							discoveredStory, discoveredConv, retryTriggerErr.Error(), discoveredStory,
+						)
+					}
 				} else if supAttempt >= 2 {
 					// Previous conversation resume also failed -> fallback to a new conversation in the ASE flow
 					resolvedConvID = ""
@@ -1618,13 +1668,28 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 				gateSpan.SetTag("error.message", aseGateErr.Error())
 				gateSpan.End()
 			}
+			if res != nil && strings.TrimSpace(res.FailureCategory) == "" {
+				res.Status = "failed"
+				res.FailureCategory = "ASE_GATE_INCOMPLETE"
+				res.FailureStage = "COMPLETION_GATE"
+				res.FailureDirection = "LOCAL_EXECUTION"
+				res.FailureService = "autopilot/ase-gate"
+			}
+			var gateResBytes []byte
+			if res != nil {
+				gateResBytes, _ = json.Marshal(res)
+			}
 			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{
 				FencingToken:          job.FencingToken,
+				Result:                gateResBytes,
 				Error:                 aseGateErr.Error(),
 				FinalTurnCount:        finalTurns,
 				FinalTranscriptSHA256: finalSHA,
 			})
 			return true, aseGateErr
+		}
+		if isASEJob(job) && worktreeDir != "" && worktreeDir != "." {
+			_ = os.Remove(filepath.Join(worktreeDir, ".session_story_id"))
 		}
 
 		// STORY-GOV-5232 / AC3: Enforce strict serial lifecycle sequence:

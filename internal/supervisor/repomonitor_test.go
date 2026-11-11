@@ -2079,5 +2079,18 @@ func TestStoryIazio0201_SupervisorAlternatesRebaseHealAndBrainASETurn(t *testing
 	if !TranscriptReferencesRepoPath(repo03Transcript, repo03) {
 		t.Fatalf("expected TranscriptReferencesRepoPath=true for dominant repo03")
 	}
+
+	// STORY-GOV-5256: A worktree on an unmerged non-main story branch (e.g. feat/gov-5251-...)
+	// must NEVER be considered idle for git-update even when the story file on that branch already has status: DONE.
+	doneBranchDir := t.TempDir()
+	initTestGitRepo(t, doneBranchDir)
+	doneStoriesDir := filepath.Join(doneBranchDir, "docs", "stories")
+	_ = os.MkdirAll(doneStoriesDir, 0o755)
+	_ = os.WriteFile(filepath.Join(doneStoriesDir, "2026-11-11-gov-5251.story.md"), []byte("---\nid: STORY-GOV-5251\nstatus: DONE\n---\n## 5. Definition of Done\n- [x] Done\n## 7. Reviews\n| Tool | Status |\n|---|---|\n| check | PASS |\n"), 0o644)
+	_ = exec.Command("git", "-C", doneBranchDir, "checkout", "-b", "feat/gov-5251-k8s-clusters-jenkins-unification").Run()
+	if IsWorktreeIdleForGitUpdate(doneBranchDir, nil, nil) {
+		t.Fatalf("expected worktree on unmerged feature branch feat/gov-5251-... to NOT be idle even when story is marked DONE on branch")
+	}
 }
+
 
