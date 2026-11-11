@@ -3534,6 +3534,9 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 
 	// Reconcile active Antigravity brain transcript ASE turns across Windows/WSL/Linux/macOS
 	if st.ExecutionProvenance != "COORDINATED_HARNESS" {
+		if st.ActiveStoryID != "" && supervisor.IsStoryOwnedBySiblingWorktree(repoPath, st.ActiveStoryID) {
+			st.ActiveStoryID = ""
+		}
 		if activeBrainASE, brainConvID, brainStoryID := supervisor.InspectActiveBrainASETurnForRepo(repoPath, time.Now()); activeBrainASE {
 			st.ASEState = "RUNNING"
 			st.ExecutionProvenance = "INDEPENDENT_USER_SESSION"
@@ -3544,7 +3547,7 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 			if st.ActiveConversationID == "" && brainConvID != "" {
 				st.ActiveConversationID = brainConvID
 			}
-			if st.ActiveStoryID == "" && brainStoryID != "" {
+			if st.ActiveStoryID == "" && brainStoryID != "" && !supervisor.IsStoryOwnedBySiblingWorktree(repoPath, brainStoryID) {
 				st.ActiveStoryID = brainStoryID
 			}
 		}

@@ -857,15 +857,23 @@ func inspectSingleGitDirectoryWithIdle(ctx context.Context, dir string, canSanit
 	return inspectSingleGitDirectoryWithOptions(ctx, dir, canSanitizeEphemeral, true)
 }
 
-var supervisorTranscriptBoundStoryRe = regexp.MustCompile(`(?i)(?:--story(?:-id)?[=\s\\"']+|story\s+begin\s+|/autonomous-story-execution[^\n]{0,120}?|story_id[\\"\s:=]+|session_story_id[^\n]{0,80}?)(STORY-[A-Z0-9]+-[0-9]+)`)
+var supervisorTranscriptBoundStoryRe = regexp.MustCompile(`(?i)(?:--story(?:-id)?[=\s\\"']+|story\s+begin\s+|/autonomous-story-execution[^\n]{0,120}?|(?:^|[^a-z0-9_])story_id[\\"\s:=]+|session_story_id[^\n]{0,80}?)(STORY-[A-Z0-9]+-[0-9]+)`)
 
 func canonicalizeSupervisorTranscriptPath(s string) string {
 	lower := strings.ToLower(s)
 	norm := strings.ReplaceAll(lower, `\\`, `/`)
+	if !strings.Contains(norm, `:\`) {
+		norm = strings.ReplaceAll(norm, `\r\n`, "\n")
+		norm = strings.ReplaceAll(norm, `\n`, "\n")
+		norm = strings.ReplaceAll(norm, `\t`, " ")
+	}
+	norm = strings.ReplaceAll(norm, `\"`, `"`)
 	norm = strings.ReplaceAll(norm, `\`, `/`)
 	for strings.Contains(norm, "//") {
 		norm = strings.ReplaceAll(norm, "//", "/")
 	}
+	norm = strings.ReplaceAll(norm, "/private/var/folders/", "/var/folders/")
+	norm = strings.ReplaceAll(norm, "/private/tmp/", "/tmp/")
 	for i := 0; i < 26; i++ {
 		ch := string(rune('a' + i))
 		wslPrefix := "/mnt/" + ch + "/"
@@ -875,6 +883,189 @@ func canonicalizeSupervisorTranscriptPath(s string) string {
 		}
 	}
 	return norm
+}
+
+func stripSupervisorTrailingWorktreeNumber(cleanPath string) string {
+	idx := strings.LastIndexByte(cleanPath, '-')
+	slashIdx := strings.LastIndexByte(cleanPath, '/')
+	if idx <= slashIdx+1 || idx >= len(cleanPath)-1 {
+		return cleanPath
+	}
+	for i := idx + 1; i < len(cleanPath); i++ {
+		if cleanPath[i] < '0' || cleanPath[i] > '9' {
+			return cleanPath
+		}
+	}
+	return cleanPath[:idx]
+}
+
+func isSupervisorTranscriptBoundaryChar(ch byte) bool {
+	return ch == '/' || ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' ||
+		ch == '"' || ch == '\'' || ch == ':' || ch == ';' ||
+		ch == ',' || ch == ')' || ch == ']' || ch == '}' || ch == '>'
+}
+
+func countSupervisorWorktreeFamilyOccurrences(searchAll, cleanRepo string) (selfCount int, maxOtherSiblingCount int) {
+	familyPrefix := stripSupervisorTrailingWorktreeNumber(cleanRepo)
+	counts := make(map[string]int)
+	search := searchAll
+	for {
+		idx := strings.Index(search, familyPrefix)
+		if idx < 0 {
+			break
+		}
+		afterPrefix := idx + len(familyPrefix)
+		validBefore := true
+		if idx > 0 && !strings.HasPrefix(familyPrefix, "/") {
+			prev := search[idx-1]
+			if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') || prev == '_' || prev == '-' {
+				validBefore = false
+			}
+		}
+		advance := afterPrefix
+		if validBefore {
+			candPath := familyPrefix
+			afterCand := afterPrefix
+			if afterPrefix < len(search) && search[afterPrefix] == '-' {
+				j := afterPrefix + 1
+				for j < len(search) && search[j] >= '0' && search[j] <= '9' {
+					j++
+				}
+				if j > afterPrefix+1 {
+					candPath = search[idx:j]
+					afterCand = j
+					advance = j
+				}
+			}
+			if afterCand >= len(search) {
+				counts[candPath]++
+			} else {
+				rest := search[afterCand:]
+				nextCh := search[afterCand]
+				if nextCh != '-' && !strings.HasPrefix(rest, "/.git/objects") && !strings.HasPrefix(rest, "/.git/modules") {
+					if isSupervisorTranscriptBoundaryChar(nextCh) {
+						counts[candPath]++
+					}
+				}
+			}
+		}
+		if advance <= 0 || advance > len(search) {
+			break
+		}
+		search = search[advance:]
+	}
+	selfCount = counts[cleanRepo]
+	for k, v := range counts {
+		if k != cleanRepo && v > maxOtherSiblingCount {
+			maxOtherSiblingCount = v
+		}
+	}
+	return selfCount, maxOtherSiblingCount
+}
+
+// IsStoryOwnedBySiblingWorktree returns true when storyID is not explicitly active in repoPath
+// and a sibling worktree in the same parent directory explicitly owns storyID.
+func IsStoryOwnedBySiblingWorktree(repoPath, storyID string) bool {
+	sid := strings.ToUpper(strings.TrimSpace(storyID))
+	cleanRepo := filepath.Clean(strings.TrimSpace(repoPath))
+	if cleanRepo == "" || cleanRepo == "." || !strings.HasPrefix(sid, "STORY-") {
+		return false
+	}
+	if b, err := os.ReadFile(filepath.Join(cleanRepo, ".session_story_id")); err == nil &&
+		strings.EqualFold(strings.TrimSpace(string(b)), sid) {
+		return false
+	}
+	if br, ok := readWorktreeHeadBranchFast(cleanRepo); ok && strings.EqualFold(InferStoryIDFromBranch(br), sid) {
+		return false
+	}
+	if isStoryExplicitlyInProgressOnDisk(cleanRepo, sid) {
+		return false
+	}
+
+	parentDir := filepath.Dir(cleanRepo)
+	familyBase := stripSupervisorTrailingWorktreeNumber(strings.ToLower(filepath.Base(cleanRepo)))
+	entries, err := os.ReadDir(parentDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		candNameLower := strings.ToLower(e.Name())
+		if stripSupervisorTrailingWorktreeNumber(candNameLower) != familyBase {
+			continue
+		}
+		sibPath := filepath.Clean(filepath.Join(parentDir, e.Name()))
+		if sibPath == cleanRepo {
+			continue
+		}
+		if b, sErr := os.ReadFile(filepath.Join(sibPath, ".session_story_id")); sErr == nil &&
+			strings.EqualFold(strings.TrimSpace(string(b)), sid) {
+			return true
+		}
+		if lockInfo, lErr := repolock.Read(sibPath); lErr == nil && strings.EqualFold(strings.TrimSpace(lockInfo.StoryID), sid) {
+			return true
+		}
+		if br, ok := readWorktreeHeadBranchFast(sibPath); ok && strings.EqualFold(InferStoryIDFromBranch(br), sid) {
+			return true
+		}
+		if isStoryExplicitlyInProgressOnDisk(sibPath, sid) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasExplicitSupervisorIdleStateFile(repoPath string) bool {
+	if strings.TrimSpace(repoPath) == "" {
+		return false
+	}
+	if b, err := os.ReadFile(filepath.Join(repoPath, ".autopilot", "ase-state.json")); err == nil {
+		var as struct {
+			Status string `json:"status"`
+			Phase  string `json:"phase"`
+		}
+		if json.Unmarshal(b, &as) == nil {
+			if strings.EqualFold(strings.TrimSpace(as.Status), "DONE") ||
+				strings.EqualFold(strings.TrimSpace(as.Status), "COMPLETED") ||
+				strings.EqualFold(strings.TrimSpace(as.Phase), "completed") {
+				return true
+			}
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(repoPath, ".autopilot", "state.json")); err == nil {
+		var s struct {
+			State   string `json:"state"`
+			StoryID string `json:"story_id"`
+		}
+		if json.Unmarshal(b, &s) == nil {
+			if strings.EqualFold(strings.TrimSpace(s.State), "IDLE") && strings.TrimSpace(s.StoryID) == "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func canBindSupervisorTranscriptStoryToRepo(repoPath, storyID string) bool {
+	sid := strings.ToUpper(strings.TrimSpace(storyID))
+	if !strings.HasPrefix(sid, "STORY-") {
+		return false
+	}
+	if isStoryMarkedDoneOnDisk(repoPath, sid) || IsStoryOwnedBySiblingWorktree(repoPath, sid) {
+		return false
+	}
+	hasSession := false
+	if b, err := os.ReadFile(filepath.Join(repoPath, ".session_story_id")); err == nil {
+		hasSession = strings.HasPrefix(strings.ToUpper(strings.TrimSpace(string(b))), "STORY-")
+	}
+	if strings.TrimSpace(repoPath) != "" && hasExplicitSupervisorIdleStateFile(repoPath) && !hasSession {
+		if br, ok := readWorktreeHeadBranchFast(repoPath); !ok || br == "main" || br == "master" {
+			return isStoryExplicitlyInProgressOnDisk(repoPath, sid)
+		}
+	}
+	return true
 }
 
 // TranscriptReferencesRepoPath returns true if transcript text references repoPath across Windows/WSL path formats
@@ -887,56 +1078,29 @@ func TranscriptReferencesRepoPath(text, repoPath string) bool {
 	}
 	searchAll := canonicalizeSupervisorTranscriptPath(text)
 	if cwdMarker := "command working directory: "; strings.Contains(searchAll, cwdMarker) {
-		idx := strings.Index(searchAll, cwdMarker)
-		rest := searchAll[idx+len(cwdMarker):]
-		if nl := strings.IndexAny(rest, "\r\n\""); nl >= 0 {
-			rest = rest[:nl]
-		}
-		declaredCWD := strings.TrimRight(strings.TrimSpace(rest), "/")
-		if declaredCWD != "" {
-			return declaredCWD == cleanRepo
+		searchCWD := searchAll
+		for {
+			idx := strings.Index(searchCWD, cwdMarker)
+			if idx < 0 {
+				break
+			}
+			rest := searchCWD[idx+len(cwdMarker):]
+			if nl := strings.IndexAny(rest, "\r\n\"'"); nl >= 0 {
+				rest = rest[:nl]
+			}
+			if cutIdx := strings.Index(rest, "/napp data directory:"); cutIdx >= 0 {
+				rest = rest[:cutIdx]
+			}
+			declaredCWD := strings.TrimRight(strings.TrimSpace(rest), "/")
+			if strings.HasPrefix(declaredCWD, "/") || (len(declaredCWD) >= 3 && declaredCWD[1] == ':' && declaredCWD[2] == '/') {
+				return declaredCWD == cleanRepo
+			}
+			searchCWD = searchCWD[idx+len(cwdMarker):]
 		}
 	}
 
-	selfCount := 0
-	siblingDashCount := 0
-	search := searchAll
-	for {
-		idx := strings.Index(search, cleanRepo)
-		if idx < 0 {
-			break
-		}
-		afterIdx := idx + len(cleanRepo)
-		validBefore := true
-		if idx > 0 && !strings.HasPrefix(cleanRepo, "/") {
-			prev := search[idx-1]
-			if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') || prev == '_' || prev == '-' {
-				validBefore = false
-			}
-		}
-		if validBefore {
-			if afterIdx >= len(search) {
-				selfCount++
-			} else {
-				rest := search[afterIdx:]
-				nextCh := search[afterIdx]
-				if nextCh == '-' {
-					siblingDashCount++
-				} else if !strings.HasPrefix(rest, "/.git/objects") && !strings.HasPrefix(rest, "/.git/modules") {
-					if nextCh == '/' || nextCh == ' ' || nextCh == '\t' || nextCh == '\n' || nextCh == '\r' ||
-						nextCh == '"' || nextCh == '\'' || nextCh == ':' || nextCh == ';' ||
-						nextCh == ',' || nextCh == ')' || nextCh == ']' || nextCh == '}' || nextCh == '>' {
-						selfCount++
-					}
-				}
-			}
-		}
-		search = search[afterIdx:]
-	}
-	if selfCount == 0 {
-		return false
-	}
-	if siblingDashCount > selfCount {
+	selfCount, maxOtherSiblingCount := countSupervisorWorktreeFamilyOccurrences(searchAll, cleanRepo)
+	if selfCount == 0 || maxOtherSiblingCount >= selfCount {
 		return false
 	}
 	return true
@@ -1140,13 +1304,13 @@ func InspectActiveBrainASETurnForRepo(repoPath string, now time.Time) (active bo
 					continue
 				}
 				var candStory string
-				matches := supervisorTranscriptBoundStoryRe.FindAllStringSubmatch(tailStr, -1)
-				if len(matches) == 0 {
-					matches = supervisorTranscriptBoundStoryRe.FindAllStringSubmatch(headStr, -1)
-				}
-				for i := len(matches) - 1; i >= 0; i-- {
-					sid := strings.ToUpper(matches[i][1])
-					if !isStoryMarkedDoneOnDisk(repoPath, sid) {
+				allMatches := append(
+					supervisorTranscriptBoundStoryRe.FindAllStringSubmatch(headStr, -1),
+					supervisorTranscriptBoundStoryRe.FindAllStringSubmatch(tailStr, -1)...,
+				)
+				for i := len(allMatches) - 1; i >= 0; i-- {
+					sid := strings.ToUpper(allMatches[i][1])
+					if canBindSupervisorTranscriptStoryToRepo(repoPath, sid) {
 						candStory = sid
 						break
 					}
