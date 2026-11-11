@@ -2056,5 +2056,28 @@ func TestStoryIazio0201_SupervisorAlternatesRebaseHealAndBrainASETurn(t *testing
 	if IsWorktreeIdleForGitUpdate(slotRepo, nil, nil) {
 		t.Fatalf("expected IsWorktreeIdleForGitUpdate=false while active brain ASE turn is running")
 	}
+
+	// Sibling worktree dominance & story ownership guard (STORY-GOV-5254):
+	// A transcript working in sibling meta-repo-03 that mentions meta-repo-04 once in prose must NOT match meta-repo-04,
+	// and a story owned by meta-repo-03 must NOT bind to meta-repo-04.
+	repo03 := filepath.Join(filepath.Dir(slotRepo), "meta-repo-03")
+	_ = os.MkdirAll(filepath.Join(repo03, ".autopilot"), 0o755)
+	_ = exec.Command("git", "init", "-b", "main", repo03).Run()
+	_ = os.WriteFile(filepath.Join(repo03, ".session_story_id"), []byte("STORY-GOV-5249\n"), 0o644)
+	if !IsStoryOwnedBySiblingWorktree(slotRepo, "STORY-GOV-5249") {
+		t.Fatalf("expected IsStoryOwnedBySiblingWorktree(slotRepo, STORY-GOV-5249)=true when repo03 owns it")
+	}
+	repo03Transcript := strings.Join([]string{
+		`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"/autonomous-story-execution STORY-GOV-5249"}`,
+		`{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":"` + strings.ReplaceAll(filepath.Join(repo03, "AGENTS.md"), `\`, `\\`) + `"}}]}`,
+		`{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":"` + strings.ReplaceAll(filepath.Join(repo03, "README.md"), `\`, `\\`) + `"}}]}`,
+		`{"step_index":3,"type":"TOOL_RESPONSE","content":"example path ` + strings.ReplaceAll(slotRepo, `\`, `\\`) + ` in wiki"}`,
+	}, "\n") + "\n"
+	if TranscriptReferencesRepoPath(repo03Transcript, slotRepo) {
+		t.Fatalf("expected TranscriptReferencesRepoPath=false for incidental mention of slotRepo inside dominant repo03 transcript")
+	}
+	if !TranscriptReferencesRepoPath(repo03Transcript, repo03) {
+		t.Fatalf("expected TranscriptReferencesRepoPath=true for dominant repo03")
+	}
 }
 
