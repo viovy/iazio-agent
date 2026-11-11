@@ -343,6 +343,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				}
 			}
 		}()
+		watchdog.StartSystemdWatchdog(ctx)
 		home, _ := os.UserHomeDir()
 		if home != "" && !isTestBinary() {
 			unlock, ok := acquireAgentSingleInstanceLock(home, stdout, stderr)
@@ -475,8 +476,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}()
 				}
 				if runtime.GOOS == "windows" {
-					wslSup := service.NewWSLCompanionSupervisor(home)
-					wslSup.StartSupervisor(runCtx, 2*time.Minute)
+					wslSup := service.NewWSLCompanionSupervisor(getenv("IAZIO_WSL_DISTRO"))
+					wslSup.StartSupervisor(runCtx, 30*time.Second)
 				}
 			}
 

@@ -105,6 +105,9 @@ func initTestFleetWorkspace(t *testing.T) string {
 	_ = exec.Command("git", "init", "--bare", bareRemote).Run()
 	runGit("remote", "add", "origin", bareRemote)
 	runGit("push", "-u", "origin", "main")
+	hooksDir := filepath.Join(fleetDir, ".git", "hooks")
+	_ = os.MkdirAll(hooksDir, 0o755)
+	_ = os.WriteFile(filepath.Join(hooksDir, "post-commit"), []byte("#!/bin/sh\ngit push origin HEAD >/dev/null 2>&1 || true\n"), 0o755)
 	return fleetDir
 }
 
