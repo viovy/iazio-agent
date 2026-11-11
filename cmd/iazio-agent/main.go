@@ -1400,13 +1400,18 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				disp.SetPostJobHook(func(ctx context.Context, job *worker.Job) {
 					if job != nil {
 						if sink := getActiveElasticSink(); sink != nil {
-							sink.Info("dispatcher job completed", map[string]any{
+							fields := map[string]any{
 								"host":     host,
 								"job_id":   job.ID,
 								"job_type": job.Type,
 								"repo":     job.Repo,
 								"story_id": job.StoryID,
-							})
+							}
+							if strings.TrimSpace(job.Error) != "" {
+								sink.Error("dispatcher job failed", errors.New(job.Error), fields)
+							} else {
+								sink.Info("dispatcher job completed", fields)
+							}
 						}
 					}
 					if eagerUpdater != nil {
