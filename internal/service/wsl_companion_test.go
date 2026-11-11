@@ -123,3 +123,63 @@ func TestWSLCompanionSupervisor_HealingFailure_Diagnostics(t *testing.T) {
 	_, _ = sDefault.runner("true")
 }
 
+func TestWSLCompanionSupervisor_PathSanitizationAndLingerFallback(t *testing.T) {
+	pollCount := 0
+	mockRunner := func(name string, args ...string) ([]byte, error) {
+		fullCmd := name + " " + strings.Join(args, " ")
+		if strings.Contains(fullCmd, "-l -q") {
+			return []byte("docker-desktop\r\nDebian\r\n"), nil
+		}
+		if strings.Contains(fullCmd, "is-system-running") {
+			return []byte("starting\n"), nil
+		}
+		if strings.Contains(fullCmd, "is-active iazio-agent.service") {
+			pollCount++
+			if pollCount == 1 {
+				return []byte("activating\n"), nil
+			}
+			return []byte("active\n"), nil
+		}
+		if strings.Contains(fullCmd, "is-active iazio-harvester.service") {
+			return []byte("activating\n"), nil
+		}
+		if strings.Contains(fullCmd, "loginctl show-user -p Linger") {
+			// Simulate wsl.exe -e non-PAM empty output
+			return []byte(""), nil
+		}
+		if strings.Contains(fullCmd, "/var/lib/systemd/linger/") {
+			return []byte("Linger=yes\n"), nil
+		}
+		return []byte("ok\n"), nil
+	}
+
+	// Pass a Windows home path to verify sanitizeWSLDistroName strips paths and selects Debian over docker-desktop
+	sup := NewWSLCompanionSupervisor(`C:\Users\romeo`, mockRunner)
+	keepaliveCalled := ""
+	sup.keepaliveFn = func(distro string) bool {
+		keepaliveCalled = distro
+		return true
+	}
+
+	status := sup.CheckAndHeal(context.Background())
+	if status.Distro != "Debian" {
+		t.Fatalf("expected sanitized distro to resolve to Debian (skipping docker-desktop), got %q", status.Distro)
+	}
+	if keepaliveCalled != "Debian" || !status.KeepaliveActive {
+		t.Fatalf("expected keepaliveFn called for Debian, got %q active=%v", keepaliveCalled, status.KeepaliveActive)
+	}
+	if !status.AgentActive {
+		t.Fatalf("expected AgentActive true after activating -> active poll")
+	}
+	if !status.HarvesterActive {
+		t.Fatalf("expected HarvesterActive true when activating")
+	}
+	if !status.LingerActive {
+		t.Fatalf("expected LingerActive true via /var/lib/systemd/linger fallback")
+	}
+	if status.AutoHealed {
+		t.Fatalf("expected AutoHealed false when services were already active/activating and linger present")
+	}
+}
+
+

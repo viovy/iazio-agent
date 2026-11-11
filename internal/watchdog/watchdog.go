@@ -949,6 +949,9 @@ func StartSystemdWatchdog(ctx context.Context) {
 		interval = 5 * time.Second
 	}
 
+	// Immediately send initial watchdog notification so startup work cannot trip WatchdogSec before first tick.
+	_ = NotifyWatchdog()
+
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()

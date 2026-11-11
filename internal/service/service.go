@@ -1042,7 +1042,12 @@ func reconcileLinuxServiceConfiguration(home, bin string, run func(name string, 
 	// Reconcile companion iazio-harvester user service if harvester binary exists in canonical ~/.local/bin
 	harvesterBin := filepath.Join(home, ".local", "bin", "iazio-harvester")
 	if _, err := os.Stat(harvesterBin); err == nil && !isTestProcess() && !IsServiceControlDisabled() && !IsTempOrTestPath(home) {
-		_ = procutil.Command(harvesterBin, "service", "reconcile").Run()
+		harvUnit := filepath.Join(unitDir, "iazio-harvester.service")
+		_, harvUnitErr := os.Stat(harvUnit)
+		_, harvActErr := statusFn("systemctl", "--user", "is-active", "--quiet", "iazio-harvester.service")
+		if harvUnitErr != nil || harvActErr != nil {
+			_ = procutil.Command(harvesterBin, "service", "reconcile").Run()
+		}
 	}
 
 	lockFile := filepath.Join(home, ".iazio", "maintenance.lock")
