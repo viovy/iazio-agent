@@ -66,6 +66,7 @@ type Job struct {
 	Attempts              int             `json:"attempts,omitempty"`
 	InfraRequeueCount     int             `json:"infra_requeue_count,omitempty"`
 	FailureCategory       string          `json:"failure_category,omitempty"`
+	Error                 string          `json:"error,omitempty"`
 	ActiveConversationID  string          `json:"active_conversation_id,omitempty"`
 	ConversationID        string          `json:"conversation_id,omitempty"`
 	ResumeConversationID  string          `json:"resume_conversation_id,omitempty"`
@@ -1038,7 +1039,7 @@ func (d *Dispatcher) acquireWorktreeRepoLock(ctx context.Context, job *Job, work
 
 // PollAndProcess claims one job and processes it. Returns (true, err) if a job was processed,
 // or (false, nil) if no job was available.
-func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
+func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr error) {
 	if d.client == nil {
 		return false, errors.New("control plane client not configured")
 	}
@@ -1070,7 +1071,14 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		telemetry.WithTag("job.target_agent", job.TargetAgent),
 	)
 	ctx, span := telemetry.StartSpan(ctx, "dispatcher.processJob", spanOpts...)
-	defer span.End()
+	defer func() {
+		if retErr != nil && span != nil {
+			span.SetError(retErr)
+		}
+		if span != nil {
+			span.End()
+		}
+	}()
 
 	worktreeDir, invoker := d.resolveJobWorktree(job)
 	if (worktreeDir == "" || worktreeDir == ".") && d.worktreeResolver != nil {
@@ -1304,6 +1312,9 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 
 	defer func() {
 		if d.postJobHook != nil && job != nil {
+			if retErr != nil && strings.TrimSpace(job.Error) == "" {
+				job.Error = retErr.Error()
+			}
 			d.postJobHook(ctx, job)
 		}
 	}()
@@ -1413,10 +1424,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 		for supAttempt := 1; supAttempt <= maxSupervisorAttempts; supAttempt++ {
 			res, err = invoker.ExecutePrompt(execCtx, payload)
 			if err == nil && res != nil {
-				combinedLower := strings.ToLower(res.Summary + "\n" + res.Output)
-				if strings.Contains(combinedLower, "jetski: no output produced") ||
-					strings.Contains(combinedLower, "headless mode cannot prompt for") ||
-					strings.Contains(combinedLower, "so it was auto-denied") {
+				if hasHeadlessPermissionDenialInAgentOutput(res.Summary + "\n" + res.Output) {
 					err = fmt.Errorf("PERMISSION_DENIED: headless agent tool permission was auto-denied: %s", strings.TrimSpace(res.Summary))
 				} else if strings.EqualFold(res.Status, "failed") || res.ExitCode != 0 {
 					err = fmt.Errorf("prompt execution failed (status=%s exit=%d): %s", res.Status, res.ExitCode, strings.TrimSpace(res.Summary))
@@ -1478,6 +1486,9 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 			_ = d.client.HeartbeatJob(ctx, job.ID, job.LeaseToken, job.FencingToken, discoveredStory, worktreeDir)
 		}
 		if toolSpan != nil {
+			if err != nil {
+				toolSpan.SetError(err)
+			}
 			toolSpan.End()
 		}
 		if err != nil {
@@ -1487,7 +1498,19 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				direction := "LOCAL_EXECUTION"
 				service := "iazio-harness"
 				errLower := strings.ToLower(err.Error())
-				if strings.Contains(errLower, "429") || strings.Contains(errLower, "quota") || strings.Contains(errLower, "auth") || strings.Contains(errLower, "token") {
+				if res != nil && strings.TrimSpace(res.FailureCategory) != "" {
+					category = strings.TrimSpace(res.FailureCategory)
+					if strings.TrimSpace(res.FailureDirection) != "" {
+						direction = strings.TrimSpace(res.FailureDirection)
+					}
+					if strings.TrimSpace(res.FailureService) != "" {
+						service = strings.TrimSpace(res.FailureService)
+					}
+				} else if strings.Contains(err.Error(), "PERMISSION_DENIED") {
+					category = "PERMISSION_DENIED"
+					direction = "LOCAL_EXECUTION"
+					service = "iazio-harness/sandbox"
+				} else if strings.Contains(errLower, "429") || strings.Contains(errLower, "quota") || strings.Contains(errLower, "auth") || strings.Contains(errLower, "token") {
 					category = "TOOL_QUOTA_OR_AUTH"
 					direction = "UPSTREAM"
 					service = "antigravity-llm-provider"
@@ -1510,8 +1533,13 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (bool, error) {
 				}
 			}
 			finalTurns, finalSHA := d.flushConversationHarvest(ctx, job, extractConversationIDFromResult(res)...)
+			var failResBytes []byte
+			if res != nil {
+				failResBytes, _ = json.Marshal(res)
+			}
 			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{
 				FencingToken:          job.FencingToken,
+				Result:                failResBytes,
 				Error:                 err.Error(),
 				FinalTurnCount:        finalTurns,
 				FinalTranscriptSHA256: finalSHA,
@@ -1857,3 +1885,22 @@ func isASEJob(job *Job) bool {
 	raw := strings.TrimSpace(string(job.Payload))
 	return strings.HasPrefix(raw, "/autonomous-story-execution") || strings.HasPrefix(raw, "autopilot ase")
 }
+
+func hasHeadlessPermissionDenialInAgentOutput(text string) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.Contains(line, "[agy step #") {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "jetski: no output produced") ||
+			strings.Contains(lower, "headless mode cannot prompt for") ||
+			strings.Contains(lower, "so it was auto-denied") {
+			return true
+		}
+	}
+	return false
+}
+

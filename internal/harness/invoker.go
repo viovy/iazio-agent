@@ -46,6 +46,11 @@ type PromptExecutionResult struct {
 	ConversationIDs      []string `json:"conversation_ids,omitempty"`
 	Status               string   `json:"status"`
 	ExitCode             int      `json:"exit_code,omitempty"`
+	FailureCategory      string   `json:"failure_category,omitempty"`
+	FailureStage         string   `json:"failure_stage,omitempty"`
+	FailureDirection     string   `json:"failure_direction,omitempty"`
+	FailureService       string   `json:"failure_service,omitempty"`
+	FailureReasonSummary string   `json:"failure_reason_summary,omitempty"`
 	GitHeadSHA           string   `json:"git_head_sha,omitempty"`
 	GitTreeSHA           string   `json:"git_tree_sha,omitempty"`
 	ModifiedFiles        []string `json:"modified_files,omitempty"`

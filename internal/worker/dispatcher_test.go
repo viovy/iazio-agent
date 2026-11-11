@@ -2663,5 +2663,88 @@ func (m *mockSequenceSyncer) SyncRepoSync(ctx context.Context, repoName string) 
 	return nil
 }
 
+func TestDispatcher_IgnoresAgyStepTranscriptInPermissionDenialAndPropagatesFailedResult(t *testing.T) {
+	// 1. Transcript lines containing [agy step #N] must not trigger false-positive PERMISSION_DENIED
+	transcriptText := "[2026-11-11T04:55:21Z] [agy step #691] thinking: why did hasHeadlessPermissionDenial check 'headless mode cannot prompt for' or 'so it was auto-denied' or 'jetski: no output produced'?"
+	if hasHeadlessPermissionDenialInAgentOutput(transcriptText) {
+		t.Fatal("expected hasHeadlessPermissionDenialInAgentOutput to ignore [agy step #N] transcript lines")
+	}
+	if !hasHeadlessPermissionDenialInAgentOutput("ERROR: Headless mode cannot prompt for approval, so it was auto-denied.") {
+		t.Fatal("expected hasHeadlessPermissionDenialInAgentOutput to detect real headless permission denial")
+	}
+
+	// 2. PollAndProcess succeeds when res.Output contains [agy step #N] quoting auto-denied
+	var completedReq CompleteRequest
+	var postHookErr string
+	cp := &mockControlPlane{
+		boundStories:  make(map[string]StoryBindingRequest),
+		completedJobs: make(map[string]CompleteRequest),
+		claimFunc: func(_ context.Context, _ ClaimRequest) (*Job, error) {
+			return &Job{
+				ID:           "job_7a422318d6294d43",
+				Type:         JobTypePromptExecute,
+				Repo:         ".",
+				FencingToken: 5,
+				Payload:      json.RawMessage(`{"prompt":"fix issue"}`),
+			}, nil
+		},
+		completeFunc: func(_ context.Context, _ string, req CompleteRequest) error {
+			completedReq = req
+			return nil
+		},
+	}
+	var promptRes *harness.PromptExecutionResult
+	var promptErr error
+	inv := &mockInvoker{
+		executePromptFunc: func(_ context.Context, _ json.RawMessage) (*harness.PromptExecutionResult, error) {
+			return promptRes, promptErr
+		},
+	}
+	promptRes = &harness.PromptExecutionResult{
+		Status:         "completed",
+		ExitCode:       0,
+		StoryID:        "STORY-VIGO-0310",
+		ConversationID: "8200c304-7ab5-4e18-b5c4-50a5845e47ef",
+		Summary:        "Completed STORY-VIGO-0310",
+		Output:         transcriptText,
+	}
+	d := NewDispatcher(cp, inv, "mac-mini")
+	d.SetPostJobHook(func(_ context.Context, job *Job) {
+		postHookErr = job.Error
+	})
+	processed, err := d.PollAndProcess(context.Background())
+	if !processed || err != nil {
+		t.Fatalf("expected PollAndProcess to succeed, got processed=%v err=%v", processed, err)
+	}
+	if completedReq.Error != "" {
+		t.Fatalf("expected empty CompleteRequest.Error, got %q", completedReq.Error)
+	}
+	if postHookErr != "" {
+		t.Fatalf("expected empty job.Error in postJobHook on success, got %q", postHookErr)
+	}
+
+	// 3. When ExecutePrompt fails with a structured PromptExecutionResult, CompleteRequest includes Result and postJobHook sees job.Error
+	promptRes = &harness.PromptExecutionResult{
+		Status:          "failed",
+		ExitCode:        1,
+		FailureCategory: "ASE_GATE_INCOMPLETE",
+		FailureStage:    "COMPLETION_GATE",
+		ConversationID:  "8200c304-7ab5-4e18-b5c4-50a5845e47ef",
+		Summary:         "unpushed_commits",
+	}
+	promptErr = errors.New("exit status 1: auth token mentioned in transcript")
+	processed, err = d.PollAndProcess(context.Background())
+	if !processed || err == nil {
+		t.Fatalf("expected PollAndProcess to return error on failed prompt, got processed=%v err=%v", processed, err)
+	}
+	if len(completedReq.Result) == 0 || !strings.Contains(string(completedReq.Result), "ASE_GATE_INCOMPLETE") {
+		t.Fatalf("expected CompleteRequest.Result to preserve PromptExecutionResult with ASE_GATE_INCOMPLETE, got %s", string(completedReq.Result))
+	}
+	if postHookErr == "" {
+		t.Fatal("expected job.Error to be populated in postJobHook when PollAndProcess fails")
+	}
+}
+
+
 
 
