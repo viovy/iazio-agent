@@ -784,8 +784,11 @@ func (d *Dispatcher) isCandidateWorktreeIdle(clean string) bool {
 	if d.IsWorktreeInFlight(clean) || isWorktreeLockedByOther(clean, "") {
 		return false
 	}
-	if b, err := os.ReadFile(filepath.Join(clean, ".session_story_id")); err == nil && strings.TrimSpace(string(b)) != "" {
-		return false
+	if b, err := os.ReadFile(filepath.Join(clean, ".session_story_id")); err == nil {
+		boundStory := strings.TrimSpace(string(b))
+		if boundStory != "" && !repolock.IsStoryDone(clean, boundStory) {
+			return false
+		}
 	}
 	if d.worktreeBusyDetector != nil && d.worktreeBusyDetector(clean) {
 		return false

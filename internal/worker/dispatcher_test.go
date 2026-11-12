@@ -1886,6 +1886,32 @@ func TestDispatcher_CollectIdleWorktrees_FiltersBusyLockedAndDirty(t *testing.T)
 	if len(got) != 1 || got[0] != filepath.Clean(cleanIdle) {
 		t.Fatalf("expected only [%s] to be returned as idle, got %v", filepath.Clean(cleanIdle), got)
 	}
+
+	// Verify that if .session_story_id points to a completed story (marked DONE), it IS idle
+	doneStoryWT := initTestFleetWorkspace(t)
+	if err := os.WriteFile(filepath.Join(doneStoryWT, ".session_story_id"), []byte("STORY-DONE-0001\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	storyDocDir := filepath.Join(doneStoryWT, "docs", "stories")
+	_ = os.MkdirAll(storyDocDir, 0o755)
+	if err := os.WriteFile(filepath.Join(storyDocDir, "story-done.story.md"), []byte("---\nid: STORY-DONE-0001\nstatus: DONE\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Commit the story doc so the git worktree is clean
+	cmdAdd := exec.Command("git", "add", "docs/stories/story-done.story.md")
+	cmdAdd.Dir = doneStoryWT
+	if out, err := cmdAdd.CombinedOutput(); err != nil {
+		t.Fatalf("git add failed: %v (%s)", err, string(out))
+	}
+	cmdCommit := exec.Command("git", "commit", "-m", "chore: mark STORY-DONE-0001 done")
+	cmdCommit.Dir = doneStoryWT
+	if out, err := cmdCommit.CombinedOutput(); err != nil {
+		t.Fatalf("git commit failed: %v (%s)", err, string(out))
+	}
+	gotWithDone := d.CollectIdleWorktrees([]string{doneStoryWT})
+	if len(gotWithDone) != 1 || gotWithDone[0] != filepath.Clean(doneStoryWT) {
+		t.Fatalf("expected worktree with completed .session_story_id to be collected as idle, got %v", gotWithDone)
+	}
 }
 
 func TestDispatcher_AtomicLocalReservationBeforeAckLease_AndDeclineOnBusy(t *testing.T) {

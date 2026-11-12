@@ -2080,6 +2080,33 @@ func TestStoryIazio0201_SupervisorAlternatesRebaseHealAndBrainASETurn(t *testing
 		t.Fatalf("expected TranscriptReferencesRepoPath=true for dominant repo03")
 	}
 
+	// Sibling worktree disambiguation via --worktree-path
+	repo05 := filepath.Join(filepath.Dir(slotRepo), "meta-repo-05")
+	_ = exec.Command("git", "init", "-b", "main", repo05).Run()
+	repo05HarnessTranscript := strings.Join([]string{
+		`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"/autonomous-story-execution"}`,
+		`{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"iazio-harness run --worktree-path ` + strings.ReplaceAll(repo05, `\`, `/`) + `"}}]}`,
+		`{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":"` + strings.ReplaceAll(filepath.Join(slotRepo, "file.txt"), `\`, `/`) + `"}}]}`,
+	}, "\n") + "\n"
+	if TranscriptReferencesRepoPath(repo05HarnessTranscript, slotRepo) {
+		t.Fatalf("expected TranscriptReferencesRepoPath=false for slotRepo when transcript declares --worktree-path repo05")
+	}
+	if !TranscriptReferencesRepoPath(repo05HarnessTranscript, repo05) {
+		t.Fatalf("expected TranscriptReferencesRepoPath=true for repo05 matching declared --worktree-path")
+	}
+
+	// Sibling worktree lock attribution in InspectActiveBrainASETurnForRepo
+	// If repo05 holds repo.lock with conversation_id, slotRepo must NOT claim it
+	repo05Iazio := filepath.Join(repo05, ".iazio")
+	_ = os.MkdirAll(repo05Iazio, 0o755)
+	_ = os.WriteFile(filepath.Join(repo05Iazio, "repo.lock"), []byte(`{"job_id":"job-test","conversation_id":"cand-conv-123","status":"RUNNING"}`), 0o644)
+	if isSupervisorConversationClaimedByOtherWorktree(slotRepo, "cand-conv-123") != true {
+		t.Fatalf("expected isSupervisorConversationClaimedByOtherWorktree=true when sibling repo05 holds repo.lock with cand-conv-123")
+	}
+	if isSupervisorConversationClaimedByOtherWorktree(repo05, "cand-conv-123") != false {
+		t.Fatalf("expected isSupervisorConversationClaimedByOtherWorktree=false for repo05 which owns cand-conv-123")
+	}
+
 	// STORY-GOV-5256: A worktree on an unmerged non-main story branch (e.g. feat/gov-5251-...)
 	// must NEVER be considered idle for git-update even when the story file on that branch already has status: DONE.
 	doneBranchDir := t.TempDir()
