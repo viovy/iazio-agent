@@ -27,6 +27,10 @@ func newNonTempTestHome(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("HOME", dir)
+	t.Setenv("IAZIO_TEST_MODE", "")
+	t.Setenv("IAZIO_DISABLE_SERVICE_CONTROL", "")
+	t.Setenv("GO_TEST", "")
 	t.Cleanup(func() {
 		_ = os.RemoveAll(dir)
 		_ = os.Remove(base)

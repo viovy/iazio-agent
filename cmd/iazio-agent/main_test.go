@@ -5122,6 +5122,8 @@ func TestProbeRepoRuntimeFallback_DeadRepoLockAndStaleSessionFile(t *testing.T) 
 
 func TestStoryGov5258_ExactSlotSuffixAndADR002StateAndProbeSerialization(t *testing.T) {
 	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
 	primaryWithMidHyphenDigit := filepath.Join(tmp, "engine-10x-core")
 	slottedClone := filepath.Join(tmp, "engine-10x-core-02")
 	_ = os.MkdirAll(primaryWithMidHyphenDigit, 0o755)

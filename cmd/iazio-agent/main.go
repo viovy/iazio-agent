@@ -126,14 +126,24 @@ func isTestBinary() bool {
 }
 
 type safeWriter struct {
-	mu sync.Mutex
-	w  io.Writer
+	mu     sync.Mutex
+	w      io.Writer
+	closed bool
 }
 
 func (s *safeWriter) Write(p []byte) (n int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed || s.w == nil {
+		return len(p), nil
+	}
 	return s.w.Write(p)
+}
+
+func (s *safeWriter) Close() {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
 }
 
 var createWindowsMutexFn = createWindowsNamedMutex
@@ -294,11 +304,22 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		}
 	}
 
-	if stdout != nil {
-		stdout = &safeWriter{w: stdout}
-	}
-	if stderr != nil {
-		stderr = &safeWriter{w: stderr}
+	if stdout != nil && stdout == stderr {
+		sw := &safeWriter{w: stdout}
+		defer sw.Close()
+		stdout = sw
+		stderr = sw
+	} else {
+		if stdout != nil {
+			swOut := &safeWriter{w: stdout}
+			defer swOut.Close()
+			stdout = swOut
+		}
+		if stderr != nil {
+			swErr := &safeWriter{w: stderr}
+			defer swErr.Close()
+			stderr = swErr
+		}
 	}
 	if len(args) == 0 {
 		return fmt.Errorf("usage: iazio-agent version|auth|service|update|run|probe")
@@ -519,16 +540,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				return fetchManifestAuthEnabledTools(fetchCtx, api, profile, resolveControlPlaneToken(getenv))
 			})
 			var getToolsMu sync.Mutex
-			var cachedTools []controlplane.Tool
-			var cachedToolsAt time.Time
 			getTools := func() []controlplane.Tool {
 				getToolsMu.Lock()
 				defer getToolsMu.Unlock()
-				if len(cachedTools) > 0 && time.Since(cachedToolsAt) < 2*time.Second {
-					out := make([]controlplane.Tool, len(cachedTools))
-					copy(out, cachedTools)
-					return out
-				}
 				home, _ := os.UserHomeDir()
 				dirs := inventory.DefaultDirs(getenv("PATH"), home, runtime.GOOS)
 				found := inventory.Scan(dirs)
@@ -557,8 +571,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						AuthCheckedAt:     t.AuthCheckedAt,
 					})
 				}
-				cachedTools = tools
-				cachedToolsAt = time.Now()
 				return tools
 			}
 
@@ -1107,7 +1119,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					vSnap := pendingRemoteTargetVersion
 					pendingRemoteMu.Unlock()
 
+					bgWG.Add(1)
 					go func(expectedSeq uint64, t []string, f bool, v string) {
+						defer bgWG.Done()
 						res, deferred, err := doToolUpdateDetailed(runCtx, t, f, v)
 						if !deferred {
 							clearPendingRemoteIfSeq(expectedSeq)
@@ -1125,7 +1139,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						if eagerUpdater != nil {
 							eagerUpdater.TriggerEvaluation("command")
 						} else {
+							bgWG.Add(1)
 							go func() {
+								defer bgWG.Done()
 								if doToolUpdate(runCtx, nil, false) {
 									restartOrExecSelf(stdout)
 									cancel()
@@ -1133,7 +1149,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							}()
 						}
 					case "FORCE_TOOL_UPDATE":
+						bgWG.Add(1)
 						go func() {
+							defer bgWG.Done()
 							var p struct {
 								Tools         []string `json:"tools"`
 								Force         *bool    `json:"force"`
@@ -1151,7 +1169,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							}
 						}()
 					case "CLEANUP_BINARIES", "CLEANUP_DEV_BINARIES":
+						bgWG.Add(1)
 						go func() {
+							defer bgWG.Done()
 							report, err := runCleanupBinariesWithReport(runCtx, nil, stdout, stderr, nil)
 							if err != nil && stderr != nil {
 								fmt.Fprintf(stderr, "[cleanup] dev binary cleanup error: %v\n", err)
@@ -1194,11 +1214,15 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						if stdout != nil {
 							fmt.Fprintf(stdout, "[supervisor] received PING command (%s); host is reachable\n", cmd.ID)
 						}
+						bgWG.Add(1)
 						go func() {
+							defer bgWG.Done()
 							_ = client.PostPingAck(runCtx, host, cmd.ID, version)
 						}()
 					case "CHECK_FLEET_GIT_STATUS":
+						bgWG.Add(1)
 						go func() {
+							defer bgWG.Done()
 							var target string
 							if err := json.Unmarshal(cmd.Payload, &target); err != nil {
 								target = strings.Trim(strings.TrimSpace(string(cmd.Payload)), "\"")
@@ -1227,7 +1251,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							}
 						}()
 					case "FETCH_METADATA_YML":
+						bgWG.Add(1)
 						go func() {
+							defer bgWG.Done()
 							var target string
 							if err := json.Unmarshal(cmd.Payload, &target); err != nil {
 								target = strings.Trim(strings.TrimSpace(string(cmd.Payload)), "\"")
@@ -1238,7 +1264,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							}
 						}()
 					case "FORCE_CLEAN_GIT", "HEAL_GIT_REPO":
+						bgWG.Add(1)
 						go func() {
+							defer bgWG.Done()
 							var target string
 							if err := json.Unmarshal(cmd.Payload, &target); err != nil {
 								target = strings.Trim(strings.TrimSpace(string(cmd.Payload)), "\"")
@@ -1267,7 +1295,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 							}
 						}()
 					case "KILL_BACKGROUND_TASKS":
+						bgWG.Add(1)
 						go func() {
+							defer bgWG.Done()
 							var target string
 							if err := json.Unmarshal(cmd.Payload, &target); err != nil {
 								target = strings.Trim(strings.TrimSpace(string(cmd.Payload)), "\"")
@@ -1402,7 +1432,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 					// If harness finished and idle, trigger eager update check if fleet clean
 					if len(reaped) > 0 && eagerUpdater != nil && !updatingTools.Load() {
+						bgWG.Add(1)
 						go func() {
+							defer bgWG.Done()
 							repoMonitor.InspectFleet(runCtx)
 							agentUpdated, _, _ := eagerUpdater.EvaluateAndTrigger(runCtx, nil, false)
 							if agentUpdated {
@@ -1638,7 +1670,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 								lastUpdateMu.Unlock()
 
 								if shouldCheck && !updatingTools.Load() {
+									bgWG.Add(1)
 									go func() {
+										defer bgWG.Done()
 										t, f, v, rem, seq := snapshotPendingRemote()
 
 										if rem {
