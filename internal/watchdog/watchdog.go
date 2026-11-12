@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/ase/gate"
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 	"github.com/viovy/iazio-agent/internal/reaper"
 	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/sessionstore"

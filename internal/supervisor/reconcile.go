@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 // Proc is one row from an injected process table.

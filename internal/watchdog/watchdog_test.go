@@ -734,6 +734,7 @@ func TestWatchdog_PrematureExit0GateEnforcement(t *testing.T) {
 		}
 	}
 	runGit("init")
+	runGit("checkout", "-B", "main")
 	runGit("config", "user.name", "Test Operator")
 	runGit("config", "user.email", "operator@iazio.test")
 
@@ -785,11 +786,16 @@ func TestWatchdog_PrematureExit0GateEnforcement(t *testing.T) {
 
 	// Now mark story as completed and provide test/release stamps and simulate second exit 0
 	_ = os.WriteFile(storyFile, []byte("---\nid: STORY-GOV-3684\nstatus: DONE\n---\n"), 0644)
-	_ = os.MkdirAll(filepath.Join(tmpDir, "tmp", "reports"), 0755)
-	_ = os.WriteFile(filepath.Join(tmpDir, "tmp", "reports", "validate-local-ok.stamp"), []byte("ok"), 0644)
-	_ = os.WriteFile(filepath.Join(tmpDir, "tmp", "reports", "verify-live-release-ok.stamp"), []byte("ok"), 0644)
 	runGit("add", ".")
 	runGit("commit", "-m", "feat: complete STORY-GOV-3684")
+	headOut, err := exec.Command("git", "-C", tmpDir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD failed: %v", err)
+	}
+	headSHA := strings.TrimSpace(string(headOut))
+	_ = os.MkdirAll(filepath.Join(tmpDir, "tmp", "reports"), 0755)
+	_ = os.WriteFile(filepath.Join(tmpDir, "tmp", "reports", "validate-local-ok.stamp"), []byte(headSHA), 0644)
+	_ = os.WriteFile(filepath.Join(tmpDir, "tmp", "reports", "verify-live-release-ok.stamp"), []byte(headSHA), 0644)
 	w.OnProcessExit("job-1311", 7777, 0, nil)
 
 	j, _ := w.GetJob("job-1311")

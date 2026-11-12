@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/controlplane"
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 	"github.com/viovy/iazio-agent/internal/repolock"
 )
 

@@ -18,7 +18,7 @@ import (
 	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-agent/internal/harness"
 	"github.com/viovy/iazio-agent/internal/supervisor"
-	"github.com/viovy/iazio-agent/internal/telemetry"
+	"github.com/viovy/iazio-core/pkg/telemetry"
 )
 
 type fakeDeadPIDRunner struct {

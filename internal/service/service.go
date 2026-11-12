@@ -17,7 +17,7 @@ import (
 	"time"
 	"unicode/utf16"
 
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 const DarwinLabel = "io.iazio.iazio-agent"

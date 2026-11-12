@@ -4196,6 +4196,7 @@ func TestExecuteRun_PendingCommandsAndToolUpdateAndHelpers(t *testing.T) {
 	}
 	// Replace copied test binary with lightweight version stub so inventory scan does not re-run test binary
 	_ = os.WriteFile(filepath.Join(fakeHome, ".local", "bin", "iazio-agent"), []byte("#!/bin/sh\necho 'iazio-agent 1.0.0'\n"), 0o755)
+	_ = os.Remove(filepath.Join(fakeHome, "bin", "iazio-agent.exe"))
 
 	// 3. applyLinux with systemd enabled and disabled
 	origSystemd := isSystemdAvailable
@@ -5077,10 +5078,65 @@ func TestStoryGov5225_E2E_CompiledAgentTempHomeNeverInvokesHostServiceControl(t 
 	}
 }
 
+func TestStoryGov5258_ExactSlotSuffixAndADR002StateAndProbeSerialization(t *testing.T) {
+	tmp := t.TempDir()
+	primaryWithMidHyphenDigit := filepath.Join(tmp, "engine-10x-core")
+	slottedClone := filepath.Join(tmp, "engine-10x-core-02")
+	_ = os.MkdirAll(primaryWithMidHyphenDigit, 0o755)
+	_ = os.MkdirAll(slottedClone, 0o755)
+	gm := []byte("[submodule \"sub-leaf\"]\n\tpath = sub-leaf\n")
+	_ = os.WriteFile(filepath.Join(primaryWithMidHyphenDigit, ".gitmodules"), gm, 0o644)
+	_ = os.WriteFile(filepath.Join(slottedClone, ".gitmodules"), gm, 0o644)
 
+	detail := controlplane.HostDetail{
+		Repos: []controlplane.RepoSummary{
+			{WorktreePath: slottedClone, Lock: "IDLE"},
+			{WorktreePath: primaryWithMidHyphenDigit, Lock: "IDLE"},
+		},
+	}
+	if got := resolveWorktreeFromHostDetail(detail, "sub-leaf"); got != primaryWithMidHyphenDigit {
+		t.Fatalf("expected primary repo %s (not substring-skipped by -1 in -10x-) to be selected before slotted clone %s, got %s",
+			primaryWithMidHyphenDigit, slottedClone, got)
+	}
 
+	// False-positive substring guard in resolveWorktreeForRepo: "meta-reporting" must not match "meta-repo"
+	falseCand := filepath.Join(tmp, "meta-reporting")
+	_ = os.MkdirAll(falseCand, 0o755)
+	_ = os.WriteFile(filepath.Join(falseCand, ".gitmodules"), []byte("[submodule \"other\"]\n\tpath = other\n"), 0o644)
+	setCachedFleetRoot(falseCand)
+	defer setCachedFleetRoot("")
+	if got := resolveWorktreeForRepo(context.Background(), nil, "h1", "meta-reporting-app", func(string) string { return "" }); got == falseCand {
+		t.Fatalf("expected meta-reporting-app not to match meta-reporting via 'meta-repo' substring, got %q", got)
+	}
 
+	// ADR-002 .autopilot/ase-state.json completion detection without docs/stories/index.yml
+	leafDir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(leafDir, ".autopilot"), 0o755)
+	_ = os.WriteFile(filepath.Join(leafDir, ".autopilot", "ase-state.json"), []byte(`{"story_id":"STORY-GOV-5258","status":"DONE","phase":"completed"}`), 0o644)
+	if !isStoryCompletedOnDiskFallback(leafDir, "STORY-GOV-5258") {
+		t.Fatal("expected isStoryCompletedOnDiskFallback to return true for DONE story in .autopilot/ase-state.json")
+	}
+	if isStoryCompletedOnDiskFallback(leafDir, "STORY-GOV-525") {
+		t.Fatal("expected substring story ID STORY-GOV-525 not to match STORY-GOV-5258")
+	}
 
-
-
-
+	// Per-repo probe lock serialization
+	unlock1 := acquireProbeRepoLock(leafDir)
+	acquiredSecond := make(chan struct{})
+	go func() {
+		u2 := acquireProbeRepoLock(leafDir)
+		close(acquiredSecond)
+		u2()
+	}()
+	select {
+	case <-acquiredSecond:
+		t.Fatal("expected second acquireProbeRepoLock to block while first is held")
+	case <-time.After(30 * time.Millisecond):
+	}
+	unlock1()
+	select {
+	case <-acquiredSecond:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected second acquireProbeRepoLock to succeed after first unlock")
+	}
+}

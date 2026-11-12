@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 // DefaultAuthStatusInterval is the default periodic TTL for `<tool> auth status --json` probes.

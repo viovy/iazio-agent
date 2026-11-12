@@ -79,6 +79,7 @@ type Client struct {
 	DiscoveredDevBinaries func() []string
 	PrePollBarrier        func(ctx context.Context) bool
 	IdleWorktrees         func() []string
+	PollLock              sync.Locker
 }
 
 func (c Client) bearerToken(ctx context.Context) string {
@@ -88,6 +89,12 @@ func (c Client) bearerToken(ctx context.Context) string {
 		}
 	}
 	return strings.TrimSpace(c.Token)
+}
+
+func (c Client) ensureSpoolerAuth() {
+	if c.Spooler != nil && (c.TokenProvider != nil || strings.TrimSpace(c.Token) != "") {
+		c.Spooler.SetFallbackTokenProvider(c.bearerToken)
+	}
 }
 
 func (c Client) retryParams() (int, time.Duration) {
@@ -307,6 +314,7 @@ func (c Client) HostDaemonLoop(ctx context.Context, hostID, kind string, every t
 
 // Loop registers the host, starts a decoupled heartbeat engine, and polls for a lease until ctx is cancelled.
 func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Duration, onJob func(Assignment) error, profile ...string) error {
+	c.ensureSpoolerAuth()
 	if every <= 0 {
 		every = 30 * time.Second
 	}
@@ -476,16 +484,29 @@ func (c Client) Loop(ctx context.Context, hostID, kind string, every time.Durati
 			}
 		}
 
-		job, ok, err := c.NextLease(ctx, hostID)
-		if err != nil && ctx.Err() != nil {
+		pollAndDispatch := func() (bool, error) {
+			if c.PollLock != nil {
+				c.PollLock.Lock()
+				defer c.PollLock.Unlock()
+			}
+			job, ok, err := c.NextLease(ctx, hostID)
+			if err != nil && ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			if ok {
+				if err := onJob(job); err != nil && ctx.Err() != nil {
+					return false, ctx.Err()
+				}
+				return true, nil
+			}
+			return false, err
+		}
+
+		dispatched, pollErr := pollAndDispatch()
+		if pollErr != nil && ctx.Err() != nil {
 			return nil
 		}
-		if ok {
-			if err := onJob(job); err != nil {
-				if ctx.Err() != nil {
-					return nil
-				}
-			}
+		if dispatched {
 			// When a job just executed, immediately poll again to drain active queues
 			continue
 		}
@@ -880,6 +901,7 @@ func (c Client) post(ctx context.Context, path string, body any) error {
 }
 
 func (c Client) postJSON(ctx context.Context, path string, body any, out any) error {
+	c.ensureSpoolerAuth()
 	if ctx != nil && ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -921,7 +943,7 @@ func (c Client) postJSON(ctx context.Context, path string, body any, out any) er
 			}
 			_ = resp.Body.Close()
 			lastErr = fmt.Errorf("control plane %s: %s", path, resp.Status)
-			if IsTransientStatus(resp.StatusCode) || resp.StatusCode >= 500 {
+			if IsTransientStatus(resp.StatusCode) || resp.StatusCode >= 500 || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 				shouldSpool = true
 			}
 			if !IsTransientStatus(resp.StatusCode) || attempt == maxRetries {
@@ -954,7 +976,10 @@ func (c Client) postJSON(ctx context.Context, path string, body any, out any) er
 	return lastErr
 }
 
-var defaultHTTPClient = &http.Client{Timeout: 30 * time.Second}
+var defaultHTTPClient = &http.Client{
+	Timeout:   30 * time.Second,
+	Transport: newSecureHTTPTransport(),
+}
 
 func (c Client) http() *http.Client {
 	if c.HTTP != nil {

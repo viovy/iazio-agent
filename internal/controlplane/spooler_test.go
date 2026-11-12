@@ -170,3 +170,85 @@ func TestOfflineReportSpooler_TokenProviderRefreshesAndRetries401(t *testing.T) 
 		t.Fatalf("expected refreshed token on second drain, got %v", seenAuth)
 	}
 }
+
+func TestOfflineReportSpooler_ClientFallbackTokenProviderAnd403Retry(t *testing.T) {
+	tempDir := t.TempDir()
+
+	var currentToken atomic.Value
+	currentToken.Store("initial-stale-token")
+
+	var attempts atomic.Int32
+	var lastAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		lastAuth = r.Header.Get("Authorization")
+		if n == 1 {
+			// Initial PostExit fails with 403 Forbidden (e.g. expired/rotating token) -> must be spooled
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		if n == 2 {
+			// First Drain still sees 403 -> must NOT quarantine as .rejected
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		if lastAuth != "Bearer rotated-client-token-5258" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	// Note: spooler.TokenProvider is intentionally left nil to verify Client auto-wires fallbackTokenProvider
+	spooler, err := NewOfflineReportSpooler(tempDir, server.Client())
+	if err != nil {
+		t.Fatalf("NewOfflineReportSpooler: %v", err)
+	}
+
+	c := Client{
+		BaseURL: server.URL,
+		TokenProvider: func(context.Context) string {
+			v, _ := currentToken.Load().(string)
+			return v
+		},
+		Spooler:        spooler,
+		MaxRetries:     0,
+		InitialBackoff: 1,
+	}
+
+	ctx := context.Background()
+	if err := c.PostExit(ctx, "job-5258", ExitOptions{ExitCode: 0}); err == nil {
+		t.Fatal("expected initial PostExit to fail on 403")
+	}
+
+	// Drain 1: returns 403 Forbidden -> must keep .json file and not rename to .rejected
+	drained1, err := spooler.Drain(ctx)
+	if err == nil || drained1 != 0 {
+		t.Fatalf("expected Drain 1 to fail on 403 with 0 drained, got drained=%d err=%v", drained1, err)
+	}
+	entries, _ := os.ReadDir(tempDir)
+	if len(entries) != 1 || entries[0].Name()[len(entries[0].Name())-5:] != ".json" {
+		t.Fatalf("expected spooled .json file preserved after 403, got %v", entries)
+	}
+
+	// Rotate token on Client; Drain 2 must automatically resolve the rotated token via fallbackTokenProvider
+	currentToken.Store("rotated-client-token-5258")
+	drained2, err := spooler.Drain(ctx)
+	if err != nil || drained2 != 1 {
+		t.Fatalf("expected Drain 2 to succeed with rotated client token, got drained=%d err=%v", drained2, err)
+	}
+	if lastAuth != "Bearer rotated-client-token-5258" {
+		t.Fatalf("expected Authorization Bearer rotated-client-token-5258, got %q", lastAuth)
+	}
+
+	// Also verify default transport TLS hardening
+	defaultSpooler, err := NewOfflineReportSpooler(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("NewOfflineReportSpooler default client: %v", err)
+	}
+	tr, ok := defaultSpooler.client.Transport.(*http.Transport)
+	if !ok || tr == nil || tr.TLSClientConfig == nil || tr.TLSClientConfig.MinVersion < 0x0303 || tr.TLSClientConfig.InsecureSkipVerify {
+		t.Fatalf("expected default spooler transport to enforce TLS 1.2+ with InsecureSkipVerify=false, got %+v", defaultSpooler.client.Transport)
+	}
+}

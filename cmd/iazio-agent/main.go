@@ -34,16 +34,16 @@ import (
 	"github.com/viovy/iazio-agent/internal/harness"
 	"github.com/viovy/iazio-agent/internal/inventory"
 	"github.com/viovy/iazio-agent/internal/preflight"
-	"github.com/viovy/iazio-agent/internal/procutil"
 	"github.com/viovy/iazio-agent/internal/reaper"
 	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/service"
 	"github.com/viovy/iazio-agent/internal/sessionstore"
 	"github.com/viovy/iazio-agent/internal/supervisor"
-	"github.com/viovy/iazio-agent/internal/telemetry"
 	"github.com/viovy/iazio-agent/internal/watchdog"
 	"github.com/viovy/iazio-agent/internal/worker"
 	"github.com/viovy/iazio-agent/internal/workspace"
+	"github.com/viovy/iazio-core/pkg/procutil"
+	"github.com/viovy/iazio-core/pkg/telemetry"
 )
 
 func main() {
@@ -518,7 +518,17 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			authProber := inventory.NewAuthStatusProber(authStatusInterval, func(fetchCtx context.Context) (map[string]bool, error) {
 				return fetchManifestAuthEnabledTools(fetchCtx, api, profile, resolveControlPlaneToken(getenv))
 			})
+			var getToolsMu sync.Mutex
+			var cachedTools []controlplane.Tool
+			var cachedToolsAt time.Time
 			getTools := func() []controlplane.Tool {
+				getToolsMu.Lock()
+				defer getToolsMu.Unlock()
+				if len(cachedTools) > 0 && time.Since(cachedToolsAt) < 2*time.Second {
+					out := make([]controlplane.Tool, len(cachedTools))
+					copy(out, cachedTools)
+					return out
+				}
 				home, _ := os.UserHomeDir()
 				dirs := inventory.DefaultDirs(getenv("PATH"), home, runtime.GOOS)
 				found := inventory.Scan(dirs)
@@ -547,6 +557,8 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						AuthCheckedAt:     t.AuthCheckedAt,
 					})
 				}
+				cachedTools = tools
+				cachedToolsAt = time.Now()
 				return tools
 			}
 
@@ -674,8 +686,13 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			)
 
 			var willRestart atomic.Bool
+			var toolUpdateSingleFlightMu sync.Mutex
+			var pollMu sync.Mutex
+			var bgWG sync.WaitGroup
 
 			performUpdateFn := func(c context.Context, targetTools []string, force bool, targetVersion ...string) (supervisor.UpdateResult, error) {
+				toolUpdateSingleFlightMu.Lock()
+				defer toolUpdateSingleFlightMu.Unlock()
 				updatingTools.Store(true)
 				if api != "" {
 					if err := client.Heartbeat(c, host, getTools(), false); err != nil && stderr != nil {
@@ -785,14 +802,6 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				)
 			}
 
-			// Start hybrid trigger loop and repoMonitor AFTER eagerUpdater is fully constructed to eliminate initialization race
-			eagerUpdater.StartHybridTriggerLoop(runCtx, func() {
-				restartOrExecSelf(stdout)
-				cancel()
-			})
-			eagerUpdater.TriggerEvaluation("agent_startup")
-			repoMonitor.Start(runCtx)
-
 			var lastUpdateCheck time.Time = time.Now().UTC()
 			var lastUpdateMu sync.Mutex
 
@@ -847,6 +856,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					return res, false, nil
 				}
 
+				toolUpdateSingleFlightMu.Lock()
+				defer toolUpdateSingleFlightMu.Unlock()
+
 				if !opts.BypassDirty && !areAllReposCleanAndHarnessIdle(ctx, client, sup, host, api, opts.Force, stdout, hostGate, disp) {
 					span.SetTag("result", "deferred")
 					if sink != nil {
@@ -856,6 +868,17 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						})
 					}
 					return supervisor.UpdateResult{}, true, nil
+				}
+
+				var releaseFallbackGate func()
+				if hostGate != nil {
+					var acquired bool
+					releaseFallbackGate, acquired = hostGate.TryAcquireMaintenanceLease("perform_update")
+					if !acquired {
+						span.SetTag("result", "deferred")
+						return supervisor.UpdateResult{}, true, nil
+					}
+					defer releaseFallbackGate()
 				}
 
 				updatingTools.Store(true)
@@ -937,8 +960,13 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				pendingRemoteMu.Unlock()
 			}
 
-			if updateInterval > 0 {
+			startPeriodicUpdateLoop := func() {
+				if updateInterval <= 0 {
+					return
+				}
+				bgWG.Add(1)
 				go func() {
+					defer bgWG.Done()
 					select {
 					case <-runCtx.Done():
 						return
@@ -1013,6 +1041,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				Spooler:            spooler,
 				EagerUpdateEnabled: updateInterval > 0 || eagerUpdater != nil,
 				PrePollBarrier:     makePrePollBarrier(hostGate, eagerUpdater),
+				PollLock:           &pollMu,
 				LastEagerUpdateAt: func() *time.Time {
 					lastUpdateMu.Lock()
 					defer lastUpdateMu.Unlock()
@@ -1392,6 +1421,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				cliInvoker := harness.NewCLIInvoker(resolveHarnessBinaryPath(), "")
 				disp = worker.NewDispatcher(cpClient, cliInvoker, host)
 				disp.SetHostGate(hostGate)
+				disp.SetClaimMutex(&pollMu)
 				wireDispatcherReadinessAndIdleWorktrees(disp, &client, eagerUpdater, getRepos)
 				disp.SetHarvestFlusher(func(hCtx context.Context, convID string) (int, string, error) {
 					return flushHarvestConversationDetailed(hCtx, convID)
@@ -1484,7 +1514,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 				disp.SetWorktreeResolver(func(repoName string) string {
 					return resolveWorktreeForRepo(runCtx, client, host, repoName, getenv)
 				})
+				bgWG.Add(1)
 				go func() {
+					defer bgWG.Done()
 					pollTicker := time.NewTicker(2 * time.Second)
 					defer pollTicker.Stop()
 					for {
@@ -1502,7 +1534,9 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 				}()
 
+				bgWG.Add(1)
 				go func() {
+					defer bgWG.Done()
 					defer func() {
 						if r := recover(); r != nil {
 							fmt.Fprintf(os.Stderr, "[SIR: PANIC_RECOVERED] recovered panic in repo status probe: %v\n", r)
@@ -1574,6 +1608,15 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					}
 				}()
 			}
+
+			// Start hybrid trigger loop, repoMonitor, and periodic update loop AFTER client and disp are fully constructed
+			eagerUpdater.StartHybridTriggerLoop(runCtx, func() {
+				restartOrExecSelf(stdout)
+				cancel()
+			})
+			eagerUpdater.TriggerEvaluation("agent_startup")
+			repoMonitor.Start(runCtx)
+			startPeriodicUpdateLoop()
 
 			wdRunner := supervisor.NewOSRunner()
 			spawner := func(sCtx context.Context, job watchdog.TrackedJob) (int, error) {
@@ -1681,8 +1724,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 			wd.StartWatchguard(runCtx, 5*time.Second)
 			defer func() {
 				cancel()
+				eagerUpdater.Wait()
 				repoMonitor.Wait()
 				wd.WaitWatchguard()
+				bgWG.Wait()
 			}()
 
 			reattached := sup.ScanAndReattachRuns(wdRunner)
@@ -2929,7 +2974,11 @@ func resolveSelfBinaryPath(goos string, selfBin string, home string, args []stri
 	return selfBin
 }
 
+var restartExecMu sync.Mutex
+
 func restartOrExecSelf(stdout io.Writer) {
+	restartExecMu.Lock()
+	defer restartExecMu.Unlock()
 	if stdout != nil {
 		fmt.Fprintln(stdout, "[supervisor] iazio-agent self-updated; executing in-PID handoff to updated binary...")
 	}
@@ -3008,6 +3057,36 @@ func isStoryCompletedOnDiskFallback(repoPath, storyID string) bool {
 	storyID = strings.TrimSpace(storyID)
 	if !strings.HasPrefix(storyID, "STORY-") {
 		return false
+	}
+	// 1. ADR-002 primary source: .autopilot/ase-state.json or .autopilot/state.json
+	for _, rel := range []string{
+		filepath.Join(".autopilot", "ase-state.json"),
+		filepath.Join(".autopilot", "state.json"),
+	} {
+		if b, err := os.ReadFile(filepath.Join(repoPath, rel)); err == nil {
+			var st struct {
+				StoryID            string `json:"story_id"`
+				ID                 string `json:"id"`
+				Status             string `json:"status"`
+				State              string `json:"state"`
+				Phase              string `json:"phase"`
+				VerificationStatus string `json:"verification_status"`
+			}
+			if json.Unmarshal(b, &st) == nil {
+				sid := strings.TrimSpace(st.StoryID)
+				if sid == "" {
+					sid = strings.TrimSpace(st.ID)
+				}
+				if sid == "" || sid == storyID {
+					for _, raw := range []string{st.Status, st.State, st.Phase, st.VerificationStatus} {
+						v := strings.ToUpper(strings.TrimSpace(raw))
+						if v == "DONE" || v == "COMPLETED" || v == "PASSED" || v == "ARCHIVED" || v == "CANCELLED" {
+							return true
+						}
+					}
+				}
+			}
+		}
 	}
 	indexPath := filepath.Join(repoPath, "docs", "stories", "index.yml")
 	if b, err := os.ReadFile(indexPath); err == nil {
@@ -3314,7 +3393,23 @@ func resolveGitUpdateInterval(args []string, getenv func(string) string, stderr 
 	return clamped
 }
 
+var probeRepoLocks sync.Map
+
+func acquireProbeRepoLock(repoPath string) func() {
+	key := filepath.Clean(strings.TrimSpace(repoPath))
+	if key == "" {
+		key = "."
+	}
+	val, _ := probeRepoLocks.LoadOrStore(key, &sync.Mutex{})
+	mu := val.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
 func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.RepoRuntimeStatus {
+	unlockProbe := acquireProbeRepoLock(repoPath)
+	defer unlockProbe()
+
 	st := controlplane.RepoRuntimeStatus{
 		RepoPath:      repoPath,
 		Alias:         alias,
@@ -3882,7 +3977,7 @@ func resolveWorktreeFromHostDetail(detail controlplane.HostDetail, repoName stri
 			continue
 		}
 		base := filepath.Base(wt)
-		if strings.Contains(base, "-0") || strings.Contains(base, "-1") || strings.Contains(base, "-2") {
+		if stripSlotSuffix(base) != base {
 			continue
 		}
 		gmPath := filepath.Join(wt, ".gitmodules")
@@ -4077,7 +4172,7 @@ func resolveWorktreeForRepo(ctx context.Context, getter hostDetailGetter, host, 
 				}
 			}
 		}
-		if strings.Contains(clean, "meta-repo") && strings.Contains(filepath.Base(cand), "meta-repo") {
+		if stripSlotSuffix(clean) == "meta-repo" && stripSlotSuffix(filepath.Base(cand)) == "meta-repo" {
 			if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
 				return true
 			}
@@ -4122,9 +4217,9 @@ func resolveWorktreeForRepo(ctx context.Context, getter hostDetailGetter, host, 
 			}
 		}
 	}
-	if strings.Contains(clean, "meta-repo") {
+	if stripSlotSuffix(clean) == "meta-repo" {
 		for _, cand := range candidateRoots {
-			if strings.Contains(filepath.Base(cand), "meta-repo") {
+			if stripSlotSuffix(filepath.Base(cand)) == "meta-repo" {
 				if _, err := os.Stat(filepath.Join(cand, ".gitmodules")); err == nil {
 					setCachedFleetRoot(cand)
 					return cand

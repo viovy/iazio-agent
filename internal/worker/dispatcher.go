@@ -5,6 +5,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,12 +20,12 @@ import (
 
 	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-agent/internal/harness"
-	"github.com/viovy/iazio-agent/internal/procutil"
 	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/supervisor"
-	"github.com/viovy/iazio-agent/internal/telemetry"
 	"github.com/viovy/iazio-agent/internal/watchdog"
 	"github.com/viovy/iazio-agent/internal/workspace"
+	"github.com/viovy/iazio-core/pkg/procutil"
+	"github.com/viovy/iazio-core/pkg/telemetry"
 )
 
 // Supported job types.
@@ -174,17 +175,41 @@ func (c *HTTPControlPlaneClient) bearerToken(ctx context.Context) string {
 	return strings.TrimSpace(c.AuthToken)
 }
 
+func (c *HTTPControlPlaneClient) ensureSpoolerAuth() {
+	if c != nil && c.Spooler != nil && (c.TokenProvider != nil || strings.TrimSpace(c.AuthToken) != "") {
+		c.Spooler.SetFallbackTokenProvider(c.bearerToken)
+	}
+}
+
 // NewHTTPControlPlaneClient constructs an HTTPControlPlaneClient.
 func NewHTTPControlPlaneClient(baseURL, authToken string, client *http.Client, spooler ...*controlplane.OfflineReportSpooler) *HTTPControlPlaneClient {
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		var tr *http.Transport
+		if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
+			tr = base.Clone()
+			if tr.TLSClientConfig == nil {
+				tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+			} else {
+				tr.TLSClientConfig = tr.TLSClientConfig.Clone()
+				if tr.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+					tr.TLSClientConfig.MinVersion = tls.VersionTLS12
+				}
+				tr.TLSClientConfig.InsecureSkipVerify = false
+			}
+		} else {
+			tr = &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
+		}
+		client = &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: tr,
+		}
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
 	var sp *controlplane.OfflineReportSpooler
 	if len(spooler) > 0 {
 		sp = spooler[0]
 	}
-	return &HTTPControlPlaneClient{
+	cpClient := &HTTPControlPlaneClient{
 		BaseURL:        baseURL,
 		AuthToken:      authToken,
 		HTTPClient:     client,
@@ -192,9 +217,12 @@ func NewHTTPControlPlaneClient(baseURL, authToken string, client *http.Client, s
 		MaxRetries:     controlplane.DefaultMaxRetries,
 		InitialBackoff: controlplane.DefaultInitialBackoff,
 	}
+	cpClient.ensureSpoolerAuth()
+	return cpClient
 }
 
 func (c *HTTPControlPlaneClient) doWithRetry(ctx context.Context, method, url string, bodyBytes []byte) (*http.Response, error) {
+	c.ensureSpoolerAuth()
 	maxRetries := c.MaxRetries
 	if maxRetries < 0 {
 		maxRetries = 0
@@ -304,7 +332,7 @@ func (c *HTTPControlPlaneClient) CompleteJob(ctx context.Context, jobID string, 
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		if c.Spooler != nil && resp.StatusCode >= 500 {
+		if c.Spooler != nil && (resp.StatusCode >= 500 || controlplane.IsTransientStatus(resp.StatusCode) || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
 			headers := map[string]string{"Content-Type": "application/json"}
 			if tok := c.bearerToken(ctx); tok != "" {
 				headers["Authorization"] = "Bearer " + tok
@@ -519,9 +547,28 @@ type Dispatcher struct {
 	workspace             string
 	jobTimeout            time.Duration
 	flusher               HarvestFlusher
+	defaultClaimMu        sync.Mutex
+	claimMu               sync.Locker
 	activeJobsMu          sync.Mutex
 	activeJobs            map[string]controlplane.ActiveJob
 	inFlightPrepJobs      map[string]string
+}
+
+// SetClaimMutex configures an external lock (shared with controlplane.Client.PollLock) to serialize job polling and worktree reservation.
+func (d *Dispatcher) SetClaimMutex(l sync.Locker) {
+	d.claimMu = l
+}
+
+func (d *Dispatcher) lockClaim() func() {
+	l := d.claimMu
+	if l == nil {
+		l = &d.defaultClaimMu
+	}
+	l.Lock()
+	var once sync.Once
+	return func() {
+		once.Do(l.Unlock)
+	}
 }
 
 // ActiveJobs returns the list of jobs currently being processed by the dispatcher.
@@ -1013,7 +1060,7 @@ func (d *Dispatcher) acquireWorktreeRepoLock(ctx context.Context, job *Job, work
 	}
 	if b, sErr := os.ReadFile(filepath.Join(worktreeDir, ".session_story_id")); sErr == nil {
 		if boundStory := strings.TrimSpace(string(b)); boundStory != "" {
-			if initialStoryID == "" || !strings.EqualFold(initialStoryID, boundStory) {
+			if (initialStoryID == "" || !strings.EqualFold(initialStoryID, boundStory)) && !repolock.IsStoryDone(worktreeDir, boundStory) {
 				fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s (story=%s): worktree %s is bound to uncompleted ASE story %s\n", job.ID, initialStoryID, worktreeDir, boundStory)
 				if span := telemetry.SpanFromContext(ctx); span != nil {
 					span.SetTag("decline_reason", reasonRepoDirtyUncompletedASE)
@@ -1059,6 +1106,9 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 	if d.invoker == nil {
 		return false, errors.New("harness invoker not configured")
 	}
+
+	unlockClaim := d.lockClaim()
+	defer unlockClaim()
 
 	claimReq, canClaim := d.checkPreClaimBarrier(ctx)
 	if !canClaim {
@@ -1170,6 +1220,8 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 			_ = repoLockHandle.Release()
 		}()
 	}
+	// Release claim mutex once the worktree, hostGate lease, and OS repo lock are reserved for this job.
+	unlockClaim()
 
 	d.setActiveJob(job.ID, worktreeDir, os.Getpid())
 	defer d.clearActiveJob(job.ID)

@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 var (
@@ -58,9 +58,14 @@ func (h *LockHandle) Worktree() string {
 	return h.worktree
 }
 
+var lockFileIOMu sync.RWMutex
+
 // writeLockFileAtomic marshals info and atomically replaces lockPath via a temporary file + rename
 // so concurrent unlocked Read(worktree) callers never observe a 0-byte or partially written JSON file.
 func writeLockFileAtomic(lockPath string, info LockInfo) error {
+	lockFileIOMu.Lock()
+	defer lockFileIOMu.Unlock()
+
 	data, err := json.MarshalIndent(info, "", "  ")
 	if err != nil {
 		return err
@@ -89,17 +94,19 @@ func writeLockFileAtomic(lockPath string, info LockInfo) error {
 		_ = os.Remove(tmpPath)
 		return err
 	}
-	if err := os.Rename(tmpPath, lockPath); err != nil {
-		if runtime.GOOS == "windows" {
-			_ = os.Remove(lockPath)
-			if err2 := os.Rename(tmpPath, lockPath); err2 == nil {
-				return nil
-			}
+	var renameErr error
+	for attempt := 0; attempt < 25; attempt++ {
+		renameErr = os.Rename(tmpPath, lockPath)
+		if renameErr == nil {
+			return nil
 		}
-		_ = os.Remove(tmpPath)
-		return err
+		if runtime.GOOS != "windows" {
+			break
+		}
+		time.Sleep(time.Millisecond)
 	}
-	return nil
+	_ = os.Remove(tmpPath)
+	return renameErr
 }
 
 // Update updates the in-memory and on-disk lock state while holding the OS flock.
@@ -301,8 +308,22 @@ func Acquire(worktree string, info LockInfo, isAlive func(int) bool) (*LockHandl
 
 // Read reads the last recorded LockInfo from .iazio/repo.lock without acquiring the OS flock.
 func Read(worktree string) (LockInfo, error) {
+	lockFileIOMu.RLock()
+	defer lockFileIOMu.RUnlock()
+
 	lockPath := filepath.Join(worktree, ".iazio", "repo.lock")
-	data, err := os.ReadFile(lockPath)
+	var data []byte
+	var err error
+	for attempt := 0; attempt < 25; attempt++ {
+		data, err = os.ReadFile(lockPath)
+		if err == nil {
+			break
+		}
+		if runtime.GOOS != "windows" || os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if err != nil {
 		return LockInfo{}, err
 	}
@@ -313,13 +334,23 @@ func Read(worktree string) (LockInfo, error) {
 	return info, nil
 }
 
-// ForceRelease removes the repository lock file and flock, marking it idle.
+// ForceRelease removes the repository lock metadata file when no live process holds the OS lock.
+// It never unlinks an actively locked repo.lock.flock inode, preventing Unix inode-replacement lock bypass
+// and Windows sharing-violation corruption.
 func ForceRelease(worktree string) error {
 	if worktree == "" {
 		return nil
 	}
+	flockPath := filepath.Join(worktree, ".iazio", "repo.lock.flock")
+	if f, err := os.OpenFile(flockPath, os.O_CREATE|os.O_RDWR, 0o600); err == nil {
+		if lockErr := tryLockFile(f); lockErr != nil {
+			_ = f.Close()
+			return fmt.Errorf("%w: cannot force-release active OS lock on %s", ErrRepoBusy, worktree)
+		}
+		_ = unlockFile(f)
+		_ = f.Close()
+	}
 	_ = os.Remove(filepath.Join(worktree, ".iazio", "repo.lock"))
-	_ = os.Remove(filepath.Join(worktree, ".iazio", "repo.lock.flock"))
 	return nil
 }
 
@@ -453,9 +484,64 @@ func parseStoryFrontmatter(filePath string) (id, status string) {
 	return id, status
 }
 
+func matchesStoryIDBoundary(filename, storyID string) bool {
+	lowerFile := strings.ToLower(strings.TrimSuffix(filename, ".story.md"))
+	lowerFile = strings.TrimSuffix(lowerFile, ".md")
+	for _, cand := range []string{strings.ToLower(storyID), strings.TrimPrefix(strings.ToLower(storyID), "story-")} {
+		if cand == "" {
+			continue
+		}
+		idx := strings.Index(lowerFile, cand)
+		for idx >= 0 {
+			beforeOK := idx == 0 || !isAlphaNumByte(lowerFile[idx-1])
+			end := idx + len(cand)
+			afterOK := end == len(lowerFile) || !isAlphaNumByte(lowerFile[end])
+			if beforeOK && afterOK {
+				return true
+			}
+			next := strings.Index(lowerFile[idx+1:], cand)
+			if next < 0 {
+				break
+			}
+			idx += 1 + next
+		}
+	}
+	return false
+}
+
+func isAlphaNumByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+// IsStoryDone checks whether the given storyID is marked DONE or COMPLETED in .autopilot state or docs/stories/*.story.md.
+func IsStoryDone(worktree, storyID string) bool {
+	return isStoryDone(worktree, storyID)
+}
+
 func isStoryDone(worktree, storyID string) bool {
+	storyID = strings.TrimSpace(storyID)
 	if storyID == "" {
 		return false
+	}
+	// Check opaque autopilot state first (ADR-002)
+	for _, stateRel := range []string{
+		filepath.Join(worktree, ".autopilot", "ase-state.json"),
+		filepath.Join(worktree, ".autopilot", "state.json"),
+	} {
+		if raw, err := os.ReadFile(stateRel); err == nil {
+			var st struct {
+				StoryID string `json:"story_id"`
+				Status  string `json:"status"`
+				Phase   string `json:"phase"`
+			}
+			if json.Unmarshal(raw, &st) == nil && strings.EqualFold(strings.TrimSpace(st.StoryID), storyID) {
+				s := strings.ToUpper(strings.TrimSpace(st.Status))
+				p := strings.ToUpper(strings.TrimSpace(st.Phase))
+				if s == "DONE" || s == "COMPLETED" || p == "DONE" || p == "COMPLETED" {
+					return true
+				}
+			}
+		}
 	}
 	globs := []string{
 		filepath.Join(worktree, "docs", "stories", "*.story.md"),
@@ -478,7 +564,7 @@ func isStoryDone(worktree, storyID string) bool {
 		}
 		for _, m := range matches {
 			fmID, fmStatus := parseStoryFrontmatter(m)
-			if strings.EqualFold(fmID, storyID) || (fmID == "" && strings.Contains(strings.ToUpper(filepath.Base(m)), strings.ToUpper(storyID))) {
+			if strings.EqualFold(fmID, storyID) || (fmID == "" && matchesStoryIDBoundary(filepath.Base(m), storyID)) {
 				if fmStatus == "DONE" || fmStatus == "COMPLETED" {
 					return true
 				}

@@ -10,7 +10,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 // RepoManifest describes a submodule or superproject repository returned by codebase repos.

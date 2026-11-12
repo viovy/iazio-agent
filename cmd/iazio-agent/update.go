@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -24,9 +25,34 @@ import (
 
 	"github.com/viovy/iazio-agent/internal/auth"
 	"github.com/viovy/iazio-agent/internal/inventory"
-	"github.com/viovy/iazio-agent/internal/procutil"
 	"github.com/viovy/iazio-agent/internal/service"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
+
+func newUpdateHTTPClient(timeout time.Duration) *http.Client {
+	var rt http.RoundTripper
+	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
+		tr := base.Clone()
+		if tr.TLSClientConfig == nil {
+			tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		} else {
+			tr.TLSClientConfig = tr.TLSClientConfig.Clone()
+			if tr.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+				tr.TLSClientConfig.MinVersion = tls.VersionTLS12
+			}
+			tr.TLSClientConfig.InsecureSkipVerify = false
+		}
+		rt = tr
+	} else if http.DefaultTransport != nil {
+		rt = http.DefaultTransport
+	} else {
+		rt = &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: rt,
+	}
+}
 
 type ManifestToolItem struct {
 	Name              string `json:"name"`
@@ -72,7 +98,7 @@ func fetchManifestAuthEnabledTools(ctx context.Context, apiURL, profile, token s
 	if strings.TrimSpace(token) != "" {
 		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
 	}
-	client := &http.Client{Timeout: 4 * time.Second}
+	client := newUpdateHTTPClient(4 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -304,7 +330,7 @@ func performUpdateWithResult(ctx context.Context, opts UpdateOptions, stdout, st
 	}
 
 	var manifest ManifestResponse
-	client := &http.Client{Timeout: 5 * time.Minute}
+	client := newUpdateHTTPClient(5 * time.Minute)
 	resp, err := client.Do(req)
 	if err != nil {
 		// Control plane might be unreachable in offline or mock test runs; fallback to baseline
@@ -1276,11 +1302,16 @@ const defaultMaxExtractedBinarySize int64 = 256 << 20 // 256 MiB
 
 var maxExtractedBinarySize int64 = defaultMaxExtractedBinarySize
 
-func readBoundedArchiveEntry(r io.Reader) ([]byte, error) {
+func limitOrDefault() int64 {
 	limit := maxExtractedBinarySize
 	if limit <= 0 {
 		limit = defaultMaxExtractedBinarySize
 	}
+	return limit
+}
+
+func readBoundedArchiveEntry(r io.Reader) ([]byte, error) {
+	limit := limitOrDefault()
 	data, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
 		return nil, err
@@ -1297,6 +1328,10 @@ func extractBinary(archiveData []byte, archiveName, binaryName, targetOS string)
 	if targetOS == "windows" && !strings.HasSuffix(expectedName, ".exe") {
 		expectedName += ".exe"
 	}
+	limit := maxExtractedBinarySize
+	if limit <= 0 {
+		limit = defaultMaxExtractedBinarySize
+	}
 
 	if strings.HasSuffix(lowerArchive, ".zip") {
 		zr, err := zip.NewReader(bytes.NewReader(archiveData), int64(len(archiveData)))
@@ -1304,8 +1339,14 @@ func extractBinary(archiveData []byte, archiveName, binaryName, targetOS string)
 			return nil, fmt.Errorf("open zip: %w", err)
 		}
 		for _, f := range zr.File {
+			if strings.Contains(f.Name, "..") || f.FileInfo().IsDir() || f.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
 			base := filepath.Base(f.Name)
 			if strings.EqualFold(base, expectedName) || (targetOS == "windows" && strings.EqualFold(base, strings.TrimSuffix(expectedName, ".exe"))) {
+				if f.UncompressedSize64 > uint64(limit) {
+					return nil, fmt.Errorf("extracted binary exceeds maximum size of %d bytes", limit)
+				}
 				rc, err := f.Open()
 				if err != nil {
 					return nil, err
@@ -1333,8 +1374,14 @@ func extractBinary(archiveData []byte, archiveName, binaryName, targetOS string)
 			if err != nil {
 				return nil, err
 			}
+			if strings.Contains(hdr.Name, "..") || (hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA && hdr.Typeflag != 0) {
+				continue
+			}
 			base := filepath.Base(hdr.Name)
 			if strings.EqualFold(base, expectedName) || (targetOS == "windows" && strings.EqualFold(base, strings.TrimSuffix(expectedName, ".exe"))) {
+				if hdr.Size > limit {
+					return nil, fmt.Errorf("extracted binary exceeds maximum size of %d bytes", limit)
+				}
 				return readBoundedArchiveEntry(tr)
 			}
 		}
@@ -1928,7 +1975,7 @@ func buildToolFromSourceRepo(
 				archiveCmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 				tarCmd := procutil.CommandContext(ctx, "tar", "-x", "-C", tempDir)
 				if pipe, pErr := archiveCmd.StdoutPipe(); pErr == nil {
-					tarCmd.Stdin = pipe
+					tarCmd.Stdin = io.LimitReader(pipe, limitOrDefault())
 					if err := tarCmd.Start(); err == nil && archiveCmd.Start() == nil {
 						_ = archiveCmd.Wait()
 						if err := tarCmd.Wait(); err == nil {

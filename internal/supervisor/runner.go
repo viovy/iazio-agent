@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 type waitResult struct {

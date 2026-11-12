@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 // TerminateProcessGroup cleanly shuts down a process group by sending SIGTERM,
