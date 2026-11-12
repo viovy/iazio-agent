@@ -3002,7 +3002,7 @@ func TestIntegration_DiscardCommand_CancelsRunningJob_CleansGitRepoAndRepolock(t
 	if err != nil {
 		t.Fatalf("failed to acquire repolock: %v", err)
 	}
-	_ = lockHandle
+	defer func() { _ = lockHandle.Release() }()
 
 	// 4. Register running job in supervisor and watchdog
 	sup := supervisor.New(time.Now)

@@ -3937,7 +3937,9 @@ func healGitRepo(ctx context.Context, repoPath string) {
 			_ = os.Remove(m)
 		}
 	}
-	_ = repolock.ForceRelease(cleanRepo)
+	if err := repolock.ForceRelease(cleanRepo); err != nil {
+		_ = os.Remove(filepath.Join(cleanRepo, ".iazio", "repo.lock"))
+	}
 
 	gitDir := filepath.Join(cleanRepo, ".git")
 	if out, err := procutil.CommandContext(ctx, "git", "-C", cleanRepo, "rev-parse", "--git-dir").Output(); err == nil {
