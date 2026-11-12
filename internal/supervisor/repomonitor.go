@@ -1096,6 +1096,32 @@ func TranscriptReferencesRepoPath(text, repoPath string) bool {
 		}
 	}
 
+	// Also check for explicit CLI/harness worktree argument markers
+	for _, marker := range []string{"--worktree-path ", "--worktree-path=", "--worktree_path ", "--worktree_path="} {
+		if strings.Contains(searchAll, marker) {
+			searchMarker := searchAll
+			for {
+				idx := strings.Index(searchMarker, marker)
+				if idx < 0 {
+					break
+				}
+				rest := searchMarker[idx+len(marker):]
+				rest = strings.TrimLeft(rest, `"'`)
+				if endIdx := strings.IndexAny(rest, " \t\r\n\"'"); endIdx >= 0 {
+					rest = rest[:endIdx]
+				}
+				declaredWT := strings.TrimRight(strings.TrimSpace(rest), "/")
+				if declaredWT != "" && (strings.HasPrefix(declaredWT, "/") || (len(declaredWT) >= 3 && declaredWT[1] == ':' && declaredWT[2] == '/')) {
+					familyPrefix := stripSupervisorTrailingWorktreeNumber(cleanRepo)
+					if strings.HasPrefix(declaredWT, familyPrefix) {
+						return declaredWT == cleanRepo
+					}
+				}
+				searchMarker = searchMarker[idx+len(marker):]
+			}
+		}
+	}
+
 	selfCount, maxOtherSiblingCount := countSupervisorWorktreeFamilyOccurrences(searchAll, cleanRepo)
 	if selfCount == 0 || maxOtherSiblingCount >= selfCount {
 		return false
@@ -1233,6 +1259,95 @@ func isSupervisorTranscriptTurnInFlight(tail []byte, modTime, now time.Time) boo
 	return false
 }
 
+// isSupervisorConversationClaimedByOtherWorktree returns true if candID is explicitly bound
+// or belongs to a different worktree (via .iazio/repo.lock, watchdog/harness active jobs,
+// or the Antigravity conversation DB workspace URI).
+func isSupervisorConversationClaimedByOtherWorktree(repoPath, candID string) bool {
+	cleanRepo := filepath.Clean(strings.TrimSpace(repoPath))
+	if cleanRepo == "" || cleanRepo == "." {
+		return false
+	}
+	cleanRepoSlash := strings.ToLower(filepath.ToSlash(cleanRepo))
+
+	// 1. Check if an active watchdog or harness job binds candID to another worktree
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		for _, stateFile := range []string{
+			filepath.Join(home, ".iazio", "watchdog-active-jobs.json"),
+			filepath.Join(home, ".iazio", "harness-active-jobs.json"),
+		} {
+			if data, err := os.ReadFile(stateFile); err == nil {
+				var jobs []struct {
+					WorktreePath   string `json:"worktree_path"`
+					ConversationID string `json:"conversation_id"`
+					Status         string `json:"status"`
+				}
+				if json.Unmarshal(data, &jobs) == nil {
+					for _, j := range jobs {
+						if strings.EqualFold(strings.TrimSpace(j.ConversationID), candID) {
+							wtSlash := strings.ToLower(filepath.ToSlash(filepath.Clean(j.WorktreePath)))
+							if wtSlash != "" && wtSlash != cleanRepoSlash {
+								return true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Check sibling worktrees in the same parent directory for .iazio/repo.lock holding candID
+	parentDir := filepath.Dir(cleanRepo)
+	if entries, err := os.ReadDir(parentDir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			sibPath := filepath.Clean(filepath.Join(parentDir, e.Name()))
+			if strings.EqualFold(filepath.ToSlash(sibPath), cleanRepoSlash) {
+				continue
+			}
+			if lockInfo, lErr := repolock.Read(sibPath); lErr == nil {
+				if strings.EqualFold(strings.TrimSpace(lockInfo.ConversationID), candID) {
+					return true
+				}
+			}
+		}
+	}
+
+	// 3. Check conversation db in ~/.gemini/antigravity-cli/conversations/<candID>.db for declared workspace URI
+	if home != "" {
+		dbPath := filepath.Join(home, ".gemini", "antigravity-cli", "conversations", candID+".db")
+		if raw, err := os.ReadFile(dbPath); err == nil {
+			const prefix = "file://"
+			idx := 0
+			for {
+				pos := strings.Index(string(raw[idx:]), prefix)
+				if pos < 0 {
+					break
+				}
+				start := idx + pos + len(prefix)
+				end := start
+				for end < len(raw) && raw[end] >= 32 && raw[end] <= 126 && raw[end] != '"' && raw[end] != '\'' && raw[end] != '\r' && raw[end] != '\n' && raw[end] != '}' && raw[end] != ']' {
+					end++
+				}
+				if end > start {
+					declared := filepath.Clean(strings.TrimSpace(string(raw[start:end])))
+					declaredSlash := strings.ToLower(filepath.ToSlash(declared))
+					if declaredSlash != "" && strings.Contains(declaredSlash, "/meta-repo") && !strings.Contains(declaredSlash, ".json") && !strings.Contains(declaredSlash, ".txt") && !strings.Contains(declaredSlash, ".log") {
+						if declaredSlash != cleanRepoSlash {
+							return true
+						}
+					}
+				}
+				idx = start
+			}
+		}
+	}
+
+	return false
+}
+
 // InspectActiveBrainASETurnForRepo scans Antigravity brain directories for an in-flight /autonomous-story-execution
 // turn targeting repoPath.
 func InspectActiveBrainASETurnForRepo(repoPath string, now time.Time) (active bool, convID string, storyID string) {
@@ -1253,6 +1368,9 @@ func InspectActiveBrainASETurnForRepo(repoPath string, now time.Time) (active bo
 				continue
 			}
 			candID := e.Name()
+			if isSupervisorConversationClaimedByOtherWorktree(repoPath, candID) {
+				continue
+			}
 			for _, rel := range []string{
 				filepath.Join(".system_generated", "logs", "transcript.jsonl"),
 				filepath.Join(".system_generated", "logs", "transcript_full.jsonl"),
