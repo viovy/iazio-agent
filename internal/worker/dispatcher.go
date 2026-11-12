@@ -1013,7 +1013,7 @@ func (d *Dispatcher) acquireWorktreeRepoLock(ctx context.Context, job *Job, work
 		return nil, false
 	}
 	if b, sErr := os.ReadFile(filepath.Join(worktreeDir, ".session_story_id")); sErr == nil {
-		if boundStory := strings.TrimSpace(string(b)); boundStory != "" {
+		if boundStory := strings.TrimSpace(string(b)); boundStory != "" && !repolock.IsStoryDone(worktreeDir, boundStory) {
 			if initialStoryID == "" || !strings.EqualFold(initialStoryID, boundStory) {
 				onFeat, _ := repolock.IsOnFeatureBranch(worktreeDir)
 				gateRes := asegate.Verify(asegate.GateOptions{

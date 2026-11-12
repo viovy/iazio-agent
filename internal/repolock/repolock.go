@@ -453,6 +453,11 @@ func parseStoryFrontmatter(filePath string) (id, status string) {
 	return id, status
 }
 
+// IsStoryDone returns true when storyID has status DONE or COMPLETED in docs/stories/.
+func IsStoryDone(worktree, storyID string) bool {
+	return isStoryDone(worktree, storyID)
+}
+
 func isStoryDone(worktree, storyID string) bool {
 	if storyID == "" {
 		return false
