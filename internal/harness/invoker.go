@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -132,24 +133,71 @@ func resolveDefaultHarnessBinary() string {
 		var cands []string
 		if runtime.GOOS == "windows" {
 			cands = []string{
+				filepath.Join(home, ".iazio", "bin", binName),
 				filepath.Join(home, "bin", binName),
 				filepath.Join(home, ".local", "bin", binName),
-				filepath.Join(home, ".iazio", "bin", binName),
 			}
 		} else {
 			cands = []string{
+				filepath.Join(home, ".iazio", "bin", binName),
 				filepath.Join(home, ".local", "bin", binName),
 				filepath.Join(home, "bin", binName),
-				filepath.Join(home, ".iazio", "bin", binName),
 			}
 		}
 		for _, cand := range cands {
-			if _, err := os.Stat(cand); err == nil {
+			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
 				return cand
 			}
 		}
 	}
 	return "iazio-harness"
+}
+
+// ResolveHarnessBinary resolves the canonical iazio-harness binary path across
+// IAZIO_HARNESS_BIN, ~/.iazio/bin, ~/.local/bin, ~/bin (%USERPROFILE%\bin), and $PATH.
+func ResolveHarnessBinary() string {
+	resolved := resolveDefaultHarnessBinary()
+	if resolved != "iazio-harness" && resolved != "iazio-harness.exe" {
+		return resolved
+	}
+	binName := "iazio-harness"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	if uh, err := os.UserHomeDir(); err == nil && strings.TrimSpace(uh) != "" {
+		home := strings.TrimSpace(uh)
+		cands := []string{
+			filepath.Join(home, ".iazio", "bin", binName),
+			filepath.Join(home, ".local", "bin", binName),
+			filepath.Join(home, "bin", binName),
+		}
+		for _, cand := range cands {
+			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+				return cand
+			}
+		}
+	}
+	if lp, err := exec.LookPath("iazio-harness"); err == nil && strings.TrimSpace(lp) != "" {
+		return strings.TrimSpace(lp)
+	}
+	return resolved
+}
+
+// ValidateStdinJSONPayload validates that a JSON payload intended for iazio-harness stdin
+// is non-empty and parses as a non-empty JSON object.
+func ValidateStdinJSONPayload(payload []byte) error {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		return errors.New("empty stdin JSON payload")
+	}
+	var m map[string]any
+	if err := json.Unmarshal(trimmed, &m); err != nil {
+		return fmt.Errorf("invalid stdin JSON payload: %w", err)
+	}
+	if len(m) == 0 {
+		return errors.New("empty stdin JSON object payload")
+	}
+	return nil
 }
 
 // NewCLIInvoker creates a CLIInvoker with default binary resolution.
@@ -166,8 +214,11 @@ func NewCLIInvoker(binaryPath, workDir string) *CLIInvoker {
 
 // CreateStory invokes `iazio-harness story create --json` passing the payload on stdin.
 func (c *CLIInvoker) CreateStory(ctx context.Context, payload json.RawMessage) (*StoryExecutionResult, error) {
-	if len(payload) == 0 {
+	if len(bytes.TrimSpace(payload)) == 0 {
 		return nil, errors.New("empty payload for story create")
+	}
+	if err := ValidateStdinJSONPayload(payload); err != nil {
+		return nil, fmt.Errorf("invalid payload for story create: %w", err)
 	}
 
 	stdout, stderr, err := c.runCommand(ctx, []string{"story", "create", "--json"}, payload)
@@ -185,11 +236,14 @@ func (c *CLIInvoker) CreateStory(ctx context.Context, payload json.RawMessage) (
 
 // ExecutePrompt invokes `iazio-harness prompt run --json` passing the payload on stdin.
 func (c *CLIInvoker) ExecutePrompt(ctx context.Context, payload json.RawMessage) (*PromptExecutionResult, error) {
-	if len(payload) == 0 {
+	if len(bytes.TrimSpace(payload)) == 0 {
 		return nil, errors.New("empty payload for prompt execution")
 	}
 
 	payload = EnsurePromptPayload("", payload)
+	if err := ValidateStdinJSONPayload(payload); err != nil {
+		return nil, fmt.Errorf("invalid payload for prompt execution: %w", err)
+	}
 
 	stdout, stderr, err := c.runCommand(ctx, []string{"prompt", "run", "--json"}, payload)
 	if err != nil {
@@ -243,8 +297,11 @@ func (c *CLIInvoker) ListRepos(ctx context.Context) (*CodebaseReposResult, error
 
 // ExportCodebase invokes `iazio-harness codebase export --json` passing payload on stdin.
 func (c *CLIInvoker) ExportCodebase(ctx context.Context, payload json.RawMessage) (*CodebaseExportResult, error) {
-	if len(payload) == 0 {
+	if len(bytes.TrimSpace(payload)) == 0 {
 		return nil, errors.New("empty payload for codebase export")
+	}
+	if err := ValidateStdinJSONPayload(payload); err != nil {
+		return nil, fmt.Errorf("invalid payload for codebase export: %w", err)
 	}
 
 	stdout, stderr, err := c.runCommand(ctx, []string{"codebase", "export", "--json"}, payload)
@@ -432,7 +489,7 @@ func (w *storyTrackingWriter) scanLine(line string) {
 func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []byte) (string, string, error) {
 	bin := c.HarnessBinary
 	if bin == "" || bin == "iazio-harness" || bin == "iazio-harness.exe" {
-		bin = resolveDefaultHarnessBinary()
+		bin = ResolveHarnessBinary()
 	}
 	cmd := procutil.CommandContext(ctx, bin, args...)
 	setProcGroup(cmd)
@@ -569,7 +626,41 @@ func EnsurePromptPayloadWithTrace(jobID, traceID string, raw json.RawMessage) js
 // EnsurePromptPayloadWithJob synchronizes authoritative job envelope attributes (prompt_id, trace_id,
 // target_agent, repo, story_id) into the stdin prompt payload JSON before invoking iazio-harness.
 func EnsurePromptPayloadWithJob(jobID, traceID, targetAgent, repo, storyID string, raw json.RawMessage) json.RawMessage {
-	if len(raw) == 0 {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) {
+		cleanStory := strings.TrimSpace(storyID)
+		cleanRepo := strings.TrimSpace(repo)
+		cleanAgent := strings.TrimSpace(targetAgent)
+		if cleanStory == "" && cleanRepo == "" && cleanAgent == "" && len(trimmed) == 0 {
+			return raw
+		}
+		synth := make(map[string]any)
+		if strings.TrimSpace(jobID) != "" {
+			synth["job_id"] = strings.TrimSpace(jobID)
+		}
+		if cleanStory != "" && cleanStory != "pending-allocation" && cleanStory != "pending_harness_creation" {
+			synth["story_id"] = cleanStory
+			synth["prompt_id"] = "prompt-" + cleanStory
+			synth["prompt"] = fmt.Sprintf("/autonomous-story-execution %s", cleanStory)
+		} else if strings.TrimSpace(jobID) != "" {
+			synth["prompt_id"] = "prompt-" + strings.TrimSpace(jobID)
+			synth["prompt"] = fmt.Sprintf("/autonomous-story-execution %s", strings.TrimSpace(jobID))
+		} else {
+			synth["prompt_id"] = fmt.Sprintf("prompt-%d", time.Now().UnixNano())
+			synth["prompt"] = "/autonomous-story-execution"
+		}
+		if strings.TrimSpace(traceID) != "" {
+			synth["trace_id"] = strings.TrimSpace(traceID)
+		}
+		if cleanAgent != "" && !strings.EqualFold(cleanAgent, "auto") {
+			synth["target_agent"] = cleanAgent
+		}
+		if cleanRepo != "" {
+			synth["repo"] = cleanRepo
+		}
+		if b, err := json.Marshal(synth); err == nil {
+			return b
+		}
 		return raw
 	}
 	var m map[string]any

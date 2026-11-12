@@ -610,4 +610,50 @@ exit 0
 	}
 }
 
+func TestStoryGov5264_CanonicalHarnessBinaryResolutionAndStdinPayloadValidation(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
+	t.Setenv("IAZIO_HARNESS_BIN", "")
+
+	iazioBinDir := filepath.Join(tmpHome, ".iazio", "bin")
+	if err := os.MkdirAll(iazioBinDir, 0o755); err != nil {
+		t.Fatalf("mkdir .iazio/bin: %v", err)
+	}
+	binName := "iazio-harness"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	fakeHarness := filepath.Join(iazioBinDir, binName)
+	if err := os.WriteFile(fakeHarness, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake iazio-harness: %v", err)
+	}
+
+	resolved := ResolveHarnessBinary()
+	if resolved != fakeHarness {
+		t.Fatalf("expected ResolveHarnessBinary()=%q from ~/.iazio/bin, got %q", fakeHarness, resolved)
+	}
+
+	// ValidateStdinJSONPayload must reject empty/whitespace/empty-object payloads
+	if err := ValidateStdinJSONPayload(nil); err == nil {
+		t.Fatal("expected error for nil stdin payload")
+	}
+	if err := ValidateStdinJSONPayload([]byte("   \n\t ")); err == nil {
+		t.Fatal("expected error for whitespace stdin payload")
+	}
+	if err := ValidateStdinJSONPayload([]byte("{}")); err == nil {
+		t.Fatal("expected error for empty JSON object payload")
+	}
+	if err := ValidateStdinJSONPayload([]byte(`{"prompt":"ok"}`)); err != nil {
+		t.Fatalf("expected valid JSON payload to pass, got %v", err)
+	}
+
+	// EnsurePromptPayloadWithJob must synthesize a valid JSON object when raw is empty/null/{} and job context is present
+	synth := EnsurePromptPayloadWithJob("job_19ac24ca0f266589", "447a00bda372231850c95358278fd2b2", "agy", "k8s", "STORY-GOV-5264", nil)
+	if err := ValidateStdinJSONPayload(synth); err != nil {
+		t.Fatalf("expected synthesized payload to pass validation, got err=%v (payload=%s)", err, string(synth))
+	}
+}
+
+
 

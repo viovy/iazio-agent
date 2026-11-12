@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/viovy/iazio-core/pkg/procutil"
@@ -67,11 +66,7 @@ type CLICodebaseInvoker struct {
 // NewCodebaseInvoker creates a CLICodebaseInvoker with binary path resolution.
 func NewCodebaseInvoker(binaryPath, workDir string) *CLICodebaseInvoker {
 	if binaryPath == "" {
-		if env := os.Getenv("IAZIO_HARNESS_BIN"); env != "" {
-			binaryPath = env
-		} else {
-			binaryPath = "iazio-harness"
-		}
+		binaryPath = resolveDefaultHarnessBinary()
 	}
 	return &CLICodebaseInvoker{
 		HarnessBinary: binaryPath,
@@ -81,7 +76,11 @@ func NewCodebaseInvoker(binaryPath, workDir string) *CLICodebaseInvoker {
 
 // ListLocalRepos runs `iazio-harness codebase repos --json` and parses the output into []RepoManifest.
 func (c *CLICodebaseInvoker) ListLocalRepos(ctx context.Context) ([]RepoManifest, error) {
-	cmd := procutil.CommandContext(ctx, c.HarnessBinary, "codebase", "repos", "--json")
+	bin := c.HarnessBinary
+	if bin == "" || bin == "iazio-harness" || bin == "iazio-harness.exe" {
+		bin = ResolveHarnessBinary()
+	}
+	cmd := procutil.CommandContext(ctx, bin, "codebase", "repos", "--json")
 	if c.WorkDir != "" {
 		cmd.Dir = c.WorkDir
 	}
@@ -115,7 +114,11 @@ func (c *CLICodebaseInvoker) ExportRepoDelta(ctx context.Context, req ExportRequ
 		return nil, fmt.Errorf("marshal export request: %w", err)
 	}
 
-	cmd := procutil.CommandContext(ctx, c.HarnessBinary, "codebase", "export", "--json")
+	bin := c.HarnessBinary
+	if bin == "" || bin == "iazio-harness" || bin == "iazio-harness.exe" {
+		bin = ResolveHarnessBinary()
+	}
+	cmd := procutil.CommandContext(ctx, bin, "codebase", "export", "--json")
 	if c.WorkDir != "" {
 		cmd.Dir = c.WorkDir
 	}
