@@ -588,3 +588,26 @@ printf '{"status":"completed","exit_code":0,"story_id":"STORY-IAZIO-0190","conve
 	}
 }
 
+func TestStoryGov5257_ResultFileEnvelopeFallbackWhenStdoutEmpty(t *testing.T) {
+	fakeBin := filepath.Join(t.TempDir(), "fake-harness-result-file")
+	script := `#!/bin/sh
+if [ -n "$IAZIO_RESULT_FILE" ]; then
+  printf '{"status":"completed","exit_code":0,"story_id":"STORY-GOV-5257","conversation_id":"conv-5257-file","summary":"Persisted via IAZIO_RESULT_FILE"}\n' > "$IAZIO_RESULT_FILE"
+fi
+exit 0
+`
+	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake-harness-result-file: %v", err)
+	}
+
+	inv := NewCLIInvoker(fakeBin, t.TempDir())
+	res, err := inv.ExecutePrompt(context.Background(), json.RawMessage(`{"prompt":"test","repo":"iazio-agent","job_id":"job_gov5257"}`))
+	if err != nil {
+		t.Fatalf("ExecutePrompt failed: %v", err)
+	}
+	if res.Status != "completed" || res.StoryID != "STORY-GOV-5257" || res.ConversationID != "conv-5257-file" {
+		t.Fatalf("expected fallback from IAZIO_RESULT_FILE to populate result, got %+v", res)
+	}
+}
+
+

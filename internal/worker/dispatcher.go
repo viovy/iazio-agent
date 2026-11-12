@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	asegate "github.com/viovy/iazio-agent/internal/ase/gate"
 	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-agent/internal/harness"
 	"github.com/viovy/iazio-agent/internal/repolock"
@@ -1059,15 +1060,22 @@ func (d *Dispatcher) acquireWorktreeRepoLock(ctx context.Context, job *Job, work
 		return nil, false
 	}
 	if b, sErr := os.ReadFile(filepath.Join(worktreeDir, ".session_story_id")); sErr == nil {
-		if boundStory := strings.TrimSpace(string(b)); boundStory != "" {
-			if (initialStoryID == "" || !strings.EqualFold(initialStoryID, boundStory)) && !repolock.IsStoryDone(worktreeDir, boundStory) {
-				fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s (story=%s): worktree %s is bound to uncompleted ASE story %s\n", job.ID, initialStoryID, worktreeDir, boundStory)
-				if span := telemetry.SpanFromContext(ctx); span != nil {
-					span.SetTag("decline_reason", reasonRepoDirtyUncompletedASE)
-					span.SetTag("worktree.quarantine_reason", "bound_to_uncompleted_ase_story:"+boundStory)
+		if boundStory := strings.TrimSpace(string(b)); boundStory != "" && !repolock.IsStoryDone(worktreeDir, boundStory) {
+			if initialStoryID == "" || !strings.EqualFold(initialStoryID, boundStory) {
+				onFeat, _ := repolock.IsOnFeatureBranch(worktreeDir)
+				gateRes := asegate.Verify(asegate.GateOptions{
+					WorktreePath: worktreeDir,
+					StoryID:      boundStory,
+				})
+				if onFeat || !gateRes.StoryDone || !gateRes.GitClean {
+					fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s (story=%s): worktree %s is bound to uncompleted ASE story %s\n", job.ID, initialStoryID, worktreeDir, boundStory)
+					if span := telemetry.SpanFromContext(ctx); span != nil {
+						span.SetTag("decline_reason", reasonRepoDirtyUncompletedASE)
+						span.SetTag("worktree.quarantine_reason", "bound_to_uncompleted_ase_story:"+boundStory)
+					}
+					_ = d.declineJob(ctx, job.ID, reasonRepoDirtyUncompletedASE)
+					return nil, false
 				}
-				_ = d.declineJob(ctx, job.ID, reasonRepoDirtyUncompletedASE)
-				return nil, false
 			}
 		}
 	}

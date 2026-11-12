@@ -507,6 +507,20 @@ func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []
 		}
 	}
 
+	var resultFile string
+	var cleanupResultFile bool
+	if len(args) >= 2 && args[0] == "prompt" && args[1] == "run" {
+		resultFile = strings.TrimSpace(os.Getenv("IAZIO_RESULT_FILE"))
+		if resultFile == "" {
+			resultFile = filepath.Join(os.TempDir(), fmt.Sprintf("iazio-result-%d-%d.json", os.Getpid(), time.Now().UnixNano()))
+			cleanupResultFile = true
+		}
+		cmd.Env = append(cmd.Env, "IAZIO_RESULT_FILE="+resultFile)
+	}
+	if cleanupResultFile && resultFile != "" {
+		defer func() { _ = os.Remove(resultFile) }()
+	}
+
 	cmd.Stdin = bytes.NewReader(stdinData)
 	var cbMu sync.Mutex
 	var sharedLastStory, sharedLastConv string
@@ -532,6 +546,12 @@ func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []
 	stderrWriter.Flush()
 	stdoutStr := stdoutWriter.buf.String()
 	stderrStr := stderrWriter.buf.String()
+
+	if resultFile != "" && (strings.TrimSpace(stdoutStr) == "" || !strings.Contains(stdoutStr, "{")) {
+		if rawFile, readErr := os.ReadFile(resultFile); readErr == nil && len(bytes.TrimSpace(rawFile)) > 0 {
+			stdoutStr = string(rawFile)
+		}
+	}
 
 	return stdoutStr, stderrStr, err
 }
