@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -1844,35 +1843,19 @@ func ComputeWorktreeDirtyFingerprint(ctx context.Context, repoPath string) (head
 
 // DefaultShellGitUpdate executes "autopilot git-update" directly in repoPath.
 func DefaultShellGitUpdate(ctx context.Context, repoPath string) (string, error) {
-	autopilotBin := "autopilot"
-	if p, err := exec.LookPath("autopilot"); err == nil && p != "" {
-		autopilotBin = p
-	} else if home, err := os.UserHomeDir(); err == nil && home != "" {
-		cand := filepath.Join(home, ".local", "bin", "autopilot")
-		if fi, sErr := os.Stat(cand); sErr == nil && !fi.IsDir() {
-			autopilotBin = cand
-		}
-	}
+	autopilotBin := ResolveBinary("autopilot")
 	upCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	cmd := procutil.CommandContext(upCtx, autopilotBin, "git-update")
 	cmd.Dir = repoPath
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(AugmentedEnv(os.Environ()), "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
 
 // DefaultAgyEscalation launches iazio-harness with target agent "agy" in repoPath executing prompt.
 func DefaultAgyEscalation(ctx context.Context, repoPath, prompt, diagnosticOutput string) (string, error) {
-	harnessBin := "iazio-harness"
-	if p, err := exec.LookPath("iazio-harness"); err == nil && p != "" {
-		harnessBin = p
-	} else if home, err := os.UserHomeDir(); err == nil && home != "" {
-		cand := filepath.Join(home, ".local", "bin", "iazio-harness")
-		if fi, sErr := os.Stat(cand); sErr == nil && !fi.IsDir() {
-			harnessBin = cand
-		}
-	}
+	harnessBin := ResolveBinary("iazio-harness")
 	fullPrompt := prompt
 	if strings.TrimSpace(diagnosticOutput) != "" {
 		fullPrompt = fmt.Sprintf("%s\n\nDiagnostic failure summary from shell autopilot git-update:\n%s", prompt, strings.TrimSpace(diagnosticOutput))

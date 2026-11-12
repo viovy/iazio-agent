@@ -52,6 +52,13 @@ func NewOSRunner() *OSRunner {
 // ResolveBinary finds the binary on PATH or standard user directories.
 // It verifies symlinks and resolves canonical targets to prevent dangling inode execution.
 func ResolveBinary(name string) string {
+	if name == "iazio-harness" || name == "iazio-harness.exe" {
+		if envBin := strings.TrimSpace(os.Getenv("IAZIO_HARNESS_BIN")); envBin != "" {
+			if fi, err := os.Stat(envBin); err == nil && !fi.IsDir() {
+				return envBin
+			}
+		}
+	}
 	if filepath.IsAbs(name) {
 		if lfi, err := os.Lstat(name); err == nil && (lfi.Mode()&os.ModeSymlink != 0) {
 			if resolved, err := filepath.EvalSymlinks(name); err == nil {
@@ -60,20 +67,17 @@ func ResolveBinary(name string) string {
 		}
 		return name
 	}
-	if resolved, err := exec.LookPath(name); err == nil {
-		if lfi, err := os.Lstat(resolved); err == nil && (lfi.Mode()&os.ModeSymlink != 0) {
-			if realPath, err := filepath.EvalSymlinks(resolved); err == nil {
-				return realPath
-			}
+	home := strings.TrimSpace(os.Getenv("HOME"))
+	if home == "" {
+		if uh, err := os.UserHomeDir(); err == nil {
+			home = strings.TrimSpace(uh)
 		}
-		return resolved
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
+	if home != "" {
 		candidates := []string{
+			filepath.Join(home, ".iazio", "bin", name),
 			filepath.Join(home, ".local", "bin", name),
-		}
-		if runtime.GOOS == "windows" {
-			candidates = append(candidates, filepath.Join(home, "bin", name))
+			filepath.Join(home, "bin", name),
 		}
 		for _, c := range candidates {
 			var targets []string
@@ -99,6 +103,14 @@ func ResolveBinary(name string) string {
 			}
 		}
 	}
+	if resolved, err := exec.LookPath(name); err == nil {
+		if lfi, err := os.Lstat(resolved); err == nil && (lfi.Mode()&os.ModeSymlink != 0) {
+			if realPath, err := filepath.EvalSymlinks(resolved); err == nil {
+				return realPath
+			}
+		}
+		return resolved
+	}
 	return name
 }
 
@@ -108,10 +120,13 @@ func AugmentedEnv(base []string) []string {
 	home, _ := os.UserHomeDir()
 	var userDirs []string
 	if home != "" {
-		userDirs = append(userDirs, filepath.Join(home, ".local", "bin"), filepath.Join(home, "brew", "bin"), filepath.Join(home, "brew", "sbin"))
-		if runtime.GOOS == "windows" {
-			userDirs = append(userDirs, filepath.Join(home, "bin"))
-		}
+		userDirs = append(userDirs,
+			filepath.Join(home, ".iazio", "bin"),
+			filepath.Join(home, ".local", "bin"),
+			filepath.Join(home, "bin"),
+			filepath.Join(home, "brew", "bin"),
+			filepath.Join(home, "brew", "sbin"),
+		)
 	}
 	if runtime.GOOS == "darwin" {
 		userDirs = append(userDirs, "/opt/homebrew/bin", "/usr/local/bin")

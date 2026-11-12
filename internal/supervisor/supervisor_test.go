@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -281,6 +282,22 @@ func TestResolveBinaryAndAugmentedEnv(t *testing.T) {
 	abs := "/usr/bin/echo"
 	if got := ResolveBinary(abs); got != abs {
 		t.Fatalf("ResolveBinary(%q) = %q, want %q", abs, got, abs)
+	}
+
+	// Canonical ~/.iazio/bin resolution even when not on PATH
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
+	t.Setenv("IAZIO_HARNESS_BIN", "")
+	iazioBin := filepath.Join(tmpHome, ".iazio", "bin")
+	_ = os.MkdirAll(iazioBin, 0o755)
+	binFile := filepath.Join(iazioBin, "iazio-harness")
+	if runtime.GOOS == "windows" {
+		binFile += ".exe"
+	}
+	_ = os.WriteFile(binFile, []byte("binary"), 0o755)
+	if got := ResolveBinary("iazio-harness"); got != binFile {
+		t.Fatalf("ResolveBinary(iazio-harness) = %q, want %q", got, binFile)
 	}
 
 	// AugmentedEnv sets PATH with user dirs
