@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -774,6 +775,16 @@ func sanitizeSingleDirEphemeralArtifacts(ctx context.Context, dir string) []stri
 	for _, rel := range []string{".session_story_id", "cov_auth"} {
 		if cleanOrRestoreSingleArtifact(ctx, dir, rel) {
 			record(rel)
+		}
+	}
+
+	syncFailedMarker := filepath.Join(dir, ".iazio", "post-ase-sync-failed")
+	if b, rErr := os.ReadFile(syncFailedMarker); rErr == nil {
+		lower := strings.ToLower(strings.TrimSpace(string(b)))
+		if lower == "" || strings.Contains(lower, strings.ToLower(repolock.ErrJobDeferredText)) || strings.Contains(lower, "queued/deferred") {
+			if os.Remove(syncFailedMarker) == nil {
+				record(".iazio/post-ase-sync-failed")
+			}
 		}
 	}
 
@@ -1868,8 +1879,16 @@ func DefaultAgyEscalation(ctx context.Context, repoPath, prompt, diagnosticOutpu
 	}
 	escCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
-	cmd := procutil.CommandContext(escCtx, harnessBin, "prompt", "run", "--agent", "agy", "--cwd", repoPath, "--prompt", fullPrompt, "--json")
+	payloadBytes, _ := json.Marshal(map[string]any{
+		"prompt_id":     fmt.Sprintf("git-update-agy-%d", time.Now().UnixNano()),
+		"prompt":        fullPrompt,
+		"target_agent":  "agy",
+		"repo":          repoPath,
+		"worktree_path": repoPath,
+	})
+	cmd := procutil.CommandContext(escCtx, harnessBin, "prompt", "run", "--json")
 	cmd.Dir = repoPath
+	cmd.Stdin = bytes.NewReader(payloadBytes)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
@@ -2137,6 +2156,7 @@ func (m *RepoStateMonitor) UpdateAndRemediateWorktree(ctx context.Context, item 
 	res.FinalState = st
 
 	if step1Err == nil && isCleanOnMainSynced(st) {
+		_ = os.Remove(filepath.Join(cleanPath, ".iazio", "post-ase-sync-failed"))
 		res.Stage1Success = true
 		m.mu.Lock()
 		delete(m.agyCooldowns, cleanPath)
@@ -2208,6 +2228,7 @@ func (m *RepoStateMonitor) UpdateAndRemediateWorktree(ctx context.Context, item 
 	res.FinalState = stAfter
 
 	if step2Err == nil && isCleanOnMainSynced(stAfter) {
+		_ = os.Remove(filepath.Join(cleanPath, ".iazio", "post-ase-sync-failed"))
 		res.Stage2Success = true
 		m.mu.Lock()
 		delete(m.agyCooldowns, cleanPath)

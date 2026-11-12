@@ -55,6 +55,7 @@ func SanitizeWorkspace(ctx context.Context, workspacePath string) (*WorkspaceSan
 	if workspacePath == "" {
 		return res, nil
 	}
+	_ = os.Remove(filepath.Join(workspacePath, iazioDirName, "post-ase-sync-failed"))
 
 	gitDir := filepath.Join(workspacePath, ".git")
 	fi, err := os.Stat(gitDir)
@@ -443,6 +444,7 @@ func ResetAndSanitizeFreshWorkspace(ctx context.Context, workspacePath, jobID st
 	if workspacePath == "" {
 		return res, nil
 	}
+	_ = os.Remove(filepath.Join(workspacePath, iazioDirName, "post-ase-sync-failed"))
 
 	var requestedBranch string
 	if len(targetBranch) > 0 {

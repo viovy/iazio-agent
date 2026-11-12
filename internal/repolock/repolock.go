@@ -21,6 +21,9 @@ var (
 	ErrLockAcquisitionFailed = errors.New("failed to acquire repository file lock")
 )
 
+// ErrJobDeferredText is the canonical substring emitted when a tool update is deferred/queued.
+const ErrJobDeferredText = "tool update queued/deferred"
+
 // LockInfo describes the active or last recorded job holding a repository worktree.
 type LockInfo struct {
 	JobID          string    `json:"job_id"`
@@ -601,9 +604,17 @@ func IsWorktreeCleanForNewJob(worktree string, allowedStoryID ...string) (bool, 
 			}
 		}
 	}
-	// Check for post-ase-sync-failed quarantine marker (Rule B90 §2)
-	if _, err := os.Stat(filepath.Join(worktree, ".iazio", "post-ase-sync-failed")); err == nil {
-		return false, "quarantined: post-ASE tool update or codebase synchronization failed"
+	// Check for post-ase-sync-failed quarantine marker (Rule B90 §2).
+	// Auto-clear false-positive markers written when a post-ASE tool update was merely deferred/queued
+	// while an execution lease was still held ("tool update queued/deferred").
+	syncFailedMarker := filepath.Join(worktree, ".iazio", "post-ase-sync-failed")
+	if markerBytes, err := os.ReadFile(syncFailedMarker); err == nil {
+		markerText := strings.ToLower(strings.TrimSpace(string(markerBytes)))
+		if markerText == "" || strings.Contains(markerText, strings.ToLower(ErrJobDeferredText)) || strings.Contains(markerText, "queued/deferred") {
+			_ = os.Remove(syncFailedMarker)
+		} else {
+			return false, "quarantined: post-ASE tool update or codebase synchronization failed"
+		}
 	}
 	// Check if this is a git worktree
 	if _, err := os.Stat(filepath.Join(worktree, ".git")); err != nil {

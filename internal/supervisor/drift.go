@@ -199,6 +199,20 @@ func FindOutdatedTools(
 		if curVer == "" && strings.HasPrefix(installDir, "/") {
 			curVer = inspectVersion(strings.TrimRight(installDir, "/") + "/" + binName)
 		}
+		if curVer == "" {
+			cleanInstall := filepath.Clean(installDir)
+			if strings.EqualFold(filepath.Base(cleanInstall), "bin") {
+				parentDir := filepath.Dir(cleanInstall)
+				if strings.EqualFold(filepath.Base(parentDir), ".local") {
+					homeDir := filepath.Dir(parentDir)
+					if homeDir != "" && homeDir != "." && homeDir != parentDir {
+						curVer = inspectVersion(filepath.Join(homeDir, "bin", binName))
+					}
+				} else if parentDir != "" && parentDir != "." && parentDir != cleanInstall {
+					curVer = inspectVersion(filepath.Join(parentDir, ".local", "bin", binName))
+				}
+			}
+		}
 
 		targetVer := tool.TargetVersion
 		if targetVer == "" || targetVer == "latest" {
