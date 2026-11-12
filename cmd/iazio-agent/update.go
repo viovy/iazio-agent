@@ -738,7 +738,8 @@ func evalDryRunTool(
 			}
 		}
 	}
-	curVer := inventory.InspectInstalledVersion(destPath)
+	destVer := inventory.InspectInstalledVersion(destPath)
+	curVer := destVer
 	if curVer == "" && existingShadowPath != "" {
 		curVer = inventory.InspectInstalledVersion(existingShadowPath)
 	}
@@ -817,7 +818,8 @@ func updateSingleTool(
 			}
 		}
 	}
-	curVer := inventory.InspectInstalledVersion(destPath)
+	destVer := inventory.InspectInstalledVersion(destPath)
+	curVer := destVer
 	if curVer == "" && existingShadowPath != "" {
 		curVer = inventory.InspectInstalledVersion(existingShadowPath)
 	}
@@ -858,7 +860,7 @@ func updateSingleTool(
 
 	latestVer := strings.TrimPrefix(rel.TagName, "v")
 	upToDate, isOverride := evaluateReleaseAgainstInstalled(curVer, latestVer)
-	if upToDate && !force {
+	if upToDate && destVer != "" && !force {
 		fmt.Fprintf(stdout, "  [=] %s: %s (up-to-date)\n", tool.Name, latestVer)
 		return false, nil
 	}

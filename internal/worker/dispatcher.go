@@ -928,7 +928,7 @@ func (d *Dispatcher) isHostMaintenanceActive() bool {
 	return false
 }
 
-func (d *Dispatcher) checkPreClaimBarrier(ctx context.Context) (ClaimRequest, bool) {
+func (d *Dispatcher) checkPreClaimBarrier(ctx context.Context, cachedIdle ...[]string) (ClaimRequest, bool) {
 	if d.isHostMaintenanceActive() {
 		return ClaimRequest{}, false
 	}
@@ -952,8 +952,14 @@ func (d *Dispatcher) checkPreClaimBarrier(ctx context.Context) (ClaimRequest, bo
 		JobTypes: d.jobTypes,
 	}
 	if d.idleWorktreesProvider != nil {
+		var rawIdle []string
+		if len(cachedIdle) > 0 && cachedIdle[0] != nil {
+			rawIdle = cachedIdle[0]
+		} else {
+			rawIdle = d.idleWorktreesProvider()
+		}
 		var idle []string
-		for _, wt := range d.idleWorktreesProvider() {
+		for _, wt := range rawIdle {
 			if trimmed := strings.TrimSpace(wt); trimmed != "" && !d.IsWorktreeInFlight(trimmed) {
 				idle = append(idle, trimmed)
 			}
@@ -1108,30 +1114,72 @@ func (d *Dispatcher) acquireWorktreeRepoLock(ctx context.Context, job *Job, work
 	return h, true
 }
 
+// PollAndDispatchConcurrent claims and reserves jobs sequentially while dispatching
+// their execution concurrently across available idle worktrees on this host.
+func (d *Dispatcher) PollAndDispatchConcurrent(ctx context.Context, wg *sync.WaitGroup) (int, error) {
+	dispatched := 0
+	var cachedIdle []string
+	for {
+		if ctx.Err() != nil {
+			break
+		}
+		runJob, remainingIdle, err := d.claimAndReserveJob(ctx, cachedIdle)
+		if err != nil {
+			return dispatched, err
+		}
+		if runJob == nil {
+			break
+		}
+		dispatched++
+		if wg != nil {
+			wg.Add(1)
+		}
+		go func(fn func() error) {
+			if wg != nil {
+				defer wg.Done()
+			}
+			_ = fn()
+		}(runJob)
+		if len(remainingIdle) == 0 {
+			break
+		}
+		cachedIdle = remainingIdle
+	}
+	return dispatched, nil
+}
+
 // PollAndProcess claims one job and processes it. Returns (true, err) if a job was processed,
 // or (false, nil) if no job was available.
 func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr error) {
+	runJob, _, err := d.claimAndReserveJob(ctx)
+	if err != nil || runJob == nil {
+		return false, err
+	}
+	return true, runJob()
+}
+
+func (d *Dispatcher) claimAndReserveJob(ctx context.Context, cachedIdle ...[]string) (func() error, []string, error) {
 	if d.client == nil {
-		return false, errors.New("control plane client not configured")
+		return nil, nil, errors.New("control plane client not configured")
 	}
 	if d.invoker == nil {
-		return false, errors.New("harness invoker not configured")
+		return nil, nil, errors.New("harness invoker not configured")
 	}
 
 	unlockClaim := d.lockClaim()
 	defer unlockClaim()
 
-	claimReq, canClaim := d.checkPreClaimBarrier(ctx)
+	claimReq, canClaim := d.checkPreClaimBarrier(ctx, cachedIdle...)
 	if !canClaim {
-		return false, nil
+		return nil, nil, nil
 	}
 
 	job, err := d.client.ClaimJob(ctx, claimReq)
 	if err != nil {
-		return false, fmt.Errorf("claim job failed: %w", err)
+		return nil, nil, fmt.Errorf("claim job failed: %w", err)
 	}
 	if job == nil {
-		return false, nil
+		return nil, nil, nil
 	}
 
 	var spanOpts []telemetry.SpanOption
@@ -1145,14 +1193,6 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 		telemetry.WithTag("job.target_agent", job.TargetAgent),
 	)
 	ctx, span := telemetry.StartSpan(ctx, "dispatcher.processJob", spanOpts...)
-	defer func() {
-		if retErr != nil && span != nil {
-			span.SetError(retErr)
-		}
-		if span != nil {
-			span.End()
-		}
-	}()
 
 	worktreeDir, invoker := d.resolveJobWorktree(job)
 	if (worktreeDir == "" || worktreeDir == ".") && d.worktreeResolver != nil {
@@ -1163,13 +1203,29 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 					invoker = invoker.WithWorkDir(job.Repo)
 				} else {
 					errMsg := fmt.Sprintf("ERR_WORKSPACE_NOT_FOUND: requested repo %q cannot be resolved to any existing workspace on host %s", job.Repo, d.hostID)
-					_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: errMsg})
-					return true, fmt.Errorf("%s", errMsg)
+					return func() error {
+						defer func() {
+							if span != nil {
+								span.SetError(errors.New(errMsg))
+								span.End()
+							}
+						}()
+						_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: errMsg})
+						return fmt.Errorf("%s", errMsg)
+					}, nil, nil
 				}
 			} else {
 				errMsg := fmt.Sprintf("ERR_WORKSPACE_NOT_FOUND: requested repo %q cannot be resolved to any existing workspace on host %s", job.Repo, d.hostID)
-				_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: errMsg})
-				return true, fmt.Errorf("%s", errMsg)
+				return func() error {
+					defer func() {
+						if span != nil {
+							span.SetError(errors.New(errMsg))
+							span.End()
+						}
+					}()
+					_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: errMsg})
+					return fmt.Errorf("%s", errMsg)
+				}, nil, nil
 			}
 		}
 	}
@@ -1186,9 +1242,11 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 	if !d.tryReserveInFlightWorktree(job.ID, worktreeDir) {
 		fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: worktree %s already in-flight\n", job.ID, worktreeDir)
 		_ = d.declineJob(ctx, job.ID, reasonRepoBusy)
-		return false, nil
+		if span != nil {
+			span.End()
+		}
+		return nil, nil, nil
 	}
-	defer d.clearInFlightWorktree(job.ID)
 
 	var relGateLease func()
 	if d.hostGate != nil && (job.Type == JobTypeStoryCreate || job.Type == JobTypeStoryExecute || job.Type == JobTypePromptExecute) {
@@ -1199,16 +1257,22 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 			if job.LeaseToken != "" || (worktreeDir != "" && worktreeDir != ".") {
 				fmt.Fprintf(os.Stderr, "[dispatcher] declining job %s: hostGate lease error: %v\n", job.ID, leaseErr)
 				_ = d.declineJob(ctx, job.ID, reasonRepoBusy)
-				return false, nil
+				if span != nil {
+					span.End()
+				}
+				return nil, nil, nil
 			}
-			_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: leaseErr.Error()})
-			return true, leaseErr
+			return func() error {
+				defer func() {
+					if span != nil {
+						span.SetError(leaseErr)
+						span.End()
+					}
+				}()
+				_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: leaseErr.Error()})
+				return leaseErr
+			}, nil, nil
 		}
-		defer func() {
-			if relGateLease != nil {
-				relGateLease()
-			}
-		}()
 	}
 
 	resolvedConvID := job.ResolvedConversationID()
@@ -1224,18 +1288,46 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 			relGateLease = nil
 		}
 		d.clearInFlightWorktree(job.ID)
-		return false, nil
+		if span != nil {
+			span.End()
+		}
+		return nil, nil, nil
 	}
-	if repoLockHandle != nil {
-		defer func() {
-			_ = repoLockHandle.Release()
-		}()
-	}
-	// Release claim mutex once the worktree, hostGate lease, and OS repo lock are reserved for this job.
-	unlockClaim()
 
 	d.setActiveJob(job.ID, worktreeDir, os.Getpid())
-	defer d.clearActiveJob(job.ID)
+
+	var remainingIdle []string
+	cleanReserved := normalizeWorktreeKey(worktreeDir)
+	for _, wt := range claimReq.IdleWorktrees {
+		if normalizeWorktreeKey(wt) != cleanReserved && !d.IsWorktreeInFlight(wt) {
+			remainingIdle = append(remainingIdle, wt)
+		}
+	}
+
+	// Release claim mutex once the worktree, hostGate lease, OS repo lock, and activeJobs entry are reserved for this job.
+	unlockClaim()
+
+	return func() (retErr error) {
+		defer func() {
+			if retErr != nil && span != nil {
+				span.SetError(retErr)
+			}
+			if span != nil {
+				span.End()
+			}
+		}()
+		defer d.clearInFlightWorktree(job.ID)
+		defer func() {
+			if relGateLease != nil {
+				relGateLease()
+			}
+		}()
+		if repoLockHandle != nil {
+			defer func() {
+				_ = repoLockHandle.Release()
+			}()
+		}
+		defer d.clearActiveJob(job.ID)
 
 	// Phase 2 of Two-Phase Lease Handshake: Acknowledge lease immediately after local worktree reservation
 	// (before potentially long-running 52-submodule workspace sanitization or preDispatchHook) so the 20s
@@ -1417,7 +1509,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 				FinalTurnCount:        finalTurns,
 				FinalTranscriptSHA256: finalSHA,
 			})
-			return true, err
+			return err
 		}
 		resBytes, _ := json.Marshal(res)
 		compErr := d.client.CompleteJob(ctx, job.ID, CompleteRequest{
@@ -1435,7 +1527,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 				d.syncer.TriggerRepoSync(targetRepo)
 			}
 		}
-		return true, compErr
+		return compErr
 
 	case JobTypePromptExecute, JobTypeStoryExecute:
 		toolName := job.TargetAgent
@@ -1642,7 +1734,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 					Timestamp:        time.Now().UTC().Format(time.RFC3339),
 				}
 				if foErr := d.client.FailoverJob(ctx, job.ID, attemptReq); foErr == nil {
-					return true, err
+					return err
 				}
 			}
 			finalTurns, finalSHA := d.flushConversationHarvest(ctx, job, extractConversationIDFromResult(res)...)
@@ -1657,7 +1749,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 				FinalTurnCount:        finalTurns,
 				FinalTranscriptSHA256: finalSHA,
 			})
-			return true, err
+			return err
 		}
 		_, gateSpan := telemetry.StartSpan(ctx, "agent.ase_completion_gate",
 			telemetry.WithTag("job.id", job.ID),
@@ -1749,7 +1841,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 				FinalTurnCount:        finalTurns,
 				FinalTranscriptSHA256: finalSHA,
 			})
-			return true, aseGateErr
+			return aseGateErr
 		}
 		if isASEJob(job) && worktreeDir != "" && worktreeDir != "." {
 			_ = os.Remove(filepath.Join(worktreeDir, ".session_story_id"))
@@ -1764,6 +1856,14 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 			targetRepo = res.Repo
 		}
 		if isASEJob(job) {
+			// Release this job's active execution tracking and hostGate lease before running the
+			// post-ASE tool update so single-job hosts can immediately acquire the maintenance lease
+			// instead of self-deferring against the finishing job itself.
+			d.clearActiveJob(job.ID)
+			if relGateLease != nil {
+				relGateLease()
+				relGateLease = nil
+			}
 			var postAseSyncErr error
 			if d.toolUpdater != nil {
 				_, tuSpan := telemetry.StartSpan(ctx, "agent.ase_tool_update",
@@ -1774,12 +1874,18 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 				tuErr := d.toolUpdater(updateCtx, nil, false)
 				cancelUpdate()
 				if tuErr != nil {
-					postAseSyncErr = fmt.Errorf("tool update failed: %w", tuErr)
-					if tuSpan != nil {
-						tuSpan.SetTag("error", "true")
-						tuSpan.SetTag("error.message", tuErr.Error())
+					if errors.Is(tuErr, ErrJobDeferred) {
+						if tuSpan != nil {
+							tuSpan.SetTag("result", "deferred")
+						}
+					} else {
+						postAseSyncErr = fmt.Errorf("tool update failed: %w", tuErr)
+						if tuSpan != nil {
+							tuSpan.SetTag("error", "true")
+							tuSpan.SetTag("error.message", tuErr.Error())
+						}
+						fmt.Fprintf(os.Stderr, "[dispatcher] warning: post-ASE tool update failed for job %s: %v\n", job.ID, tuErr)
 					}
-					fmt.Fprintf(os.Stderr, "[dispatcher] warning: post-ASE tool update failed for job %s: %v\n", job.ID, tuErr)
 				}
 				if tuSpan != nil {
 					tuSpan.End()
@@ -1836,7 +1942,7 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 		if compErr == nil && !isASEJob(job) && d.syncer != nil && targetRepo != "" {
 			d.syncer.TriggerRepoSync(targetRepo)
 		}
-		return true, compErr
+		return compErr
 
 	case JobTypeToolsUpdate:
 		start := time.Now()
@@ -1853,10 +1959,10 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 						FencingToken: job.FencingToken,
 						Result:       json.RawMessage(`{"status":"queued","deferred":true,"message":"tool update queued for execution when harness is idle","summary":"Tool update queued for execution when harness is idle"}`),
 					})
-					return true, compErr
+					return compErr
 				}
 				_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: err.Error()})
-				return true, err
+				return err
 			}
 		}
 		elapsedSec := int64(time.Since(start).Seconds())
@@ -1885,13 +1991,14 @@ func (d *Dispatcher) PollAndProcess(ctx context.Context) (processed bool, retErr
 			FencingToken: job.FencingToken,
 			Result:       resPayload,
 		})
-		return true, compErr
+		return compErr
 
 	default:
 		unsupportedErr := fmt.Sprintf("unsupported job type: %s", job.Type)
 		_ = d.client.CompleteJob(ctx, job.ID, CompleteRequest{FencingToken: job.FencingToken, Error: unsupportedErr})
-		return true, errors.New(unsupportedErr)
+		return errors.New(unsupportedErr)
 	}
+	}, remainingIdle, nil
 }
 
 // EnsurePromptID ensures that a prompt payload JSON contains a valid prompt_id field.

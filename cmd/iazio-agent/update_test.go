@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-agent/internal/service"
+	"github.com/viovy/iazio-agent/internal/supervisor"
 )
 
 func TestVerifyChecksum(t *testing.T) {
@@ -2632,5 +2633,33 @@ func TestParseUpdateFlags_PositionalToolNames(t *testing.T) {
 		t.Errorf("expected TargetTools [autopilot-ai-conformance, iazio-harvester], got: %+v", opts.TargetTools)
 	}
 }
+
+func TestBuildInspectOutdatedHook_FiltersBackedOffTools(t *testing.T) {
+	manifest := &supervisor.FleetManifest{
+		Tools: []supervisor.ManifestTool{
+			{Name: "autopilot-backlog", BinaryName: "autopilot-backlog", TargetVersion: "0.0.610"},
+		},
+	}
+	fetcher := &stubDriftFetcher{manifest: manifest}
+	binDir := t.TempDir()
+
+	hook := buildInspectOutdatedHook(
+		true,
+		fetcher,
+		func(*supervisor.FleetManifest) string { return binDir },
+		"windows",
+		func(tool string) bool {
+			return strings.EqualFold(tool, "autopilot-backlog")
+		},
+	)
+	outdated, err := hook(context.Background())
+	if err != nil {
+		t.Fatalf("buildInspectOutdatedHook error: %v", err)
+	}
+	if len(outdated) != 0 {
+		t.Fatalf("expected backed-off tool autopilot-backlog to be filtered from InspectOutdatedTools, got %+v", outdated)
+	}
+}
+
 
 

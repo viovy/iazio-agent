@@ -811,6 +811,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 					driftFetcher,
 					getInstallRoots,
 					runtime.GOOS,
+					isToolInBackoff,
 				)
 			}
 
@@ -1556,12 +1557,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 						case <-runCtx.Done():
 							return
 						case <-pollTicker.C:
-							for {
-								processed, err := disp.PollAndProcess(runCtx)
-								if err != nil || !processed || runCtx.Err() != nil {
-									break
-								}
-							}
+							_, _ = disp.PollAndDispatchConcurrent(runCtx, &bgWG)
 						}
 					}
 				}()
@@ -3932,6 +3928,7 @@ func healGitRepo(ctx context.Context, repoPath string) {
 	_ = os.Remove(filepath.Join(cleanRepo, ".autopilot", "state.json"))
 	_ = os.Remove(filepath.Join(cleanRepo, ".autopilot", "ase-state.json"))
 	_ = os.Remove(filepath.Join(cleanRepo, ".session_story_id"))
+	_ = os.Remove(filepath.Join(cleanRepo, ".iazio", "post-ase-sync-failed"))
 	if matches, err := filepath.Glob(filepath.Join(cleanRepo, "tmp", "ase-resume-*.json")); err == nil {
 		for _, m := range matches {
 			_ = os.Remove(m)
@@ -4453,7 +4450,12 @@ func buildInspectOutdatedHook(
 	driftFetcher supervisor.DriftFetcher,
 	getInstallRoots func(*supervisor.FleetManifest) string,
 	targetOS string,
+	isToolInBackoff ...func(string) bool,
 ) func(context.Context) ([]supervisor.OutdatedToolInfo, error) {
+	var backoffFn func(string) bool
+	if len(isToolInBackoff) > 0 {
+		backoffFn = isToolInBackoff[0]
+	}
 	return func(ctx context.Context) ([]supervisor.OutdatedToolInfo, error) {
 		if driftFetcher == nil {
 			return nil, nil
@@ -4462,6 +4464,16 @@ func buildInspectOutdatedHook(
 		if err != nil {
 			return nil, err
 		}
+		activeTools := make([]supervisor.ManifestTool, 0, len(manifest.Tools))
+		for _, t := range manifest.Tools {
+			if backoffFn != nil && (backoffFn(t.Name) || backoffFn(t.BinaryName)) {
+				continue
+			}
+			activeTools = append(activeTools, t)
+		}
+		activeManifest := *manifest
+		activeManifest.Tools = activeTools
+
 		var binDir string
 		if getInstallRoots != nil {
 			binDir = getInstallRoots(manifest)
@@ -4470,7 +4482,7 @@ func buildInspectOutdatedHook(
 		if !updateSuite {
 			checkTools = []string{"iazio-agent"}
 		}
-		return supervisor.FindOutdatedTools(manifest, inventory.InspectInstalledVersion, binDir, checkTools, targetOS)
+		return supervisor.FindOutdatedTools(&activeManifest, inventory.InspectInstalledVersion, binDir, checkTools, targetOS)
 	}
 }
 
