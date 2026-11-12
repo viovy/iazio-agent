@@ -545,4 +545,106 @@ func TestVerify_StampHEADBoundVerification(t *testing.T) {
 	if !resMatch.Passed || !resMatch.TestsPassed || !resMatch.ReleaseVerified {
 		t.Fatalf("expected matching HEAD SHA in stamp files to pass, got %+v", resMatch)
 	}
+
+	// 4. Non-empty stamp file without a commit SHA fails closed (P1-IAZIO-05)
+	_ = os.WriteFile(testStamp, []byte("status=ok\n"), 0644)
+	_ = os.WriteFile(relStamp, []byte("verified\n"), 0644)
+	resNoSHA := Verify(GateOptions{
+		WorktreePath:           tmpDir,
+		RequireTestsPassed:     true,
+		RequireReleaseVerified: true,
+		GitRunner:              mockGit,
+	})
+	if resNoSHA.Passed || resNoSHA.TestsPassed || resNoSHA.ReleaseVerified {
+		t.Fatalf("expected stamp files without commit SHA to fail closed, got %+v", resNoSHA)
+	}
+}
+
+func TestVerify_UnmergedFeatureBranchFailsClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+	mockGit := func(args ...string) (string, error) {
+		switch args[0] {
+		case "status":
+			return "", nil
+		case "rev-parse":
+			return "feat/gov-5258-unmerged", nil
+		case "submodule":
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+
+	res := Verify(GateOptions{
+		WorktreePath: tmpDir,
+		GitRunner:    mockGit,
+	})
+	if res.Passed || res.BranchClean {
+		t.Fatalf("expected unmerged feature branch to fail BranchClean, got %+v", res)
+	}
+}
+
+func TestVerify_ADR002AutopilotStateAndSubstringBoundary(t *testing.T) {
+	mockGit := func(args ...string) (string, error) {
+		switch args[0] {
+		case "status":
+			return "", nil
+		case "rev-parse":
+			return "main", nil
+		case "submodule":
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+
+	// 1. Substring prefix STORY-GOV-12 must NOT false-match 2026-10-25-gov-123-other.story.md
+	tmpDir := t.TempDir()
+	storiesDir := filepath.Join(tmpDir, "docs", "stories")
+	if err := os.MkdirAll(storiesDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	otherStory := filepath.Join(storiesDir, "2026-10-25-gov-123-other.story.md")
+	if err := os.WriteFile(otherStory, []byte("---\nid: STORY-GOV-123\nstatus: DONE\n---\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	resSubstr := Verify(GateOptions{
+		WorktreePath: tmpDir,
+		StoryID:      "STORY-GOV-12",
+		GitRunner:    mockGit,
+	})
+	if resSubstr.Passed || resSubstr.StoryDone {
+		t.Fatalf("expected STORY-GOV-12 not to false-match STORY-GOV-123, got %+v", resSubstr)
+	}
+
+	// 2. ADR-002 .autopilot/ase-state.json in OSS leaf worktree without docs/stories/
+	ossDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(ossDir, ".autopilot"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	stateFile := filepath.Join(ossDir, ".autopilot", "ase-state.json")
+	if err := os.WriteFile(stateFile, []byte(`{"story_id":"STORY-GOV-5258","status":"IN_PROGRESS"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	resInProg := Verify(GateOptions{
+		WorktreePath: ossDir,
+		StoryID:      "STORY-GOV-5258",
+		GitRunner:    mockGit,
+	})
+	if resInProg.Passed || resInProg.StoryDone {
+		t.Fatalf("expected IN_PROGRESS .autopilot/ase-state.json to fail closed, got %+v", resInProg)
+	}
+
+	if err := os.WriteFile(stateFile, []byte(`{"story_id":"STORY-GOV-5258","status":"DONE"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	resDone := Verify(GateOptions{
+		WorktreePath: ossDir,
+		StoryID:      "STORY-GOV-5258",
+		GitRunner:    mockGit,
+	})
+	if !resDone.Passed || !resDone.StoryDone {
+		t.Fatalf("expected DONE .autopilot/ase-state.json to pass StoryDone, got %+v", resDone)
+	}
 }

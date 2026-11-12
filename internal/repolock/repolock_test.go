@@ -255,16 +255,108 @@ func TestForceRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Acquire failed: %v", err)
 	}
+
+	// While OS lock is actively held, ForceRelease must fail closed with ErrRepoBusy
+	if err := ForceRelease(wt); !errors.Is(err, ErrRepoBusy) {
+		_ = handle.Release()
+		t.Fatalf("expected ForceRelease to return ErrRepoBusy while OS lock held, got: %v", err)
+	}
+
 	_ = handle.Release()
 
 	if err := ForceRelease(wt); err != nil {
-		t.Fatalf("ForceRelease failed: %v", err)
+		t.Fatalf("ForceRelease failed after Release: %v", err)
 	}
 
 	_, readErr := Read(wt)
 	if readErr == nil {
 		t.Fatalf("expected Read to fail after ForceRelease")
 	}
+
+	// Verify .iazio/repo.lock.flock remains on disk to prevent Unix inode replacement bypass
+	if _, statErr := os.Stat(filepath.Join(wt, ".iazio", "repo.lock.flock")); statErr != nil {
+		t.Fatalf("expected .iazio/repo.lock.flock to remain on disk after ForceRelease, got: %v", statErr)
+	}
+}
+
+func TestHelperProcessHoldRepoLock(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_REPO_LOCK") != "1" {
+		return
+	}
+	wt := os.Getenv("GO_HELPER_REPO_LOCK_WT")
+	h, err := Acquire(wt, LockInfo{
+		JobID: "helper-job",
+		PID:   os.Getpid(),
+	}, func(int) bool { return true })
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "helper Acquire failed: %v\n", err)
+		os.Exit(2)
+	}
+	_, _ = fmt.Fprintln(os.Stdout, "LOCKED")
+	buf := make([]byte, 1)
+	_, _ = os.Stdin.Read(buf)
+	_ = h.Release()
+	os.Exit(0)
+}
+
+func TestAcquire_CrossProcessLockContention(t *testing.T) {
+	wt := t.TempDir()
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcessHoldRepoLock$")
+	cmd.Env = append(os.Environ(),
+		"GO_WANT_HELPER_REPO_LOCK=1",
+		"GO_HELPER_REPO_LOCK_WT="+wt,
+	)
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("StdinPipe: %v", err)
+	}
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start helper: %v", err)
+	}
+	defer func() {
+		_ = stdinPipe.Close()
+		_ = cmd.Wait()
+	}()
+
+	readyBuf := make([]byte, 64)
+	n, rErr := stdoutPipe.Read(readyBuf)
+	if rErr != nil || !strings.Contains(string(readyBuf[:n]), "LOCKED") {
+		t.Fatalf("helper did not signal LOCKED: err=%v out=%q", rErr, string(readyBuf[:n]))
+	}
+
+	// Attempt Acquire from parent process with isAlive=false to prove OS-level LockFileEx/flock enforcement
+	_, err = Acquire(wt, LockInfo{
+		JobID: "parent-contender",
+		PID:   os.Getpid(),
+	}, func(int) bool { return false })
+	if !errors.Is(err, ErrRepoBusy) {
+		t.Fatalf("expected ErrRepoBusy from cross-process OS lock contention, got: %v", err)
+	}
+
+	// ForceRelease must also refuse while child process holds the OS lock
+	if fErr := ForceRelease(wt); !errors.Is(fErr, ErrRepoBusy) {
+		t.Fatalf("expected ForceRelease to return ErrRepoBusy while child holds OS lock, got: %v", fErr)
+	}
+
+	// Release child process and verify parent can now acquire
+	_ = stdinPipe.Close()
+	if wErr := cmd.Wait(); wErr != nil {
+		t.Fatalf("helper wait failed: %v", wErr)
+	}
+
+	parentHandle, err := Acquire(wt, LockInfo{
+		JobID: "parent-after-child-release",
+		PID:   os.Getpid(),
+	}, func(int) bool { return true })
+	if err != nil {
+		t.Fatalf("expected Acquire to succeed after child released OS lock, got: %v", err)
+	}
+	_ = parentHandle.Release()
 }
 
 func TestTryLockFileAndUnlockFile_DirectOSExclusivity(t *testing.T) {
@@ -361,7 +453,7 @@ func TestWriteLockFileAtomic_ConcurrentReadNeverSeesPartialJSON(t *testing.T) {
 
 	done := make(chan struct{})
 	var readerWG sync.WaitGroup
-	errCh := make(chan error, readers)
+	errCh := make(chan error, readers+writers)
 
 	for r := 0; r < readers; r++ {
 		readerWG.Add(1)
@@ -616,7 +708,7 @@ func TestIsWorktreeCleanForNewJob_And_UnpushedCommits(t *testing.T) {
 		t.Fatalf("expected unpushed commit to block new job, got clean=%v reason=%s", clean, reason)
 	}
 
-	// 7. Verify isStoryDone YAML frontmatter parsing precision (finding F7)
+	// 7. Verify isStoryDone YAML frontmatter parsing precision (finding F7) and ADR-002 .autopilot/ase-state.json
 	storyDir := filepath.Join(repoDir, "docs", "stories")
 	_ = os.MkdirAll(storyDir, 0o755)
 	// Story 2 is DONE, and its markdown body mentions STORY-TEST-1
@@ -627,6 +719,22 @@ func TestIsWorktreeCleanForNewJob_And_UnpushedCommits(t *testing.T) {
 	}
 	if !isStoryDone(repoDir, "STORY-TEST-2") {
 		t.Fatal("expected isStoryDone to return true for STORY-TEST-2")
+	}
+	// Substring prefix STORY-TEST-20 vs STORY-TEST-2 must NOT false-match
+	story20File := filepath.Join(storyDir, "2026-11-09-test-20.story.md")
+	_ = os.WriteFile(story20File, []byte("---\nid: STORY-TEST-20\nstatus: DONE\n---\n"), 0o644)
+	if isStoryDone(repoDir, "STORY-TEST-200") {
+		t.Fatal("expected isStoryDone to return false for substring prefix mismatch")
+	}
+	// ADR-002: .autopilot/ase-state.json marks story DONE in OSS leaf worktrees without docs/stories/
+	ossDir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(ossDir, ".autopilot"), 0o755)
+	_ = os.WriteFile(filepath.Join(ossDir, ".autopilot", "ase-state.json"), []byte(`{"story_id":"STORY-GOV-5258","status":"DONE"}`), 0o644)
+	if !isStoryDone(ossDir, "STORY-GOV-5258") {
+		t.Fatal("expected isStoryDone to return true from .autopilot/ase-state.json")
+	}
+	if isStoryDone(ossDir, "STORY-GOV-525") {
+		t.Fatal("expected isStoryDone to return false for mismatched story_id in .autopilot/ase-state.json")
 	}
 
 	// 8. Post-ASE sync failure quarantine marker (Rule B90 §2 / finding F1)

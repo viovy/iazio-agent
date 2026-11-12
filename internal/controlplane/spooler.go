@@ -4,6 +4,7 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +15,25 @@ import (
 	"sync"
 	"time"
 )
+
+func newSecureHTTPTransport() *http.Transport {
+	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
+		tr := base.Clone()
+		if tr.TLSClientConfig == nil {
+			tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		} else {
+			tr.TLSClientConfig = tr.TLSClientConfig.Clone()
+			if tr.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+				tr.TLSClientConfig.MinVersion = tls.VersionTLS12
+			}
+			tr.TLSClientConfig.InsecureSkipVerify = false
+		}
+		return tr
+	}
+	return &http.Transport{
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+}
 
 // SpooledRequest represents a serialized outbound HTTP report or notification buffered on disk.
 type SpooledRequest struct {
@@ -29,10 +49,45 @@ type SpooledRequest struct {
 // OfflineReportSpooler persists outbound telemetry and completion reports when the control plane is offline
 // and automatically drains them chronologically when connectivity is restored.
 type OfflineReportSpooler struct {
-	mu            sync.Mutex
-	spoolDir      string
-	client        *http.Client
-	TokenProvider func(ctx context.Context) string
+	mu                    sync.Mutex
+	tokenMu               sync.RWMutex
+	spoolDir              string
+	client                *http.Client
+	TokenProvider         func(ctx context.Context) string
+	fallbackTokenProvider func(ctx context.Context) string
+}
+
+// SetFallbackTokenProvider registers a fallback token resolver (e.g. from Client or HTTPControlPlaneClient)
+// used during Drain whenever TokenProvider is nil or returns an empty string.
+func (s *OfflineReportSpooler) SetFallbackTokenProvider(fn func(ctx context.Context) string) {
+	if s == nil || fn == nil {
+		return
+	}
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
+	if s.fallbackTokenProvider == nil {
+		s.fallbackTokenProvider = fn
+	}
+}
+
+func (s *OfflineReportSpooler) resolveBearerToken(ctx context.Context) string {
+	if s == nil {
+		return ""
+	}
+	if s.TokenProvider != nil {
+		if tok := strings.TrimSpace(s.TokenProvider(ctx)); tok != "" {
+			return tok
+		}
+	}
+	s.tokenMu.RLock()
+	fb := s.fallbackTokenProvider
+	s.tokenMu.RUnlock()
+	if fb != nil {
+		if tok := strings.TrimSpace(fb(ctx)); tok != "" {
+			return tok
+		}
+	}
+	return ""
 }
 
 // NewOfflineReportSpooler initializes a spooler rooted at spoolDir (or ~/.iazio/reports-spool by default).
@@ -48,7 +103,10 @@ func NewOfflineReportSpooler(spoolDir string, client *http.Client) (*OfflineRepo
 		return nil, fmt.Errorf("create spool dir %s: %w", spoolDir, err)
 	}
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		client = &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: newSecureHTTPTransport(),
+		}
 	}
 	return &OfflineReportSpooler{
 		spoolDir: spoolDir,
@@ -133,18 +191,15 @@ func (s *OfflineReportSpooler) Drain(ctx context.Context) (int, error) {
 		for k, v := range req.Headers {
 			httpReq.Header.Set(k, v)
 		}
-		if s.TokenProvider != nil {
-			if freshTok := strings.TrimSpace(s.TokenProvider(ctx)); freshTok != "" {
-				httpReq.Header.Set("Authorization", "Bearer "+freshTok)
-			}
+		if freshTok := s.resolveBearerToken(ctx); freshTok != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+freshTok)
 		}
 
 		resp, err := s.client.Do(httpReq)
 		if err != nil {
 			// Connection refused or network down: retain remaining spooled reports for next cycle
 			req.Attempts++
-			updated, _ := json.MarshalIndent(req, "", "  ")
-			_ = os.WriteFile(fPath, updated, 0o600)
+			_ = writeSpooledRequestAtomic(fPath, req)
 			return drainedCount, err
 		}
 		_ = resp.Body.Close()
@@ -153,11 +208,10 @@ func (s *OfflineReportSpooler) Drain(ctx context.Context) (int, error) {
 			// Successfully drained
 			_ = os.Remove(fPath)
 			drainedCount++
-		} else if IsTransientStatus(resp.StatusCode) || resp.StatusCode == http.StatusUnauthorized {
+		} else if IsTransientStatus(resp.StatusCode) || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			// Remote server overload/restarting or token awaiting refresh: stop draining, wait for next tick
 			req.Attempts++
-			updated, _ := json.MarshalIndent(req, "", "  ")
-			_ = os.WriteFile(fPath, updated, 0o600)
+			_ = writeSpooledRequestAtomic(fPath, req)
 			return drainedCount, fmt.Errorf("transient status %d", resp.StatusCode)
 		} else {
 			// Unrecoverable 4xx client error: quarantine
@@ -166,6 +220,22 @@ func (s *OfflineReportSpooler) Drain(ctx context.Context) (int, error) {
 	}
 
 	return drainedCount, nil
+}
+
+func writeSpooledRequestAtomic(fPath string, req SpooledRequest) error {
+	updated, err := json.MarshalIndent(req, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmpFile := fPath + ".tmp"
+	if err := os.WriteFile(tmpFile, updated, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpFile, fPath); err != nil {
+		_ = os.Remove(tmpFile)
+		return err
+	}
+	return nil
 }
 
 // StartAutoDrain starts a background worker that periodically drains spooled requests until ctx is done.

@@ -5,7 +5,7 @@ package main
 import (
 	"os/exec"
 
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 func createWindowsNamedMutex(_ string) (uintptr, bool, func()) {

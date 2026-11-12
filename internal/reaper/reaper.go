@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 // ReapResult summarizes orphan processes terminated and session locks released.

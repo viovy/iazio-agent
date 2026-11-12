@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 const createNoWindow = 0x08000000

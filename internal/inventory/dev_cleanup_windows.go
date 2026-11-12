@@ -7,7 +7,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 func scheduleRebootDelete(path string) {

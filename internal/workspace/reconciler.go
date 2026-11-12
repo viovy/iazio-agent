@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 // WorkspaceManifest captures non-destructive snapshot telemetry for a workspace.

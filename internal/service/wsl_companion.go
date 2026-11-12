@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 // WSLServiceStatus describes the operational state of WSL services supervised from Windows native.

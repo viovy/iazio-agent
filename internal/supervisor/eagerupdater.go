@@ -129,6 +129,15 @@ type EagerToolUpdater struct {
 	failedLastTime   map[string]time.Time
 	suiteFailCount   int
 	suiteLastFailure time.Time
+	loopWG           sync.WaitGroup
+}
+
+// Wait blocks until any background hybrid trigger loop started via StartHybridTriggerLoop has exited.
+func (u *EagerToolUpdater) Wait() {
+	if u == nil {
+		return
+	}
+	u.loopWG.Wait()
 }
 
 // NewEagerToolUpdater constructs an EagerToolUpdater.
@@ -438,7 +447,9 @@ func (u *EagerToolUpdater) StartHybridTriggerLoop(ctx context.Context, onAgentUp
 	u.mu.Lock()
 	u.onAgentUpdated = onAgentUpdated
 	u.mu.Unlock()
+	u.loopWG.Add(1)
 	go func() {
+		defer u.loopWG.Done()
 		debounceTimer := time.NewTimer(500 * time.Millisecond)
 		debounceTimer.Stop()
 		periodicTicker := time.NewTicker(90 * time.Second)

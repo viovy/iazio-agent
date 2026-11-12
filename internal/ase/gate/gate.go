@@ -2,11 +2,12 @@
 package gate
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 // GateResult captures the evaluation of all ASE completion gates.
@@ -96,14 +97,14 @@ func Verify(opts GateOptions) GateResult {
 		}
 	}
 
-	// 2. Branch cleanliness: detached HEAD check
+	// 2. Branch cleanliness: must be on main/master (not detached HEAD or unmerged feature branch)
 	branch, err := git("rev-parse", "--abbrev-ref", "HEAD")
 	if err != nil {
 		res.BranchClean = false
 		res.UnmetGates = append(res.UnmetGates, "branch_not_detached")
 	} else {
 		branch = strings.TrimSpace(branch)
-		if branch == "HEAD" {
+		if branch != "main" && branch != "master" {
 			res.BranchClean = false
 			res.UnmetGates = append(res.UnmetGates, "branch_not_detached")
 		}
@@ -188,6 +189,9 @@ func isTransientPorcelainNoise(trimmedLine string) bool {
 		return true
 	}
 	cleanP := strings.TrimSuffix(p, "/")
+	if cleanP == "tmp" || cleanP == "tmp/reports" || strings.HasPrefix(cleanP, "tmp/reports/") {
+		return true
+	}
 	for _, seg := range strings.Split(cleanP, "/") {
 		if seg == ".scannerwork" {
 			return true
@@ -207,7 +211,8 @@ func isStampValidForHEAD(stampPath string, git func(args ...string) (string, err
 	}
 	stampSHA := extractStampSHA(content)
 	if stampSHA == "" {
-		return true
+		// Fail closed: stamp files without an explicit commit SHA cannot be verified against HEAD
+		return false
 	}
 	if git == nil {
 		return false
@@ -293,6 +298,17 @@ func isStoryCompleted(worktreePath, docsHubPath, storyID string) bool {
 	if storyID == "" {
 		return false
 	}
+
+	// ADR-002: Check .autopilot/ase-state.json / .autopilot/state.json first
+	for _, rootDir := range []string{worktreePath, docsHubPath} {
+		if strings.TrimSpace(rootDir) == "" {
+			continue
+		}
+		if matched, done := checkAutopilotStateStoryDone(rootDir, storyID); matched {
+			return done
+		}
+	}
+
 	lowerStoryID := strings.ToLower(storyID)
 	cleanID := strings.TrimPrefix(lowerStoryID, "story-")
 
@@ -310,10 +326,18 @@ func isStoryCompleted(worktreePath, docsHubPath, storyID string) bool {
 			if !strings.HasSuffix(lowerName, ".story.md") {
 				continue
 			}
-			if strings.Contains(lowerName, lowerStoryID) || (cleanID != "" && strings.Contains(lowerName, cleanID)) {
-				hasStoryFile = true
+			if matchesStoryIDBoundary(lowerName, lowerStoryID, cleanID) {
 				content, err := os.ReadFile(filepath.Join(storiesDir, e.Name()))
-				if err == nil && hasFrontmatterStatusDone(string(content)) {
+				if err != nil {
+					hasStoryFile = true
+					continue
+				}
+				matchedID, statusDone := hasFrontmatterStatusDoneForStory(string(content), storyID)
+				if !matchedID {
+					continue
+				}
+				hasStoryFile = true
+				if statusDone {
 					return true
 				}
 			}
@@ -327,13 +351,81 @@ func isStoryCompleted(worktreePath, docsHubPath, storyID string) bool {
 	return false
 }
 
+// checkAutopilotStateStoryDone inspects .autopilot/ase-state.json and .autopilot/state.json (ADR-002).
+// It returns (matchedStoryID, isDone).
+func checkAutopilotStateStoryDone(rootDir, storyID string) (bool, bool) {
+	for _, rel := range []string{
+		filepath.Join(".autopilot", "ase-state.json"),
+		filepath.Join(".autopilot", "state.json"),
+	} {
+		data, err := os.ReadFile(filepath.Join(rootDir, rel))
+		if err != nil {
+			continue
+		}
+		var state struct {
+			StoryID   string `json:"story_id"`
+			Status    string `json:"status"`
+			State     string `json:"state"`
+			Phase     string `json:"phase"`
+			Completed bool   `json:"completed"`
+		}
+		if err := json.Unmarshal(data, &state); err != nil {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(state.StoryID), storyID) {
+			continue
+		}
+		st := strings.ToUpper(strings.TrimSpace(state.Status))
+		if st == "" {
+			st = strings.ToUpper(strings.TrimSpace(state.State))
+		}
+		if st == "" {
+			st = strings.ToUpper(strings.TrimSpace(state.Phase))
+		}
+		return true, state.Completed || st == "DONE" || st == "COMPLETED"
+	}
+	return false, false
+}
+
+func matchesStoryIDBoundary(lowerFilename, lowerStoryID, cleanID string) bool {
+	for _, token := range []string{lowerStoryID, cleanID} {
+		if token == "" {
+			continue
+		}
+		idx := strings.Index(lowerFilename, token)
+		for idx >= 0 {
+			beforeOK := idx == 0 || !isAlphaNum(lowerFilename[idx-1])
+			afterIdx := idx + len(token)
+			afterOK := afterIdx == len(lowerFilename) || !isAlphaNum(lowerFilename[afterIdx])
+			if beforeOK && afterOK {
+				return true
+			}
+			next := strings.Index(lowerFilename[idx+1:], token)
+			if next < 0 {
+				break
+			}
+			idx += 1 + next
+		}
+	}
+	return false
+}
+
+func isAlphaNum(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
 // hasFrontmatterStatusDone extracts the YAML frontmatter block strictly between the opening and closing "---"
 // delimiters and returns true only if `status: DONE` (unquoted or single/double quoted) appears inside frontmatter.
 func hasFrontmatterStatusDone(text string) bool {
+	_, done := hasFrontmatterStatusDoneForStory(text, "")
+	return done
+}
+
+func hasFrontmatterStatusDoneForStory(text, expectedStoryID string) (bool, bool) {
 	trimmed := strings.TrimLeft(text, "\ufeff \t\r\n")
 	lines := strings.Split(trimmed, "\n")
 	if len(lines) < 3 || strings.TrimSpace(lines[0]) != "---" {
-		return false
+		return false, false
 	}
 	closingIdx := -1
 	for i := 1; i < len(lines); i++ {
@@ -343,24 +435,34 @@ func hasFrontmatterStatusDone(text string) bool {
 		}
 	}
 	if closingIdx < 1 {
-		return false
+		return false, false
 	}
 	statusDone := false
+	frontmatterID := ""
 	for i := 1; i < closingIdx; i++ {
 		line := strings.TrimSpace(lines[i])
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 		key, val, ok := strings.Cut(line, ":")
-		if !ok || strings.TrimSpace(key) != "status" {
+		if !ok {
 			continue
 		}
+		k := strings.TrimSpace(key)
 		if idx := strings.Index(val, "#"); idx >= 0 {
 			val = val[:idx]
 		}
 		val = strings.TrimSpace(val)
 		val = strings.Trim(val, `"'`)
-		statusDone = (val == "DONE")
+		switch k {
+		case "id", "story_id":
+			frontmatterID = val
+		case "status":
+			statusDone = (val == "DONE")
+		}
 	}
-	return statusDone
+	if expectedStoryID != "" && frontmatterID != "" && !strings.EqualFold(frontmatterID, expectedStoryID) {
+		return false, false
+	}
+	return true, statusDone
 }

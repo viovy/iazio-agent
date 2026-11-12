@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/viovy/iazio-agent/internal/procutil"
+	"github.com/viovy/iazio-core/pkg/procutil"
 )
 
 // ActiveHarnessSignal represents a detected active execution indicator.
