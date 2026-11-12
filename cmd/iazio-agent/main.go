@@ -1520,6 +1520,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 								continue
 							}
 							var statuses []controlplane.RepoRuntimeStatus
+							var repoStates []supervisor.RepoState
 							for _, r := range detail.Repos {
 								p := r.WorktreePath
 								if p == "" {
@@ -1528,8 +1529,62 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 								if p == "" {
 									continue
 								}
+								repoStates = append(repoStates, supervisor.RepoState{
+									WorktreePath:   p,
+									Queue:          r.Queue,
+									Reason:         r.Reason,
+									DiscardPending: r.DiscardPending,
+									Lock:           r.Lock,
+									RunningJobID:   r.RunningJobID,
+								})
 								statuses = append(statuses, probeRepoRuntime(runCtx, p, r.Alias))
 							}
+							supervisor.ReconcileStrandedCheckouts(
+								runCtx,
+								host,
+								repoStates,
+								func(worktree string) bool {
+									cleanWT := filepath.Clean(worktree)
+									if sup.PID(worktree) > 0 || sup.PID(cleanWT) > 0 {
+										return true
+									}
+									if disp != nil {
+										for _, dj := range disp.ActiveJobs() {
+											if filepath.Clean(dj.WorktreePath) == cleanWT {
+												return true
+											}
+										}
+									}
+									if wd != nil {
+										for _, wj := range wd.ActiveJobs() {
+											if filepath.Clean(wj.WorktreePath) == cleanWT {
+												return true
+											}
+										}
+									}
+									inFlightPrepMu.Lock()
+									for _, pj := range inFlightPrepJobs {
+										if filepath.Clean(pj.WorktreePath) == cleanWT {
+											inFlightPrepMu.Unlock()
+											return true
+										}
+									}
+									inFlightPrepMu.Unlock()
+									if lockInfo, err := repolock.Read(cleanWT); err == nil {
+										if (lockInfo.PID > 0 && watchdog.IsProcessAlive(lockInfo.PID)) ||
+											(lockInfo.HarnessPID > 0 && watchdog.IsProcessAlive(lockInfo.HarnessPID)) ||
+											(lockInfo.ToolPID > 0 && watchdog.IsProcessAlive(lockInfo.ToolPID)) {
+											return true
+										}
+										_ = os.Remove(filepath.Join(cleanWT, ".iazio", "repo.lock"))
+									}
+									return false
+								},
+								client.AbandonJob,
+								client.RemediateRepo,
+								stdout,
+								stderr,
+							)
 							if len(statuses) > 0 {
 								_ = client.PostRepoStatus(runCtx, host, statuses)
 							}
@@ -2078,6 +2133,40 @@ func flushHarvestConversationDetailed(ctx context.Context, conversationID string
 func flushHarvestConversation(ctx context.Context, conversationID string) error {
 	_, _, err := flushHarvestConversationDetailed(ctx, conversationID)
 	return err
+}
+
+func hasDeadRunningRepoLockFallback(repoPath string) bool {
+	if strings.TrimSpace(repoPath) == "" {
+		return false
+	}
+	lockInfo, err := repolock.Read(repoPath)
+	if err != nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(lockInfo.Status), "RUNNING") &&
+		lockInfo.PID <= 0 && lockInfo.HarnessPID <= 0 && lockInfo.ToolPID <= 0 {
+		return false
+	}
+	if (lockInfo.PID > 0 && watchdog.IsProcessAlive(lockInfo.PID)) ||
+		(lockInfo.HarnessPID > 0 && watchdog.IsProcessAlive(lockInfo.HarnessPID)) ||
+		(lockInfo.ToolPID > 0 && watchdog.IsProcessAlive(lockInfo.ToolPID)) {
+		return false
+	}
+	return true
+}
+
+func isFallbackSessionStoryFileStale(sessionFile string, now time.Time) bool {
+	if strings.TrimSpace(sessionFile) == "" {
+		return false
+	}
+	fi, err := os.Stat(sessionFile)
+	if err != nil || fi.IsDir() {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return !fi.ModTime().IsZero() && now.Sub(fi.ModTime()) > 15*time.Minute
 }
 
 func runAuth(ctx context.Context, args []string, stdout io.Writer, getenv func(string) string) error {
@@ -3499,7 +3588,12 @@ func probeRepoRuntime(ctx context.Context, repoPath, alias string) controlplane.
 					hasResumeFile = true
 				}
 				if nonMainBranch || len(st.NonMainSubmodules) > 0 || hasResumeFile {
-					if st.ASEState == "IDLE" || (!hasRootSessionFile && !hasResumeFile) {
+					deadRepoLock := hasDeadRunningRepoLockFallback(repoPath)
+					staleSessionFile := isFallbackSessionStoryFileStale(sessionFile, time.Now())
+					if st.ASEState == "IDLE" || deadRepoLock || (staleSessionFile && !hasResumeFile) || (!hasRootSessionFile && !hasResumeFile) {
+						if deadRepoLock {
+							_ = os.Remove(filepath.Join(repoPath, ".iazio", "repo.lock"))
+						}
 						st.ASEState = "FAILED_DIRTY"
 						st.ExecutionProvenance = "NONE"
 						st.ToolLiveness = "TERMINATED"

@@ -5077,6 +5077,49 @@ func TestStoryGov5225_E2E_CompiledAgentTempHomeNeverInvokesHostServiceControl(t 
 	}
 }
 
+func TestProbeRepoRuntimeFallback_DeadRepoLockAndStaleSessionFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX git fallback test runs on unix")
+	}
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	var cleanPathElements []string
+	for _, elem := range filepath.SplitList(os.Getenv("PATH")) {
+		if strings.Contains(elem, ".iazio") {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(elem, "iazio-harness")); err == nil {
+			continue
+		}
+		cleanPathElements = append(cleanPathElements, elem)
+	}
+	t.Setenv("PATH", strings.Join(cleanPathElements, string(os.PathListSeparator)))
+
+	repoDir := t.TempDir()
+	_ = exec.Command("git", "init", "-b", "feat/gov-5249-oss-clean-room-hygiene", repoDir).Run()
+	_ = os.WriteFile(filepath.Join(repoDir, ".session_story_id"), []byte("STORY-GOV-5249\n"), 0o644)
+	_ = os.MkdirAll(filepath.Join(repoDir, ".iazio"), 0o755)
+	_ = os.WriteFile(filepath.Join(repoDir, ".iazio", "repo.lock"), []byte(`{"job_id":"job_de8c502853f28781","pid":999999,"status":"RUNNING"}`), 0o644)
+
+	st := probeRepoRuntime(context.Background(), repoDir, "meta-repo-03")
+	if st.ASEState != "FAILED_DIRTY" || st.ToolLiveness != "TERMINATED" || st.ExecutionProvenance != "NONE" {
+		t.Fatalf("expected dead repo.lock fallback to classify as FAILED_DIRTY/TERMINATED/NONE, got ASEState=%q ToolLiveness=%q Provenance=%q",
+			st.ASEState, st.ToolLiveness, st.ExecutionProvenance)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, ".iazio", "repo.lock")); !os.IsNotExist(err) {
+		t.Fatalf("expected dead .iazio/repo.lock to be released by fallback probe")
+	}
+
+	staleTime := time.Now().Add(-2 * time.Hour)
+	_ = os.Chtimes(filepath.Join(repoDir, ".session_story_id"), staleTime, staleTime)
+	stStale := probeRepoRuntime(context.Background(), repoDir, "meta-repo-03")
+	if stStale.ASEState != "FAILED_DIRTY" || stStale.ToolLiveness != "TERMINATED" || stStale.ExecutionProvenance != "NONE" {
+		t.Fatalf("expected stale .session_story_id (>15m) fallback to classify as FAILED_DIRTY/TERMINATED/NONE, got ASEState=%q ToolLiveness=%q Provenance=%q",
+			stStale.ASEState, stStale.ToolLiveness, stStale.ExecutionProvenance)
+	}
+}
+
+
 
 
 
