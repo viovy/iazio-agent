@@ -1060,6 +1060,10 @@ func canBindSupervisorTranscriptStoryToRepo(repoPath, storyID string) bool {
 	if !strings.HasPrefix(sid, "STORY-") {
 		return false
 	}
+	// Automated submodule pointer maintenance synthetic IDs are never ASE stories.
+	if strings.HasPrefix(sid, "STORY-GOV-POINTERS-") || sid == "STORY-GOV-POINTERS" {
+		return false
+	}
 	if isStoryMarkedDoneOnDisk(repoPath, sid) || IsStoryOwnedBySiblingWorktree(repoPath, sid) {
 		return false
 	}
@@ -1197,8 +1201,93 @@ func supervisorBrainRootDirs() []string {
 	return dirs
 }
 
-func containsSupervisorASEMarker(s string) bool {
+func isSupervisorAutomatedMaintenanceRepoLock(repoPath string) bool {
+	clean := filepath.Clean(strings.TrimSpace(repoPath))
+	if clean == "" || clean == "." {
+		return false
+	}
+	info, err := repolock.Read(clean)
+	if err != nil {
+		return false
+	}
+	status := strings.ToUpper(strings.TrimSpace(info.Status))
+	if status == "COMPLETED" || status == "FAILED" || status == "IDLE" || repolock.IsExpiredMaintenanceLock(info) {
+		return false
+	}
+	alive := (info.PID > 0 && isProcessAlive(info.PID)) ||
+		(info.HarnessPID > 0 && isProcessAlive(info.HarnessPID)) ||
+		(info.ToolPID > 0 && isProcessAlive(info.ToolPID))
+	if !alive {
+		return false
+	}
+	jid := strings.ToLower(strings.TrimSpace(info.JobID))
+	prompt := strings.ToLower(strings.TrimSpace(info.Prompt))
+	return jid == "autopilot-git-update" ||
+		jid == "autopilot-git-update-agy" ||
+		strings.HasPrefix(jid, "git-update-") ||
+		strings.Contains(prompt, "autopilot git-update")
+}
+
+func isSupervisorAutomatedMaintenanceTranscript(s string) bool {
 	lower := strings.ToLower(s)
+	return strings.Contains(lower, `execute shell prompt "autopilot git-update"`) ||
+		strings.Contains(lower, `execute shell prompt \"autopilot git-update\"`) ||
+		strings.Contains(lower, "diagnostic failure summary from shell autopilot git-update") ||
+		strings.Contains(lower, "iazio-agy-log-git-update-agy-")
+}
+
+func stripSupervisorSystemTagRange(s, openTag, closeTag string) string {
+	for {
+		lower := strings.ToLower(s)
+		start := strings.Index(lower, openTag)
+		if start < 0 {
+			break
+		}
+		endRel := strings.Index(lower[start:], closeTag)
+		if endRel < 0 {
+			s = s[:start]
+			break
+		}
+		end := start + endRel + len(closeTag)
+		s = s[:start] + " " + s[end:]
+	}
+	return s
+}
+
+func stripSupervisorTranscriptBoilerplateAndToolOutputs(s string) string {
+	if s == "" {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		lowerLine := strings.ToLower(line)
+		if strings.Contains(lowerLine, `"type":"tool_response"`) || strings.Contains(lowerLine, `"type": "tool_response"`) {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	out := strings.Join(kept, "\n")
+	for _, pair := range [][2]string{
+		{"<user_rules>", "</user_rules>"},
+		{"<rule[", "</rule["},
+		{"<skills>", "</skills>"},
+		{"<subagents>", "</subagents>"},
+		{"<slash_commands>", "</slash_commands>"},
+		{"<mcp_servers>", "</mcp_servers>"},
+		{"<context_summary>", "</context_summary>"},
+	} {
+		out = stripSupervisorSystemTagRange(out, pair[0], pair[1])
+	}
+	return out
+}
+
+func containsSupervisorASEMarker(s string) bool {
+	if isSupervisorAutomatedMaintenanceTranscript(s) {
+		return false
+	}
+	cleaned := stripSupervisorTranscriptBoilerplateAndToolOutputs(s)
+	lower := strings.ToLower(cleaned)
 	return strings.Contains(lower, "/autonomous-story-execution") ||
 		strings.Contains(lower, "skills/autonomous-story-execution") ||
 		strings.Contains(lower, "autopilot-story") ||
@@ -1229,10 +1318,18 @@ func hasSupervisorPendingBackgroundTask(tail string) bool {
 }
 
 func isSupervisorTranscriptTurnInFlight(tail []byte, modTime, now time.Time) bool {
-	if modTime.IsZero() || now.Sub(modTime) > 15*time.Minute {
+	if modTime.IsZero() {
+		return false
+	}
+	age := now.Sub(modTime)
+	if age > 15*time.Minute {
 		return false
 	}
 	tailStr := string(tail)
+	hasBg := hasSupervisorPendingBackgroundTask(tailStr)
+	if !hasBg && age > 3*time.Minute {
+		return false
+	}
 	lines := strings.Split(tailStr, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
@@ -1259,10 +1356,7 @@ func isSupervisorTranscriptTurnInFlight(tail []byte, modTime, now time.Time) boo
 			}
 		}
 		if strings.EqualFold(step.Type, "PLANNER_RESPONSE") && strings.EqualFold(step.Status, "DONE") && !hasTools {
-			if hasSupervisorPendingBackgroundTask(tailStr) {
-				return true
-			}
-			return false
+			return hasBg
 		}
 		return true
 	}
@@ -1364,6 +1458,9 @@ func InspectActiveBrainASETurnForRepo(repoPath string, now time.Time) (active bo
 	if strings.TrimSpace(repoPath) == "" {
 		return false, "", ""
 	}
+	if isSupervisorAutomatedMaintenanceRepoLock(repoPath) {
+		return false, "", ""
+	}
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -1419,7 +1516,11 @@ func InspectActiveBrainASETurnForRepo(repoPath string, now time.Time) (active bo
 
 				headStr := string(head)
 				tailStr := string(tail)
-				if !TranscriptReferencesRepoPath(headStr+"\n"+tailStr, repoPath) {
+				combined := headStr + "\n" + tailStr
+				if isSupervisorAutomatedMaintenanceTranscript(combined) {
+					continue
+				}
+				if !TranscriptReferencesRepoPath(combined, repoPath) {
 					continue
 				}
 				if !containsSupervisorASEMarker(headStr) && !containsSupervisorASEMarker(tailStr) {
@@ -1429,9 +1530,11 @@ func InspectActiveBrainASETurnForRepo(repoPath string, now time.Time) (active bo
 					continue
 				}
 				var candStory string
+				cleanedHead := stripSupervisorTranscriptBoilerplateAndToolOutputs(headStr)
+				cleanedTail := stripSupervisorTranscriptBoilerplateAndToolOutputs(tailStr)
 				allMatches := append(
-					supervisorTranscriptBoundStoryRe.FindAllStringSubmatch(headStr, -1),
-					supervisorTranscriptBoundStoryRe.FindAllStringSubmatch(tailStr, -1)...,
+					supervisorTranscriptBoundStoryRe.FindAllStringSubmatch(cleanedHead, -1),
+					supervisorTranscriptBoundStoryRe.FindAllStringSubmatch(cleanedTail, -1)...,
 				)
 				for i := len(allMatches) - 1; i >= 0; i-- {
 					sid := strings.ToUpper(allMatches[i][1])
@@ -1841,14 +1944,45 @@ func ComputeWorktreeDirtyFingerprint(ctx context.Context, repoPath string) (head
 	return headSHA, treeSHA, fingerprint
 }
 
+func computeDirtyOnlyStatusHash(ctx context.Context, repoPath string) string {
+	out, err := procutil.CommandContext(ctx, "git", "-C", repoPath, "status", "--porcelain=v2").Output()
+	if err != nil {
+		return ""
+	}
+	var lines []string
+	for _, l := range strings.Split(string(out), "\n") {
+		t := strings.TrimSpace(l)
+		if t == "" || strings.HasPrefix(t, "# ") {
+			continue
+		}
+		lines = append(lines, t)
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	sort.Strings(lines)
+	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+	return fmt.Sprintf("%x", sum[:8])
+}
+
 // DefaultShellGitUpdate executes "autopilot git-update" directly in repoPath.
 func DefaultShellGitUpdate(ctx context.Context, repoPath string) (string, error) {
 	autopilotBin := ResolveBinary("autopilot")
-	upCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	upCtx, cancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer cancel()
 	cmd := procutil.CommandContext(upCtx, autopilotBin, "git-update")
 	cmd.Dir = repoPath
-	cmd.Env = append(AugmentedEnv(os.Environ()), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(
+		AugmentedEnv(os.Environ()),
+		"GIT_TERMINAL_PROMPT=0",
+		"IAZIO_AGENT_MANAGED=1",
+		"IAZIO_MANAGED_BY=harness",
+	)
+	setSupervisorProcGroup(cmd)
+	cmd.Cancel = func() error {
+		return killSupervisorProcGroup(cmd)
+	}
+	cmd.WaitDelay = 3 * time.Second
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
@@ -1871,16 +2005,28 @@ func DefaultAgyEscalation(ctx context.Context, repoPath, prompt, diagnosticOutpu
 	})
 	cmd := procutil.CommandContext(escCtx, harnessBin, "prompt", "run", "--json")
 	cmd.Dir = repoPath
+	cmd.Env = append(
+		AugmentedEnv(os.Environ()),
+		"GIT_TERMINAL_PROMPT=0",
+		"IAZIO_AGENT_MANAGED=1",
+		"IAZIO_MANAGED_BY=harness",
+	)
+	setSupervisorProcGroup(cmd)
+	cmd.Cancel = func() error {
+		return killSupervisorProcGroup(cmd)
+	}
+	cmd.WaitDelay = 3 * time.Second
 	cmd.Stdin = bytes.NewReader(payloadBytes)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
 
 type agyCooldownRecord struct {
-	Fingerprint string
-	HeadSHA     string
-	TreeSHA     string
-	AttemptedAt time.Time
+	Fingerprint     string
+	DirtyStatusHash string
+	HeadSHA         string
+	TreeSHA         string
+	AttemptedAt     time.Time
 }
 
 // RepoConfigItem identifies a monitored repo path and optional alias.
@@ -2134,13 +2280,14 @@ func (m *RepoStateMonitor) UpdateAndRemediateWorktree(ctx context.Context, item 
 
 	// Release lock temporarily to inspect/sanitize without self-blocking IsWorktreeIdleForGitUpdate
 	releaseLock()
+	healStrandedMaintenanceBranchBeforeGitUpdate(ctx, cleanPath)
 	_, _ = SanitizeIdleEphemeralArtifacts(ctx, cleanPath, sup, isAlive)
 	st := InspectRepoGitState(ctx, cleanPath, item.Alias)
 	res.FinalState = st
 
-	if step1Err == nil && isCleanOnMainSynced(st) {
+	if isCleanOnMainSynced(st) {
 		_ = os.Remove(filepath.Join(cleanPath, ".iazio", "post-ase-sync-failed"))
-		res.Stage1Success = true
+		res.Stage1Success = (step1Err == nil)
 		m.mu.Lock()
 		delete(m.agyCooldowns, cleanPath)
 		m.mu.Unlock()
@@ -2162,21 +2309,24 @@ func (m *RepoStateMonitor) UpdateAndRemediateWorktree(ctx context.Context, item 
 	}
 
 	headSHA, treeSHA, fp := ComputeWorktreeDirtyFingerprint(ctx, cleanPath)
+	dirtyStatusHash := computeDirtyOnlyStatusHash(ctx, cleanPath)
 	res.DirtyFingerprint = fp
 	now := nowFn().UTC()
 
 	m.mu.Lock()
 	prevRec, hasPrev := m.agyCooldowns[cleanPath]
-	if hasPrev && prevRec.Fingerprint == fp && now.Sub(prevRec.AttemptedAt) < cooldownDur {
+	sameDirtyState := hasPrev && (prevRec.Fingerprint == fp || (dirtyStatusHash != "" && prevRec.DirtyStatusHash == dirtyStatusHash))
+	if sameDirtyState && now.Sub(prevRec.AttemptedAt) < cooldownDur {
 		m.mu.Unlock()
 		res.Stage2CooldownSkipped = true
 		return res
 	}
 	m.agyCooldowns[cleanPath] = agyCooldownRecord{
-		Fingerprint: fp,
-		HeadSHA:     headSHA,
-		TreeSHA:     treeSHA,
-		AttemptedAt: now,
+		Fingerprint:     fp,
+		DirtyStatusHash: dirtyStatusHash,
+		HeadSHA:         headSHA,
+		TreeSHA:         treeSHA,
+		AttemptedAt:     now,
 	}
 	m.mu.Unlock()
 
