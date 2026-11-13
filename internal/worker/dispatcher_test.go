@@ -70,21 +70,24 @@ type mockControlPlane struct {
 	claimFunc    func(ctx context.Context, req ClaimRequest) (*Job, error)
 	completeFunc func(ctx context.Context, jobID string, req CompleteRequest) error
 	bindFunc     func(ctx context.Context, jobID string, req StoryBindingRequest) error
-	ackLeaseFunc func(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) error
-	declineFunc  func(ctx context.Context, jobID, reason string) error
+	ackLeaseFunc             func(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) error
+	ackLeaseWithWorktreeFunc func(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID, worktreePath string) error
+	declineFunc              func(ctx context.Context, jobID, reason string) error
 
-	completedJobs map[string]CompleteRequest
-	boundStories  map[string]StoryBindingRequest
-	ackedJobs     map[string]string
-	declinedJobs  map[string]string
+	completedJobs      map[string]CompleteRequest
+	boundStories       map[string]StoryBindingRequest
+	ackedJobs          map[string]string
+	ackedWorktreePaths map[string]string
+	declinedJobs       map[string]string
 }
 
 func newMockControlPlane() *mockControlPlane {
 	return &mockControlPlane{
-		completedJobs: make(map[string]CompleteRequest),
-		boundStories:  make(map[string]StoryBindingRequest),
-		ackedJobs:     make(map[string]string),
-		declinedJobs:  make(map[string]string),
+		completedJobs:      make(map[string]CompleteRequest),
+		boundStories:       make(map[string]StoryBindingRequest),
+		ackedJobs:          make(map[string]string),
+		ackedWorktreePaths: make(map[string]string),
+		declinedJobs:       make(map[string]string),
 	}
 }
 
@@ -117,6 +120,18 @@ func (m *mockControlPlane) BindStory(ctx context.Context, jobID string, req Stor
 
 func (m *mockControlPlane) AckLease(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) error {
 	m.ackedJobs[jobID] = leaseToken
+	if m.ackLeaseFunc != nil {
+		return m.ackLeaseFunc(ctx, jobID, leaseToken, agentPID, activeConvID)
+	}
+	return nil
+}
+
+func (m *mockControlPlane) AckLeaseWithWorktree(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID, worktreePath string) error {
+	m.ackedJobs[jobID] = leaseToken
+	m.ackedWorktreePaths[jobID] = worktreePath
+	if m.ackLeaseWithWorktreeFunc != nil {
+		return m.ackLeaseWithWorktreeFunc(ctx, jobID, leaseToken, agentPID, activeConvID, worktreePath)
+	}
 	if m.ackLeaseFunc != nil {
 		return m.ackLeaseFunc(ctx, jobID, leaseToken, agentPID, activeConvID)
 	}
@@ -2874,6 +2889,9 @@ func TestStoryGov5256_SupervisorAutoResumesUnmergedFeatureBranchAndBlocksOtherSt
 	}
 	if _, statErr := os.Stat(filepath.Join(wt, ".session_story_id")); !os.IsNotExist(statErr) {
 		t.Fatalf("expected .session_story_id to be cleaned up after ASE completion gate passed, got err=%v", statErr)
+	}
+	if gotWT := cp.ackedWorktreePaths["job_7d5cad6fd223f5a0"]; filepath.Clean(gotWT) != filepath.Clean(wt) {
+		t.Fatalf("expected AckLeaseWithWorktree to record worktree %q, got %q", wt, gotWT)
 	}
 }
 

@@ -1332,16 +1332,17 @@ func (d *Dispatcher) claimAndReserveJob(ctx context.Context, cachedIdle ...[]str
 	// Phase 2 of Two-Phase Lease Handshake: Acknowledge lease immediately after local worktree reservation
 	// (before potentially long-running 52-submodule workspace sanitization or preDispatchHook) so the 20s
 	// LeaseAckDeadlineAt never expires during workspace preparation.
-	if job.LeaseToken != "" {
-		var ackErr error
+	ackLeaseWithWorktree := func(ackCtx context.Context, activeConvID string) error {
 		if wtAcker, ok := d.client.(interface {
 			AckLeaseWithWorktree(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID, worktreePath string) error
 		}); ok {
-			ackErr = wtAcker.AckLeaseWithWorktree(ctx, job.ID, job.LeaseToken, os.Getpid(), resolvedConvID, worktreeDir)
-		} else {
-			ackErr = d.client.AckLease(ctx, job.ID, job.LeaseToken, os.Getpid(), resolvedConvID)
+			return wtAcker.AckLeaseWithWorktree(ackCtx, job.ID, job.LeaseToken, os.Getpid(), activeConvID, worktreeDir)
 		}
-		if ackErr != nil {
+		return d.client.AckLease(ackCtx, job.ID, job.LeaseToken, os.Getpid(), activeConvID)
+	}
+
+	if job.LeaseToken != "" {
+		if ackErr := ackLeaseWithWorktree(ctx, resolvedConvID); ackErr != nil {
 			fmt.Fprintf(os.Stderr, "[dispatcher] ack lease warning for job %s: %v\n", job.ID, ackErr)
 		}
 	}
@@ -1369,7 +1370,7 @@ func (d *Dispatcher) claimAndReserveJob(ctx context.Context, cachedIdle ...[]str
 						// Upstream control-plane errors (including 409 LEASE_FENCED after a control-plane redeploy/restart,
 						// 5xx, or transient network blips) must NEVER kill an active local agy/iazio-harness execution
 						// (job_38eeeb536a5a7130 root cause). Re-ack the lease to re-synchronize with the control plane.
-						_ = d.client.AckLease(hbCtx, job.ID, job.LeaseToken, os.Getpid(), cid)
+						_ = ackLeaseWithWorktree(hbCtx, cid)
 					}
 				}
 			}
@@ -1463,7 +1464,7 @@ func (d *Dispatcher) claimAndReserveJob(ctx context.Context, cachedIdle ...[]str
 
 		_ = d.client.HeartbeatJob(ctx, job.ID, job.LeaseToken, job.FencingToken, sid, worktreeDir, clean)
 		if job.LeaseToken != "" {
-			_ = d.client.AckLease(ctx, job.ID, job.LeaseToken, os.Getpid(), clean)
+			_ = ackLeaseWithWorktree(ctx, clean)
 		}
 	}
 
