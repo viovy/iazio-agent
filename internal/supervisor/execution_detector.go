@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -268,32 +269,10 @@ func DefaultOSProcessScanner(repoPaths []string) ([]ActiveHarnessSignal, error) 
 			continue
 		}
 
-		// Check if command is bound to any registered repository path or name
-		matchingRepo := ""
-		for _, rp := range repoPaths {
-			if rp == "" {
-				continue
-			}
-			cleanRP := filepath.Clean(rp)
-			if strings.Contains(commandLine, cleanRP) {
-				matchingRepo = rp
-				break
-			}
-			base := filepath.Base(cleanRP)
-			if base != "" && base != "." && base != "/" {
-				// Require exact token boundary match to avoid substring false positives (e.g., matching flag '--worktree-path')
-				for _, token := range strings.Fields(commandLine) {
-					token = strings.Trim(token, "\"'")
-					if token == base || filepath.Base(token) == base || strings.HasSuffix(token, "/"+base) {
-						matchingRepo = rp
-						break
-					}
-				}
-				if matchingRepo != "" {
-					break
-				}
-			}
-		}
+		// Check if command is bound to any registered repository path or name.
+		// First check full path boundary matches (preferring longer paths so /work/meta-repo-02 beats /work/meta-repo),
+		// then fall back to exact token basename matches.
+		matchingRepo := matchCommandLineRepoPath(commandLine, repoPaths)
 
 		if matchingRepo != "" || (len(repoPaths) == 0 && strings.Contains(commandLine, "iazio-harness run")) {
 			signals = append(signals, ActiveHarnessSignal{
@@ -308,4 +287,112 @@ func DefaultOSProcessScanner(repoPaths []string) ([]ActiveHarnessSignal, error) 
 	}
 
 	return signals, nil
+}
+
+// matchCommandLineRepoPath matches a command line against registered repository paths
+// using path-boundary rules (preferring longer paths first) so that a prefix path like
+// "/home/romeo/work/meta-repo" never falsely matches "/home/romeo/work/meta-repo-02".
+func matchCommandLineRepoPath(commandLine string, repoPaths []string) string {
+	if len(repoPaths) == 0 || strings.TrimSpace(commandLine) == "" {
+		return ""
+	}
+	type candidate struct {
+		raw   string
+		clean string
+		base  string
+	}
+	candidates := make([]candidate, 0, len(repoPaths))
+	for _, rp := range repoPaths {
+		trimmed := strings.TrimSpace(rp)
+		if trimmed == "" {
+			continue
+		}
+		clean := filepath.Clean(trimmed)
+		candidates = append(candidates, candidate{
+			raw:   rp,
+			clean: clean,
+			base:  filepath.Base(clean),
+		})
+	}
+	// Sort by descending cleaned path length so longer paths (/work/meta-repo-02) are checked before shorter prefixes (/work/meta-repo).
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return len(candidates[i].clean) > len(candidates[j].clean)
+	})
+
+	for _, c := range candidates {
+		if commandLineContainsRepoPath(commandLine, c.clean) {
+			return c.raw
+		}
+	}
+
+	// Only fall back to exact token basename matching when no full path in the command line matched any candidate.
+	for _, c := range candidates {
+		if c.base == "" || c.base == "." || c.base == "/" {
+			continue
+		}
+		if commandLineContainsExactBaseToken(commandLine, c.base) {
+			return c.raw
+		}
+	}
+	return ""
+}
+
+func commandLineContainsRepoPath(commandLine, cleanRP string) bool {
+	if cleanRP == "" || cleanRP == "." || cleanRP == "/" {
+		return false
+	}
+	searchFrom := 0
+	for searchFrom < len(commandLine) {
+		idx := strings.Index(commandLine[searchFrom:], cleanRP)
+		if idx < 0 {
+			return false
+		}
+		start := searchFrom + idx
+		end := start + len(cleanRP)
+		validStart := start == 0 || isCommandPathStartBoundary(commandLine[start-1])
+		validEnd := end == len(commandLine) || isCommandPathEndBoundary(commandLine[end])
+		if validStart && validEnd {
+			return true
+		}
+		searchFrom = start + 1
+	}
+	return false
+}
+
+func commandLineContainsExactBaseToken(commandLine, base string) bool {
+	searchFrom := 0
+	for searchFrom < len(commandLine) {
+		idx := strings.Index(commandLine[searchFrom:], base)
+		if idx < 0 {
+			return false
+		}
+		start := searchFrom + idx
+		end := start + len(base)
+		// Basename token must be preceded by whitespace or '=' or quote (not '/' which is part of a full path)
+		validStart := start == 0 || commandLine[start-1] == ' ' || commandLine[start-1] == '\t' || commandLine[start-1] == '=' || commandLine[start-1] == '"' || commandLine[start-1] == '\''
+		validEnd := end == len(commandLine) || commandLine[end] == ' ' || commandLine[end] == '\t' || commandLine[end] == '"' || commandLine[end] == '\''
+		if validStart && validEnd {
+			return true
+		}
+		searchFrom = start + 1
+	}
+	return false
+}
+
+func isCommandPathStartBoundary(ch byte) bool {
+	switch ch {
+	case ' ', '\t', '=', '"', '\'', ':', ';', ',':
+		return true
+	default:
+		return false
+	}
+}
+
+func isCommandPathEndBoundary(ch byte) bool {
+	switch ch {
+	case '/', '\\', ' ', '\t', '"', '\'', ':', ';', ',':
+		return true
+	default:
+		return false
+	}
 }

@@ -146,3 +146,28 @@ func TestDefaultOSProcessScanner(t *testing.T) {
 		t.Errorf("expected 0 signals for nonexistent path, got %d", len(sigs))
 	}
 }
+
+func TestMatchCommandLineRepoPath_PreventsPrefixCollisionAcrossMultiSlotRepos(t *testing.T) {
+	repos := []string{
+		"/home/romeo/work/meta-repo",
+		"/home/romeo/work/meta-repo-02",
+	}
+
+	cmdSlot02 := "iazio-harness run --job-id job_5caae91005a69cef --repo /home/romeo/work/meta-repo-02"
+	got02 := matchCommandLineRepoPath(cmdSlot02, repos)
+	if got02 != "/home/romeo/work/meta-repo-02" {
+		t.Fatalf("expected /home/romeo/work/meta-repo-02 for slot-02 command, got %q", got02)
+	}
+
+	cmdSlot02Subpath := "autopilot ase --bind -C /home/romeo/work/meta-repo-02/vigo-api"
+	got02Sub := matchCommandLineRepoPath(cmdSlot02Subpath, repos)
+	if got02Sub != "/home/romeo/work/meta-repo-02" {
+		t.Fatalf("expected /home/romeo/work/meta-repo-02 for slot-02 subpath command, got %q", got02Sub)
+	}
+
+	cmdSlot01 := "iazio-harness run --job-id job_1111111111111111 --repo=/home/romeo/work/meta-repo"
+	got01 := matchCommandLineRepoPath(cmdSlot01, repos)
+	if got01 != "/home/romeo/work/meta-repo" {
+		t.Fatalf("expected /home/romeo/work/meta-repo for slot-01 command, got %q", got01)
+	}
+}
