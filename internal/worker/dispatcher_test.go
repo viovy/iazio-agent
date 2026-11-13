@@ -2869,6 +2869,7 @@ func TestStoryGov5256_SupervisorAutoResumesUnmergedFeatureBranchAndBlocksOtherSt
 		Repo:                 wt,
 		StoryID:              "STORY-GOV-5251",
 		ActiveConversationID: "ebd2122a-fe9f-4472-b880-b33e99199901",
+		LeaseToken:           "lease-token-5256",
 		FencingToken:         2,
 		Payload:              json.RawMessage(`{"prompt":"/autonomous-story-execution STORY-GOV-5251","worktree_path":"` + filepath.ToSlash(wt) + `"}`),
 	}
