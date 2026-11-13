@@ -2120,4 +2120,65 @@ func TestStoryIazio0201_SupervisorAlternatesRebaseHealAndBrainASETurn(t *testing
 	}
 }
 
+func TestStoryGov5273_SupervisorMaintenanceTranscriptAndCleanMainShortCircuit(t *testing.T) {
+	ctx := context.Background()
+	repo04 := t.TempDir()
+	initTestGitRepo(t, repo04)
+	_ = os.MkdirAll(filepath.Join(repo04, ".autopilot"), 0o755)
+	_ = os.WriteFile(filepath.Join(repo04, ".autopilot", "state.json"), []byte(`{"state":"IDLE","story_id":""}`), 0o644)
+
+	brainRoot := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainRoot)
+
+	// 1. Stage-2 git-update escalation transcript and <RULE[.../AGENTS.md]> boilerplate must NOT trigger InspectActiveBrainASETurnForRepo
+	convGitUpdate := "adc06b45-cb61-41f3-9231-228abac20909"
+	logsGitUpdate := filepath.Join(brainRoot, convGitUpdate, ".system_generated", "logs")
+	_ = os.MkdirAll(logsGitUpdate, 0o755)
+	gitUpdateBody := strings.Join([]string{
+		fmt.Sprintf(`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"<user_rules><RULE[%s/AGENTS.md]>autopilot ase --bind | git-flow ase-start</RULE[%s/AGENTS.md]></user_rules><user_information>Command Working Directory: %s\nApp Data Directory: /Users/romeo/.gemini/antigravity-cli</user_information><USER_REQUEST>execute shell prompt \"autopilot git-update\"\n[SIR] STORY-GOV-POINTERS-20261113-033931</USER_REQUEST>"}`, repo04, repo04, repo04),
+		fmt.Sprintf(`{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"autopilot git-update","Path":%q}}]}`, filepath.Join(repo04, "README.md")),
+	}, "\n") + "\n"
+	_ = os.WriteFile(filepath.Join(logsGitUpdate, "transcript.jsonl"), []byte(gitUpdateBody), 0o644)
+
+	if active, _, _ := InspectActiveBrainASETurnForRepo(repo04, time.Now()); active {
+		t.Fatalf("expected InspectActiveBrainASETurnForRepo=false for Stage-2 git-update escalation transcript")
+	}
+	if canBindSupervisorTranscriptStoryToRepo(repo04, "STORY-GOV-POINTERS-20261113-033931") {
+		t.Fatalf("expected canBindSupervisorTranscriptStoryToRepo=false for STORY-GOV-POINTERS-*")
+	}
+
+	// 2. When Stage-1 shell git-update times out mid-pointer-sync leaving worktree on chore/governance-pointers-*,
+	// UpdateAndRemediateWorktree heals back to clean main and NEVER escalates a clean synced main worktree to Stage-2 agy!
+	var agyCalls int
+	sup := New(time.Now)
+	mon := NewRepoStateMonitor(sup, "mac-mini", 2*time.Minute, nil, nil, nil, nil)
+	mon.ConfigureGitUpdate(
+		30*time.Minute,
+		func(c context.Context, rp string) (string, error) {
+			// Simulate autopilot git-update creating chore/governance-pointers-* and timing out mid-PR-monitor
+			_ = exec.Command("git", "-C", rp, "checkout", "-b", "chore/governance-pointers-20261113-033931").Run()
+			sirDir := filepath.Join(rp, "tmp", "reports")
+			_ = os.MkdirAll(sirDir, 0o755)
+			_ = os.WriteFile(filepath.Join(sirDir, "intervention-git-update-sir-123456.json"), []byte(`{"status":"OPEN"}`), 0o644)
+			return "[MONITOR] PR #4127 — watching until MERGED", errors.New("signal: killed")
+		},
+		func(c context.Context, rp, prompt, diag string) (string, error) {
+			agyCalls++
+			return "", nil
+		},
+		nil,
+	)
+
+	res := mon.UpdateAndRemediateWorktree(ctx, RepoConfigItem{Path: repo04, Alias: "meta-repo-04"})
+	if res.Stage2Escalated || agyCalls != 0 {
+		t.Fatalf("expected UpdateAndRemediateWorktree NOT to escalate to Stage-2 agy after healing stranded maintenance branch back to clean main, got Stage2Escalated=%v agyCalls=%d",
+			res.Stage2Escalated, agyCalls)
+	}
+	if res.FinalState.Branch != "main" || !res.FinalState.IsClean {
+		t.Fatalf("expected FinalState on clean main after healing interrupted maintenance branch, got branch=%q clean=%v",
+			res.FinalState.Branch, res.FinalState.IsClean)
+	}
+}
+
+
 

@@ -67,6 +67,14 @@ func ResolveBinary(name string) string {
 		}
 		return name
 	}
+	if pathEnv := strings.TrimSpace(os.Getenv("PATH")); pathEnv != "" {
+		firstDir := strings.Split(pathEnv, string(os.PathListSeparator))[0]
+		if isTempSupervisorHomeDir(firstDir) {
+			if resolved, err := exec.LookPath(name); err == nil {
+				return resolved
+			}
+		}
+	}
 	home := strings.TrimSpace(os.Getenv("HOME"))
 	if home == "" {
 		if uh, err := os.UserHomeDir(); err == nil {

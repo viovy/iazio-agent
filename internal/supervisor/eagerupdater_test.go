@@ -327,7 +327,8 @@ func TestRepoMonitor_HelpersAndStoryArtifactChecks(t *testing.T) {
 	fakeBinDir := t.TempDir()
 	_ = makeTestExecutable(t, fakeBinDir+"/autopilot", "#!/bin/sh\necho ok-git-update\n")
 	_ = makeTestExecutable(t, fakeBinDir+"/iazio-harness", "#!/bin/sh\necho ok-agy-escalation\n")
-	t.Setenv("PATH", fakeBinDir)
+	t.Setenv("HOME", fakeBinDir)
+	t.Setenv("PATH", fakeBinDir+":/usr/bin:/bin")
 
 	out1, err1 := DefaultShellGitUpdate(ctx, repoDir)
 	if err1 != nil || out1 != "ok-git-update" {
