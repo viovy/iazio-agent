@@ -824,17 +824,32 @@ func (d *Dispatcher) declineJob(ctx context.Context, jobID, reason string) error
 	if d.client == nil || strings.TrimSpace(jobID) == "" {
 		return nil
 	}
-	if decliner, ok := d.client.(interface {
-		DeclineJob(ctx context.Context, jobID, reason string) error
-	}); ok {
-		return decliner.DeclineJob(ctx, jobID, reason)
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt) * 200 * time.Millisecond):
+			}
+		}
+		if decliner, ok := d.client.(interface {
+			DeclineJob(ctx context.Context, jobID, reason string) error
+		}); ok {
+			lastErr = decliner.DeclineJob(ctx, jobID, reason)
+		} else if abandoner, ok := d.client.(interface {
+			AbandonJob(ctx context.Context, jobID, reason string) error
+		}); ok {
+			lastErr = abandoner.AbandonJob(ctx, jobID, reason)
+		} else {
+			return nil
+		}
+		if lastErr == nil {
+			return nil
+		}
+		fmt.Fprintf(os.Stderr, "[dispatcher] declineJob %s attempt %d/3 failed: %v\n", jobID, attempt+1, lastErr)
 	}
-	if abandoner, ok := d.client.(interface {
-		AbandonJob(ctx context.Context, jobID, reason string) error
-	}); ok {
-		return abandoner.AbandonJob(ctx, jobID, reason)
-	}
-	return nil
+	return lastErr
 }
 
 // NewDispatcher constructs a new Dispatcher, optionally accepting a RepoSyncer for immediate post-job sync hooks.
