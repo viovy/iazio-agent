@@ -4945,10 +4945,22 @@ func TestStoryGOV5196_WireIdleWorktreesAndPruneStaleHarnessActiveJobs(t *testing
 			Status:       watchdog.StatusRunning,
 			UpdatedAt:    freshTime,
 		},
+		{
+			JobID:        "job-1570",
+			WorktreePath: "/var/folders/l8/abc/T/TestE2E_StoryGov5206_Sch1569_Job1570/002",
+			Status:       watchdog.StatusCompleted,
+			UpdatedAt:    freshTime,
+		},
+		{
+			JobID:        "job-tmp-test",
+			WorktreePath: "/tmp/TestWorker_123/001",
+			Status:       watchdog.StatusCompleted,
+			UpdatedAt:    freshTime,
+		},
 	}
 	pruned := pruneStaleHarnessActiveJobs(activeFile, inputJobs)
 	if len(pruned) != 1 || pruned[0].JobID != "job-fresh-live" {
-		t.Fatalf("expected stale job to be pruned leaving only job-fresh-live, got %+v", pruned)
+		t.Fatalf("expected stale and synthetic TestE2E_/Test entries to be pruned leaving only job-fresh-live, got %+v", pruned)
 	}
 	if _, err := os.Stat(activeFile); err != nil {
 		t.Fatalf("expected pruned harness-active-jobs.json to be persisted, got %v", err)

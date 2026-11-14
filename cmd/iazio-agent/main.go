@@ -3241,21 +3241,28 @@ func isStoryCompletedOnDiskFallback(repoPath, storyID string) bool {
 	return false
 }
 
+func isSyntheticTestHarnessJobPath(wt string) bool {
+	return strings.Contains(wt, "TestExecuteJob_") ||
+		strings.Contains(wt, "TestE2E_") ||
+		strings.Contains(wt, "/T/Test") ||
+		strings.Contains(wt, "/tmp/Test") ||
+		strings.Contains(wt, `\Temp\Test`)
+}
+
 func isStaleOrSyntheticHarnessActiveJob(hj watchdog.TrackedJob) bool {
 	id := strings.TrimSpace(hj.JobID)
 	if id == "" || id == "job-cp-fallback" || strings.HasPrefix(id, "job-reap-") || strings.HasPrefix(id, "job-missing-") {
 		return true
 	}
-	wt := hj.WorktreePath
-	if strings.Contains(wt, "TestExecuteJob_") || strings.Contains(wt, "/T/Test") || strings.Contains(wt, `\Temp\Test`) {
+	if isSyntheticTestHarnessJobPath(hj.WorktreePath) {
 		return true
 	}
 	// Guard against recycled OS PIDs for old harness-active-jobs.json entries (>2h without lock ownership)
 	if !hj.UpdatedAt.IsZero() && time.Since(hj.UpdatedAt) > 2*time.Hour {
-		if wt == "" {
+		if hj.WorktreePath == "" {
 			return true
 		}
-		info, err := repolock.Read(wt)
+		info, err := repolock.Read(hj.WorktreePath)
 		if err != nil || info.JobID != id {
 			return true
 		}
@@ -3270,6 +3277,10 @@ func pruneStaleHarnessActiveJobs(harnessActivePath string, hJobs []watchdog.Trac
 	kept := make([]watchdog.TrackedJob, 0, len(hJobs))
 	changed := false
 	for _, hj := range hJobs {
+		if isSyntheticTestHarnessJobPath(hj.WorktreePath) {
+			changed = true
+			continue
+		}
 		if hj.Status == watchdog.StatusRunning && isStaleOrSyntheticHarnessActiveJob(hj) {
 			changed = true
 			continue

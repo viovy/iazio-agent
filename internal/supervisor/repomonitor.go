@@ -1,11 +1,13 @@
 package supervisor
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -1229,33 +1231,7 @@ func isSupervisorAutomatedMaintenanceRepoLock(repoPath string) bool {
 		strings.Contains(prompt, "autopilot git-update")
 }
 
-func isSupervisorAutomatedMaintenanceTranscript(s string) bool {
-	lower := strings.ToLower(s)
-	return strings.Contains(lower, `execute shell prompt "autopilot git-update"`) ||
-		strings.Contains(lower, `execute shell prompt \"autopilot git-update\"`) ||
-		strings.Contains(lower, "diagnostic failure summary from shell autopilot git-update") ||
-		strings.Contains(lower, "iazio-agy-log-git-update-agy-")
-}
-
-func stripSupervisorSystemTagRange(s, openTag, closeTag string) string {
-	for {
-		lower := strings.ToLower(s)
-		start := strings.Index(lower, openTag)
-		if start < 0 {
-			break
-		}
-		endRel := strings.Index(lower[start:], closeTag)
-		if endRel < 0 {
-			s = s[:start]
-			break
-		}
-		end := start + endRel + len(closeTag)
-		s = s[:start] + " " + s[end:]
-	}
-	return s
-}
-
-func stripSupervisorTranscriptBoilerplateAndToolOutputs(s string) string {
+func stripSupervisorTranscriptToolResponseLines(s string) string {
 	if s == "" {
 		return ""
 	}
@@ -1268,7 +1244,92 @@ func stripSupervisorTranscriptBoilerplateAndToolOutputs(s string) string {
 		}
 		kept = append(kept, line)
 	}
-	out := strings.Join(kept, "\n")
+	return strings.Join(kept, "\n")
+}
+
+func isSupervisorAutomatedMaintenanceTranscript(s string) bool {
+	lower := strings.ToLower(stripSupervisorTranscriptToolResponseLines(s))
+	return strings.Contains(lower, `execute shell prompt "autopilot git-update"`) ||
+		strings.Contains(lower, `execute shell prompt \"autopilot git-update\"`) ||
+		strings.Contains(lower, "diagnostic failure summary from shell autopilot git-update") ||
+		strings.Contains(lower, "iazio-agy-log-git-update-agy-")
+}
+
+func extractSupervisorContextSummaryUserRequests(s string) string {
+	const openTag = "<context_summary>"
+	const closeTag = "</context_summary>"
+	const reqHeader = "# user requests"
+	lowerAll := strings.ToLower(s)
+	preserveOriginal := len(lowerAll) == len(s)
+	var collected []string
+	offset := 0
+	for offset < len(lowerAll) {
+		relStart := strings.Index(lowerAll[offset:], openTag)
+		if relStart < 0 {
+			break
+		}
+		blockStart := offset + relStart + len(openTag)
+		blockLower := lowerAll[blockStart:]
+		advance := len(lowerAll)
+		if relEnd := strings.Index(blockLower, closeTag); relEnd >= 0 {
+			blockLower = blockLower[:relEnd]
+			advance = blockStart + relEnd + len(closeTag)
+		}
+		if reqIdx := strings.Index(blockLower, reqHeader); reqIdx >= 0 {
+			reqSecLower := blockLower[reqIdx:]
+			cut := len(reqSecLower)
+			for _, sep := range []string{"\n# ", `\n# `, "\n</context_summary>", `\n</context_summary>`} {
+				if idx := strings.Index(reqSecLower[len(reqHeader):], sep); idx >= 0 {
+					cand := len(reqHeader) + idx
+					if cand < cut {
+						cut = cand
+					}
+				}
+			}
+			if preserveOriginal && blockStart+reqIdx+cut <= len(s) {
+				collected = append(collected, s[blockStart+reqIdx:blockStart+reqIdx+cut])
+			} else {
+				collected = append(collected, reqSecLower[:cut])
+			}
+		}
+		offset = advance
+	}
+	return strings.Join(collected, "\n")
+}
+
+func stripSupervisorSystemTagRange(s, openTag, closeTag string) string {
+	for {
+		lower := strings.ToLower(s)
+		start := strings.Index(lower, openTag)
+		if start < 0 {
+			break
+		}
+		rest := lower[start+len(openTag):]
+		endRel := strings.Index(rest, closeTag)
+		if endRel >= 0 {
+			end := start + len(openTag) + endRel + len(closeTag)
+			s = s[:start] + " " + s[end:]
+			continue
+		}
+		reqIdx := strings.Index(rest, "<user_request>")
+		nlIdx := strings.IndexByte(rest, '\n')
+		cut := len(s)
+		if reqIdx >= 0 && (nlIdx < 0 || reqIdx < nlIdx) {
+			cut = start + len(openTag) + reqIdx
+		} else if nlIdx >= 0 {
+			cut = start + len(openTag) + nlIdx
+		}
+		s = s[:start] + " " + s[cut:]
+	}
+	return s
+}
+
+func stripSupervisorTranscriptBoilerplateAndToolOutputs(s string) string {
+	if s == "" {
+		return ""
+	}
+	out := stripSupervisorTranscriptToolResponseLines(s)
+	preservedRequests := extractSupervisorContextSummaryUserRequests(out)
 	for _, pair := range [][2]string{
 		{"<user_rules>", "</user_rules>"},
 		{"<rule[", "</rule["},
@@ -1279,6 +1340,9 @@ func stripSupervisorTranscriptBoilerplateAndToolOutputs(s string) string {
 		{"<context_summary>", "</context_summary>"},
 	} {
 		out = stripSupervisorSystemTagRange(out, pair[0], pair[1])
+	}
+	if preservedRequests != "" {
+		out += "\n" + preservedRequests
 	}
 	return out
 }
@@ -1293,6 +1357,9 @@ func containsSupervisorASEMarker(s string) bool {
 		strings.Contains(lower, "skills/autonomous-story-execution") ||
 		strings.Contains(lower, "autopilot-story") ||
 		strings.Contains(lower, "autopilot-git-flow") ||
+		strings.Contains(lower, "autopilot-review-scheme") ||
+		strings.Contains(lower, "autopilot review-scheme") ||
+		strings.Contains(lower, "autopilot conformance") ||
 		strings.Contains(lower, "autopilot story begin") ||
 		strings.Contains(lower, "autopilot ase") ||
 		strings.Contains(lower, "git-flow ase-start") ||
@@ -1424,33 +1491,148 @@ func isSupervisorConversationClaimedByOtherWorktree(repoPath, candID string) boo
 	if home != "" {
 		dbPath := filepath.Join(home, ".gemini", "antigravity-cli", "conversations", candID+".db")
 		if raw, err := os.ReadFile(dbPath); err == nil {
-			const prefix = "file://"
-			idx := 0
-			for {
-				pos := strings.Index(string(raw[idx:]), prefix)
-				if pos < 0 {
-					break
-				}
-				start := idx + pos + len(prefix)
-				end := start
-				for end < len(raw) && raw[end] >= 32 && raw[end] <= 126 && raw[end] != '"' && raw[end] != '\'' && raw[end] != '\r' && raw[end] != '\n' && raw[end] != '}' && raw[end] != ']' {
-					end++
-				}
-				if end > start {
-					declared := filepath.Clean(strings.TrimSpace(string(raw[start:end])))
-					declaredSlash := strings.ToLower(filepath.ToSlash(declared))
-					if declaredSlash != "" && strings.Contains(declaredSlash, "/meta-repo") && !strings.Contains(declaredSlash, ".json") && !strings.Contains(declaredSlash, ".txt") && !strings.Contains(declaredSlash, ".log") {
-						if declaredSlash != cleanRepoSlash {
-							return true
-						}
-					}
-				}
-				idx = start
+			if isSupervisorDBWorkspaceClaimedBySiblingWorktree(raw, cleanRepoSlash) {
+				return true
 			}
 		}
 	}
 
 	return false
+}
+
+func stripSupervisorWorktreeNumber(cleanPath string) string {
+	idx := strings.LastIndexByte(cleanPath, '-')
+	slashIdx := strings.LastIndexByte(cleanPath, '/')
+	if idx <= slashIdx+1 || idx >= len(cleanPath)-1 {
+		return cleanPath
+	}
+	for i := idx + 1; i < len(cleanPath); i++ {
+		if cleanPath[i] < '0' || cleanPath[i] > '9' {
+			return cleanPath
+		}
+	}
+	return cleanPath[:idx]
+}
+
+func splitSupervisorSlashDirBase(p string) (string, string) {
+	p = strings.TrimRight(p, "/")
+	idx := strings.LastIndexByte(p, '/')
+	if idx < 0 {
+		return "", p
+	}
+	if idx == 0 {
+		return "/", p[1:]
+	}
+	return p[:idx], p[idx+1:]
+}
+
+func isSupervisorDBWorkspaceClaimedBySiblingWorktree(raw []byte, cleanRepoSlash string) bool {
+	if len(raw) == 0 || strings.TrimSpace(cleanRepoSlash) == "" {
+		return false
+	}
+	cleanRepoSlash = strings.TrimRight(strings.ToLower(filepath.ToSlash(cleanRepoSlash)), "/")
+	parentSlash, baseName := splitSupervisorSlashDirBase(cleanRepoSlash)
+	familyBase := stripSupervisorWorktreeNumber(baseName)
+	if parentSlash == "" || familyBase == "" {
+		return false
+	}
+
+	selfRootCount := 0
+	siblingCounts := make(map[string]int)
+	maxSiblingRootCount := 0
+
+	prefix := []byte("file://")
+	idx := 0
+	for idx < len(raw) {
+		pos := bytes.Index(raw[idx:], prefix)
+		if pos < 0 {
+			break
+		}
+		start := idx + pos + len(prefix)
+		end := start
+		for end < len(raw) {
+			b := raw[end]
+			if b < 32 || b > 126 ||
+				b == '"' || b == '\'' || b == '\r' || b == '\n' ||
+				b == '}' || b == ']' || b == ')' || b == ' ' || b == '\t' ||
+				b == '<' || b == '>' || b == '#' || b == '?' ||
+				b == ',' || b == ';' || b == '`' {
+				break
+			}
+			end++
+		}
+		if end > start {
+			token := strings.TrimSpace(string(raw[start:end]))
+			declaredSlash := strings.TrimRight(strings.ToLower(filepath.ToSlash(filepath.Clean(token))), "/")
+			if strings.HasPrefix(declaredSlash, "/") {
+				dirSlash, decBase := splitSupervisorSlashDirBase(declaredSlash)
+				if dirSlash == parentSlash && stripSupervisorWorktreeNumber(decBase) == familyBase {
+					if declaredSlash == cleanRepoSlash {
+						selfRootCount++
+					} else {
+						siblingCounts[declaredSlash]++
+						if siblingCounts[declaredSlash] > maxSiblingRootCount {
+							maxSiblingRootCount = siblingCounts[declaredSlash]
+						}
+					}
+				}
+			}
+		}
+		idx = start
+	}
+
+	return maxSiblingRootCount > 0 && (selfRootCount == 0 || maxSiblingRootCount > selfRootCount*2)
+}
+
+func readSupervisorMiddleUserInputs(f *os.File, size, headLimit, tailLimit int64) string {
+	const maxScanFileSize = 32 * 1024 * 1024
+	const maxCollectedBytes = 256 * 1024
+	if f == nil || size <= headLimit+tailLimit || size > maxScanFileSize {
+		return ""
+	}
+	startOffset := headLimit - 4096
+	if startOffset < 0 {
+		startOffset = 0
+	}
+	endOffset := size - tailLimit + 4096
+	if endOffset > size {
+		endOffset = size
+	}
+	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+		return ""
+	}
+	reader := bufio.NewReaderSize(f, 64*1024)
+	offset := startOffset
+	if startOffset > 0 {
+		firstFrag, rErr := reader.ReadString('\n')
+		offset += int64(len(firstFrag))
+		if rErr != nil {
+			return ""
+		}
+	}
+	var b strings.Builder
+	for offset < endOffset {
+		line, rErr := reader.ReadString('\n')
+		offset += int64(len(line))
+		if len(line) > 0 {
+			lower := strings.ToLower(line)
+			if strings.Contains(lower, `"type":"user_input"`) || strings.Contains(lower, `"type": "user_input"`) {
+				if b.Len()+len(line) > maxCollectedBytes {
+					remaining := maxCollectedBytes - b.Len()
+					if remaining > 0 {
+						b.WriteString(line[:remaining])
+						b.WriteByte('\n')
+					}
+					break
+				}
+				b.WriteString(line)
+			}
+		}
+		if rErr != nil {
+			break
+		}
+	}
+	return b.String()
 }
 
 // InspectActiveBrainASETurnForRepo scans Antigravity brain directories for an in-flight /autonomous-story-execution
@@ -1500,6 +1682,7 @@ func InspectActiveBrainASETurnForRepo(repoPath string, now time.Time) (active bo
 				const headLimit = 96 * 1024
 				const tailLimit = 128 * 1024
 				var head, tail []byte
+				var midUserInputs string
 				if size <= headLimit+tailLimit {
 					all := make([]byte, size)
 					n, _ := f.Read(all)
@@ -1512,26 +1695,38 @@ func InspectActiveBrainASETurnForRepo(repoPath string, now time.Time) (active bo
 					tail = make([]byte, tailLimit)
 					tn, _ := f.ReadAt(tail, size-tailLimit)
 					tail = tail[:tn]
+					midUserInputs = readSupervisorMiddleUserInputs(f, size, headLimit, tailLimit)
 				}
 				_ = f.Close()
 
 				headStr := string(head)
 				tailStr := string(tail)
 				combined := headStr + "\n" + tailStr
-				if isSupervisorAutomatedMaintenanceTranscript(combined) {
+				if midUserInputs != "" {
+					combined = headStr + "\n" + midUserInputs + "\n" + tailStr
+				}
+				if isSupervisorAutomatedMaintenanceTranscript(headStr) ||
+					isSupervisorAutomatedMaintenanceTranscript(midUserInputs) ||
+					isSupervisorAutomatedMaintenanceTranscript(tailStr) {
 					continue
 				}
 				if !TranscriptReferencesRepoPath(combined, repoPath) {
 					continue
 				}
-				if !containsSupervisorASEMarker(headStr) && !containsSupervisorASEMarker(tailStr) {
+				if !containsSupervisorASEMarker(headStr) &&
+					!containsSupervisorASEMarker(midUserInputs) &&
+					!containsSupervisorASEMarker(tailStr) {
 					continue
 				}
 				if !isSupervisorTranscriptTurnInFlight(tail, modTime, now) {
 					continue
 				}
 				var candStory string
-				cleanedHead := stripSupervisorTranscriptBoilerplateAndToolOutputs(headStr)
+				combinedHead := headStr
+				if midUserInputs != "" {
+					combinedHead += "\n" + midUserInputs
+				}
+				cleanedHead := stripSupervisorTranscriptBoilerplateAndToolOutputs(combinedHead)
 				cleanedTail := stripSupervisorTranscriptBoilerplateAndToolOutputs(tailStr)
 				allMatches := append(
 					supervisorTranscriptBoundStoryRe.FindAllStringSubmatch(cleanedHead, -1),
@@ -1966,6 +2161,26 @@ func computeDirtyOnlyStatusHash(ctx context.Context, repoPath string) string {
 	return fmt.Sprintf("%x", sum[:8])
 }
 
+func maintenanceCommandEnv() []string {
+	base := AugmentedEnv(os.Environ())
+	env := make([]string, 0, len(base)+3)
+	for _, kv := range base {
+		if strings.HasPrefix(kv, "IAZIO_MANAGED_BY=") ||
+			strings.HasPrefix(kv, "IAZIO_HARNESS_JOB_ID=") ||
+			strings.HasPrefix(kv, "GIT_TERMINAL_PROMPT=") ||
+			strings.HasPrefix(kv, "IAZIO_AGENT_MANAGED=") ||
+			strings.HasPrefix(kv, "IAZIO_MAINTENANCE_RUN=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env,
+		"GIT_TERMINAL_PROMPT=0",
+		"IAZIO_AGENT_MANAGED=1",
+		"IAZIO_MAINTENANCE_RUN=1",
+	)
+}
+
 // DefaultShellGitUpdate executes "autopilot git-update" directly in repoPath.
 func DefaultShellGitUpdate(ctx context.Context, repoPath string) (string, error) {
 	autopilotBin := ResolveBinary("autopilot")
@@ -1973,12 +2188,7 @@ func DefaultShellGitUpdate(ctx context.Context, repoPath string) (string, error)
 	defer cancel()
 	cmd := procutil.CommandContext(upCtx, autopilotBin, "git-update")
 	cmd.Dir = repoPath
-	cmd.Env = append(
-		AugmentedEnv(os.Environ()),
-		"GIT_TERMINAL_PROMPT=0",
-		"IAZIO_AGENT_MANAGED=1",
-		"IAZIO_MANAGED_BY=harness",
-	)
+	cmd.Env = maintenanceCommandEnv()
 	setSupervisorProcGroup(cmd)
 	cmd.Cancel = func() error {
 		return killSupervisorProcGroup(cmd)
@@ -2007,12 +2217,7 @@ func DefaultAgyEscalation(ctx context.Context, repoPath, prompt, diagnosticOutpu
 	})
 	cmd := procutil.CommandContext(escCtx, harnessBin, "prompt", "run", "--json")
 	cmd.Dir = repoPath
-	cmd.Env = append(
-		AugmentedEnv(os.Environ()),
-		"GIT_TERMINAL_PROMPT=0",
-		"IAZIO_AGENT_MANAGED=1",
-		"IAZIO_MANAGED_BY=harness",
-	)
+	cmd.Env = maintenanceCommandEnv()
 	setSupervisorProcGroup(cmd)
 	cmd.Cancel = func() error {
 		return killSupervisorProcGroup(cmd)

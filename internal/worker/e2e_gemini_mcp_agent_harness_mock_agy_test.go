@@ -66,6 +66,7 @@ func buildHarnessAndMockAgyBinaries(t *testing.T) (harnessBin string, mockAgyBin
 		}
 	}
 
+	t.Setenv("IAZIO_TEST_MODE", "1")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return harnessBin, mockAgyBin, binDir
 }

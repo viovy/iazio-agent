@@ -2214,5 +2214,111 @@ func TestRepoStateMonitor_InspectFleet_SanitizesGeminiHooks(t *testing.T) {
 	}
 }
 
+func TestStoryGov5281_SupervisorCompactedLargeTranscriptAndToolResponseIsolation(t *testing.T) {
+	repo03 := t.TempDir()
+	initTestGitRepo(t, repo03)
+
+	brainRoot := t.TempDir()
+	t.Setenv("IAZIO_BRAIN_DIR", brainRoot)
+
+	convID := "test5281-agent-4000-8000-000000005281"
+	convLogs := filepath.Join(brainRoot, convID, ".system_generated", "logs")
+	_ = os.MkdirAll(convLogs, 0o755)
+
+	padding := strings.Repeat("supervisor analysis padding ", 5500)
+	step0 := fmt.Sprintf(`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"<user_information>Command Working Directory: %s\nApp Data Directory: /Users/romeo/.gemini/antigravity-cli</user_information><CONTEXT_SUMMARY>\n# User Requests\n1. deep review\n2. /autonomous-story-execution implement discoveries\n\n# Previous Session Summary:\n%s\n</CONTEXT_SUMMARY><USER_REQUEST>continue</USER_REQUEST>"}`, repo03, padding)
+	stepMid := `{"step_index":1,"type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>/autonomous-story-execution STORY-GOV-5281</USER_REQUEST>"}`
+	stepToolPad := fmt.Sprintf(`{"step_index":2,"type":"TOOL_RESPONSE","status":"DONE","content":"%s"}`, padding)
+	stepToolPoison := `{"step_index":3,"type":"TOOL_RESPONSE","status":"DONE","content":"1233: return strings.Contains(lower, ` + "`execute shell prompt \"autopilot git-update\"`" + `) || strings.Contains(lower, \"iazio-agy-log-git-update-agy-\")"}`
+	stepTail := fmt.Sprintf(`{"step_index":4,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":%q}}]}`, filepath.Join(repo03, "README.md"))
+
+	body := strings.Join([]string{step0, stepMid, stepToolPad, stepToolPoison, stepTail}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(convLogs, "transcript.jsonl"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	active, gotConv, gotStory := InspectActiveBrainASETurnForRepo(repo03, time.Now())
+	if !active || gotConv != convID {
+		t.Fatalf("expected InspectActiveBrainASETurnForRepo=true with convID=%s, got active=%v conv=%q", convID, active, gotConv)
+	}
+	if gotStory != "STORY-GOV-5281" {
+		t.Fatalf("expected storyID=STORY-GOV-5281 from middle USER_INPUT step, got %q", gotStory)
+	}
+}
+
+func TestStoryGov5281_MaintenanceCommandEnvIsolation(t *testing.T) {
+	t.Setenv("IAZIO_MANAGED_BY", "harness")
+	t.Setenv("IAZIO_HARNESS_JOB_ID", "job-123")
+
+	env := maintenanceCommandEnv()
+	var hasMaint, hasAgentManaged, hasManagedBy, hasHarnessJobID bool
+	for _, entry := range env {
+		switch {
+		case entry == "IAZIO_MAINTENANCE_RUN=1":
+			hasMaint = true
+		case entry == "IAZIO_AGENT_MANAGED=1":
+			hasAgentManaged = true
+		case strings.HasPrefix(entry, "IAZIO_MANAGED_BY="):
+			hasManagedBy = true
+		case strings.HasPrefix(entry, "IAZIO_HARNESS_JOB_ID="):
+			hasHarnessJobID = true
+		}
+	}
+	if !hasMaint || !hasAgentManaged {
+		t.Fatalf("expected IAZIO_MAINTENANCE_RUN=1 and IAZIO_AGENT_MANAGED=1 in maintenanceCommandEnv, got hasMaint=%v hasAgentManaged=%v", hasMaint, hasAgentManaged)
+	}
+	if hasManagedBy || hasHarnessJobID {
+		t.Fatalf("did not expect IAZIO_MANAGED_BY or IAZIO_HARNESS_JOB_ID in maintenanceCommandEnv, got hasManagedBy=%v hasHarnessJobID=%v", hasManagedBy, hasHarnessJobID)
+	}
+}
+
+func TestIsSupervisorDBWorkspaceClaimedBySiblingWorktreeAndBrainDetection(t *testing.T) {
+	// (a) Self workspace root + sub-file URIs + prose sibling doc link must NOT reject self worktree.
+	selfDB := []byte("header\x00file:///Users/romeo/work/meta-repo-03\x00file:///Users/romeo/work/meta-repo-03/ai/skills/autopilot/SKILL.md\x00see [ref](file:///Users/romeo/work/meta-repo-02/docs/x.md)\x00tail")
+	if isSupervisorDBWorkspaceClaimedBySiblingWorktree(selfDB, "/users/romeo/work/meta-repo-03") {
+		t.Fatalf("expected self workspace .db with sub-file URIs and sibling prose link to return false for meta-repo-03")
+	}
+
+	// (b) Explicit sibling workspace root without self workspace root must claim for sibling.
+	siblingDB := []byte("header\x00file:///Users/romeo/work/meta-repo-02\x00file:///Users/romeo/work/meta-repo-02/README.md\x00")
+	if !isSupervisorDBWorkspaceClaimedBySiblingWorktree(siblingDB, "/users/romeo/work/meta-repo-03") {
+		t.Fatalf("expected sibling workspace .db to return true when probing meta-repo-03")
+	}
+
+	// (c) End-to-end InspectActiveBrainASETurnForRepo detects meta-repo-03 brain session when .db has sub-file URIs.
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	workRoot := filepath.Join(tmpRoot, "work")
+	repo03 := filepath.Join(workRoot, "meta-repo-03")
+	repo02 := filepath.Join(workRoot, "meta-repo-02")
+	brainRoot := filepath.Join(homeDir, ".gemini", "antigravity-cli", "brain")
+	convDir := filepath.Join(homeDir, ".gemini", "antigravity-cli", "conversations")
+	convID := "ea854a37-959c-4886-bf7f-d3ab255ffde1"
+	logsDir := filepath.Join(brainRoot, convID, ".system_generated", "logs")
+	for _, dir := range []string{repo03, repo02, logsDir, convDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	t.Setenv("HOME", homeDir)
+	t.Setenv("IAZIO_BRAIN_DIR", brainRoot)
+
+	dbContent := fmt.Sprintf("sqlite\x00file://%s\x00file://%s/ai/skills/autopilot/SKILL.md\x00[note](file://%s/docs/x.md)", repo03, repo03, repo02)
+	if err := os.WriteFile(filepath.Join(convDir, convID+".db"), []byte(dbContent), 0o644); err != nil {
+		t.Fatalf("write conv db: %v", err)
+	}
+	transcriptBody := strings.Join([]string{
+		fmt.Sprintf(`{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"Command Working Directory: %s\n<USER_REQUEST>/autonomous-story-execution STORY-GOV-5281</USER_REQUEST>"}`, repo03),
+		fmt.Sprintf(`{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":%q}}]}`, filepath.Join(repo03, "README.md")),
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(logsDir, "transcript.jsonl"), []byte(transcriptBody), 0o644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	active, gotConv, gotStory := InspectActiveBrainASETurnForRepo(repo03, time.Now())
+	if !active || gotConv != convID || gotStory != "STORY-GOV-5281" {
+		t.Fatalf("expected InspectActiveBrainASETurnForRepo to detect (%v, %s, STORY-GOV-5281), got (%v, %q, %q)", true, convID, active, gotConv, gotStory)
+	}
+}
 
 
