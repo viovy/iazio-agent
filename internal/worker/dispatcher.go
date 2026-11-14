@@ -1832,6 +1832,12 @@ func (d *Dispatcher) claimAndReserveJob(ctx context.Context, cachedIdle ...[]str
 				}
 			}
 		}
+		// STORY-IAZIO-0204 RC-7: reject premature CRAFT / mid-flow success prose even when git is clean.
+		if aseGateErr == nil && isASEJob(job) && res != nil {
+			if details := asegate.PrematureCraftCloseoutDetails(res.Summary, res.Output); details != "" {
+				aseGateErr = fmt.Errorf("ASE_COMPLETION_GATE_VIOLATION: premature_craft_closeout (%s)", details)
+			}
+		}
 
 		if aseGateErr != nil {
 			if gateSpan != nil {

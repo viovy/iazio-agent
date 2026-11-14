@@ -21,6 +21,8 @@ type GateResult struct {
 	StoryDone       bool     `json:"story_done"`
 	TestsPassed     bool     `json:"tests_passed"`
 	ReleaseVerified bool     `json:"release_verified"`
+	// PrematureCraft is true when summary/output claims CRAFT/success while mid-flow markers remain.
+	PrematureCraft bool `json:"premature_craft,omitempty"`
 }
 
 // GateOptions configures the post-exit completion check.
@@ -33,6 +35,9 @@ type GateOptions struct {
 	RequireTestsPassed     bool
 	RequireReleaseVerified bool
 	GitRunner              func(args ...string) (string, error)
+	// Summary and Output are optional agent transcripts checked for premature CRAFT closeout (RC-7).
+	Summary string
+	Output  string
 }
 
 // DefaultGitRunner executes a git command in the target directory.
@@ -152,6 +157,12 @@ func Verify(opts GateOptions) GateResult {
 			res.ReleaseVerified = false
 			res.UnmetGates = append(res.UnmetGates, "release_verified")
 		}
+	}
+
+	// 7. Premature CRAFT / mid-flow completion honesty (STORY-IAZIO-0204 RC-7)
+	if IsPrematureCraftCloseout(opts.Summary, opts.Output) {
+		res.PrematureCraft = true
+		res.UnmetGates = append(res.UnmetGates, "premature_craft_closeout")
 	}
 
 	if len(res.UnmetGates) > 0 {
