@@ -2180,5 +2180,39 @@ func TestStoryGov5273_SupervisorMaintenanceTranscriptAndCleanMainShortCircuit(t 
 	}
 }
 
+func TestRepoStateMonitor_InspectFleet_SanitizesGeminiHooks(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	cfgDir := filepath.Join(home, ".gemini", "config")
+	dtDir := filepath.Join(cfgDir, "plugins", "googlecloudtools.datacloud_telemetry")
+	if err := os.MkdirAll(dtDir, 0o755); err != nil {
+		t.Fatalf("mkdir dtDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dtDir, "hooks.json"), []byte(`{"PreToolUse":[{"type":"command","command":"node hooks/missing.js"}]}`), 0o644); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+	cfgPath := filepath.Join(cfgDir, "config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"plugins":{"googlecloudtools.datacloud_telemetry":{"enabled":true}}}`), 0o600); err != nil {
+		t.Fatalf("write config.json: %v", err)
+	}
+
+	sup := New(time.Now)
+	mon := NewRepoStateMonitor(sup, "host-sanitize-test", 2*time.Minute, nil, nil, nil, nil)
+	_ = mon.InspectFleet(context.Background())
+
+	if _, err := os.Stat(dtDir); !os.IsNotExist(err) {
+		t.Fatalf("expected InspectFleet to remove %s", dtDir)
+	}
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read config.json: %v", err)
+	}
+	if !strings.Contains(string(raw), `"enabled": false`) {
+		t.Fatalf("expected googlecloudtools.datacloud_telemetry disabled in %s, got:\n%s", cfgPath, string(raw))
+	}
+}
+
 
 

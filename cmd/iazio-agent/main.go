@@ -38,6 +38,7 @@ import (
 	"github.com/viovy/iazio-agent/internal/repolock"
 	"github.com/viovy/iazio-agent/internal/service"
 	"github.com/viovy/iazio-agent/internal/sessionstore"
+	"github.com/viovy/iazio-agent/internal/agyhooks"
 	"github.com/viovy/iazio-agent/internal/supervisor"
 	"github.com/viovy/iazio-agent/internal/watchdog"
 	"github.com/viovy/iazio-agent/internal/worker"
@@ -482,6 +483,15 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, geten
 		if ctx.Err() == nil {
 			runCtx, cancel := context.WithCancel(ctx)
 			defer cancel()
+
+			if sanRes, sanErr := agyhooks.SanitizeUserGeminiHooks(agyhooks.ResolveAgentHome(getenv, isTestBinary())); sanErr != nil {
+				sink.Error("gemini plugin hook sanitization warning at startup", sanErr, nil)
+			} else if sanRes.Changed {
+				sink.Info("sanitized stale gemini plugin hooks at startup", map[string]any{
+					"removed_plugin_dirs": sanRes.RemovedPluginDirs,
+					"disabled_plugins":    sanRes.DisabledPlugins,
+				})
+			}
 
 			watchdog.StartSystemdWatchdog(runCtx)
 			if !isTestBinary() && !service.IsServiceControlDisabled() {
