@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/viovy/iazio-agent/internal/agyhooks"
 	"github.com/viovy/iazio-core/pkg/procutil"
 	"github.com/viovy/iazio-core/pkg/telemetry"
 )
@@ -597,6 +598,8 @@ func (c *CLIInvoker) runCommand(ctx context.Context, args []string, stdinData []
 	}
 	cmd.Stdout = &stdoutWriter
 	cmd.Stderr = &stderrWriter
+
+	_, _ = agyhooks.SanitizeUserGeminiHooks(agyhooks.ResolveEnvHome(cmd.Env))
 
 	err := cmd.Run()
 	stdoutWriter.Flush()

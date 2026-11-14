@@ -79,6 +79,7 @@ type mockControlPlane struct {
 	ackedJobs          map[string]string
 	ackedWorktreePaths map[string]string
 	declinedJobs       map[string]string
+	failoverReqs       map[string][]controlplane.AttemptFailure
 }
 
 func newMockControlPlane() *mockControlPlane {
@@ -88,6 +89,7 @@ func newMockControlPlane() *mockControlPlane {
 		ackedJobs:          make(map[string]string),
 		ackedWorktreePaths: make(map[string]string),
 		declinedJobs:       make(map[string]string),
+		failoverReqs:       make(map[string][]controlplane.AttemptFailure),
 	}
 }
 
@@ -147,6 +149,9 @@ func (m *mockControlPlane) DeclineJob(ctx context.Context, jobID, reason string)
 }
 
 func (m *mockControlPlane) FailoverJob(ctx context.Context, jobID string, req controlplane.AttemptFailure) error {
+	if m.failoverReqs != nil {
+		m.failoverReqs[jobID] = append(m.failoverReqs[jobID], req)
+	}
 	return nil
 }
 
@@ -2952,6 +2957,137 @@ func TestStoryGov5256_SupervisorAutoResumesUnmergedFeatureBranchAndBlocksOtherSt
 	}
 	if gotWT := cp.ackedWorktreePaths["job_7d5cad6fd223f5a0"]; filepath.Clean(gotWT) != filepath.Clean(wt) {
 		t.Fatalf("expected AckLeaseWithWorktree to record worktree %q, got %q", wt, gotWT)
+	}
+}
+
+func TestDispatcher_PollAndProcess_RemediatesStalePluginHookAndRetries(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	cfgDir := filepath.Join(home, ".gemini", "config")
+	dtDir := filepath.Join(cfgDir, "plugins", "googlecloudtools.datacloud_telemetry")
+	cfgPath := filepath.Join(cfgDir, "config.json")
+
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:          "job-stale-hook-retry-1",
+			Type:        JobTypePromptExecute,
+			Repo:        "meta-repo",
+			TargetAgent: "agy",
+			LeaseToken:  "lease-hook-1",
+			Payload:     json.RawMessage(`{"prompt":"Run checks","target_agent":"agy"}`),
+		}, nil
+	}
+
+	var attempts int
+	var secondResumeConv string
+	inv := &mockInvoker{
+		executePromptFunc: func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+			attempts++
+			if attempts == 1 {
+				if err := os.MkdirAll(dtDir, 0o755); err != nil {
+					t.Fatalf("mkdir dtDir: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(dtDir, "hooks.json"), []byte(`{"PreToolUse":[{"type":"command","command":"node hooks/missing.js"}]}`), 0o644); err != nil {
+					t.Fatalf("write hooks.json: %v", err)
+				}
+				if err := os.WriteFile(cfgPath, []byte(`{"plugins":{"googlecloudtools.datacloud_telemetry":{"enabled":true}}}`), 0o600); err != nil {
+					t.Fatalf("write config.json: %v", err)
+				}
+				return &harness.PromptExecutionResult{
+					Status:         "completed",
+					ExitCode:       0,
+					ConversationID: "conv-stale-hook-001",
+					Summary:        "Turn 1 exited 0 on hook failure",
+					Output:         "JSON hook \"jsonhook__googlecloudtools.datacloud_telemetry_PreToolUse_0_0\" failed:\ncommand failed: chdir /Users/romeo/.gemini/config/plugins/googlecloudtools.datacloud_telemetry: no such file or directory",
+				}, nil
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(payload, &decoded); err == nil {
+				secondResumeConv, _ = decoded["resume_conversation_id"].(string)
+			}
+			if _, statErr := os.Stat(dtDir); !os.IsNotExist(statErr) {
+				t.Fatalf("expected dispatcher retry to remove stale plugin dir %s before attempt 2", dtDir)
+			}
+			return &harness.PromptExecutionResult{
+				Status:         "completed",
+				ExitCode:       0,
+				ConversationID: "conv-stale-hook-001",
+				Summary:        "Completed cleanly after hook remediation",
+			}, nil
+		},
+	}
+
+	d := NewDispatcher(cp, inv, "host-1")
+	processed, err := d.PollAndProcess(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("expected PollAndProcess to remediate and succeed, got processed=%v err=%v", processed, err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 attempts (Turn 1 hook failure + Turn 2 retry), got %d", attempts)
+	}
+	if secondResumeConv != "conv-stale-hook-001" {
+		t.Fatalf("expected attempt 2 to attach resume_conversation_id=conv-stale-hook-001, got %q", secondResumeConv)
+	}
+	comp := cp.completedJobs["job-stale-hook-retry-1"]
+	if comp.Error != "" {
+		t.Fatalf("expected empty CompleteRequest.Error after hook remediation, got %q", comp.Error)
+	}
+	cfgBytes, readErr := os.ReadFile(cfgPath)
+	if readErr != nil || !strings.Contains(string(cfgBytes), `"enabled": false`) {
+		t.Fatalf("expected %s to pin googlecloudtools.datacloud_telemetry enabled=false, readErr=%v content=%s", cfgPath, readErr, string(cfgBytes))
+	}
+}
+
+func TestDispatcher_PollAndProcess_StalePluginHookFailoverCategory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	cp := newMockControlPlane()
+	cp.claimFunc = func(ctx context.Context, req ClaimRequest) (*Job, error) {
+		return &Job{
+			ID:          "job-stale-hook-failover-1",
+			Type:        JobTypePromptExecute,
+			Repo:        "meta-repo",
+			TargetAgent: "agy",
+			LeaseToken:  "lease-hook-2",
+			Payload:     json.RawMessage(`{"prompt":"Run checks","target_agent":"agy"}`),
+		}, nil
+	}
+
+	var attempts int
+	inv := &mockInvoker{
+		executePromptFunc: func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+			attempts++
+			return &harness.PromptExecutionResult{
+				Status:           "failed",
+				ExitCode:         1,
+				FailureCategory:  "STALE_PLUGIN_HOOK_DIR",
+				FailureStage:     "TOOL_EXECUTION",
+				FailureDirection: "LOCAL_EXECUTION",
+				FailureService:   "agy-cli/plugin-hooks",
+				Summary:          "STALE_PLUGIN_HOOK_DIR: PreToolUse hook failed",
+			}, errors.New("STALE_PLUGIN_HOOK_DIR: PreToolUse hook failed")
+		},
+	}
+
+	d := NewDispatcher(cp, inv, "host-1")
+	processed, err := d.PollAndProcess(context.Background())
+	if err == nil || !processed {
+		t.Fatalf("expected error after retries exhausted, got processed=%v err=%v", processed, err)
+	}
+	if attempts != 3 {
+		t.Fatalf("expected all 3 supervisor attempts for remediable STALE_PLUGIN_HOOK_DIR, got %d", attempts)
+	}
+	reqs := cp.failoverReqs["job-stale-hook-failover-1"]
+	if len(reqs) != 1 {
+		t.Fatalf("expected 1 FailoverJob call on fast local failure, got %d (%+v)", len(reqs), reqs)
+	}
+	if reqs[0].FailureCategory != "STALE_PLUGIN_HOOK_DIR" || reqs[0].FailureDirection != "LOCAL_EXECUTION" || reqs[0].FailureService != "agy-cli/plugin-hooks" {
+		t.Fatalf("unexpected failover classification: %+v", reqs[0])
 	}
 }
 

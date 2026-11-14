@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/viovy/iazio-agent/internal/agyhooks"
 	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-core/pkg/procutil"
 	"github.com/viovy/iazio-agent/internal/repolock"
@@ -1989,6 +1990,7 @@ func DefaultShellGitUpdate(ctx context.Context, repoPath string) (string, error)
 
 // DefaultAgyEscalation launches iazio-harness with target agent "agy" in repoPath executing prompt.
 func DefaultAgyEscalation(ctx context.Context, repoPath, prompt, diagnosticOutput string) (string, error) {
+	_, _ = agyhooks.SanitizeUserGeminiHooks(agyhooks.ResolveAgentHome(os.Getenv, agyhooks.IsTestProcess()))
 	harnessBin := ResolveBinary("iazio-harness")
 	fullPrompt := prompt
 	if strings.TrimSpace(diagnosticOutput) != "" {
@@ -2410,6 +2412,8 @@ func (m *RepoStateMonitor) LastSnapshot() FleetStateSnapshot {
 func (m *RepoStateMonitor) InspectFleet(ctx context.Context) FleetStateSnapshot {
 	m.inspectMu.Lock()
 	defer m.inspectMu.Unlock()
+
+	_, _ = agyhooks.SanitizeUserGeminiHooks(agyhooks.ResolveAgentHome(os.Getenv, agyhooks.IsTestProcess()))
 
 	m.mu.RLock()
 	lastSnap := m.lastSnapshot

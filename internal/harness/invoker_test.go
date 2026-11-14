@@ -655,5 +655,52 @@ func TestStoryGov5264_CanonicalHarnessBinaryResolutionAndStdinPayloadValidation(
 	}
 }
 
+func TestCLIInvoker_RunCommand_SanitizesGeminiHooksPreSpawn(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	cfgDir := filepath.Join(home, ".gemini", "config")
+	dtDir := filepath.Join(cfgDir, "plugins", "googlecloudtools.datacloud_telemetry")
+	if err := os.MkdirAll(dtDir, 0o755); err != nil {
+		t.Fatalf("mkdir dtDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dtDir, "hooks.json"), []byte(`{"PreToolUse":[{"type":"command","command":"node hooks/missing.js"}]}`), 0o644); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+	cfgPath := filepath.Join(cfgDir, "config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"plugins":{"googlecloudtools.datacloud_telemetry":{"enabled":true}}}`), 0o600); err != nil {
+		t.Fatalf("write config.json: %v", err)
+	}
+
+	binDir := t.TempDir()
+	var fakeHarness string
+	if runtime.GOOS == "windows" {
+		fakeHarness = filepath.Join(binDir, "fake-harness.cmd")
+		winScript := fmt.Sprintf("@echo off\r\nif exist \"%s\" exit /b 2\r\necho {\"status\":\"completed\",\"summary\":\"ok\"}\r\nexit /b 0\r\n", dtDir)
+		if err := os.WriteFile(fakeHarness, []byte(winScript), 0o755); err != nil {
+			t.Fatalf("write fakeHarness: %v", err)
+		}
+	} else {
+		fakeHarness = filepath.Join(binDir, "fake-harness")
+		shScript := fmt.Sprintf("#!/bin/sh\nif [ -e %q ]; then\n  echo 'stale plugin dir still exists pre-spawn' >&2\n  exit 2\nfi\necho '{\"status\":\"completed\",\"summary\":\"ok\"}'\nexit 0\n", dtDir)
+		if err := os.WriteFile(fakeHarness, []byte(shScript), 0o755); err != nil {
+			t.Fatalf("write fakeHarness: %v", err)
+		}
+	}
+
+	inv := NewCLIInvoker(fakeHarness, t.TempDir())
+	res, err := inv.ExecutePrompt(context.Background(), json.RawMessage(`{"prompt":"hello"}`))
+	if err != nil {
+		t.Fatalf("expected ExecutePrompt to succeed after pre-spawn sanitization, got err=%v", err)
+	}
+	if res == nil || res.Status != "completed" {
+		t.Fatalf("expected completed result, got %+v", res)
+	}
+	if _, statErr := os.Stat(dtDir); !os.IsNotExist(statErr) {
+		t.Fatalf("expected %s to be deleted pre-spawn", dtDir)
+	}
+}
+
 
 

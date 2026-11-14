@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/viovy/iazio-agent/internal/agyhooks"
 	asegate "github.com/viovy/iazio-agent/internal/ase/gate"
 	"github.com/viovy/iazio-agent/internal/controlplane"
 	"github.com/viovy/iazio-agent/internal/harness"
@@ -1611,6 +1612,20 @@ func (d *Dispatcher) claimAndReserveJob(ctx context.Context, cachedIdle ...[]str
 			if err == nil && res != nil {
 				if hasHeadlessPermissionDenialInAgentOutput(res.Summary + "\n" + res.Output) {
 					err = fmt.Errorf("PERMISSION_DENIED: headless agent tool permission was auto-denied: %s", strings.TrimSpace(res.Summary))
+				} else if matchedHook, hookPlugin := hasStalePluginHookInAgentOutput(res); matchedHook {
+					if strings.TrimSpace(res.FailureCategory) == "" {
+						res.FailureCategory = "STALE_PLUGIN_HOOK_DIR"
+					}
+					if strings.TrimSpace(res.FailureStage) == "" {
+						res.FailureStage = "TOOL_EXECUTION"
+					}
+					if strings.TrimSpace(res.FailureDirection) == "" {
+						res.FailureDirection = "LOCAL_EXECUTION"
+					}
+					if strings.TrimSpace(res.FailureService) == "" {
+						res.FailureService = "agy-cli/plugin-hooks"
+					}
+					err = fmt.Errorf("STALE_PLUGIN_HOOK_DIR: Antigravity PreToolUse plugin hook (%s) failed with missing plugin directory: %s", hookPlugin, strings.TrimSpace(res.Summary))
 				} else if strings.EqualFold(res.Status, "failed") || res.ExitCode != 0 {
 					err = fmt.Errorf("prompt execution failed (status=%s exit=%d): %s", res.Status, res.ExitCode, strings.TrimSpace(res.Summary))
 				} else if isASEJob(job) && worktreeDir != "" && worktreeDir != "." {
@@ -1644,10 +1659,14 @@ func (d *Dispatcher) claimAndReserveJob(ctx context.Context, cachedIdle ...[]str
 				strings.Contains(errLower, "incomplete_ase_flow") ||
 				strings.Contains(errLower, "unpushed_commits") ||
 				(res != nil && strings.EqualFold(strings.TrimSpace(res.FailureCategory), "ASE_GATE_INCOMPLETE"))
-			if strings.Contains(retryTriggerErr.Error(), "PERMISSION_DENIED") ||
+			isStalePluginHook := isStalePluginHookFailure(retryTriggerErr, res)
+			if isStalePluginHook {
+				_, _ = agyhooks.SanitizeUserGeminiHooks(agyhooks.ResolveAgentHome(os.Getenv, agyhooks.IsTestProcess()))
+			}
+			if !isStalePluginHook && (strings.Contains(retryTriggerErr.Error(), "PERMISSION_DENIED") ||
 				errors.Is(retryTriggerErr, context.DeadlineExceeded) ||
 				errors.Is(retryTriggerErr, context.Canceled) ||
-				(!isASEGateFailure && (strings.Contains(errLower, "429 you have exhausted") || strings.Contains(errLower, "resourceexhausted") || strings.Contains(errLower, "insufficient_quota"))) {
+				(!isASEGateFailure && (strings.Contains(errLower, "429 you have exhausted") || strings.Contains(errLower, "resourceexhausted") || strings.Contains(errLower, "insufficient_quota")))) {
 				break
 			}
 			// Mutual supervision: iazio-harness or agy crashed/exited non-zero locally or exited before landing ASE branch.
@@ -1731,6 +1750,10 @@ func (d *Dispatcher) claimAndReserveJob(ctx context.Context, cachedIdle ...[]str
 					category = "PERMISSION_DENIED"
 					direction = "LOCAL_EXECUTION"
 					service = "iazio-harness/sandbox"
+				} else if strings.Contains(err.Error(), "STALE_PLUGIN_HOOK_DIR") || hasStalePluginHookFailureText(err.Error()) {
+					category = "STALE_PLUGIN_HOOK_DIR"
+					direction = "LOCAL_EXECUTION"
+					service = "agy-cli/plugin-hooks"
 				} else if strings.Contains(errLower, "429") || strings.Contains(errLower, "quota") || strings.Contains(errLower, "auth") || strings.Contains(errLower, "token") {
 					category = "TOOL_QUOTA_OR_AUTH"
 					direction = "UPSTREAM"
@@ -2159,5 +2182,62 @@ func hasHeadlessPermissionDenialInAgentOutput(text string) bool {
 		}
 	}
 	return false
+}
+
+func stripAgyStepLines(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.Contains(line, "[agy step #") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
+func hasStalePluginHookFailureText(texts ...string) bool {
+	filtered := make([]string, 0, len(texts))
+	for _, t := range texts {
+		if cleaned := stripAgyStepLines(t); strings.TrimSpace(cleaned) != "" {
+			filtered = append(filtered, cleaned)
+		}
+	}
+	matched, _ := agyhooks.DetectStalePluginHookFailure(filtered...)
+	return matched
+}
+
+func hasStalePluginHookInAgentOutput(res *harness.PromptExecutionResult) (bool, string) {
+	if res == nil {
+		return false, ""
+	}
+	if strings.EqualFold(strings.TrimSpace(res.FailureCategory), "STALE_PLUGIN_HOOK_DIR") {
+		if matched, plugin := agyhooks.DetectStalePluginHookFailure(res.Summary, res.Output); matched && plugin != "" {
+			return true, plugin
+		}
+		return true, "googlecloudtools.datacloud_telemetry"
+	}
+	filteredSummary := stripAgyStepLines(res.Summary)
+	filteredOutput := stripAgyStepLines(res.Output)
+	return agyhooks.DetectStalePluginHookFailure(filteredSummary, filteredOutput)
+}
+
+func isStalePluginHookFailure(err error, res *harness.PromptExecutionResult) bool {
+	if res != nil && strings.EqualFold(strings.TrimSpace(res.FailureCategory), "STALE_PLUGIN_HOOK_DIR") {
+		return true
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "STALE_PLUGIN_HOOK_DIR") {
+			return true
+		}
+		if matched, _ := agyhooks.DetectStalePluginHookFailure(stripAgyStepLines(err.Error())); matched {
+			return true
+		}
+	}
+	matched, _ := hasStalePluginHookInAgentOutput(res)
+	return matched
 }
 
