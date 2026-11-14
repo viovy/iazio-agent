@@ -2687,6 +2687,65 @@ func TestASECompletionGate_Invariants_StoryGov5232(t *testing.T) {
 	_ = os.Remove(filepath.Join(wt, ".iazio", "post-ase-sync-failed"))
 }
 
+func TestASECompletionGate_PrematureCraftCloseout_StoryIazio0204(t *testing.T) {
+	wt := t.TempDir()
+	_ = exec.Command("git", "init", wt).Run()
+	_ = exec.Command("git", "-C", wt, "config", "user.email", "test@test.local").Run()
+	_ = exec.Command("git", "-C", wt, "config", "user.name", "Test").Run()
+	_ = exec.Command("git", "-C", wt, "checkout", "-b", "main").Run()
+	_ = os.WriteFile(filepath.Join(wt, "file.txt"), []byte("init\n"), 0o644)
+	_ = exec.Command("git", "-C", wt, "add", "file.txt").Run()
+	_ = exec.Command("git", "-C", wt, "commit", "-m", "init").Run()
+	bareRemote := t.TempDir()
+	_ = exec.Command("git", "init", "--bare", bareRemote).Run()
+	_ = exec.Command("git", "-C", wt, "remote", "add", "origin", bareRemote).Run()
+	_ = exec.Command("git", "-C", wt, "push", "-u", "origin", "main").Run()
+
+	var lastCompleteReq CompleteRequest
+	cp := newMockControlPlane()
+	cp.completeFunc = func(_ context.Context, _ string, req CompleteRequest) error {
+		lastCompleteReq = req
+		return nil
+	}
+	prematureSummary := "## CRAFT Closeout\nLaunched autopilot-git-flow land; waiting for CI green."
+	inv := &mockInvoker{
+		executePromptFunc: func(ctx context.Context, payload json.RawMessage) (*harness.PromptExecutionResult, error) {
+			return &harness.PromptExecutionResult{
+				Status:   "completed",
+				ExitCode: 0,
+				StoryID:  "STORY-IAZIO-0204",
+				Summary:  prematureSummary,
+				Output:   prematureSummary,
+			}, nil
+		},
+	}
+	d := NewDispatcher(cp, inv, "host-1")
+	job := &Job{
+		ID:                   "job_5b4dc7312a463143",
+		Type:                 JobTypePromptExecute,
+		Repo:                 wt,
+		StoryID:              "STORY-IAZIO-0204",
+		ActiveConversationID: "conv-premature-craft",
+		FencingToken:         1,
+		Payload:              json.RawMessage(`{"prompt":"/autonomous-story-execution STORY-IAZIO-0204","worktree_path":"` + filepath.ToSlash(wt) + `"}`),
+	}
+	cp.claimFunc = func(_ context.Context, _ ClaimRequest) (*Job, error) { return job, nil }
+
+	processed, err := d.PollAndProcess(context.Background())
+	if !processed || err == nil {
+		t.Fatalf("expected premature CRAFT on clean main to fail gate, processed=%v err=%v", processed, err)
+	}
+	if !strings.Contains(err.Error(), "ASE_COMPLETION_GATE_VIOLATION") || !strings.Contains(err.Error(), "premature_craft_closeout") {
+		t.Fatalf("expected premature_craft_closeout violation, got %v", err)
+	}
+	if !strings.Contains(lastCompleteReq.Error, "premature_craft_closeout") {
+		t.Fatalf("expected CompleteRequest.Error premature_craft_closeout, got %q", lastCompleteReq.Error)
+	}
+	if len(lastCompleteReq.Result) == 0 || !strings.Contains(string(lastCompleteReq.Result), "ASE_GATE_INCOMPLETE") {
+		t.Fatalf("expected ASE_GATE_INCOMPLETE in CompleteRequest.Result, got %s", string(lastCompleteReq.Result))
+	}
+}
+
 type mockSequenceSyncer struct {
 	syncCallback func(repo string)
 }

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
@@ -54,7 +55,11 @@ func main() {
 			convID = strings.ToLower(strings.Trim(tok, ".,:;()[]{}\"'"))
 		}
 	}
-	fmt.Printf("{\"status\":\"completed\",\"conversation_id\":%q,\"story_id\":%q,\"summary\":\"mock agy completed %s\"}\n", convID, storyID, storyID)
+	summary := "mock agy completed " + storyID
+	if strings.Contains(args, "PREMATURE_CRAFT") {
+		summary = "## CRAFT Closeout\nLaunched autopilot-git-flow land; waiting for CI green."
+	}
+	fmt.Printf("{\"status\":\"completed\",\"conversation_id\":%q,\"story_id\":%q,\"summary\":%q,\"output\":%q}\n", convID, storyID, summary, summary)
 }
 `), 0o644); err != nil {
 		t.Fatalf("write mock_agy.go: %v", err)
@@ -459,5 +464,51 @@ func TestMockAgy_Discovery5_DefaultAgyEscalationStdinJSON(t *testing.T) {
 
 	if _, err := supervisor.DefaultAgyEscalation(context.Background(), wtDir, "Resolve dirty git state STORY-GOV-5263", "git status dirty"); err != nil {
 		t.Fatalf("expected DefaultAgyEscalation to succeed with mock iazio-harness + mock agy via stdin JSON, got error: %v", err)
+	}
+}
+
+// TestMockAgy_RC7_PrematureCraftCloseoutFailsCompletionGate verifies STORY-IAZIO-0204 RC-7:
+// mock-agy emits ## CRAFT Closeout while still "waiting for" land, worktree is clean on main,
+// and the ASE completion gate fails closed with premature_craft_closeout / ASE_GATE_INCOMPLETE.
+func TestMockAgy_RC7_PrematureCraftCloseoutFailsCompletionGate(t *testing.T) {
+	_, harnessBin := buildMockAgyAndHarnessBinaries(t)
+	wtDir := initCleanGitWorktree(t, "STORY-IAZIO-0204")
+
+	job := &worker.Job{
+		ID:           "job_5b4dc7312a463143",
+		Type:         worker.JobTypeStoryExecute,
+		Repo:         "meta-repo",
+		TargetAgent:  "agy",
+		StoryID:      "STORY-IAZIO-0204",
+		FencingToken: 204,
+		LeaseToken:   "lease-rc7",
+		Payload:      json.RawMessage(`{"prompt":"/autonomous-story-execution PREMATURE_CRAFT STORY-IAZIO-0204","story_id":"STORY-IAZIO-0204"}`),
+	}
+
+	cp := newMockQueueControlPlane(job)
+	invoker := harness.NewCLIInvoker(harnessBin, wtDir)
+	disp := worker.NewDispatcher(cp, invoker, "debian")
+	disp.SetIdleWorktreesProvider(func() []string {
+		return disp.CollectIdleWorktrees([]string{wtDir})
+	})
+
+	processed, err := disp.PollAndProcess(context.Background())
+	if !processed {
+		t.Fatalf("expected job to be processed, got processed=false")
+	}
+	if err == nil || !strings.Contains(err.Error(), "premature_craft_closeout") {
+		t.Fatalf("expected premature_craft_closeout gate failure, got err=%v", err)
+	}
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	req, ok := cp.completed["job_5b4dc7312a463143"]
+	if !ok {
+		t.Fatal("expected CompleteJob to be called")
+	}
+	if !strings.Contains(req.Error, "premature_craft_closeout") {
+		t.Fatalf("expected CompleteRequest.Error premature_craft_closeout, got %q", req.Error)
+	}
+	if len(req.Result) == 0 || !strings.Contains(string(req.Result), "ASE_GATE_INCOMPLETE") {
+		t.Fatalf("expected ASE_GATE_INCOMPLETE in result, got %s", string(req.Result))
 	}
 }
